@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import List, Optional
 
-from simulator.core import (
+from core import (
     Request,
     RootRequest,
     DropReason,
@@ -10,11 +10,11 @@ from simulator.core import (
     TimePoint,
     TimeDuration,
 )
-from simulator.retry_policies import RetryPolicy, RetryContext
-from simulator.service import ServiceRuntime
-from simulator.simulator import Simulator
-from simulator.metrics import Metrics
-from simulator.timeout_controllers import TimeoutController
+from retry_policies import RetryPolicy, RetryContext
+from service import ServiceRuntime
+from simulator import Simulator
+from metrics import Metrics
+from timeout_controllers import TimeoutController
 
 
 @dataclass(frozen=True)

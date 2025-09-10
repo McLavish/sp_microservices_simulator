@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from simulator.core import TimeDuration, TimePoint, TimeInterval
+from core import TimeDuration, TimePoint, TimeInterval
 
 
 @dataclass

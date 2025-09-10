@@ -4,7 +4,7 @@ from enum import Enum
 import random
 from typing import Deque, Optional, Tuple, NamedTuple
 
-from simulator.core import TimeDuration, TimePoint
+from core import TimeDuration, TimePoint
 
 
 @dataclass

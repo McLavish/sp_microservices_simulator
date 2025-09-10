@@ -3,8 +3,8 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import PercentFormatter
-from simulator.plotting.utils.fault_events import load_fault_events, plot_fault_events
-from simulator.fault_events import FaultEventsTracker
+from plotting.utils.fault_events import load_fault_events, plot_fault_events
+from fault_events import FaultEventsTracker
 
 
 def main(csv_file, output_file, fault_events_file=None):

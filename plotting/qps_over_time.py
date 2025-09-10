@@ -2,7 +2,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import argparse
 
-from simulator.plotting.utils.fault_events import load_fault_events, plot_fault_events
+from plotting.utils.fault_events import load_fault_events, plot_fault_events
 
 
 def main(csv_file, output_file, fault_events_file=None):

@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import List
 import numpy as np
 
-from simulator.core import (
+from core import (
     RootRequest,
     Summary,
     TimeInterval,

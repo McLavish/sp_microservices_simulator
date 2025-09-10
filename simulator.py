@@ -2,7 +2,7 @@ import heapq
 import random
 from dataclasses import dataclass, field
 from typing import Callable, Optional
-from simulator.core import TimePoint
+from core import TimePoint
 
 
 @dataclass(order=True)

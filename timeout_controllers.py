@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Deque, Optional, Tuple
 import statistics
 
-from simulator.core import TimeDuration, TimePoint
+from core import TimeDuration, TimePoint
 
 
 class TimeoutController(ABC):

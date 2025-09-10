@@ -3,10 +3,10 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 import random
 
-from simulator.core import TimePoint, TimeDuration, s_to_ns
-from simulator.faults import LoadSpike
-from simulator.simulator import Simulator
-from simulator.fault_events import FaultEventsTracker
+from core import TimePoint, TimeDuration, s_to_ns
+from faults import LoadSpike
+from simulator import Simulator
+from fault_events import FaultEventsTracker
 
 
 @dataclass

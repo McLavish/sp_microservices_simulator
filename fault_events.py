@@ -1,7 +1,7 @@
 import json
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any
-from simulator.core import TimePoint, TimeInterval, ns_to_s
+from core import TimePoint, TimeInterval, ns_to_s
 
 
 @dataclass

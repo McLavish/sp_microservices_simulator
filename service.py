@@ -1,12 +1,12 @@
 import heapq
 import math
 from typing import List, Optional, Callable
-from simulator.core import TimePoint, TimeDuration, DropReason
+from core import TimePoint, TimeDuration, DropReason
 from dataclasses import dataclass, field
 
-from simulator.faults import LatencyInjection, PartialFailure
-from simulator.simulator import Simulator
-from simulator.fault_events import FaultEventsTracker
+from faults import LatencyInjection, PartialFailure
+from simulator import Simulator
+from fault_events import FaultEventsTracker
 
 from functools import partial
 

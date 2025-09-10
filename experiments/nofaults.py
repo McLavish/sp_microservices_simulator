@@ -1,12 +1,12 @@
-from simulator.core import TimeInterval, s_to_ns, ms_to_ns, ns_to_ms
-from simulator.faults import LoadSpike, LatencyInjection, PartialFailure
-from simulator.retry_policies import FixedBackoffRetryPolicy, NoRetryPolicy
-from simulator.service import ServiceConfig, ServiceRuntime
-from simulator.simulator import Simulator
-from simulator.timeout_controllers import StaticTimeoutController
-from simulator.workload import Workload
-from simulator.caller import ClientConfig, ClientRuntime
-from simulator.fault_events import FaultEventsTracker
+from core import TimeInterval, s_to_ns, ms_to_ns, ns_to_ms
+from faults import LoadSpike, LatencyInjection, PartialFailure
+from retry_policies import FixedBackoffRetryPolicy, NoRetryPolicy
+from service import ServiceConfig, ServiceRuntime
+from simulator import Simulator
+from timeout_controllers import StaticTimeoutController
+from workload import Workload
+from caller import ClientConfig, ClientRuntime
+from fault_events import FaultEventsTracker
 
 if __name__ == "__main__":
     sim = Simulator(seed=43232)
