@@ -1,0 +1,7 @@
+.venv
+.vscode
+results
+__pycache__
+*.csv
+*.json
+*.png
