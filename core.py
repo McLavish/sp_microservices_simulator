@@ -66,6 +66,9 @@ class RootRequest:
     attempts: List[Request] = field(default_factory=list)
     global_deadline: Optional[TimePoint] = None
     done: bool = False  # indicated if the request was handled
+    # Optional: callback invoked exactly once when the root completes
+    # Not used by metrics; safe to leave None in existing flows
+    on_done: Optional[callable] = None
 
     def add_attempt(self, attempt: Request):
         self.attempts.append(attempt)

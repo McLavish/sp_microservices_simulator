@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from functools import partial
-from typing import List, Optional
+from typing import List, Optional, Callable
 
 from core import (
     Request,
@@ -60,13 +60,27 @@ class ClientRuntime:
         if hasattr(policy, "underlying_strategy"):
             self._update_policy_results(policy.underlying_strategy, success, now)
 
-    def start_request(self, sim: Simulator):
+    def start_request(
+        self,
+        sim: Simulator,
+        on_done: Optional[Callable[[RootRequest], None]] = None,
+        override_global_deadline: Optional[TimePoint] = None,
+    ):
         root_req = RootRequest()
 
+        # Compute global deadline: min(override, controller)
         global_timeout = self.cfg.timeout_controller.get_global_timeout()
-
+        computed_deadline: Optional[TimePoint] = None
         if global_timeout is not None:
-            root_req.global_deadline = sim.timestep + global_timeout
+            computed_deadline = sim.timestep + global_timeout
+        if override_global_deadline is not None:
+            computed_deadline = (
+                override_global_deadline
+                if computed_deadline is None
+                else min(computed_deadline, override_global_deadline)
+            )
+        root_req.global_deadline = computed_deadline
+        root_req.on_done = on_done
 
         # Start first attempt
         # Create dummy request that will be replaced in _start_attempt
@@ -145,6 +159,12 @@ class ClientRuntime:
         if ctx.req.success:
             ctx.root.done = True
             self.roots.append(ctx.root)
+            # Fire completion callback once
+            if getattr(ctx.root, "on_done", None):
+                try:
+                    ctx.root.on_done(ctx.root)  # type: ignore[arg-type]
+                except Exception:
+                    pass
             return
 
         # Build retry context
@@ -161,6 +181,12 @@ class ClientRuntime:
         ):
             ctx.root.done = True
             self.roots.append(ctx.root)
+            # Fire completion callback once
+            if getattr(ctx.root, "on_done", None):
+                try:
+                    ctx.root.on_done(ctx.root)  # type: ignore[arg-type]
+                except Exception:
+                    pass
             return
 
         sim.schedule(next_start, partial(self._start_attempt, sim, ctx))

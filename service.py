@@ -96,6 +96,7 @@ class ServiceRuntime:
             [bool, TimeDuration, DropReason, int], None
         ],  # success, service_time, whydropped, queue_size
         attempt_deadline: Optional[TimePoint] = None,
+        behavior: Optional[Callable[["ServiceRuntime", Simulator, Optional[TimePoint], Callable[[bool, TimeDuration, DropReason], None], TimePoint], None]] = None,
     ):
         """
         Enqueue an attempt for this service.
@@ -111,7 +112,7 @@ class ServiceRuntime:
             raise Exception("Attempt already expired at submission time")
             return
 
-        start_cb = partial(self._begin_service, sim, on_done, attempt_deadline)
+        start_cb = partial(self._begin_service, sim, on_done, attempt_deadline, behavior)
 
         if self.in_flight < self.cfg.workers:
             start_cb()  # Immediately start handling if we have free worker
@@ -143,6 +144,7 @@ class ServiceRuntime:
         sim: Simulator,
         on_done: Callable[[bool, TimeDuration, DropReason, int], None],
         attempt_deadline: Optional[TimePoint],
+        behavior: Optional[Callable[["ServiceRuntime", Simulator, Optional[TimePoint], Callable[[bool, TimeDuration, DropReason], None], TimePoint], None]] = None,
     ):
         # If the attempt expired while waiting in the queue, drop immediately without
         # consuming a worker. We make sure we are not scheduling an event in the past.
@@ -151,22 +153,27 @@ class ServiceRuntime:
             return
 
         self.in_flight += 1
-        service_time = self._sample_service_time(sim.timestep, sim)
+        begin_at = sim.timestep
 
-        # Deadline propagation: if the request is interrupted throughout the service time
-        # then we interrupt it and drop the request.
-        expiry = (
-            min(sim.timestep + service_time, attempt_deadline)
-            if attempt_deadline is not None
-            else sim.timestep + service_time
-        )
+        if behavior is None:
+            # Default behavior: original single-stage service with optional deadline cut
+            service_time = self._sample_service_time(begin_at, sim)
+            expiry = (
+                min(begin_at + service_time, attempt_deadline)
+                if attempt_deadline is not None
+                else begin_at + service_time
+            )
 
-        # TODO: Actually the service time becomes less if we propagate a deadline.
+            finish_cb = partial(
+                self._finish_service, sim, on_done, service_time, attempt_deadline
+            )
+            sim.schedule(expiry, finish_cb)
+        else:
+            # Custom behavior is responsible for scheduling and eventually calling finalize
+            def finalize(success: bool, service_time: TimeDuration, drop: DropReason):
+                self._complete_attempt(sim, on_done, success, service_time, drop)
 
-        finish_cb = partial(
-            self._finish_service, sim, on_done, service_time, attempt_deadline
-        )
-        sim.schedule(expiry, finish_cb)
+            behavior(self, sim, attempt_deadline, finalize, begin_at)
 
     def _finish_service(
         self,
@@ -175,13 +182,25 @@ class ServiceRuntime:
         service_time: TimeDuration,  # Time spent handling the request, excluding any queuing
         attempt_deadline: Optional[TimePoint],
     ):
-        self.in_flight -= 1
-
+        success = True
+        drop_reason = DropReason.NONE
         if attempt_deadline is not None and sim.timestep >= attempt_deadline:
-            on_done(False, service_time, DropReason.DEADLINE, len(self.queue))
+            success = False
+            drop_reason = DropReason.DEADLINE
         else:
-            if not self._fails_now(sim.timestep, sim):
-                on_done(True, service_time, DropReason.NONE, len(self.queue))
-            else:
-                on_done(False, service_time, DropReason.SERVER_FAILURE, len(self.queue))
+            if self._fails_now(sim.timestep, sim):
+                success = False
+                drop_reason = DropReason.SERVER_FAILURE
+        self._complete_attempt(sim, on_done, success, service_time, drop_reason)
+
+    def _complete_attempt(
+        self,
+        sim: Simulator,
+        on_done: Callable[[bool, TimeDuration, DropReason, int], None],
+        success: bool,
+        service_time: TimeDuration,
+        drop_reason: DropReason,
+    ):
+        self.in_flight -= 1
+        on_done(success, service_time, drop_reason, len(self.queue))
         self._start_next(sim)
