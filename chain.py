@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
+from enum import Enum
 
 from core import TimePoint, TimeDuration, DropReason
 from simulator import Simulator
@@ -7,10 +8,16 @@ from service import ServiceRuntime, ServiceConfig
 from caller import ClientRuntime
 
 
+class EdgeMode(Enum):
+    BLOCKING = "blocking"
+    TANDEM = "tandem"
+
+
 @dataclass
 class DownstreamEdge:
     client: ClientRuntime
     target: "ServiceNodeRuntime"
+    mode: EdgeMode = EdgeMode.BLOCKING
 
 
 @dataclass
@@ -69,9 +76,26 @@ class ServiceNodeRuntime:
                     finalize(drop == DropReason.NONE, sim2.timestep - begin_at, drop)
                     return
 
-                # With downstreams: AND fanout — all must succeed
+                # Partition downstreams by mode
+                blocking_edges = [e for e in self.downstreams if e.mode == EdgeMode.BLOCKING]
+                tandem_edges = [e for e in self.downstreams if e.mode == EdgeMode.TANDEM]
+
+                # Launch tandem edges without waiting (tandem queue semantics)
+                for edge in tandem_edges:
+                    edge.client.start_request(
+                        sim2,
+                        on_done=None,  # do not gate upstream completion
+                        override_global_deadline=deadline,
+                    )
+
+                # If no blocking edges, finalize immediately after local stage
+                if not blocking_edges:
+                    finalize(True, sim2.timestep - begin_at, DropReason.NONE)
+                    return
+
+                # With blocking edges: AND semantics — all must succeed
                 done = False
-                remaining = len(self.downstreams)
+                remaining = len(blocking_edges)
                 any_failed = False
 
                 def maybe_finish():
@@ -96,7 +120,7 @@ class ServiceNodeRuntime:
                     sim2.schedule(int(deadline), on_deadline)
 
                 # Launch downstreams concurrently
-                for edge in self.downstreams:
+                for edge in blocking_edges:
                     def _mk_cb():
                         # Create a distinct callback capturing this invocation
                         def _cb(_root):
