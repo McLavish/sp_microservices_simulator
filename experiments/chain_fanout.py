@@ -11,7 +11,9 @@ from metrics import Metrics
 from chain import ServiceNodeRuntime, DownstreamEdge
 
 
-def make_client_cfg(attempt_timeout_ms: int, max_attempts: int, delay_ms: int) -> ClientConfig:
+def make_client_cfg(
+    attempt_timeout_ms: int, max_attempts: int, delay_ms: int
+) -> ClientConfig:
     return ClientConfig(
         retry=FixedBackoffRetryPolicy(
             max_attempts=max_attempts,
@@ -50,7 +52,7 @@ if __name__ == "__main__":
         queue_capacity=100,
         partial_failures=[
             PartialFailure(
-                duration=TimeInterval(begin=s_to_ns(20), end=s_to_ns(40)), p_fail=0.2
+                duration=TimeInterval(begin=s_to_ns(20), end=s_to_ns(40)), p_fail=0.5
             )
         ],
     )
@@ -68,7 +70,6 @@ if __name__ == "__main__":
         ],
     )
 
-    # Bind runtimes
     a_rt = ServiceRuntime(cfg=a_cfg).bind()
     b_rt = ServiceRuntime(cfg=b_cfg).bind()
     c_rt = ServiceRuntime(cfg=c_cfg).bind()
