@@ -22,6 +22,7 @@ def main(csv_file, output_file, fault_events_file=None):
     reasons_pct = df[reason_cols].div(completed, axis=0) * 100.0
     reasons_pct = reasons_pct.fillna(0.0)
 
+    # Request amplification % (extra requests due to retries relative to root)
     root = df["root_requests"].replace(0, np.nan)
     retries = df["retries"]
     amplification_pct = (retries / root) * 100.0

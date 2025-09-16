@@ -96,7 +96,19 @@ class ServiceRuntime:
             [bool, TimeDuration, DropReason, int], None
         ],  # success, service_time, whydropped, queue_size
         attempt_deadline: Optional[TimePoint] = None,
-        behavior: Optional[Callable[["ServiceRuntime", Simulator, Optional[TimePoint], Callable[[bool, TimeDuration, DropReason], None], TimePoint], None]] = None,
+        behavior: Optional[
+            Callable[
+                [
+                    "ServiceRuntime",
+                    Simulator,
+                    Optional[TimePoint],
+                    Callable[[bool, TimeDuration, DropReason], None],
+                    TimePoint,
+                    Callable[[], None],
+                ],
+                None,
+            ]
+        ] = None,
     ):
         """
         Enqueue an attempt for this service.
@@ -144,7 +156,19 @@ class ServiceRuntime:
         sim: Simulator,
         on_done: Callable[[bool, TimeDuration, DropReason, int], None],
         attempt_deadline: Optional[TimePoint],
-        behavior: Optional[Callable[["ServiceRuntime", Simulator, Optional[TimePoint], Callable[[bool, TimeDuration, DropReason], None], TimePoint], None]] = None,
+        behavior: Optional[
+            Callable[
+                [
+                    "ServiceRuntime",
+                    Simulator,
+                    Optional[TimePoint],
+                    Callable[[bool, TimeDuration, DropReason], None],
+                    TimePoint,
+                    Callable[[], None],
+                ],
+                None,
+            ]
+        ] = None,
     ):
         # If the attempt expired while waiting in the queue, drop immediately without
         # consuming a worker. We make sure we are not scheduling an event in the past.
@@ -169,11 +193,24 @@ class ServiceRuntime:
             )
             sim.schedule(expiry, finish_cb)
         else:
-            # Custom behavior is responsible for scheduling and eventually calling finalize
-            def finalize(success: bool, service_time: TimeDuration, drop: DropReason):
-                self._complete_attempt(sim, on_done, success, service_time, drop)
+            # Custom behavior can optionally release the worker early (for tandem queues)
+            released = False
 
-            behavior(self, sim, attempt_deadline, finalize, begin_at)
+            def release_worker():
+                nonlocal released
+                if released:
+                    raise RuntimeError("release_worker called more than once")
+                released = True
+                self.in_flight -= 1
+                self._start_next(sim)
+
+            def finalize(success: bool, service_time: TimeDuration, drop: DropReason):
+                if released:
+                    on_done(success, service_time, drop, len(self.queue))
+                else:
+                    self._complete_attempt(sim, on_done, success, service_time, drop)
+
+            behavior(self, sim, attempt_deadline, finalize, begin_at, release_worker)
 
     def _finish_service(
         self,

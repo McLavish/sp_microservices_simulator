@@ -8,7 +8,7 @@ from workload import Workload
 from caller import ClientConfig, ClientRuntime
 from fault_events import FaultEventsTracker
 from metrics import Metrics
-from chain import ServiceNodeRuntime, DownstreamEdge, EdgeMode
+from chain import ServiceNodeRuntime, DownstreamEdge
 
 
 def make_client_cfg(attempt_timeout_ms: int, max_attempts: int, delay_ms: int) -> ClientConfig:
@@ -23,13 +23,11 @@ def make_client_cfg(attempt_timeout_ms: int, max_attempts: int, delay_ms: int) -
     )
 
 
-def run_scenario(seed: int, modes: tuple[EdgeMode, EdgeMode, EdgeMode], top_attempt_timeout_ms: int = 200):
-    """Run A -> B -> {C, E} with provided edge modes.
+def run_scenario(seed: int, top_attempt_timeout_ms: int = 200):
+    """Run A -> B -> {C, E} with unified tandem semantics.
 
-    modes = (A->B, B->C, B->E)
     Returns per-client metrics summaries for (top A, B, C, E).
     """
-    a2b_mode, b2c_mode, b2e_mode = modes
 
     sim = Simulator(seed=seed)
 
@@ -100,10 +98,10 @@ def run_scenario(seed: int, modes: tuple[EdgeMode, EdgeMode, EdgeMode], top_atte
         service=b_node,  # type: ignore[arg-type]
     )
 
-    # Wire graph per modes
-    b_node.add_downstream(DownstreamEdge(client=b_to_c_client, target=c_node, mode=b2c_mode))
-    b_node.add_downstream(DownstreamEdge(client=b_to_e_client, target=e_node, mode=b2e_mode))
-    a_node.add_downstream(DownstreamEdge(client=a_to_b_client, target=b_node, mode=a2b_mode))
+    # Wire graph using tandem semantics on every edge
+    b_node.add_downstream(DownstreamEdge(client=b_to_c_client, target=c_node))
+    b_node.add_downstream(DownstreamEdge(client=b_to_e_client, target=e_node))
+    a_node.add_downstream(DownstreamEdge(client=a_to_b_client, target=b_node))
 
     # Top-level client calling A
     top_client_cfg = ClientConfig(
@@ -139,39 +137,31 @@ def run_scenario(seed: int, modes: tuple[EdgeMode, EdgeMode, EdgeMode], top_atte
     }
 
 
-def test_blocking_vs_tandem():
-    print("\n=== Running blocking baseline ===")
-    baseline = run_scenario(seed=1234, modes=(EdgeMode.BLOCKING, EdgeMode.BLOCKING, EdgeMode.BLOCKING))
-    print({k: (v.succeeded, v.p95) for k, v in baseline.items()})
+def test_chain_tandem_behavior():
+    print("\n=== Running default chain with tandem semantics ===")
+    results = run_scenario(seed=1234)
+    print({k: (v.succeeded, v.p95, v.dropped_server_failure) for k, v in results.items()})
 
-    # Baseline invariant: succ(A) == succ(B) <= min(succ(C), succ(E))
-    assert baseline["A"].succeeded == baseline["B"].succeeded, "Baseline: A and B should match"
-    assert baseline["B"].succeeded <= min(baseline["C"].succeeded, baseline["E"].succeeded), (
-        "Baseline: B should be limited by downstream fanout"
+    # Success counts should be monotonic across the chain
+    assert results["A"].succeeded == results["B"].succeeded, "Upstream client should match immediate downstream"
+    assert results["B"].succeeded <= min(results["C"].succeeded, results["E"].succeeded), (
+        "Fanout should be limited by the least successful downstream"
     )
 
-    print("\n=== Running mixed: B->C blocking, B->E tandem ===")
-    mixed = run_scenario(seed=1234, modes=(EdgeMode.BLOCKING, EdgeMode.BLOCKING, EdgeMode.TANDEM))
-    print({k: (v.succeeded, v.p95) for k, v in mixed.items()})
+    # Partial failures on C must be observable downstream and at the root
+    assert results["C"].dropped_server_failure > 0, "C should register server failures during outage window"
+    assert results["A"].dropped_server_failure > 0, "Failures from C must propagate back to the caller"
 
-    # Mixed invariant: A == B; B limited by C only
-    assert mixed["A"].succeeded == mixed["B"].succeeded, "Mixed: A equals B"
-    assert mixed["B"].succeeded <= mixed["C"].succeeded, "Mixed: B limited by C"
+    # Tandem semantics still allow retries at the root when downstream fails
+    assert results["A"].retries_per_root > 0, "Caller should exercise retries under failure"
 
-    print("\n=== Running all TANDEM ===")
-    all_tandem = run_scenario(seed=1234, modes=(EdgeMode.TANDEM, EdgeMode.TANDEM, EdgeMode.TANDEM))
-    print({k: (v.succeeded, v.p95) for k, v in all_tandem.items()})
-
-    # Expect upstream latency improvement when not waiting
-    assert all_tandem["A"].p95 <= baseline["A"].p95, "A p95 should not worsen in TANDEM"
-
-    print("All mode tests passed.")
+    print("Tandem behavior test passed.")
 
 
 def test_deadline_propagation():
     print("\n=== Testing deadline propagation (tight top-level timeout) ===")
     # Tight top-level attempt timeout forces upstream to cut by deadline even if downstreams run long.
-    res = run_scenario(seed=4321, modes=(EdgeMode.BLOCKING, EdgeMode.BLOCKING, EdgeMode.BLOCKING), top_attempt_timeout_ms=30)
+    res = run_scenario(seed=4321, top_attempt_timeout_ms=30)
     print({k: (v.succeeded, v.dropped_deadline) for k, v in res.items()})
 
     # Expect noticeable deadline drops at A and B under tight budget
@@ -184,7 +174,7 @@ def test_deadline_propagation():
 def test_queue_pressure_and_depth():
     print("\n=== Testing queue pressure with small capacities ===")
     # Reuse run_scenario by temporarily building a custom scenario with tiny queues
-    def run_small_queues(seed: int, modes: tuple[EdgeMode, EdgeMode, EdgeMode]):
+    def run_small_queues(seed: int):
         sim = Simulator(seed=seed)
 
         a_cfg = ServiceConfig(
@@ -229,9 +219,9 @@ def test_queue_pressure_and_depth():
             service=c_node,  # type: ignore[arg-type]
         )
 
-        # Wire modes
-        a_node.add_downstream(DownstreamEdge(client=a_to_b_client, target=b_node, mode=modes[0]))
-        b_node.add_downstream(DownstreamEdge(client=b_to_c_client, target=c_node, mode=modes[1]))
+        # Wire downstream edges
+        a_node.add_downstream(DownstreamEdge(client=a_to_b_client, target=b_node))
+        b_node.add_downstream(DownstreamEdge(client=b_to_c_client, target=c_node))
 
         top_client = ClientRuntime(
             cfg=ClientConfig(
@@ -252,14 +242,10 @@ def test_queue_pressure_and_depth():
             "C": b_to_c_client.metrics().summary(),
         }
 
-    small_blocking = run_small_queues(seed=7, modes=(EdgeMode.BLOCKING, EdgeMode.BLOCKING, EdgeMode.BLOCKING))
-    print({k: (v.succeeded, v.dropped_queue, v.dropped_deadline) for k, v in small_blocking.items()})
-    assert small_blocking["A"].dropped_queue > 0 or small_blocking["B"].dropped_queue > 0, "Expect queue drops under pressure"
-
-    small_tandem = run_small_queues(seed=7, modes=(EdgeMode.TANDEM, EdgeMode.TANDEM, EdgeMode.TANDEM))
-    print({k: (v.succeeded, v.dropped_queue, v.dropped_deadline) for k, v in small_tandem.items()})
-    # Ensure still stable and not crashing; verify some requests succeed
-    assert small_tandem["A"].succeeded > 0, "Tandem mode should still process requests"
+    small = run_small_queues(seed=7)
+    print({k: (v.succeeded, v.dropped_queue, v.dropped_deadline) for k, v in small.items()})
+    assert small["A"].dropped_queue > 0 or small["B"].dropped_queue > 0, "Expect queue drops under pressure"
+    assert small["A"].succeeded > 0, "Even under pressure some requests should succeed"
 
     print("Queue pressure tests passed.")
 
@@ -300,9 +286,9 @@ def test_queue_pressure_and_depth():
     )
 
     # Wire: D is leaf
-    c_node.add_downstream(DownstreamEdge(client=c_to_d, target=d_node, mode=EdgeMode.BLOCKING))
-    b_node.add_downstream(DownstreamEdge(client=b_to_c, target=c_node, mode=EdgeMode.BLOCKING))
-    a_node.add_downstream(DownstreamEdge(client=a_to_b, target=b_node, mode=EdgeMode.BLOCKING))
+    c_node.add_downstream(DownstreamEdge(client=c_to_d, target=d_node))
+    b_node.add_downstream(DownstreamEdge(client=b_to_c, target=c_node))
+    a_node.add_downstream(DownstreamEdge(client=a_to_b, target=b_node))
 
     top_client = ClientRuntime(
         cfg=ClientConfig(
@@ -327,14 +313,14 @@ def test_queue_pressure_and_depth():
         "C": (C_sum.succeeded, C_sum.p95),
         "D": (D_sum.succeeded, D_sum.p95),
     })
-    assert A_sum.succeeded == B_sum.succeeded == C_sum.succeeded, "Depth blocking: upstream should match all until leaf"
-    assert C_sum.succeeded <= D_sum.succeeded, "Depth blocking: limited by leaf"
+    assert A_sum.succeeded == B_sum.succeeded == C_sum.succeeded, "Depth chain: upstream should match all until leaf"
+    assert C_sum.succeeded <= D_sum.succeeded, "Depth chain: limited by leaf"
 
     print("Deeper chain tests passed.")
 
 
 if __name__ == "__main__":
-    test_blocking_vs_tandem()
+    test_chain_tandem_behavior()
     test_deadline_propagation()
     test_queue_pressure_and_depth()
     print("\nALL TESTS PASSED")

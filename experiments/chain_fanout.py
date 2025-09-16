@@ -32,42 +32,36 @@ if __name__ == "__main__":
     # Define services A -> B -> (C & E)
     a_cfg = ServiceConfig(
         name="svc-A",
-        latency_median=ms_to_ns(5),
-        latency_lognorm_sigma=0.4,
-        workers=16,
-        queue_capacity=100,
+        latency_median=ms_to_ns(60),
+        latency_lognorm_sigma=0.5,
+        workers=64,
+        queue_capacity=10000000,
     )
     b_cfg = ServiceConfig(
         name="svc-B",
-        latency_median=ms_to_ns(10),
+        latency_median=ms_to_ns(60),
         latency_lognorm_sigma=0.5,
-        workers=16,
-        queue_capacity=100,
+        workers=256,
+        queue_capacity=10000000,
     )
     c_cfg = ServiceConfig(
         name="svc-C",
-        latency_median=ms_to_ns(15),
-        latency_lognorm_sigma=0.6,
+        latency_median=ms_to_ns(60),
+        latency_lognorm_sigma=0.5,
         workers=16,
-        queue_capacity=100,
+        queue_capacity=10000000,
         partial_failures=[
             PartialFailure(
-                duration=TimeInterval(begin=s_to_ns(20), end=s_to_ns(40)), p_fail=0.5
+                duration=TimeInterval(begin=s_to_ns(10), end=s_to_ns(20)), p_fail=0.5
             )
         ],
     )
     e_cfg = ServiceConfig(
         name="svc-E",
-        latency_median=ms_to_ns(8),
+        latency_median=ms_to_ns(60),
         latency_lognorm_sigma=0.5,
-        workers=12,
-        queue_capacity=80,
-        latency_injections=[
-            LatencyInjection(
-                duration=TimeInterval(begin=s_to_ns(30), end=s_to_ns(45)),
-                add_latency=ms_to_ns(10),
-            )
-        ],
+        workers=16,
+        queue_capacity=10000000,
     )
 
     a_rt = ServiceRuntime(cfg=a_cfg).bind()
@@ -82,19 +76,19 @@ if __name__ == "__main__":
     e_node = ServiceNodeRuntime(service=e_rt)
 
     # Per-edge client configurations
-    # B's client to C and E (fanout) — tighter attempt timeout to model fanout sensitivity
+    # B's client to C and E (fanout)
     b_to_c_client = ClientRuntime(
-        cfg=make_client_cfg(attempt_timeout_ms=80, max_attempts=2, delay_ms=40),
+        cfg=make_client_cfg(attempt_timeout_ms=200, max_attempts=4, delay_ms=40),
         service=c_node,  # type: ignore[arg-type]
     )
     b_to_e_client = ClientRuntime(
-        cfg=make_client_cfg(attempt_timeout_ms=80, max_attempts=2, delay_ms=40),
+        cfg=make_client_cfg(attempt_timeout_ms=200, max_attempts=4, delay_ms=40),
         service=e_node,  # type: ignore[arg-type]
     )
 
     # A's client to B
     a_to_b_client = ClientRuntime(
-        cfg=make_client_cfg(attempt_timeout_ms=120, max_attempts=2, delay_ms=60),
+        cfg=make_client_cfg(attempt_timeout_ms=800, max_attempts=4, delay_ms=60),
         service=b_node,  # type: ignore[arg-type]
     )
 
@@ -110,30 +104,24 @@ if __name__ == "__main__":
 
     # Top-level client calling A
     top_client_cfg = ClientConfig(
-        retry=FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(100)),
+        retry=FixedBackoffRetryPolicy(max_attempts=4, delay=ms_to_ns(100)),
         timeout_controller=StaticTimeoutController(
-            global_timeout=None, attempt_timeout=ms_to_ns(200)
+            global_timeout=None, attempt_timeout=ms_to_ns(3200)
         ),
     )
     top_client = ClientRuntime(cfg=top_client_cfg, service=a_node)  # type: ignore[arg-type]
 
-    # Workload
     wl = Workload(
-        base_rps=300.0,
+        base_rps=188.0,
         duration_s=60,
         load_spikes=[
-            LoadSpike(
-                duration=TimeInterval(begin=s_to_ns(25), end=s_to_ns(35)),
-                rps_multiplier=1.8,
-            )
         ],
     )
 
-    # Drive arrivals into top-level client
     wl.drive(sim, lambda s: top_client.start_request(s))
 
     sim.run(until=s_to_ns(wl.duration_s))
-    sim.run()  # drain
+    sim.run()
 
     # Export metrics and faults
     m = top_client.metrics()
@@ -151,7 +139,6 @@ if __name__ == "__main__":
     for cli, name in per_service_clients:
         cli.metrics().export_csv(path=f"{name}_output.csv", granularity_s=1.0)
 
-    # Print summaries
     print("=== Top-level (A) ===")
     m.print_stats()
     print("=== Per-service summaries ===")

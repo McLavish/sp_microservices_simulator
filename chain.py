@@ -1,23 +1,15 @@
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Tuple
-from enum import Enum
-
+from typing import Callable, List, Optional
 from core import TimePoint, TimeDuration, DropReason
 from simulator import Simulator
 from service import ServiceRuntime, ServiceConfig
 from caller import ClientRuntime
 
 
-class EdgeMode(Enum):
-    BLOCKING = "blocking"
-    TANDEM = "tandem"
-
-
 @dataclass
 class DownstreamEdge:
     client: ClientRuntime
     target: "ServiceNodeRuntime"
-    mode: EdgeMode = EdgeMode.BLOCKING
 
 
 @dataclass
@@ -57,6 +49,7 @@ class ServiceNodeRuntime:
             deadline: Optional[TimePoint],
             finalize: Callable[[bool, TimeDuration, DropReason], None],
             begin_at: TimePoint,
+            release_worker: Callable[[], None],
         ) -> None:
             # Stage 1: local service time
             base_time = svc._sample_service_time(begin_at, sim2)
@@ -76,26 +69,11 @@ class ServiceNodeRuntime:
                     finalize(drop == DropReason.NONE, sim2.timestep - begin_at, drop)
                     return
 
-                # Partition downstreams by mode
-                blocking_edges = [e for e in self.downstreams if e.mode == EdgeMode.BLOCKING]
-                tandem_edges = [e for e in self.downstreams if e.mode == EdgeMode.TANDEM]
+                downstream_edges = list(self.downstreams)
 
-                # Launch tandem edges without waiting (tandem queue semantics)
-                for edge in tandem_edges:
-                    edge.client.start_request(
-                        sim2,
-                        on_done=None,  # do not gate upstream completion
-                        override_global_deadline=deadline,
-                    )
-
-                # If no blocking edges, finalize immediately after local stage
-                if not blocking_edges:
-                    finalize(True, sim2.timestep - begin_at, DropReason.NONE)
-                    return
-
-                # With blocking edges: AND semantics — all must succeed
+                # AND semantics across all downstream edges — all must succeed eventually.
                 done = False
-                remaining = len(blocking_edges)
+                remaining = len(downstream_edges)
                 any_failed = False
 
                 def maybe_finish():
@@ -120,7 +98,7 @@ class ServiceNodeRuntime:
                     sim2.schedule(int(deadline), on_deadline)
 
                 # Launch downstreams concurrently
-                for edge in blocking_edges:
+                for edge in downstream_edges:
                     def _mk_cb():
                         # Create a distinct callback capturing this invocation
                         def _cb(_root):
@@ -146,6 +124,9 @@ class ServiceNodeRuntime:
                         on_done=cb,
                         override_global_deadline=deadline,
                     )
+
+                if not done:
+                    release_worker()
 
             sim2.schedule(end_local, after_local)
 
