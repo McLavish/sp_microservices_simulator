@@ -91,7 +91,6 @@ class ExponentialBackoffWithJitterRetryPolicy(RetryPolicy):
         return False, 0
 
 
-# TODO: move circuit breaker to a separate class, not a retry policy
 class CBState(Enum):
     CLOSED = 0
     OPEN = 1
@@ -281,7 +280,7 @@ class RetryBudgetPolicy(RetryPolicy):
             return False, 0
 
 
-# Watch out for float vs int issues with tokens
+# TODO: Refill logic is broken in this branch
 @dataclass
 class BurstyRateLimiterPolicy(RetryPolicy):
     max_requests: int  # maximum requests in the bucket
@@ -371,5 +370,3 @@ class FixedWindowBurstyLimiterPolicy(RetryPolicy):
 
 
 # class HedgePolicy:
-
-# class TimeoutPolicy:

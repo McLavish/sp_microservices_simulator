@@ -35,9 +35,8 @@ class Workload:
     def _sample_interarrival(self, time: TimePoint) -> TimeDuration:
         rps = self.rps_at(time)
         if rps <= 0.0:
-            # No load right now - push a bit forward.
+            # No load now
             return s_to_ns(0.5)
-        # Use workload's own RNG so arrivals are identical across experiments
         return s_to_ns(self._rng.expovariate(rps))
 
     def drive(self, sim: Simulator, on_arrival: Callable[[Simulator], None]):

@@ -22,18 +22,14 @@ def main(csv_file, output_file, fault_events_file=None):
     reasons_pct = df[reason_cols].div(completed, axis=0) * 100.0
     reasons_pct = reasons_pct.fillna(0.0)
 
-    # NEW: request amplification % (extra requests due to retries relative to root)
-    # amplification_pct = (retries / root_requests) * 100
     root = df["root_requests"].replace(0, np.nan)
     retries = df["retries"]
     amplification_pct = (retries / root) * 100.0
 
-    # Make the reason breakdown the TOP plot, and amplification the BOTTOM plot
     fig, (ax_top, ax_bottom) = plt.subplots(
         2, 1, figsize=(10, 7), sharex=True, gridspec_kw={"height_ratios": [1.2, 1]}
     )
 
-    # TOP: stacked breakdown by reason (as % of completed)
     ax_top.stackplot(
         t,
         *[reasons_pct[c].to_numpy() for c in reason_cols],
@@ -58,7 +54,7 @@ def main(csv_file, output_file, fault_events_file=None):
     ax_bottom.set_xlabel("Time (s)")
     ax_bottom.set_ylabel("Amplification (%)")
     ax_bottom.set_xlim(left=0)
-    # Let y autoscale since amplification can exceed 100% in extreme cases
+
     ax_bottom.yaxis.set_major_formatter(PercentFormatter(100))
     ax_bottom.grid(True, which="both")
     ax_bottom.set_title("Request Amplification Over Time")

@@ -11,6 +11,7 @@ from fault_events import FaultEventsTracker
 from functools import partial
 
 
+# https://en.wikipedia.org/wiki/Log-normal_distribution
 @dataclass(frozen=True)
 class ServiceConfig:
     name: str
@@ -27,15 +28,12 @@ class ServiceConfig:
         """Register all fault events with the tracker"""
         for latency_inj in self.latency_injections:
             tracker.add_latency_injection(
-                latency_inj.duration,
-                latency_inj.add_latency,
-                latency_inj.multiplier
+                latency_inj.duration, latency_inj.add_latency, latency_inj.multiplier
             )
-        
+
         for partial_failure in self.partial_failures:
             tracker.add_partial_failure(
-                partial_failure.duration,
-                partial_failure.p_fail
+                partial_failure.duration, partial_failure.p_fail
             )
 
 
@@ -70,17 +68,13 @@ class ServiceRuntime:
         return max(0, base * mult + add)
 
     def _sample_service_time(self, t: TimePoint, sim: Simulator) -> TimeDuration:
-        """
-        Lognormal with given median (exp(mu)) and sigma.
-        If median=0, fall back to small constant.
-        """
         rng = sim.rng()
         median = max(1, self.cfg.latency_median)
         sigma = max(1e-6, self.cfg.latency_lognorm_sigma)
         mu = math.log(median)  # since median = exp(mu)
         raw = rng.lognormvariate(mu, sigma)
         adj = self._adjust_latency(t, int(raw))
-        return max(100_000, adj)  # put 1000000 to fix 1ms
+        return max(100_000, adj)  # put 1_000_000 to fix 1ms
 
     def _fails_now(self, t: TimePoint, sim: Simulator) -> bool:
         rng = sim.rng()
@@ -128,7 +122,9 @@ class ServiceRuntime:
             self.cfg.queue_capacity is not None
             and len(self.queue) >= self.cfg.queue_capacity
         ):
-            on_done(False, 0, DropReason.QUEUE_FULL, len(self.queue))  # dropped from queue
+            on_done(
+                False, 0, DropReason.QUEUE_FULL, len(self.queue)
+            )  # dropped from queue
             return
 
         # Enqueue the request
