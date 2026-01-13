@@ -71,20 +71,24 @@ class ServiceNodeRuntime:
 
                 downstream_edges = list(self.downstreams)
 
-                # AND semantics across all downstream edges — all must succeed eventually.
+                # AND semantics across all downstream edges: all must succeed eventually.
                 done = False
                 remaining = len(downstream_edges)
-                any_failed = False
+
+                def downstream_drop_reason(_root) -> DropReason:
+                    if not _root.attempts:
+                        return DropReason.SERVER_FAILURE
+                    last_attempt = max(_root.attempts, key=lambda a: a.interval.end)
+                    return last_attempt.drop_reason
 
                 def maybe_finish():
-                    nonlocal done, remaining, any_failed
+                    nonlocal done, remaining
                     if done:
                         return
                     if remaining == 0:
                         # All downstreams completed
-                        drop = DropReason.NONE if not any_failed else DropReason.SERVER_FAILURE
                         done = True
-                        finalize(drop == DropReason.NONE, sim2.timestep - begin_at, drop)
+                        finalize(True, sim2.timestep - begin_at, DropReason.NONE)
 
                 # Deadline guard: if deadline elapses before downstreams complete, drop
                 if deadline is not None:
@@ -102,16 +106,18 @@ class ServiceNodeRuntime:
                     def _mk_cb():
                         # Create a distinct callback capturing this invocation
                         def _cb(_root):
-                            nonlocal remaining, any_failed, done
+                            nonlocal remaining, done
                             if done:
                                 return
                             # Determine success from root attempts
                             succeeded = any(a.success for a in _root.attempts)
                             if not succeeded:
-                                any_failed = True
                                 # We can finish immediately on first failure (AND semantics)
                                 done = True
-                                finalize(False, sim2.timestep - begin_at, DropReason.SERVER_FAILURE)
+                                drop = downstream_drop_reason(_root)
+                                if drop == DropReason.NONE:
+                                    drop = DropReason.SERVER_FAILURE
+                                finalize(False, sim2.timestep - begin_at, drop)
                                 return
                             remaining -= 1
                             maybe_finish()

@@ -28,3 +28,19 @@ Plotting:
 
 - Failures over time with fault events:
   - `python -m plotting.failures_over_time chain_output.csv --fault-events chain_fault_events.json`
+
+Gymnasium integration (RL):
+
+- Install Gymnasium if needed: `python -m pip install gymnasium`
+- Example usage:
+  - `python - <<'PY'`
+  - `from rl.env import ActionSpec, EnvConfig, MicroservicesEnv, build_single_service_env`
+  - `cfg = EnvConfig(build=build_single_service_env, action_spec=ActionSpec([10, 50], [1, 2], [0, 50]))`
+  - `env = MicroservicesEnv(cfg)`
+  - `obs, info = env.reset(seed=123)`
+  - `obs, reward, terminated, truncated, info = env.step(env.action_space.sample())`
+  - `print(reward, info["summary"])`
+  - `PY`
+- Train with Stable-Baselines3 (PPO):
+  - `python -m pip install stable-baselines3`
+  - `python -m rl.train_sb3 --timesteps 5000 --save-path rl_models/ppo.zip`

@@ -40,7 +40,7 @@ if __name__ == "__main__":
     # Register service fault events
     svc_cfg.register_fault_events(fault_tracker)
 
-    # Client + retry: 2 retries with 5ms fixed backoff (total 3 attempts), 150ms total deadline
+    # Client + retry: 1 retry with 100ms fixed backoff (total 2 attempts), 50ms per-attempt timeout
     cli_cfg = ClientConfig(
         retry=FixedBackoffRetryPolicy(
             max_attempts=2,

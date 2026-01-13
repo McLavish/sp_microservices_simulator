@@ -121,7 +121,6 @@ class ServiceRuntime:
         # Immediately drop the request if somehow it has already expired?
         if attempt_deadline is not None and sim.timestep >= attempt_deadline:
             on_done(False, 0, DropReason.DEADLINE, len(self.queue))
-            raise Exception("Attempt already expired at submission time")
             return
 
         start_cb = partial(self._begin_service, sim, on_done, attempt_deadline, behavior)

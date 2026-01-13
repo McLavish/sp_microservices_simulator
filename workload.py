@@ -32,8 +32,10 @@ class Workload:
                 rps *= spike.rps_multiplier
         return max(0.0, rps)
 
-    def _sample_interarrival(self, time: TimePoint) -> TimeDuration:
-        rps = self.rps_at(time)
+    def _sample_interarrival(
+        self, time: TimePoint, rps: Optional[float] = None
+    ) -> TimeDuration:
+        rps = self.rps_at(time) if rps is None else rps
         if rps <= 0.0:
             # No load now
             return s_to_ns(0.5)
@@ -45,8 +47,10 @@ class Workload:
         def tick():
             if sim.timestep >= end_at:
                 return
-            on_arrival(sim)
-            ia = max(1, self._sample_interarrival(sim.timestep))
+            rps = self.rps_at(sim.timestep)
+            if rps > 0.0:
+                on_arrival(sim)
+            ia = max(1, self._sample_interarrival(sim.timestep, rps))
             sim.schedule(sim.timestep + ia, tick)
 
         # start at t=0

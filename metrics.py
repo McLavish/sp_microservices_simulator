@@ -45,15 +45,11 @@ class Metrics:
         dropped_deadline = 0
         dropped_server_failure = 0
         for request in self.roots:
+            if not request.attempts:
+                continue
+
             success = False
             for attempt in request.attempts:
-                if attempt.drop_reason == DropReason.QUEUE_FULL:
-                    dropped_q += 1
-                if attempt.drop_reason == DropReason.DEADLINE:
-                    dropped_deadline += 1
-                if attempt.drop_reason == DropReason.SERVER_FAILURE:
-                    dropped_server_failure += 1
-
                 if attempt.success:  # there should be only 1 success per root request
                     if success:
                         raise ValueError("Multiple successful attempts in RootRequest")
@@ -62,6 +58,17 @@ class Metrics:
                     succ_lat.append(
                         self._compute_time_interval_from_attempts(request).duration()
                     )
+
+            if success:
+                continue
+
+            last_attempt = max(request.attempts, key=lambda a: a.interval.end)
+            if last_attempt.drop_reason == DropReason.QUEUE_FULL:
+                dropped_q += 1
+            elif last_attempt.drop_reason == DropReason.DEADLINE:
+                dropped_deadline += 1
+            else:
+                dropped_server_failure += 1
 
         mean_ms = ns_to_ms(int(sum(succ_lat) / len(succ_lat))) if succ_lat else 0.0
         max_ms = ns_to_ms(max(succ_lat)) if succ_lat else 0.0

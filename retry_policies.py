@@ -29,7 +29,7 @@ class RetryPolicy:
 
 @dataclass
 class FixedBackoffRetryPolicy(RetryPolicy):
-    max_attempts: int
+    max_attempts: int  # total attempts including the initial try
     delay: TimeDuration
 
     def next_delay(self, context: RetryContext) -> Tuple[bool, TimeDuration]:
@@ -46,7 +46,7 @@ class NoRetryPolicy(RetryPolicy):
 
 @dataclass
 class ExponentialBackoffRetryPolicy(RetryPolicy):
-    max_attempts: int
+    max_attempts: int  # total attempts including the initial try
     initial_delay: TimeDuration
     max_delay: TimeDuration
 
@@ -67,7 +67,7 @@ class JitterMode(Enum):
 
 @dataclass
 class ExponentialBackoffWithJitterRetryPolicy(RetryPolicy):
-    max_attempts: int
+    max_attempts: int  # total attempts including the initial try
     initial_delay: TimeDuration
     max_delay: TimeDuration
     rng: random.Random  # pass in the simulator's rng
@@ -212,7 +212,7 @@ class TimeBasedCircuitBreakerPolicy(RetryPolicy):
 @dataclass
 class LeakyRateLimiterPolicy(RetryPolicy):
     max_requests: int  # number of max requests in the period
-    max_attempts: int  # number of max attempts
+    max_attempts: int  # total attempts including the initial try
     period: TimeDuration
 
     _next_at: Optional[TimePoint] = field(default=None, init=False)
@@ -227,7 +227,7 @@ class LeakyRateLimiterPolicy(RetryPolicy):
     def next_delay(self, context: RetryContext) -> Tuple[bool, TimeDuration]:
         if context.now is None:
             raise ValueError("LeakyRateLimiterPolicy requires context.now to be set")
-        if context.attempt > self.max_attempts:
+        if context.attempt >= self.max_attempts:
             return False, 0
         delay = self.add_request(context.now)
         return True, delay
