@@ -28,6 +28,11 @@ Plotting:
 
 - Failures over time with fault events:
   - `python -m plotting.failures_over_time chain_output.csv --fault-events chain_fault_events.json`
+  - `python -m plotting.failures_over_time multichain_A_output.csv --fault-events multichain_fault_events.json`
+
+Metastable retry storm example (multi-chain):
+
+- `python -m experiments.multichain_retry_storm`
 
 Gymnasium integration (RL):
 
@@ -44,3 +49,10 @@ Gymnasium integration (RL):
 - Train with Stable-Baselines3 (PPO):
   - `python -m pip install stable-baselines3`
   - `python -m rl.train_sb3 --timesteps 5000 --save-path rl_models/ppo.zip`
+- Compare latency models (synthetic):
+  - `python -m rl.experiments.compare_models --dist lognormal`
+  - `python -m rl.experiments.compare_models --dist mixture`
+  - `python -m rl.experiments.compare_models --dist pareto`
+- Compare policy baselines:
+  - `python -m rl.experiments.compare_policies --policies fixed,aimd,model_based,model_based_queue,bayesian,ppo,oracle_fixed`
+  - `python -m rl.experiments.compare_policies --fault-scenario basic --policies fixed,aimd,model_based,bayesian,ppo,oracle_fixed`
