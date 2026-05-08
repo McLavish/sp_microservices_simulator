@@ -5,8 +5,9 @@ from typing import Callable, List, Optional, Tuple, Dict, Any
 
 import numpy as np
 
-from core import DropReason, TimeDuration, TimePoint, ms_to_ns, s_to_ns
+from core import DropReason, TimeDuration, TimePoint, TimeInterval, ms_to_ns, s_to_ns
 from caller import ClientRuntime, ClientConfig
+from faults import LatencyInjection, PartialFailure, LoadSpike
 from retry_policies import FixedBackoffRetryPolicy
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
@@ -58,6 +59,8 @@ class EnvConfig:
     reward_weights: RewardWeights = field(default_factory=RewardWeights)
     drain_on_done: bool = True
     initial_action: Optional[Tuple[int, ...]] = None
+    emit_latency_samples: bool = True
+    max_latency_samples: Optional[int] = None
 
 
 if gym is None:
@@ -129,6 +132,14 @@ class MicroservicesEnv(_GymEnvBase):
 
         obs = self._build_observation([])
         info = {"action": self._last_action_values.copy()}
+        if self._cfg.emit_latency_samples:
+            info.update(
+                {
+                    "attempt_latencies_ms": [],
+                    "attempt_censored": [],
+                    "root_latencies_ms": [],
+                }
+            )
         return obs, info
 
     def step(self, action):
@@ -149,6 +160,8 @@ class MicroservicesEnv(_GymEnvBase):
         reward, summary = self._compute_reward(new_roots)
         terminated = self._current_time_ns >= self._end_time_ns
         info = {"summary": summary, "action": self._last_action_values.copy()}
+        if self._cfg.emit_latency_samples:
+            info.update(self._collect_latency_samples(new_roots))
         return obs, reward, terminated, False, info
 
     def _build(self, seed: Optional[int]) -> EnvComponents:
@@ -307,9 +320,46 @@ class MicroservicesEnv(_GymEnvBase):
         )
         return obs
 
+    def _collect_latency_samples(self, roots) -> Dict[str, list]:
+        attempt_latencies = []
+        attempt_censored = []
+        root_latencies = []
 
-def build_single_service_env(seed: Optional[int] = None) -> EnvComponents:
+        for root in roots:
+            if not root.attempts:
+                continue
+            begin = min(a.interval.begin for a in root.attempts)
+            end = max(a.interval.end for a in root.attempts)
+            if any(a.success for a in root.attempts):
+                root_latencies.append((end - begin) / 1_000_000)
+
+            for attempt in root.attempts:
+                duration_ms = (attempt.interval.end - attempt.interval.begin) / 1_000_000
+                attempt_latencies.append(duration_ms)
+                attempt_censored.append(attempt.drop_reason == DropReason.DEADLINE)
+
+        if self._cfg.max_latency_samples is not None:
+            attempt_latencies = attempt_latencies[: self._cfg.max_latency_samples]
+            attempt_censored = attempt_censored[: self._cfg.max_latency_samples]
+            root_latencies = root_latencies[: self._cfg.max_latency_samples]
+
+        return {
+            "attempt_latencies_ms": attempt_latencies,
+            "attempt_censored": attempt_censored,
+            "root_latencies_ms": root_latencies,
+        }
+
+    def metrics_summary(self):
+        if self._client is None:
+            return None
+        return self._client.metrics().summary()
+
+
+def build_single_service_env(
+    seed: Optional[int] = None, duration_s: Optional[int] = None
+) -> EnvComponents:
     sim = Simulator(seed=1 if seed is None else seed)
+    duration = 30 if duration_s is None else int(duration_s)
 
     svc_cfg = ServiceConfig(
         name="svc-A",
@@ -329,8 +379,56 @@ def build_single_service_env(seed: Optional[int] = None) -> EnvComponents:
 
     workload = Workload(
         base_rps=200.0,
-        duration_s=30,
+        duration_s=duration,
         load_spikes=[],
+        rng_seed=seed,
+    )
+
+    return EnvComponents(sim=sim, workload=workload, client=client)
+
+
+def build_faulty_single_service_env(
+    seed: Optional[int] = None, duration_s: Optional[int] = None
+) -> EnvComponents:
+    sim = Simulator(seed=1 if seed is None else seed)
+    duration = 30 if duration_s is None else int(duration_s)
+
+    latency_injection = LatencyInjection(
+        duration=TimeInterval(begin=s_to_ns(0.2 * duration), end=s_to_ns(0.35 * duration)),
+        add_latency=ms_to_ns(30),
+    )
+    partial_failure = PartialFailure(
+        duration=TimeInterval(begin=s_to_ns(0.5 * duration), end=s_to_ns(0.65 * duration)),
+        p_fail=0.3,
+    )
+
+    svc_cfg = ServiceConfig(
+        name="svc-A",
+        latency_median=ms_to_ns(20),
+        latency_lognorm_sigma=0.5,
+        workers=16,
+        queue_capacity=200,
+        latency_injections=[latency_injection],
+        partial_failures=[partial_failure],
+    )
+    svc = ServiceRuntime(cfg=svc_cfg).bind()
+
+    timeout_ctrl = StaticTimeoutController(
+        global_timeout=None, attempt_timeout=ms_to_ns(50)
+    )
+    retry = FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(50))
+    client_cfg = ClientConfig(retry=retry, timeout_controller=timeout_ctrl)
+    client = ClientRuntime(cfg=client_cfg, service=svc)
+
+    workload = Workload(
+        base_rps=200.0,
+        duration_s=duration,
+        load_spikes=[
+            LoadSpike(
+                duration=TimeInterval(begin=s_to_ns(0.3 * duration), end=s_to_ns(0.45 * duration)),
+                rps_multiplier=2.0,
+            )
+        ],
         rng_seed=seed,
     )
 
