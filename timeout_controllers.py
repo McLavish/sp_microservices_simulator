@@ -121,7 +121,15 @@ class AdaptiveTimeoutController(TimeoutController):
         return self._current_attempt_timeout
 
     def record_result(self, success: bool, latency: TimeDuration) -> None:
-        """Record result and update timeout values"""
-        self._latencies.append(latency)
+        """Record result and update timeout values.
+
+        Only successful latencies feed the percentile window: drops at
+        submit/dequeue carry near-zero latency and would bias the
+        percentile downward, shrinking the timeout and amplifying drops.
+        The success-rate window still records every outcome so the
+        low-success-rate inflation path remains active.
+        """
+        if success:
+            self._latencies.append(latency)
         self._successes.append(success)
         self._update_timeouts()
