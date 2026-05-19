@@ -48,4 +48,4 @@ if __name__ == "__main__":
 
     m = client.metrics()
 
-    m.export_csv(path="output.csv", granularity_s=1.0)
+    m.export_csv(path="nofaults_output.csv", granularity_s=1.0)
