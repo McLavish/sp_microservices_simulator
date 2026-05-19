@@ -272,7 +272,7 @@ class RetryBudgetPolicy(RetryPolicy):
 
     # Derived token values, calculated from budget_ratio and max_retries
     _max_tokens: int = field(init=False)
-    _success_award: int = field(init=False)
+    _success_award: float = field(init=False)
     _retry_cost: int = field(init=False)
 
     _tokens: float = field(init=False)
@@ -282,7 +282,7 @@ class RetryBudgetPolicy(RetryPolicy):
         # If budget_ratio = 0.1 (10%), then 10 successes should allow 1 retry
         # So success_award = 10, retry_cost = 100
         self._retry_cost = 100  # Base cost for a retry
-        self._success_award = int(self._retry_cost * self.budget_ratio)
+        self._success_award = self._retry_cost * self.budget_ratio
         self._max_tokens = self._retry_cost * self.max_retries
 
         self._tokens = self._max_tokens  # start with full budget
