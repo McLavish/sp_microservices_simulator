@@ -9,6 +9,7 @@ from core import (
     ns_to_ms,
     DropReason,
     s_to_ns,
+    ns_to_s,
     MS_TO_NS,
 )
 
@@ -152,6 +153,9 @@ class Metrics:
                 ]
             )
 
+            if not all_attempts:
+                return
+
             min_begin = min(a.interval.begin for a in all_attempts)
             max_end = max(a.interval.end for a in all_attempts)
 
@@ -242,12 +246,11 @@ class Metrics:
                         elif last_attempt.drop_reason == DropReason.SERVER_FAILURE:
                             failure_srv_counts[b_done] += 1
 
-            seconds_per_bucket = granularity_s
             total_requests_so_far = 0
             total_failures_so_far = 0
 
             for i in range(nbuckets):
-                tp_sec = i * seconds_per_bucket
+                tp_sec = ns_to_s(start_ns + i * bucket_ns)
 
                 n_roots = root_counts[i]
                 n_retries = retry_counts[i]
