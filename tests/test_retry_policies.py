@@ -1,10 +1,18 @@
 import unittest
 
 from retry_policies import (
+    CountBasedCircuitBreakerPolicy,
     FixedBackoffRetryPolicy,
     LeakyRateLimiterPolicy,
+    NoRetryPolicy,
     RetryContext,
 )
+from caller import ClientConfig, ClientRuntime
+from core import DropReason, TimeInterval, s_to_ns
+from faults import PartialFailure
+from service import ServiceConfig, ServiceRuntime
+from simulator import Simulator
+from timeout_controllers import StaticTimeoutController
 
 
 class TestRetryPolicies(unittest.TestCase):
@@ -19,6 +27,74 @@ class TestRetryPolicies(unittest.TestCase):
         allow2, _ = policy.next_delay(RetryContext(attempt=2, now=0))
         self.assertTrue(allow1)
         self.assertFalse(allow2)
+
+    def test_open_circuit_blocks_new_root_request(self):
+        sim = Simulator(seed=1)
+        svc = ServiceRuntime(
+            cfg=ServiceConfig(
+                name="svc",
+                latency_median=1,
+                latency_lognorm_sigma=0.1,
+                workers=1,
+                queue_capacity=None,
+                partial_failures=[
+                    PartialFailure(
+                        duration=TimeInterval(begin=0, end=s_to_ns(1)),
+                        p_fail=1.0,
+                    )
+                ],
+            )
+        ).bind()
+        breaker = CountBasedCircuitBreakerPolicy(
+            failure_threshold_ratio=(1, 1),
+            success_threshold_ratio=(1, 1),
+            underlying_strategy=NoRetryPolicy(),
+            half_open_delay=s_to_ns(1),
+        )
+        client = ClientRuntime(
+            cfg=ClientConfig(
+                retry=breaker,
+                timeout_controller=StaticTimeoutController(),
+            ),
+            service=svc,
+        )
+
+        client.start_request(sim)
+        sim.run()
+        self.assertEqual(client.roots[-1].attempts[-1].drop_reason, DropReason.SERVER_FAILURE)
+
+        client.start_request(sim)
+
+        self.assertEqual(client.attempts_total, 2)
+        self.assertEqual(len(client.roots), 2)
+        self.assertEqual(client.roots[-1].attempts[-1].drop_reason, DropReason.CIRCUIT_OPEN)
+
+    def test_completion_callback_exceptions_propagate(self):
+        sim = Simulator(seed=1)
+        svc = ServiceRuntime(
+            cfg=ServiceConfig(
+                name="svc",
+                latency_median=1,
+                latency_lognorm_sigma=0.1,
+                workers=1,
+                queue_capacity=None,
+            )
+        ).bind()
+        client = ClientRuntime(
+            cfg=ClientConfig(
+                retry=NoRetryPolicy(),
+                timeout_controller=StaticTimeoutController(),
+            ),
+            service=svc,
+        )
+
+        def on_done(_root):
+            raise RuntimeError("callback failed")
+
+        client.start_request(sim, on_done=on_done)
+
+        with self.assertRaisesRegex(RuntimeError, "callback failed"):
+            sim.run()
 
 
 if __name__ == "__main__":

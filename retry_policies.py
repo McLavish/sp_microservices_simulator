@@ -23,6 +23,9 @@ class DelayDecision(NamedTuple):
 
 
 class RetryPolicy:
+    def allow_request(self, now: TimePoint) -> bool:
+        return True
+
     def next_delay(self, context: RetryContext) -> Tuple[bool, TimeDuration]:
         raise NotImplementedError
 
@@ -134,22 +137,35 @@ class CountBasedCircuitBreakerPolicy(RetryPolicy):
                     if now is not None:
                         self._opened_at = now
         elif self._state == CBState.OPEN:
+            return
+        elif self._state == CBState.HALF_OPEN:
             self._open_window.append(success)
-            # Only evaluate closing after cooldown (if any)
-            if (
-                self._opened_at is None
-                or self.half_open_delay == 0
-                or now - self._opened_at >= self.half_open_delay
-            ):
-                if len(self._open_window) == self._open_window.maxlen:
-                    successes = sum(1 for ok in self._open_window if ok)
-                    if successes >= self.success_threshold_ratio[0]:
-                        self._state = CBState.CLOSED
-                        self._closed_window.clear()
-                        self._opened_at = None
+            if len(self._open_window) == self._open_window.maxlen:
+                successes = sum(1 for ok in self._open_window if ok)
+                if successes >= self.success_threshold_ratio[0]:
+                    self._state = CBState.CLOSED
+                    self._closed_window.clear()
+                    self._opened_at = None
+                else:
+                    self._state = CBState.OPEN
+                    self._open_window.clear()
+                    self._opened_at = now
+
+    def allow_request(self, now: TimePoint) -> bool:
+        if self._state != CBState.OPEN:
+            return True
+        if (
+            self._opened_at is None
+            or self.half_open_delay == 0
+            or now - self._opened_at >= self.half_open_delay
+        ):
+            self._state = CBState.HALF_OPEN
+            self._open_window.clear()
+            return True
+        return False
 
     def next_delay(self, context: RetryContext) -> Tuple[bool, TimeDuration]:
-        if self._state == CBState.OPEN:
+        if self._state != CBState.CLOSED:
             return False, 0
         else:
             return self.underlying_strategy.next_delay(context)
@@ -179,7 +195,8 @@ class TimeBasedCircuitBreakerPolicy(RetryPolicy):
 
     def add_result(self, success: bool, now: TimePoint) -> None:
         self._evict_old(now)
-        self._window.append((now, success))
+        if self._state != CBState.OPEN:
+            self._window.append((now, success))
 
         total = len(self._window)
         failures = sum(1 for _, ok in self._window if not ok)
@@ -190,19 +207,31 @@ class TimeBasedCircuitBreakerPolicy(RetryPolicy):
                 self._state = CBState.OPEN
                 self._opened_at = now
         elif self._state == CBState.OPEN:
-            if (
-                self._opened_at is None
-                or self.half_open_delay == 0
-                or now - self._opened_at >= self.half_open_delay
-            ):
-                if total >= self.min_requests and rate < (
-                    1 - self.success_threshold_rate
-                ):
-                    self._state = CBState.CLOSED
-                    self._opened_at = None
+            return
+        elif self._state == CBState.HALF_OPEN:
+            if total >= self.min_requests and rate < (1 - self.success_threshold_rate):
+                self._state = CBState.CLOSED
+                self._opened_at = None
+            elif total >= self.min_requests:
+                self._state = CBState.OPEN
+                self._opened_at = now
+                self._window.clear()
+
+    def allow_request(self, now: TimePoint) -> bool:
+        if self._state != CBState.OPEN:
+            return True
+        if (
+            self._opened_at is None
+            or self.half_open_delay == 0
+            or now - self._opened_at >= self.half_open_delay
+        ):
+            self._state = CBState.HALF_OPEN
+            self._window.clear()
+            return True
+        return False
 
     def next_delay(self, context: RetryContext) -> Tuple[bool, TimeDuration]:
-        if self._state == CBState.OPEN:
+        if self._state != CBState.CLOSED:
             return False, 0
 
         return self.underlying_strategy.next_delay(context)

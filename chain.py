@@ -63,10 +63,18 @@ class ServiceNodeRuntime:
                     finalize(False, sim2.timestep - begin_at, DropReason.DEADLINE)
                     return
 
-                # No downstreams: behave like default finish (including partial failure)
+                local_drop = (
+                    DropReason.SERVER_FAILURE
+                    if svc._fails_now(sim2.timestep, sim2)
+                    else DropReason.NONE
+                )
+                if local_drop != DropReason.NONE:
+                    finalize(False, sim2.timestep - begin_at, local_drop)
+                    return
+
+                # No downstreams: behave like default finish.
                 if not self.downstreams:
-                    drop = DropReason.SERVER_FAILURE if svc._fails_now(sim2.timestep, sim2) else DropReason.NONE
-                    finalize(drop == DropReason.NONE, sim2.timestep - begin_at, drop)
+                    finalize(True, sim2.timestep - begin_at, DropReason.NONE)
                     return
 
                 downstream_edges = list(self.downstreams)

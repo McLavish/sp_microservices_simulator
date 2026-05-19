@@ -60,6 +60,19 @@ class ClientRuntime:
         if hasattr(policy, "underlying_strategy"):
             self._update_policy_results(policy.underlying_strategy, success, now)
 
+    def _allow_policy_request(self, policy: RetryPolicy, now: TimePoint) -> bool:
+        if hasattr(policy, "allow_request") and not policy.allow_request(now):
+            return False
+        if hasattr(policy, "underlying_strategy"):
+            return self._allow_policy_request(policy.underlying_strategy, now)
+        return True
+
+    def _complete_root(self, root: RootRequest) -> None:
+        root.done = True
+        self.roots.append(root)
+        if getattr(root, "on_done", None):
+            root.on_done(root)  # type: ignore[arg-type]
+
     def start_request(
         self,
         sim: Simulator,
@@ -81,6 +94,20 @@ class ClientRuntime:
             )
         root_req.global_deadline = computed_deadline
         root_req.on_done = on_done
+
+        if not self._allow_policy_request(self.cfg.retry, sim.timestep):
+            self.attempts_total += 1
+            req = Request(
+                service=self.service.cfg.name,
+                interval=TimeInterval(begin=sim.timestep, end=sim.timestep),
+                deadline=computed_deadline,
+                success=False,
+                drop_reason=DropReason.CIRCUIT_OPEN,
+                queue_size_at_end=0,
+            )
+            root_req.add_attempt(req)
+            self._complete_root(root_req)
+            return
 
         # Start first attempt
         # Create dummy request that will be replaced in _start_attempt
@@ -157,14 +184,7 @@ class ClientRuntime:
         #     ctx.req.success = False
 
         if ctx.req.success:
-            ctx.root.done = True
-            self.roots.append(ctx.root)
-            # Fire completion callback once
-            if getattr(ctx.root, "on_done", None):
-                try:
-                    ctx.root.on_done(ctx.root)  # type: ignore[arg-type]
-                except Exception:
-                    pass
+            self._complete_root(ctx.root)
             return
 
         # Build retry context
@@ -179,14 +199,7 @@ class ClientRuntime:
             ctx.root.global_deadline is not None
             and next_start >= ctx.root.global_deadline
         ):
-            ctx.root.done = True
-            self.roots.append(ctx.root)
-            # Fire completion callback once
-            if getattr(ctx.root, "on_done", None):
-                try:
-                    ctx.root.on_done(ctx.root)  # type: ignore[arg-type]
-                except Exception:
-                    pass
+            self._complete_root(ctx.root)
             return
 
         sim.schedule(next_start, partial(self._start_attempt, sim, ctx))
