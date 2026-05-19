@@ -1,6 +1,7 @@
 import unittest
 
 from retry_policies import (
+    BurstyRateLimiterPolicy,
     CountBasedCircuitBreakerPolicy,
     FixedBackoffRetryPolicy,
     LeakyRateLimiterPolicy,
@@ -27,6 +28,38 @@ class TestRetryPolicies(unittest.TestCase):
         allow2, _ = policy.next_delay(RetryContext(attempt=2, now=0))
         self.assertTrue(allow1)
         self.assertFalse(allow2)
+
+    def test_bursty_rate_limiter_refills_by_period(self):
+        policy = BurstyRateLimiterPolicy(
+            max_requests=2,
+            refill_rate=2,
+            period=100,
+            underlying_strategy=FixedBackoffRetryPolicy(max_attempts=10, delay=0),
+        )
+
+        self.assertEqual(policy.next_delay(RetryContext(attempt=1, now=0)), (True, 0))
+        self.assertEqual(policy.next_delay(RetryContext(attempt=1, now=0)), (True, 0))
+        self.assertEqual(policy.next_delay(RetryContext(attempt=1, now=1)), (False, 0))
+        self.assertAlmostEqual(policy._tokens, 0.02)
+
+        self.assertEqual(policy.next_delay(RetryContext(attempt=1, now=50)), (True, 0))
+        self.assertAlmostEqual(policy._tokens, 0.0)
+
+    def test_bursty_rate_limiter_rejects_invalid_config(self):
+        with self.assertRaisesRegex(ValueError, "max_requests"):
+            BurstyRateLimiterPolicy(
+                max_requests=0,
+                refill_rate=1,
+                period=100,
+                underlying_strategy=NoRetryPolicy(),
+            )
+        with self.assertRaisesRegex(ValueError, "period"):
+            BurstyRateLimiterPolicy(
+                max_requests=1,
+                refill_rate=1,
+                period=0,
+                underlying_strategy=NoRetryPolicy(),
+            )
 
     def test_open_circuit_blocks_new_root_request(self):
         sim = Simulator(seed=1)

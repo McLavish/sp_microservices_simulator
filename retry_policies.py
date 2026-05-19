@@ -313,29 +313,35 @@ class RetryBudgetPolicy(RetryPolicy):
 @dataclass
 class BurstyRateLimiterPolicy(RetryPolicy):
     max_requests: int  # maximum requests in the bucket
-    refill_rate: int  # requests per nanosecond to refill bucket
+    refill_rate: float  # requests added per period
     period: TimeDuration  # time period for refill calculations
     underlying_strategy: RetryPolicy
 
-    _tokens: int = field(init=False)
+    _tokens: float = field(init=False)
     _last_refill: Optional[TimePoint] = field(default=None, init=False)
 
     def __post_init__(self):
-        self._tokens = self.max_requests
+        if self.max_requests <= 0:
+            raise ValueError("max_requests must be > 0")
+        if self.refill_rate < 0:
+            raise ValueError("refill_rate must be >= 0")
+        if self.period <= 0:
+            raise ValueError("period must be > 0")
+        self._tokens = float(self.max_requests)
 
     def _refill_tokens(self, now: TimePoint) -> None:
         if self._last_refill is None:
             self._last_refill = now
             return
 
-        time_elapsed = now - self._last_refill
-        tokens_to_add = int(time_elapsed * self.refill_rate)  # funky rounding happening
+        time_elapsed = max(0, now - self._last_refill)
+        tokens_to_add = (time_elapsed * self.refill_rate) / self.period
         self._tokens = min(self.max_requests, self._tokens + tokens_to_add)
         self._last_refill = now
 
     def can_retry(self, now: TimePoint) -> bool:
         self._refill_tokens(now)
-        return self._tokens > 0
+        return self._tokens >= 1.0
 
     def next_delay(self, context: RetryContext) -> Tuple[bool, TimeDuration]:
         if context.now is None:
