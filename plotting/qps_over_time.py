@@ -9,7 +9,7 @@ def main(csv_file, output_file, fault_events_file=None):
     df = pd.read_csv(csv_file)
     df = df.sort_values(by="timepoint")
 
-    # remove the last point (no data)
+    # drop drain-phase partial bucket (events that landed after wl.duration_s)
     df = df[:-1]
 
     plt.figure(figsize=(10, 6))

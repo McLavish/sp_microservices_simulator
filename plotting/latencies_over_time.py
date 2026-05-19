@@ -8,6 +8,7 @@ def main(csv_file, output_file, fault_events_file=None):
     df = pd.read_csv(csv_file)
     df = df.sort_values(by="timepoint")
 
+    # drop drain-phase partial bucket (events that landed after wl.duration_s)
     df = df[:-1]
 
     t = df["timepoint"].astype(float)

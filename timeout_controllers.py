@@ -63,7 +63,9 @@ class AdaptiveTimeoutController(TimeoutController):
     # Internal state
     _latencies: Deque[TimeDuration] = field(default_factory=deque, init=False)
     _successes: Deque[bool] = field(default_factory=deque, init=False)
-    # Global timeout is fixed (i.e. we want to guarantee overall request completes in time)
+    # Global timeout is fixed by design: it bounds the entire request
+    # budget for the caller's deadline contract. Only attempt timeout
+    # adapts to observed latency.
     _current_global_timeout: Optional[TimeDuration] = field(default=None, init=False)
     _current_attempt_timeout: Optional[TimeDuration] = field(default=None, init=False)
 

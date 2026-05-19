@@ -18,6 +18,7 @@ class Workload:
     _rng: random.Random = field(init=False, repr=False)
 
     def __post_init__(self):
+        # rng_seed=None falls back to seed 0 for cross-experiment determinism; pass an int explicitly to vary.
         self._rng = random.Random(self.rng_seed if self.rng_seed is not None else 0)
 
     def register_fault_events(self, tracker: FaultEventsTracker):
@@ -37,7 +38,8 @@ class Workload:
     ) -> TimeDuration:
         rps = self.rps_at(time) if rps is None else rps
         if rps <= 0.0:
-            # No load now
+            # No load right now - push a bit forward.
+            # RNG is intentionally NOT consumed here; arrivals stay identical across experiments only when RPS-positive intervals match.
             return s_to_ns(0.5)
         return s_to_ns(self._rng.expovariate(rps))
 
