@@ -89,6 +89,12 @@ class ServiceNodeRuntime:
                     last_attempt = max(_root.attempts, key=lambda a: a.interval.end)
                     return last_attempt.drop_reason
 
+                deadline_event = None
+
+                def cancel_deadline():
+                    if deadline_event is not None:
+                        deadline_event.cancelled = True
+
                 def maybe_finish():
                     nonlocal done, remaining
                     if done:
@@ -96,6 +102,7 @@ class ServiceNodeRuntime:
                     if remaining == 0:
                         # All downstreams completed
                         done = True
+                        cancel_deadline()
                         finalize(True, sim2.timestep - begin_at, DropReason.NONE)
 
                 # Deadline guard: if deadline elapses before downstreams complete, drop
@@ -107,7 +114,7 @@ class ServiceNodeRuntime:
                             finalize(False, sim2.timestep - begin_at, DropReason.DEADLINE)
 
                     # ensure we schedule at int(deadline)
-                    sim2.schedule(int(deadline), on_deadline)
+                    deadline_event = sim2.schedule(int(deadline), on_deadline)
 
                 # Launch downstreams concurrently
                 for edge in downstream_edges:
@@ -125,6 +132,7 @@ class ServiceNodeRuntime:
                             if not succeeded:
                                 # We can finish immediately on first failure (AND semantics)
                                 done = True
+                                cancel_deadline()
                                 drop = downstream_drop_reason(_root)
                                 if drop == DropReason.NONE:
                                     drop = DropReason.SERVER_FAILURE
