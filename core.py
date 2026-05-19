@@ -84,6 +84,7 @@ class Summary:
     dropped_queue: int
     dropped_deadline: int
     dropped_server_failure: int
+    dropped_circuit_open: int
     p50: float
     p90: float
     p95: float

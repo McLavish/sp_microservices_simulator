@@ -45,6 +45,7 @@ class Metrics:
         dropped_q = 0
         dropped_deadline = 0
         dropped_server_failure = 0
+        dropped_circuit_open = 0
         for request in self.roots:
             if not request.attempts:
                 continue
@@ -68,6 +69,8 @@ class Metrics:
                 dropped_q += 1
             elif last_attempt.drop_reason == DropReason.DEADLINE:
                 dropped_deadline += 1
+            elif last_attempt.drop_reason == DropReason.CIRCUIT_OPEN:
+                dropped_circuit_open += 1
             else:
                 dropped_server_failure += 1
 
@@ -80,6 +83,7 @@ class Metrics:
             dropped_queue=dropped_q,
             dropped_deadline=dropped_deadline,
             dropped_server_failure=dropped_server_failure,
+            dropped_circuit_open=dropped_circuit_open,
             p50=self._percentile_ms(0.5, succ_lat),
             p90=self._percentile_ms(0.9, succ_lat),
             p95=self._percentile_ms(0.95, succ_lat),
@@ -99,6 +103,7 @@ class Metrics:
         print(f"Dropped (Queue Full): {summary.dropped_queue}")
         print(f"Dropped (Deadline): {summary.dropped_deadline}")
         print(f"Dropped (Server Failure): {summary.dropped_server_failure}")
+        print(f"Dropped (Circuit Open): {summary.dropped_circuit_open}")
         print(f"P50 Latency (ms): {summary.p50:.2f}")
         print(f"P95 Latency (ms): {summary.p95:.2f}")
         print(f"P99 Latency (ms): {summary.p99:.2f}")
@@ -139,6 +144,7 @@ class Metrics:
                     "failure_queue_full",
                     "failure_deadline",
                     "failure_server",
+                    "failure_circuit_open",
                     "total_request",  # bucketed at the start. rename total_started_roots?
                     "total_failure",  # bucketed at the end. rename total_failed_roots_completed?
                     "p50",  # percentiles are all bucketed at the end
@@ -176,6 +182,7 @@ class Metrics:
             failure_q_counts = [0] * nbuckets  # failed ROOTS by reason
             failure_dead_counts = [0] * nbuckets
             failure_srv_counts = [0] * nbuckets
+            failure_co_counts = [0] * nbuckets
             retry_fail_counts = [
                 0
             ] * nbuckets  # failed RETRY attempts that END in bucket
@@ -243,6 +250,8 @@ class Metrics:
                             failure_q_counts[b_done] += 1
                         elif last_attempt.drop_reason == DropReason.DEADLINE:
                             failure_dead_counts[b_done] += 1
+                        elif last_attempt.drop_reason == DropReason.CIRCUIT_OPEN:
+                            failure_co_counts[b_done] += 1
                         elif last_attempt.drop_reason == DropReason.SERVER_FAILURE:
                             failure_srv_counts[b_done] += 1
 
@@ -296,6 +305,7 @@ class Metrics:
                         str(failure_q_counts[i]),
                         str(failure_dead_counts[i]),
                         str(failure_srv_counts[i]),
+                        str(failure_co_counts[i]),
                         str(total_requests_so_far),
                         str(total_failures_so_far),
                         f"{p50:.3f}",
