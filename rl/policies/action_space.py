@@ -1,7 +1,17 @@
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
+
+import numpy as np
 
 from rl.env import ActionSpec
+
+
+def coerce_action(action: Any) -> Tuple[int, ...]:
+    if isinstance(action, np.ndarray):
+        action = action.tolist()
+    if isinstance(action, (list, tuple)):
+        return tuple(int(a) for a in action)
+    return (int(action),)
 
 
 @dataclass(frozen=True)

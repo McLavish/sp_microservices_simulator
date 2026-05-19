@@ -64,19 +64,7 @@ class BayesianPolicy:
             self._rng = np.random.default_rng(seed)
 
     def act(self, obs: np.ndarray, info: dict) -> Tuple[int, ...]:
-        latencies = info.get("attempt_latencies_ms", [])
-        censored = info.get("attempt_censored", [])
-        if latencies:
-            if self.use_censored:
-                self._buffer.add([float(v) for v in latencies])
-            else:
-                filtered = [
-                    float(v)
-                    for v, is_censored in zip(latencies, censored)
-                    if not is_censored
-                ]
-                self._buffer.add(filtered)
-
+        self._buffer.ingest_info(info, self.use_censored)
         data = self._buffer.data()
         if data.size == 0:
             return self.grid.indices[0]

@@ -5,7 +5,7 @@ from typing import Callable, List, Optional, Tuple, Dict, Any
 
 import numpy as np
 
-from core import DropReason, TimeDuration, TimePoint, TimeInterval, ms_to_ns, s_to_ns
+from core import DropReason, TimeDuration, TimePoint, TimeInterval, ms_to_ns, ns_to_ms, ns_to_s, s_to_ns
 from caller import ClientRuntime, ClientConfig
 from faults import LatencyInjection, PartialFailure, LoadSpike
 from retry_policies import FixedBackoffRetryPolicy
@@ -91,7 +91,6 @@ class MicroservicesEnv(_GymEnvBase):
 
         self.action_space = spaces.MultiDiscrete(self._action_sizes)
 
-        # Observation: rates, latency stats, retries, queue avg, current params, time progress
         self._obs_size = 12
         self.observation_space = spaces.Box(
             low=0.0, high=np.inf, shape=(self._obs_size,), dtype=np.float32
@@ -130,7 +129,7 @@ class MicroservicesEnv(_GymEnvBase):
         )
         self._apply_action(initial_action)
 
-        obs = self._build_observation([])
+        obs = self._build_observation(self._summarize_roots([]))
         info = {"action": self._last_action_values.copy()}
         if self._cfg.emit_latency_samples:
             info.update(
@@ -143,7 +142,8 @@ class MicroservicesEnv(_GymEnvBase):
         return obs, info
 
     def step(self, action):
-        action = self._coerce_action(action)
+        from rl.policies.action_space import coerce_action
+        action = coerce_action(action)
         self._apply_action(action)
 
         next_time = min(self._current_time_ns + self._step_ns, self._end_time_ns)
@@ -156,8 +156,9 @@ class MicroservicesEnv(_GymEnvBase):
         new_roots = self._client.roots[self._last_root_idx :]
         self._last_root_idx = len(self._client.roots)
 
-        obs = self._build_observation(new_roots)
-        reward, summary = self._compute_reward(new_roots)
+        summary = self._summarize_roots(new_roots)
+        obs = self._build_observation(summary)
+        reward = self._reward_from_summary(summary)
         terminated = self._current_time_ns >= self._end_time_ns
         info = {"summary": summary, "action": self._last_action_values.copy()}
         if self._cfg.emit_latency_samples:
@@ -166,13 +167,6 @@ class MicroservicesEnv(_GymEnvBase):
 
     def _build(self, seed: Optional[int]) -> EnvComponents:
         return self._cfg.build(seed)
-
-    def _coerce_action(self, action) -> Tuple[int, ...]:
-        if isinstance(action, np.ndarray):
-            action = action.tolist()
-        if isinstance(action, (list, tuple)):
-            return tuple(int(a) for a in action)
-        return (int(action),)
 
     def _apply_action(self, action: Tuple[int, ...]) -> None:
         spec = self._cfg.action_spec
@@ -213,8 +207,7 @@ class MicroservicesEnv(_GymEnvBase):
             "backoff_ms": backoff_ms,
         }
 
-    def _compute_reward(self, roots) -> Tuple[float, Dict[str, Any]]:
-        summary = self._summarize_roots(roots)
+    def _reward_from_summary(self, summary: Dict[str, float]) -> float:
         w = self._cfg.reward_weights
         reward = (
             summary["success_rate"] * w.success
@@ -224,7 +217,7 @@ class MicroservicesEnv(_GymEnvBase):
             - summary["p95_latency_ms"] * w.p95_latency_ms
             - summary["retries_per_root"] * w.retries
         )
-        return float(reward), summary
+        return float(reward)
 
     def _summarize_roots(self, roots) -> Dict[str, float]:
         if not roots:
@@ -273,11 +266,9 @@ class MicroservicesEnv(_GymEnvBase):
         deadline_rate = deadline_drops / completed if completed else 0.0
         queue_rate = queue_drops / completed if completed else 0.0
         server_rate = server_drops / completed if completed else 0.0
-        avg_latency_ms = (
-            float(np.mean(latencies)) / 1_000_000 if latencies else 0.0
-        )
+        avg_latency_ms = ns_to_ms(float(np.mean(latencies))) if latencies else 0.0
         p95_latency_ms = (
-            float(np.quantile(np.asarray(latencies), 0.95)) / 1_000_000
+            ns_to_ms(float(np.quantile(np.asarray(latencies), 0.95)))
             if latencies
             else 0.0
         )
@@ -298,9 +289,8 @@ class MicroservicesEnv(_GymEnvBase):
             "queue_avg": queue_avg,
         }
 
-    def _build_observation(self, roots) -> np.ndarray:
-        summary = self._summarize_roots(roots)
-        time_s = self._current_time_ns / 1_000_000_000
+    def _build_observation(self, summary: Dict[str, float]) -> np.ndarray:
+        time_s = ns_to_s(self._current_time_ns)
         obs = np.array(
             [
                 summary["success_rate"],
@@ -331,11 +321,10 @@ class MicroservicesEnv(_GymEnvBase):
             begin = min(a.interval.begin for a in root.attempts)
             end = max(a.interval.end for a in root.attempts)
             if any(a.success for a in root.attempts):
-                root_latencies.append((end - begin) / 1_000_000)
+                root_latencies.append(ns_to_ms(end - begin))
 
             for attempt in root.attempts:
-                duration_ms = (attempt.interval.end - attempt.interval.begin) / 1_000_000
-                attempt_latencies.append(duration_ms)
+                attempt_latencies.append(ns_to_ms(attempt.interval.end - attempt.interval.begin))
                 attempt_censored.append(attempt.drop_reason == DropReason.DEADLINE)
 
         if self._cfg.max_latency_samples is not None:

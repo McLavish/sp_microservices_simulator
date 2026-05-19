@@ -39,31 +39,33 @@ class LogNormalMixtureModel:
         sigmas = np.full(self.n_components, max(sigma_init, self.min_sigma))
         weights = np.full(self.n_components, 1.0 / self.n_components)
 
+        log_2pi_half = 0.5 * math.log(2.0 * math.pi)
         prev_ll = -math.inf
         for _ in range(self.max_iter):
-            log_probs = []
-            for j in range(self.n_components):
-                comp_logpdf = (
-                    -0.5 * ((logx - mus[j]) / sigmas[j]) ** 2
-                    - math.log(sigmas[j] * math.sqrt(2.0 * math.pi))
-                )
-                log_probs.append(np.log(weights[j]) + comp_logpdf)
-            log_probs = np.vstack(log_probs).T
+            z = (logx[:, None] - mus[None, :]) / sigmas[None, :]
+            log_probs = (
+                -0.5 * z * z
+                - (np.log(sigmas) + log_2pi_half)[None, :]
+                + np.log(weights)[None, :]
+            )
             log_sum = logsumexp(log_probs, axis=1)
             ll = float(np.sum(log_sum))
 
             resp = np.exp(log_probs - log_sum[:, None])
-            weights = np.mean(resp, axis=0)
-            weights = weights / np.sum(weights)
+            r_sum = resp.sum(axis=0)
+            r_sum_safe = np.where(r_sum > 0, r_sum, 1.0)
 
-            for j in range(self.n_components):
-                r = resp[:, j]
-                r_sum = np.sum(r)
-                if r_sum <= 0:
-                    continue
-                mus[j] = np.sum(r * logx) / r_sum
-                var = np.sum(r * (logx - mus[j]) ** 2) / r_sum
-                sigmas[j] = max(math.sqrt(var), self.min_sigma)
+            weights = r_sum / n
+            weights = weights / weights.sum()
+
+            new_mus = (resp * logx[:, None]).sum(axis=0) / r_sum_safe
+            diff = logx[:, None] - new_mus[None, :]
+            var = (resp * diff * diff).sum(axis=0) / r_sum_safe
+            new_sigmas = np.maximum(np.sqrt(var), self.min_sigma)
+
+            active = r_sum > 0
+            mus = np.where(active, new_mus, mus)
+            sigmas = np.where(active, new_sigmas, sigmas)
 
             if abs(ll - prev_ll) < self.tol:
                 break

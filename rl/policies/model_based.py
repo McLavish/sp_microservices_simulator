@@ -16,6 +16,7 @@ from rl.policies.action_space import ActionGrid, ActionValues
 class LatencyBuffer:
     max_samples: int
     samples: List[float] = field(default_factory=list)
+    _array_cache: Optional[np.ndarray] = field(default=None, init=False, repr=False)
 
     def add(self, values: List[float]) -> None:
         if not values:
@@ -23,11 +24,31 @@ class LatencyBuffer:
         self.samples.extend(values)
         if len(self.samples) > self.max_samples:
             self.samples = self.samples[-self.max_samples :]
+        self._array_cache = None
+
+    def ingest_info(self, info: dict, use_censored: bool) -> None:
+        latencies = info.get("attempt_latencies_ms", [])
+        if not latencies:
+            return
+        if use_censored:
+            self.add([float(v) for v in latencies])
+            return
+        censored = info.get("attempt_censored", [])
+        filtered = [
+            float(v)
+            for v, is_censored in zip(latencies, censored)
+            if not is_censored
+        ]
+        self.add(filtered)
 
     def data(self) -> np.ndarray:
-        if not self.samples:
-            return np.array([], dtype=np.float64)
-        return np.asarray(self.samples, dtype=np.float64)
+        if self._array_cache is None:
+            self._array_cache = (
+                np.array([], dtype=np.float64)
+                if not self.samples
+                else np.asarray(self.samples, dtype=np.float64)
+            )
+        return self._array_cache
 
 
 def _simulate_action(
@@ -133,19 +154,7 @@ class ModelBasedPolicy:
             self._rng = np.random.default_rng(seed)
 
     def act(self, obs: np.ndarray, info: dict) -> Tuple[int, ...]:
-        latencies = info.get("attempt_latencies_ms", [])
-        censored = info.get("attempt_censored", [])
-        if latencies:
-            if self.use_censored:
-                self._buffer.add([float(v) for v in latencies])
-            else:
-                filtered = [
-                    float(v)
-                    for v, is_censored in zip(latencies, censored)
-                    if not is_censored
-                ]
-                self._buffer.add(filtered)
-
+        self._buffer.ingest_info(info, self.use_censored)
         data = self._buffer.data()
         if data.size == 0:
             return self.grid.indices[0]
@@ -219,10 +228,15 @@ class ModelBasedPolicy:
         if self.use_retries_in_lambda:
             lambda_rate *= 1.0 + float(summary.get("retries_per_root", 0.0))
 
-        sample_count = max(10, int(self.queue_moment_samples))
-        samples = model.sample(self._rng, sample_count)
-        mean_s = float(np.mean(samples))
-        mean_s2 = float(np.mean(samples ** 2))
+        if hasattr(model, "moments"):
+            mean_s, mean_s2 = model.moments()
+            mean_s = float(mean_s)
+            mean_s2 = float(mean_s2)
+        else:
+            sample_count = max(10, int(self.queue_moment_samples))
+            samples = model.sample(self._rng, sample_count)
+            mean_s = float(np.mean(samples))
+            mean_s2 = float(np.dot(samples, samples) / samples.size)
         workers = max(1, int(self.queue_workers))
         rho = (lambda_rate * mean_s) / workers if mean_s > 0 else 0.0
         rho = min(max(rho, 0.0), self.queue_max_utilization)

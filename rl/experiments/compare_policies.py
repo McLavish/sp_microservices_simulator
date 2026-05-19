@@ -71,7 +71,7 @@ class ExperimentConfig:
     fault_scenario: str
 
 
-def _parse_int_list(value: str) -> List[int]:
+def _parse_ints(value: str) -> List[int]:
     items = [v.strip() for v in value.split(",") if v.strip()]
     return [int(v) for v in items]
 
@@ -85,10 +85,6 @@ def _parse_optional_int_list(value: str) -> List[Optional[int]]:
         else:
             parsed.append(int(item))
     return parsed
-
-
-def _parse_ints(value: str) -> List[int]:
-    return _parse_int_list(value)
 
 
 def _build_env(cfg: ExperimentConfig) -> MicroservicesEnv:
