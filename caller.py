@@ -159,6 +159,8 @@ class ClientRuntime:
 
         # Half-open semantics: success must finish strictly before deadline.
         within_deadline = (ctx.req.deadline is None) or (end_time < ctx.req.deadline)
+        if not within_deadline and drop_reason == DropReason.NONE:
+            drop_reason = DropReason.DEADLINE
         success_effective = (
             success and within_deadline and drop_reason == DropReason.NONE
         )
