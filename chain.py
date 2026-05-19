@@ -111,6 +111,9 @@ class ServiceNodeRuntime:
 
                 # Launch downstreams concurrently
                 for edge in downstream_edges:
+                    if done:
+                        break
+
                     def _mk_cb():
                         # Create a distinct callback capturing this invocation
                         def _cb(_root):
