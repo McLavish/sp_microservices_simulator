@@ -15,6 +15,9 @@ dev = [
     "pytest",
     "pytest-cov",
     "scipy",
+    "matplotlib",
+    "pandas",
+    "gymnasium",
 ]
 
 [tool.uv]
