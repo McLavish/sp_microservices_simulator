@@ -72,10 +72,7 @@ class EnvConfig:
     max_latency_samples: int | None = None
 
 
-if gym is None:
-    _GymEnvBase = object
-else:
-    _GymEnvBase = gym.Env
+_GymEnvBase = object if gym is None else gym.Env
 
 
 class MicroservicesEnv(_GymEnvBase):
@@ -291,7 +288,7 @@ class MicroservicesEnv(_GymEnvBase):
 
     def _build_observation(self, summary: dict[str, float]) -> np.ndarray:
         time_s = ns_to_s(self._current_time_ns)
-        obs = np.array(
+        return np.array(
             [
                 summary["success_rate"],
                 summary["deadline_drop_rate"],
@@ -308,7 +305,6 @@ class MicroservicesEnv(_GymEnvBase):
             ],
             dtype=np.float32,
         )
-        return obs
 
     def _collect_latency_samples(self, roots) -> dict[str, list]:
         attempt_latencies = []

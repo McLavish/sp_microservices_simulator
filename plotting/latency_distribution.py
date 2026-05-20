@@ -64,7 +64,7 @@ def plot_lognormal_latency(median_ms, sigma, output_file="latency_distribution.p
     # Add percentile lines
     percentiles = [50, 90, 95, 99]
     colors = ["red", "orange", "purple", "brown"]
-    for p, color in zip(percentiles, colors):
+    for p, color in zip(percentiles, colors, strict=False):
         p_value_ms = stats.lognorm.ppf(p / 100, s=sigma, scale=np.exp(mu))
         if p_value_ms <= median_ms * 5:
             ax2.axvline(

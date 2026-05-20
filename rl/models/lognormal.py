@@ -24,15 +24,13 @@ class LogNormalModel:
         x = np.asarray(x, dtype=np.float64)
         logx = np.log(x, where=x > 0, out=np.full_like(x, -math.inf))
         out = lognormal_logpdf(logx, self.mu, self.sigma)
-        out = np.where(x > 0, out, -math.inf)
-        return out
+        return np.where(x > 0, out, -math.inf)
 
     def cdf(self, x: np.ndarray) -> np.ndarray:
         x = np.asarray(x, dtype=np.float64)
         logx = np.log(x, where=x > 0, out=np.full_like(x, -math.inf))
         z = (logx - self.mu) / self.sigma
-        out = np.where(x > 0, norm_cdf(z), 0.0)
-        return out
+        return np.where(x > 0, norm_cdf(z), 0.0)
 
     def quantile(self, q: float) -> float:
         if q <= 0.0:

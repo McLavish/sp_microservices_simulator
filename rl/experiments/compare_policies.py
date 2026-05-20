@@ -89,9 +89,14 @@ def _parse_optional_int_list(value: str) -> list[int | None]:
 def _build_env(cfg: ExperimentConfig) -> MicroservicesEnv:
     duration_s = int(round(cfg.episode_duration_s)) if cfg.episode_duration_s else None
     if cfg.fault_scenario == "basic":
-        build_fn = lambda seed: build_faulty_single_service_env(seed, duration_s=duration_s)
+
+        def build_fn(seed):
+            return build_faulty_single_service_env(seed, duration_s=duration_s)
     else:
-        build_fn = lambda seed: build_single_service_env(seed, duration_s=duration_s)
+
+        def build_fn(seed):
+            return build_single_service_env(seed, duration_s=duration_s)
+
     action_spec = ActionSpec(
         attempt_timeout_ms=cfg.attempt_timeouts_ms,
         max_attempts=cfg.max_attempts,

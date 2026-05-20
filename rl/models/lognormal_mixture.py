@@ -77,7 +77,7 @@ class LogNormalMixtureModel:
         x = np.asarray(x, dtype=np.float64)
         logx = np.log(x, where=x > 0, out=np.full_like(x, -math.inf))
         logpdf = []
-        for w, mu, sigma in zip(self.weights, self.mus, self.sigmas):
+        for w, mu, sigma in zip(self.weights, self.mus, self.sigmas, strict=False):
             logpdf.append(np.log(w) + lognormal_logpdf(logx, float(mu), float(sigma)))
         return np.vstack(logpdf).T
 
@@ -134,7 +134,7 @@ class LogNormalMixtureModel:
 
     def params(self) -> dict[str, float]:
         params = {}
-        for i, (w, mu, sigma) in enumerate(zip(self.weights, self.mus, self.sigmas)):
+        for i, (w, mu, sigma) in enumerate(zip(self.weights, self.mus, self.sigmas, strict=False)):
             params[f"w{i}"] = float(w)
             params[f"mu{i}"] = float(mu)
             params[f"sigma{i}"] = float(sigma)

@@ -34,7 +34,9 @@ class LatencyBuffer:
             self.add([float(v) for v in latencies])
             return
         censored = info.get("attempt_censored", [])
-        filtered = [float(v) for v, is_censored in zip(latencies, censored) if not is_censored]
+        filtered = [
+            float(v) for v, is_censored in zip(latencies, censored, strict=False) if not is_censored
+        ]
         self.add(filtered)
 
     def data(self) -> np.ndarray:
@@ -158,7 +160,7 @@ class ModelBasedPolicy:
         best_idx = self.grid.indices[0]
         best_value = -float("inf")
 
-        for action_idx, action_vals in zip(self.grid.indices, self.grid.values):
+        for action_idx, action_vals in zip(self.grid.indices, self.grid.values, strict=False):
             value = self._evaluate_action(base_model, action_vals, queue_delay)
             if value > best_value:
                 best_value = value
