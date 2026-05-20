@@ -67,8 +67,8 @@ known-first-party = [
 quote-style = "double"
 indent-style = "space"
 
-[tool.ty.src]
-root = "."
+[tool.ty.environment]
+root = ["."]
 
 [tool.ty.rules]
 # Lenient / advisory mode: don't error on missing annotations.
