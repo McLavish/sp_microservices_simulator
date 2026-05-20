@@ -224,8 +224,9 @@ class ModelBasedPolicy:
         if self.use_retries_in_lambda:
             lambda_rate *= 1.0 + float(summary.get("retries_per_root", 0.0))
 
-        if hasattr(model, "moments"):
-            mean_s, mean_s2 = model.moments()
+        moments_fn = getattr(model, "moments", None)
+        if callable(moments_fn):
+            mean_s, mean_s2 = moments_fn()
             mean_s = float(mean_s)
             mean_s2 = float(mean_s2)
         else:

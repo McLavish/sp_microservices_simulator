@@ -8,8 +8,8 @@ from dataclasses import dataclass
 from rl.env import ActionSpec, EnvConfig, MicroservicesEnv, build_single_service_env
 
 try:
-    from stable_baselines3 import PPO
-    from stable_baselines3.common.env_util import make_vec_env
+    from stable_baselines3 import PPO  # ty: ignore[unresolved-import]
+    from stable_baselines3.common.env_util import make_vec_env  # ty: ignore[unresolved-import]
 except Exception as exc:  # pragma: no cover - depends on optional dependency
     PPO = None
     make_vec_env = None

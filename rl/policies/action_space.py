@@ -66,7 +66,10 @@ class ActionGrid:
             raise ValueError("Expected 4 indices for action")
         i, j, k = idx[:3]
         g_idx = idx[3] if len(idx) > 3 else None
-        global_timeout = None if g_idx is None else self._spec.global_timeout_ms[g_idx]
+        global_timeout_list = self._spec.global_timeout_ms
+        global_timeout = (
+            None if g_idx is None or global_timeout_list is None else global_timeout_list[g_idx]
+        )
         return ActionValues(
             self._spec.attempt_timeout_ms[i],
             self._spec.max_attempts[j],

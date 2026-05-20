@@ -27,7 +27,9 @@ class TestRLModels(unittest.TestCase):
             ]
         )
         model = LogNormalMixtureModel().fit(data)
-        self.assertAlmostEqual(float(np.sum(model.weights)), 1.0, places=6)
+        weights = model.weights
+        assert weights is not None
+        self.assertAlmostEqual(float(np.sum(weights)), 1.0, places=6)
         p95 = model.quantile(0.95)
         self.assertGreater(p95, 0.0)
 

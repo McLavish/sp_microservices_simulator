@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from core import Summary
 from rl.env import (
     ActionSpec,
     EnvConfig,
@@ -20,9 +21,11 @@ from rl.policies.model_based import ModelBasedPolicy
 from rl.policies.sb3 import SB3Policy
 
 try:
-    from stable_baselines3 import PPO
-    from stable_baselines3.common.env_util import make_vec_env
-    from stable_baselines3.common.evaluation import evaluate_policy as sb3_evaluate
+    from stable_baselines3 import PPO  # ty: ignore[unresolved-import]
+    from stable_baselines3.common.env_util import make_vec_env  # ty: ignore[unresolved-import]
+    from stable_baselines3.common.evaluation import (  # ty: ignore[unresolved-import]
+        evaluate_policy as sb3_evaluate,
+    )
 except Exception:  # pragma: no cover
     PPO = None
     make_vec_env = None
@@ -114,7 +117,7 @@ def _build_env(cfg: ExperimentConfig) -> MicroservicesEnv:
     return MicroservicesEnv(env_cfg)
 
 
-def _episode(env: MicroservicesEnv, policy, seed: int) -> tuple[float, dict]:
+def _episode(env: MicroservicesEnv, policy, seed: int) -> tuple[float, Summary | None]:
     obs, info = env.reset(seed=seed)
     policy.reset(seed=seed)
     total_reward = 0.0

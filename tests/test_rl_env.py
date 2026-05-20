@@ -5,7 +5,7 @@ import numpy as np
 try:
     import gymnasium  # noqa: F401
 except Exception:
-    gymnasium = None
+    gymnasium = None  # ty: ignore[invalid-assignment]
 
 from rl.env import ActionSpec, EnvConfig, MicroservicesEnv, build_single_service_env
 

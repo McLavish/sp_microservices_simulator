@@ -86,7 +86,7 @@ class AIMDPolicy:
             idx = tuple(int(v) for v in self.initial_action)
             if len(idx) != 3:
                 raise ValueError("AIMDPolicy initial_action must be 3 indices")
-            return idx
+            return idx[0], idx[1], idx[2]
 
         timeout_ms = self.initial_timeout_ms
         if timeout_ms is None:

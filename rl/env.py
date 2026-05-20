@@ -9,6 +9,7 @@ import numpy as np
 from caller import ClientConfig, ClientRuntime
 from core import (
     DropReason,
+    Summary,
     TimeDuration,
     TimeInterval,
     TimePoint,
@@ -362,7 +363,7 @@ class MicroservicesEnv(_GymEnvBase):
             "root_latencies_ms": root_latencies,
         }
 
-    def metrics_summary(self):
+    def metrics_summary(self) -> Summary | None:
         if self._client is None:
             return None
         return self._client.metrics().summary()

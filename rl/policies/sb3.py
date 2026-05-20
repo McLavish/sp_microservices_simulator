@@ -1,13 +1,17 @@
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from rl.policies.action_space import coerce_action
 
-try:
-    from stable_baselines3.common.base_class import BaseAlgorithm
-except Exception:  # pragma: no cover - optional dependency
-    BaseAlgorithm = None
+if TYPE_CHECKING:
+    from stable_baselines3.common.base_class import BaseAlgorithm  # ty: ignore[unresolved-import]
+else:
+    try:
+        from stable_baselines3.common.base_class import BaseAlgorithm
+    except Exception:  # pragma: no cover - optional dependency
+        BaseAlgorithm = None
 
 
 @dataclass
