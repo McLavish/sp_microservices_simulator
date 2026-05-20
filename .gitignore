@@ -5,3 +5,6 @@ __pycache__
 *.csv
 *.json
 *.png
+.ruff_cache/
+.ty_cache/
+uv.lock.tmp
