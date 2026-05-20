@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -23,15 +24,24 @@ from simulator import Simulator
 from timeout_controllers import StaticTimeoutController
 from workload import Workload
 
-try:
+if TYPE_CHECKING:
     import gymnasium as gym
     from gymnasium import spaces
-except Exception as exc:  # pragma: no cover - exercised in runtime environments
-    gym = None
-    spaces = None
-    _GYM_IMPORT_ERROR = exc
+
+    _GymEnvBase = gym.Env
+    _GYM_IMPORT_ERROR: Exception | None = None
 else:
-    _GYM_IMPORT_ERROR = None
+    try:
+        import gymnasium as gym
+        from gymnasium import spaces
+
+        _GymEnvBase = gym.Env
+        _GYM_IMPORT_ERROR = None
+    except Exception as exc:  # pragma: no cover - exercised in runtime environments
+        gym = None
+        spaces = None
+        _GymEnvBase = object
+        _GYM_IMPORT_ERROR = exc
 
 
 @dataclass
@@ -72,17 +82,15 @@ class EnvConfig:
     max_latency_samples: int | None = None
 
 
-_GymEnvBase = object if gym is None else gym.Env
-
-
 class MicroservicesEnv(_GymEnvBase):
     """Gymnasium environment wrapper for the microservices simulator."""
 
     metadata = {"render_modes": []}
 
     def __init__(self, config: EnvConfig):
-        if gym is None:
+        if gym is None or spaces is None:
             raise ImportError("gymnasium is required for MicroservicesEnv") from _GYM_IMPORT_ERROR
+        assert spaces is not None  # narrow for type checker after the check above
         self._cfg = config
 
         self._action_sizes = [
@@ -109,6 +117,21 @@ class MicroservicesEnv(_GymEnvBase):
         self._step_ns: TimeDuration = 0
         self._last_action_values: dict[str, int | None] = {}
 
+    def _require_sim(self) -> Simulator:
+        if self._sim is None:
+            raise RuntimeError("Simulator not initialized; call reset() first.")
+        return self._sim
+
+    def _require_client(self) -> ClientRuntime:
+        if self._client is None:
+            raise RuntimeError("Client not initialized; call reset() first.")
+        return self._client
+
+    def _require_workload(self) -> Workload:
+        if self._workload is None:
+            raise RuntimeError("Workload not initialized; call reset() first.")
+        return self._workload
+
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
         components = self._build(seed)
@@ -121,12 +144,14 @@ class MicroservicesEnv(_GymEnvBase):
         episode_s = (
             self._cfg.episode_duration_s
             if self._cfg.episode_duration_s is not None
-            else self._workload.duration_s
+            else self._require_workload().duration_s
         )
         self._end_time_ns = s_to_ns(episode_s)
 
         self._last_root_idx = 0
-        self._workload.drive(self._sim, lambda s: self._client.start_request(s))
+        self._require_workload().drive(
+            self._require_sim(), lambda s: self._require_client().start_request(s)
+        )
 
         initial_action = self._cfg.initial_action or tuple(
             0 for _ in range(len(self._action_sizes))
@@ -134,7 +159,7 @@ class MicroservicesEnv(_GymEnvBase):
         self._apply_action(initial_action)
 
         obs = self._build_observation(self._summarize_roots([]))
-        info = {"action": self._last_action_values.copy()}
+        info: dict[str, object] = {"action": self._last_action_values.copy()}
         if self._cfg.emit_latency_samples:
             info.update(
                 {
@@ -152,20 +177,20 @@ class MicroservicesEnv(_GymEnvBase):
         self._apply_action(action)
 
         next_time = min(self._current_time_ns + self._step_ns, self._end_time_ns)
-        self._sim.run(until=next_time)
+        self._require_sim().run(until=next_time)
         self._current_time_ns = next_time
 
         if self._current_time_ns >= self._end_time_ns and self._cfg.drain_on_done:
-            self._sim.run()
+            self._require_sim().run()
 
-        new_roots = self._client.roots[self._last_root_idx :]
-        self._last_root_idx = len(self._client.roots)
+        new_roots = self._require_client().roots[self._last_root_idx :]
+        self._last_root_idx = len(self._require_client().roots)
 
         summary = self._summarize_roots(new_roots)
         obs = self._build_observation(summary)
         reward = self._reward_from_summary(summary)
         terminated = self._current_time_ns >= self._end_time_ns
-        info = {"summary": summary, "action": self._last_action_values.copy()}
+        info: dict[str, object] = {"summary": summary, "action": self._last_action_values.copy()}
         if self._cfg.emit_latency_samples:
             info.update(self._collect_latency_samples(new_roots))
         return obs, reward, terminated, False, info
@@ -186,8 +211,8 @@ class MicroservicesEnv(_GymEnvBase):
         if spec.global_timeout_ms is not None:
             global_timeout_ms = spec.global_timeout_ms[action[idx]]
 
-        timeout_controller = self._client.cfg.timeout_controller
-        retry_policy = self._client.cfg.retry
+        timeout_controller = self._require_client().cfg.timeout_controller
+        retry_policy = self._require_client().cfg.retry
 
         if not isinstance(timeout_controller, StaticTimeoutController):
             raise TypeError("MicroservicesEnv requires StaticTimeoutController for now")
@@ -267,9 +292,9 @@ class MicroservicesEnv(_GymEnvBase):
         deadline_rate = deadline_drops / completed if completed else 0.0
         queue_rate = queue_drops / completed if completed else 0.0
         server_rate = server_drops / completed if completed else 0.0
-        avg_latency_ms = ns_to_ms(float(np.mean(latencies))) if latencies else 0.0
+        avg_latency_ms = ns_to_ms(int(np.mean(latencies))) if latencies else 0.0
         p95_latency_ms = (
-            ns_to_ms(float(np.quantile(np.asarray(latencies), 0.95))) if latencies else 0.0
+            ns_to_ms(int(np.quantile(np.asarray(latencies), 0.95))) if latencies else 0.0
         )
         retries_per_root = (attempts_total - completed) / completed if completed else 0.0
         queue_avg = float(np.mean(queue_sizes)) if queue_sizes else 0.0
@@ -301,7 +326,10 @@ class MicroservicesEnv(_GymEnvBase):
                 float(self._last_action_values.get("attempt_timeout_ms") or 0),
                 float(self._last_action_values.get("max_attempts") or 0),
                 float(self._last_action_values.get("backoff_ms") or 0),
-                float(time_s / max(1.0, self._cfg.episode_duration_s or self._workload.duration_s)),
+                float(
+                    time_s
+                    / max(1.0, self._cfg.episode_duration_s or self._require_workload().duration_s)
+                ),
             ],
             dtype=np.float32,
         )
