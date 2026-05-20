@@ -8,3 +8,8 @@ __pycache__
 .ruff_cache/
 .ty_cache/
 uv.lock.tmp
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml

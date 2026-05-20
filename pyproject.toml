@@ -12,6 +12,9 @@ dev = [
     "ruff",
     "ty",
     "pre-commit",
+    "pytest",
+    "pytest-cov",
+    "scipy",
 ]
 
 [tool.uv]
@@ -70,3 +73,45 @@ root = "."
 [tool.ty.rules]
 # Lenient / advisory mode: don't error on missing annotations.
 # Adjust as the codebase gains more type coverage.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+pythonpath = ["."]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+
+[tool.coverage.run]
+source = [
+    "core",
+    "caller",
+    "chain",
+    "service",
+    "simulator",
+    "workload",
+    "metrics",
+    "fault_events",
+    "faults",
+    "retry_policies",
+    "timeout_controllers",
+    "experiments",
+    "plotting",
+    "rl",
+]
+omit = [
+    "*/tests/*",
+    "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+show_missing = true
+skip_covered = false
