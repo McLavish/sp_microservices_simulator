@@ -73,11 +73,18 @@ class LogNormalMixtureModel:
         self.sigmas = sigmas
         return self
 
+    def _fitted_params(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (weights, mus, sigmas), narrowing the Optional fields after fit()."""
+        if self.weights is None or self.mus is None or self.sigmas is None:
+            raise RuntimeError("LogNormalMixtureModel must be fit() before use")
+        return self.weights, self.mus, self.sigmas
+
     def _logpdf_components(self, x: np.ndarray) -> np.ndarray:
+        weights, mus, sigmas = self._fitted_params()
         x = np.asarray(x, dtype=np.float64)
         logx = np.log(x, where=x > 0, out=np.full_like(x, -math.inf))
         logpdf = []
-        for w, mu, sigma in zip(self.weights, self.mus, self.sigmas, strict=False):
+        for w, mu, sigma in zip(weights, mus, sigmas, strict=False):
             logpdf.append(np.log(w) + lognormal_logpdf(logx, float(mu), float(sigma)))
         return np.vstack(logpdf).T
 
@@ -92,15 +99,16 @@ class LogNormalMixtureModel:
         return out
 
     def cdf(self, x: np.ndarray) -> np.ndarray:
+        weights, mus, sigmas = self._fitted_params()
         x = np.asarray(x, dtype=np.float64)
         out = np.zeros_like(x, dtype=np.float64)
         mask = x > 0
         if not np.any(mask):
             return out
         logx = np.log(x[mask])
-        z = (logx[:, None] - self.mus[None, :]) / self.sigmas[None, :]
+        z = (logx[:, None] - mus[None, :]) / sigmas[None, :]
         cdfs = norm_cdf(z)
-        out[mask] = np.sum(cdfs * self.weights[None, :], axis=1)
+        out[mask] = np.sum(cdfs * weights[None, :], axis=1)
         return out
 
     def quantile(self, q: float) -> float:
@@ -121,20 +129,20 @@ class LogNormalMixtureModel:
         return float(0.5 * (lo + hi))
 
     def sample(self, rng: np.random.Generator, size: int) -> np.ndarray:
-        choices = rng.choice(self.n_components, size=size, p=self.weights)
+        weights, mus, sigmas = self._fitted_params()
+        choices = rng.choice(self.n_components, size=size, p=weights)
         out = np.empty(size, dtype=np.float64)
         for j in range(self.n_components):
             mask = choices == j
             count = int(np.sum(mask))
             if count:
-                out[mask] = rng.lognormal(
-                    mean=float(self.mus[j]), sigma=float(self.sigmas[j]), size=count
-                )
+                out[mask] = rng.lognormal(mean=float(mus[j]), sigma=float(sigmas[j]), size=count)
         return out
 
     def params(self) -> dict[str, float]:
+        weights, mus, sigmas = self._fitted_params()
         params = {}
-        for i, (w, mu, sigma) in enumerate(zip(self.weights, self.mus, self.sigmas, strict=False)):
+        for i, (w, mu, sigma) in enumerate(zip(weights, mus, sigmas, strict=False)):
             params[f"w{i}"] = float(w)
             params[f"mu{i}"] = float(mu)
             params[f"sigma{i}"] = float(sigma)

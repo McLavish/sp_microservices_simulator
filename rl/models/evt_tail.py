@@ -59,14 +59,17 @@ class EVTTailModel:
             body_pdf = np.exp(self.body.logpdf(x_pos[body_mask]))
             scale = self.p_u / self._body_cdf_u if self.p_u > 0 else 0.0
             out_vals = body_pdf * scale
-            out[idx[body_mask]] = np.log(out_vals, where=out_vals > 0, out=-math.inf)
+            log_body = np.full_like(out_vals, -math.inf, dtype=np.float64)
+            np.log(out_vals, where=out_vals > 0, out=log_body)
+            out[idx[body_mask]] = log_body
 
         if np.any(tail_mask):
             x_tail = x_pos[tail_mask]
             scale = 1.0 - self.p_u
             pdf = scale * self.alpha * (self.u**self.alpha) * (x_tail ** (-self.alpha - 1))
-            out_vals = np.log(pdf, where=pdf > 0, out=-math.inf)
-            out[idx[tail_mask]] = out_vals
+            log_tail = np.full_like(pdf, -math.inf, dtype=np.float64)
+            np.log(pdf, where=pdf > 0, out=log_tail)
+            out[idx[tail_mask]] = log_tail
 
         return out
 
