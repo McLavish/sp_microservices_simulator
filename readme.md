@@ -4,18 +4,10 @@ This project uses [uv](https://docs.astral.sh/uv/) for Python environment and de
 
 ```bash
 # install uv if you don't have it: https://docs.astral.sh/uv/getting-started/installation/
-uv sync --group dev
-uv run pre-commit install
+make install
 ```
 
-After that, every commit triggers `ruff check --fix` and `ruff format` on staged files. To run things manually:
-
-```bash
-uv run ruff check .
-uv run ruff format .
-uv run ty check        # type checking (advisory, not enforced in pre-commit)
-uv run pre-commit run --all-files
-```
+That installs dev dependencies and the git pre-commit hook, which runs `ruff check --fix` and `ruff format` on every commit. Run `make help` to see all available commands (`lint`, `fmt`, `type`, `test`, `cov`, `check`, etc.).
 
 Examples:
 
