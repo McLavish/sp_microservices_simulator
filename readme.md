@@ -1,13 +1,13 @@
 ## Development setup
 
-This project uses [uv](https://docs.astral.sh/uv/) for Python environment and dependency management, [Ruff](https://docs.astral.sh/ruff/) for linting and formatting, and [Ty](https://github.com/astral-sh/ty) for type checking. Pre-commit runs Ruff automatically on staged files.
+This project uses [uv](https://docs.astral.sh/uv/) for Python environment and dependency management, [Ruff](https://docs.astral.sh/ruff/) for linting and formatting, and [Ty](https://github.com/astral-sh/ty) for type checking. Pre-commit runs Ruff and Ty automatically on every commit.
 
 ```bash
 # install uv if you don't have it: https://docs.astral.sh/uv/getting-started/installation/
 make install
 ```
 
-That installs dev dependencies and the git pre-commit hook, which runs `ruff check --fix` and `ruff format` on every commit. Run `make help` to see all available commands (`lint`, `fmt`, `type`, `test`, `cov`, `check`, etc.).
+That installs dev dependencies and the git pre-commit hook, which runs `ruff check --fix`, `ruff format`, and `ty check` on every commit. Run `make help` to see all available commands (`lint`, `fmt`, `type`, `test`, `cov`, `check`, etc.).
 
 Examples:
 

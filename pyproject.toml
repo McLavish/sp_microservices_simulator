@@ -74,8 +74,9 @@ indent-style = "space"
 root = ["."]
 
 [tool.ty.rules]
-# Lenient / advisory mode: don't error on missing annotations.
-# Adjust as the codebase gains more type coverage.
+# Enforced via pre-commit. Lenient on missing annotations for now,
+# but real type errors (None narrowing, protocol mismatches, numpy
+# misuse) are kept clean.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

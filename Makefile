@@ -23,7 +23,7 @@ fmt:  ## Format the codebase with ruff.
 fmt-check:  ## Check formatting without modifying files.
 	uv run ruff format --check .
 
-type:  ## Run ty type checker (advisory).
+type:  ## Run ty type checker.
 	uv run ty check .
 
 test:  ## Run the test suite.
@@ -35,7 +35,7 @@ cov:  ## Run tests with coverage report.
 pre-commit:  ## Run all pre-commit hooks against every file.
 	uv run pre-commit run --all-files
 
-check: lint fmt-check test  ## Run lint + format check + tests (no auto-fix).
+check: lint fmt-check type test  ## Run lint + format check + type check + tests.
 
 clean:  ## Remove caches and coverage artifacts.
 	rm -rf .ruff_cache .ty_cache .pytest_cache .coverage .coverage.* htmlcov coverage.xml
