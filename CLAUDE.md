@@ -46,8 +46,9 @@ The simulator is built around a single-threaded discrete-event loop. Events are 
 
 Tests:
 ```bash
-python -m unittest discover -s tests -v
-python -m unittest tests.test_rl_env -v   # single test module
+uv run pytest                    # full suite
+uv run pytest tests/test_rl_env  # single test module
+uv run pytest --cov              # with coverage report
 ```
 
 Single-service / chain experiments (write CSVs + JSON to repo root):
