@@ -1,6 +1,7 @@
-import numpy as np
-import matplotlib.pyplot as plt
 import argparse
+
+import matplotlib.pyplot as plt
+import numpy as np
 from scipy import stats
 
 
@@ -50,9 +51,7 @@ def plot_lognormal_latency(median_ms, sigma, output_file="latency_distribution.p
     ax1.set_xlim(0, median_ms * 5)
 
     # Plot CDF
-    ax2.plot(
-        x_ms, cdf, "g-", linewidth=2, label=f"CDF (median={median_ms} ms, σ={sigma})"
-    )
+    ax2.plot(x_ms, cdf, "g-", linewidth=2, label=f"CDF (median={median_ms} ms, σ={sigma})")
     ax2.axvline(
         median_ms,
         color="r",

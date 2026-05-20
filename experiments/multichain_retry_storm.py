@@ -1,13 +1,13 @@
-from core import TimeInterval, s_to_ns, ms_to_ns
-from faults import LatencyInjection, PartialFailure, LoadSpike
+from caller import ClientConfig, ClientRuntime
+from chain import DownstreamEdge, ServiceNodeRuntime
+from core import TimeInterval, ms_to_ns, s_to_ns
+from fault_events import FaultEventsTracker
+from faults import LatencyInjection, LoadSpike, PartialFailure
 from retry_policies import FixedBackoffRetryPolicy
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import StaticTimeoutController
 from workload import Workload
-from caller import ClientConfig, ClientRuntime
-from fault_events import FaultEventsTracker
-from chain import ServiceNodeRuntime, DownstreamEdge
 
 
 def make_client_cfg(

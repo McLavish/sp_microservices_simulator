@@ -1,10 +1,11 @@
 import argparse
-import pandas as pd
-import numpy as np
+
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 from matplotlib.ticker import PercentFormatter
+
 from plotting.utils.fault_events import load_fault_events, plot_fault_events
-from fault_events import FaultEventsTracker
 
 
 def main(csv_file, output_file, fault_events_file=None):
@@ -82,8 +83,6 @@ if __name__ == "__main__":
         default="reasons_and_request_amplification.png",
         help="Output plot filename",
     )
-    parser.add_argument(
-        "--fault-events", help="JSON file containing fault events (optional)"
-    )
+    parser.add_argument("--fault-events", help="JSON file containing fault events (optional)")
     args = parser.parse_args()
     main(args.csv_file, args.output, args.fault_events)

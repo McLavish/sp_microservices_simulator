@@ -1,6 +1,6 @@
-import unittest
 import csv
 import tempfile
+import unittest
 from pathlib import Path
 
 from core import DropReason, Request, RootRequest, TimeInterval, s_to_ns
@@ -78,9 +78,7 @@ class TestMetricsSummary(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "offset.csv"
 
-            Metrics(roots=[root], attempts_total=1).export_csv(
-                str(path), granularity_s=1.0
-            )
+            Metrics(roots=[root], attempts_total=1).export_csv(str(path), granularity_s=1.0)
 
             with path.open(newline="") as f:
                 rows = list(csv.DictReader(f))

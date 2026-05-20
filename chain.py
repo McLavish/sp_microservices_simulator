@@ -1,9 +1,10 @@
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
-from core import TimePoint, TimeDuration, DropReason
-from simulator import Simulator
-from service import ServiceRuntime, ServiceConfig
+
 from caller import ClientRuntime
+from core import DropReason, TimeDuration, TimePoint
+from service import ServiceConfig, ServiceRuntime
+from simulator import Simulator
 
 
 @dataclass
@@ -22,7 +23,7 @@ class ServiceNodeRuntime:
     """
 
     service: ServiceRuntime
-    downstreams: List[DownstreamEdge] = field(default_factory=list)
+    downstreams: list[DownstreamEdge] = field(default_factory=list)
 
     @property
     def cfg(self) -> ServiceConfig:
@@ -35,7 +36,7 @@ class ServiceNodeRuntime:
         self,
         sim: Simulator,
         on_done: Callable[[bool, TimeDuration, DropReason, int], None],
-        attempt_deadline: Optional[TimePoint] = None,
+        attempt_deadline: TimePoint | None = None,
     ) -> None:
         """Submit a logical attempt to this node.
 
@@ -46,7 +47,7 @@ class ServiceNodeRuntime:
         def behavior(
             svc: ServiceRuntime,
             sim2: Simulator,
-            deadline: Optional[TimePoint],
+            deadline: TimePoint | None,
             finalize: Callable[[bool, TimeDuration, DropReason], None],
             begin_at: TimePoint,
             release_worker: Callable[[], None],
@@ -54,7 +55,9 @@ class ServiceNodeRuntime:
             # Stage 1: local service time
             base_time = svc._sample_service_time(begin_at, sim2)
             end_local = (
-                min(begin_at + base_time, deadline) if deadline is not None else begin_at + base_time
+                min(begin_at + base_time, deadline)
+                if deadline is not None
+                else begin_at + base_time
             )
 
             def after_local():
@@ -107,6 +110,7 @@ class ServiceNodeRuntime:
 
                 # Deadline guard: if deadline elapses before downstreams complete, drop
                 if deadline is not None:
+
                     def on_deadline():
                         nonlocal done
                         if not done:

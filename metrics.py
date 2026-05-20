@@ -1,25 +1,25 @@
 from dataclasses import dataclass
-from typing import List
+
 import numpy as np
 
 from core import (
+    MS_TO_NS,
+    DropReason,
     RootRequest,
     Summary,
     TimeInterval,
     ns_to_ms,
-    DropReason,
-    s_to_ns,
     ns_to_s,
-    MS_TO_NS,
+    s_to_ns,
 )
 
 
 @dataclass
 class Metrics:
-    roots: List[RootRequest]
+    roots: list[RootRequest]
     attempts_total: int
 
-    def _percentile_ms(self, p: float, vals: List[int]) -> float:
+    def _percentile_ms(self, p: float, vals: list[int]) -> float:
         if not vals:
             return float("nan")
 
@@ -27,9 +27,7 @@ class Metrics:
         q_ns = np.quantile(arr, p)
         return float(q_ns) / MS_TO_NS
 
-    def _compute_time_interval_from_attempts(
-        self, root_request: RootRequest
-    ) -> TimeInterval:
+    def _compute_time_interval_from_attempts(self, root_request: RootRequest) -> TimeInterval:
         if not root_request.attempts:
             raise ValueError("No attempts found in RootRequest")
 
@@ -40,7 +38,7 @@ class Metrics:
 
     def summary(self) -> Summary:
         total = len(self.roots)
-        succ_lat: List[int] = []
+        succ_lat: list[int] = []
         succeeded = 0
         dropped_q = 0
         dropped_deadline = 0
@@ -57,9 +55,7 @@ class Metrics:
                         raise ValueError("Multiple successful attempts in RootRequest")
                     success = True
                     succeeded += 1
-                    succ_lat.append(
-                        self._compute_time_interval_from_attempts(request).duration()
-                    )
+                    succ_lat.append(self._compute_time_interval_from_attempts(request).duration())
 
             if success:
                 continue
@@ -183,14 +179,12 @@ class Metrics:
             failure_dead_counts = [0] * nbuckets
             failure_srv_counts = [0] * nbuckets
             failure_co_counts = [0] * nbuckets
-            retry_fail_counts = [
-                0
-            ] * nbuckets  # failed RETRY attempts that END in bucket
+            retry_fail_counts = [0] * nbuckets  # failed RETRY attempts that END in bucket
             completed_counts = [0] * nbuckets  # all attempts that END in bucket
-            latencies_by_bucket: List[List[int]] = [
+            latencies_by_bucket: list[list[int]] = [
                 [] for _ in range(nbuckets)
             ]  # successful ROOT latencies (ns), by completion bucket
-            queue_sizes_by_bucket: List[List[int]] = [
+            queue_sizes_by_bucket: list[list[int]] = [
                 [] for _ in range(nbuckets)
             ]  # queue size at attempt END, by completion bucket
 
@@ -210,9 +204,7 @@ class Metrics:
                 if not root.attempts:
                     continue
 
-                attempts_by_begin = sorted(
-                    root.attempts, key=lambda a: a.interval.begin
-                )
+                attempts_by_begin = sorted(root.attempts, key=lambda a: a.interval.begin)
                 attempts_by_end = sorted(root.attempts, key=lambda a: a.interval.end)
 
                 root_begin = attempts_by_begin[0].interval.begin
@@ -283,9 +275,7 @@ class Metrics:
                     min_ms = ns_to_ms(min(lats))
                     max_ms = ns_to_ms(max(lats))
                 else:
-                    p50 = p90 = p95 = p99 = p999 = p9999 = min_ms = max_ms = float(
-                        "nan"
-                    )
+                    p50 = p90 = p95 = p99 = p999 = p9999 = min_ms = max_ms = float("nan")
 
                 # Queue size stats for attempts ending in this bucket
                 if queue_sizes_by_bucket[i]:

@@ -1,6 +1,5 @@
 import argparse
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -13,7 +12,7 @@ from rl.models.lognormal_mixture import LogNormalMixtureModel
 @dataclass
 class DatasetSpec:
     name: str
-    params: Dict[str, float]
+    params: dict[str, float]
 
 
 def make_lognormal(rng: np.random.Generator, n: int, mu: float, sigma: float) -> np.ndarray:
@@ -36,16 +35,14 @@ def make_mixture(
     return x
 
 
-def make_pareto(
-    rng: np.random.Generator, n: int, alpha: float, x_min: float
-) -> np.ndarray:
+def make_pareto(rng: np.random.Generator, n: int, alpha: float, x_min: float) -> np.ndarray:
     u = rng.random(n)
     return x_min / (1.0 - u) ** (1.0 / alpha)
 
 
 def train_test_split(
     data: np.ndarray, seed: int, frac: float = 0.8
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     rng = np.random.default_rng(seed)
     idx = rng.permutation(len(data))
     split = int(len(data) * frac)
@@ -70,7 +67,7 @@ def evaluate_model(name: str, model, train: np.ndarray, test: np.ndarray) -> Mod
     )
 
 
-def run_experiment(dataset: np.ndarray, seed: int) -> List[ModelReport]:
+def run_experiment(dataset: np.ndarray, seed: int) -> list[ModelReport]:
     train, test = train_test_split(dataset, seed=seed)
     models = [
         ("lognormal", LogNormalModel()),
@@ -98,9 +95,7 @@ def main() -> None:
     if args.dist == "lognormal":
         dataset = make_lognormal(rng, args.n, args.mu, args.sigma)
     elif args.dist == "mixture":
-        dataset = make_mixture(
-            rng, args.n, args.w, args.mu, args.sigma, args.mu2, args.sigma2
-        )
+        dataset = make_mixture(rng, args.n, args.w, args.mu, args.sigma, args.mu2, args.sigma2)
     else:
         dataset = make_pareto(rng, args.n, args.alpha, args.x_min)
 

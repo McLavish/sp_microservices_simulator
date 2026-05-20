@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import argparse
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
 
 from rl.env import ActionSpec, EnvConfig, MicroservicesEnv, build_single_service_env
-
 
 try:
     from stable_baselines3 import PPO
@@ -26,26 +25,26 @@ class TrainConfig:
     n_envs: int
     step_duration_s: float
     episode_duration_s: float
-    attempt_timeouts_ms: List[int]
-    max_attempts: List[int]
-    backoff_ms: List[int]
-    global_timeouts_ms: Optional[List[Optional[int]]]
+    attempt_timeouts_ms: list[int]
+    max_attempts: list[int]
+    backoff_ms: list[int]
+    global_timeouts_ms: list[int | None] | None
     n_steps: int
     batch_size: int
     gamma: float
-    save_path: Optional[str]
-    load_path: Optional[str]
+    save_path: str | None
+    load_path: str | None
     eval_episodes: int
 
 
-def _parse_int_list(value: str) -> List[int]:
+def _parse_int_list(value: str) -> list[int]:
     items = [v.strip() for v in value.split(",") if v.strip()]
     return [int(v) for v in items]
 
 
-def _parse_optional_int_list(value: str) -> List[Optional[int]]:
+def _parse_optional_int_list(value: str) -> list[int | None]:
     items = [v.strip() for v in value.split(",") if v.strip()]
-    parsed: List[Optional[int]] = []
+    parsed: list[int | None] = []
     for item in items:
         if item.lower() in ("none", "null"):
             parsed.append(None)
@@ -71,7 +70,7 @@ def _make_env(cfg: TrainConfig) -> MicroservicesEnv:
 
 
 def _evaluate(model, cfg: TrainConfig) -> None:
-    total_rewards: List[float] = []
+    total_rewards: list[float] = []
     for ep in range(cfg.eval_episodes):
         env = _make_env(cfg)
         obs, _ = env.reset(seed=cfg.seed + 1000 + ep)
@@ -88,9 +87,7 @@ def _evaluate(model, cfg: TrainConfig) -> None:
         total_rewards.append(ep_reward)
         summary = last_info.get("summary", {})
         action = last_info.get("action", {})
-        print(
-            f"[eval] episode={ep} reward={ep_reward:.4f} action={action} summary={summary}"
-        )
+        print(f"[eval] episode={ep} reward={ep_reward:.4f} action={action} summary={summary}")
 
     if total_rewards:
         avg = sum(total_rewards) / len(total_rewards)
@@ -99,9 +96,7 @@ def _evaluate(model, cfg: TrainConfig) -> None:
 
 def train(cfg: TrainConfig) -> None:
     if PPO is None or make_vec_env is None:
-        raise ImportError(
-            "stable-baselines3 is required for training"
-        ) from _SB3_IMPORT_ERROR
+        raise ImportError("stable-baselines3 is required for training") from _SB3_IMPORT_ERROR
 
     def env_factory():
         return _make_env(cfg)
@@ -144,9 +139,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-envs", type=int, default=1)
     parser.add_argument("--step-duration-s", type=float, default=1.0)
     parser.add_argument("--episode-duration-s", type=float, default=10.0)
-    parser.add_argument(
-        "--attempt-timeouts-ms", type=_parse_int_list, default=[10, 30, 50, 80]
-    )
+    parser.add_argument("--attempt-timeouts-ms", type=_parse_int_list, default=[10, 30, 50, 80])
     parser.add_argument("--max-attempts", type=_parse_int_list, default=[1, 2, 3])
     parser.add_argument("--backoff-ms", type=_parse_int_list, default=[0, 20, 50])
     parser.add_argument("--global-timeouts-ms", type=_parse_optional_int_list, default=None)
@@ -159,7 +152,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _coerce_list_arg(value: Optional[Sequence[Optional[int]]], default):
+def _coerce_list_arg(value: Sequence[int | None] | None, default):
     return default if value is None else list(value)
 
 

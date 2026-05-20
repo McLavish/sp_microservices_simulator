@@ -1,6 +1,5 @@
 import math
 from dataclasses import dataclass, field
-from typing import Dict
 
 import numpy as np
 
@@ -60,14 +59,12 @@ class EVTTailModel:
             body_pdf = np.exp(self.body.logpdf(x_pos[body_mask]))
             scale = self.p_u / self._body_cdf_u if self.p_u > 0 else 0.0
             out_vals = body_pdf * scale
-            out[idx[body_mask]] = np.log(
-                out_vals, where=out_vals > 0, out=-math.inf
-            )
+            out[idx[body_mask]] = np.log(out_vals, where=out_vals > 0, out=-math.inf)
 
         if np.any(tail_mask):
             x_tail = x_pos[tail_mask]
             scale = 1.0 - self.p_u
-            pdf = scale * self.alpha * (self.u ** self.alpha) * (x_tail ** (-self.alpha - 1))
+            pdf = scale * self.alpha * (self.u**self.alpha) * (x_tail ** (-self.alpha - 1))
             out_vals = np.log(pdf, where=pdf > 0, out=-math.inf)
             out[idx[tail_mask]] = out_vals
 
@@ -131,7 +128,7 @@ class EVTTailModel:
 
         return out
 
-    def params(self) -> Dict[str, float]:
+    def params(self) -> dict[str, float]:
         return {
             "u": self.u,
             "alpha": self.alpha,

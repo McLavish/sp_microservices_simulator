@@ -1,6 +1,5 @@
 import math
 from dataclasses import dataclass, field
-from typing import Dict, Optional
 
 import numpy as np
 
@@ -18,9 +17,9 @@ class LogNormalMixtureModel:
     max_iter: int = 100
     tol: float = 1e-4
     min_sigma: float = 1e-6
-    weights: Optional[np.ndarray] = field(default=None, init=False)
-    mus: Optional[np.ndarray] = field(default=None, init=False)
-    sigmas: Optional[np.ndarray] = field(default=None, init=False)
+    weights: np.ndarray | None = field(default=None, init=False)
+    mus: np.ndarray | None = field(default=None, init=False)
+    sigmas: np.ndarray | None = field(default=None, init=False)
     _min_sample: float = field(default=0.0, init=False)
     _max_sample: float = field(default=0.0, init=False)
 
@@ -44,9 +43,7 @@ class LogNormalMixtureModel:
         for _ in range(self.max_iter):
             z = (logx[:, None] - mus[None, :]) / sigmas[None, :]
             log_probs = (
-                -0.5 * z * z
-                - (np.log(sigmas) + log_2pi_half)[None, :]
-                + np.log(weights)[None, :]
+                -0.5 * z * z - (np.log(sigmas) + log_2pi_half)[None, :] + np.log(weights)[None, :]
             )
             log_sum = logsumexp(log_probs, axis=1)
             ll = float(np.sum(log_sum))
@@ -135,7 +132,7 @@ class LogNormalMixtureModel:
                 )
         return out
 
-    def params(self) -> Dict[str, float]:
+    def params(self) -> dict[str, float]:
         params = {}
         for i, (w, mu, sigma) in enumerate(zip(self.weights, self.mus, self.sigmas)):
             params[f"w{i}"] = float(w)

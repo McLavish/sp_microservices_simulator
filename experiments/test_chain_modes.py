@@ -1,14 +1,12 @@
-from core import TimeInterval, s_to_ns, ms_to_ns
-from faults import LatencyInjection, PartialFailure, LoadSpike
+from caller import ClientConfig, ClientRuntime
+from chain import DownstreamEdge, ServiceNodeRuntime
+from core import TimeInterval, ms_to_ns, s_to_ns
+from faults import LatencyInjection, LoadSpike, PartialFailure
 from retry_policies import FixedBackoffRetryPolicy
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import StaticTimeoutController
 from workload import Workload
-from caller import ClientConfig, ClientRuntime
-from fault_events import FaultEventsTracker
-from metrics import Metrics
-from chain import ServiceNodeRuntime, DownstreamEdge
 
 
 def make_client_cfg(attempt_timeout_ms: int, max_attempts: int, delay_ms: int) -> ClientConfig:
@@ -53,9 +51,7 @@ def run_scenario(seed: int, top_attempt_timeout_ms: int = 200):
         workers=16,
         queue_capacity=100,
         partial_failures=[
-            PartialFailure(
-                duration=TimeInterval(begin=s_to_ns(20), end=s_to_ns(40)), p_fail=0.2
-            )
+            PartialFailure(duration=TimeInterval(begin=s_to_ns(20), end=s_to_ns(40)), p_fail=0.2)
         ],
     )
     e_cfg = ServiceConfig(
@@ -143,14 +139,20 @@ def test_chain_tandem_behavior():
     print({k: (v.succeeded, v.p95, v.dropped_server_failure) for k, v in results.items()})
 
     # Success counts should be monotonic across the chain
-    assert results["A"].succeeded == results["B"].succeeded, "Upstream client should match immediate downstream"
+    assert results["A"].succeeded == results["B"].succeeded, (
+        "Upstream client should match immediate downstream"
+    )
     assert results["B"].succeeded <= min(results["C"].succeeded, results["E"].succeeded), (
         "Fanout should be limited by the least successful downstream"
     )
 
     # Partial failures on C must be observable downstream and at the root
-    assert results["C"].dropped_server_failure > 0, "C should register server failures during outage window"
-    assert results["A"].dropped_server_failure > 0, "Failures from C must propagate back to the caller"
+    assert results["C"].dropped_server_failure > 0, (
+        "C should register server failures during outage window"
+    )
+    assert results["A"].dropped_server_failure > 0, (
+        "Failures from C must propagate back to the caller"
+    )
 
     # Tandem semantics still allow retries at the root when downstream fails
     assert results["A"].retries_per_root > 0, "Caller should exercise retries under failure"
@@ -173,6 +175,7 @@ def test_deadline_propagation():
 
 def test_queue_pressure_and_depth():
     print("\n=== Testing queue pressure with small capacities ===")
+
     # Reuse run_scenario by temporarily building a custom scenario with tiny queues
     def run_small_queues(seed: int):
         sim = Simulator(seed=seed)
@@ -207,14 +210,18 @@ def test_queue_pressure_and_depth():
         a_to_b_client = ClientRuntime(
             cfg=ClientConfig(
                 retry=FixedBackoffRetryPolicy(max_attempts=1, delay=ms_to_ns(10)),
-                timeout_controller=StaticTimeoutController(global_timeout=None, attempt_timeout=ms_to_ns(20)),
+                timeout_controller=StaticTimeoutController(
+                    global_timeout=None, attempt_timeout=ms_to_ns(20)
+                ),
             ),
             service=b_node,  # type: ignore[arg-type]
         )
         b_to_c_client = ClientRuntime(
             cfg=ClientConfig(
                 retry=FixedBackoffRetryPolicy(max_attempts=1, delay=ms_to_ns(10)),
-                timeout_controller=StaticTimeoutController(global_timeout=None, attempt_timeout=ms_to_ns(25)),
+                timeout_controller=StaticTimeoutController(
+                    global_timeout=None, attempt_timeout=ms_to_ns(25)
+                ),
             ),
             service=c_node,  # type: ignore[arg-type]
         )
@@ -226,7 +233,9 @@ def test_queue_pressure_and_depth():
         top_client = ClientRuntime(
             cfg=ClientConfig(
                 retry=FixedBackoffRetryPolicy(max_attempts=1, delay=ms_to_ns(10)),
-                timeout_controller=StaticTimeoutController(global_timeout=None, attempt_timeout=ms_to_ns(30)),
+                timeout_controller=StaticTimeoutController(
+                    global_timeout=None, attempt_timeout=ms_to_ns(30)
+                ),
             ),
             service=a_node,  # type: ignore[arg-type]
         )
@@ -244,7 +253,9 @@ def test_queue_pressure_and_depth():
 
     small = run_small_queues(seed=7)
     print({k: (v.succeeded, v.dropped_queue, v.dropped_deadline) for k, v in small.items()})
-    assert small["A"].dropped_queue > 0 or small["B"].dropped_queue > 0, "Expect queue drops under pressure"
+    assert small["A"].dropped_queue > 0 or small["B"].dropped_queue > 0, (
+        "Expect queue drops under pressure"
+    )
     assert small["A"].succeeded > 0, "Even under pressure some requests should succeed"
 
     print("Queue pressure tests passed.")
@@ -253,10 +264,18 @@ def test_queue_pressure_and_depth():
     # Depth test: build explicit deeper chain inline
     sim = Simulator(seed=99)
 
-    a_rt = ServiceRuntime(ServiceConfig("svc-A", ms_to_ns(3), 0.3, workers=8, queue_capacity=50)).bind()
-    b_rt = ServiceRuntime(ServiceConfig("svc-B", ms_to_ns(4), 0.3, workers=8, queue_capacity=50)).bind()
-    c_rt = ServiceRuntime(ServiceConfig("svc-C", ms_to_ns(5), 0.3, workers=8, queue_capacity=50)).bind()
-    d_rt = ServiceRuntime(ServiceConfig("svc-D", ms_to_ns(6), 0.3, workers=8, queue_capacity=50)).bind()
+    a_rt = ServiceRuntime(
+        ServiceConfig("svc-A", ms_to_ns(3), 0.3, workers=8, queue_capacity=50)
+    ).bind()
+    b_rt = ServiceRuntime(
+        ServiceConfig("svc-B", ms_to_ns(4), 0.3, workers=8, queue_capacity=50)
+    ).bind()
+    c_rt = ServiceRuntime(
+        ServiceConfig("svc-C", ms_to_ns(5), 0.3, workers=8, queue_capacity=50)
+    ).bind()
+    d_rt = ServiceRuntime(
+        ServiceConfig("svc-D", ms_to_ns(6), 0.3, workers=8, queue_capacity=50)
+    ).bind()
 
     a_node = ServiceNodeRuntime(a_rt)
     b_node = ServiceNodeRuntime(b_rt)
@@ -266,21 +285,27 @@ def test_queue_pressure_and_depth():
     c_to_d = ClientRuntime(
         cfg=ClientConfig(
             retry=FixedBackoffRetryPolicy(max_attempts=1, delay=ms_to_ns(10)),
-            timeout_controller=StaticTimeoutController(global_timeout=None, attempt_timeout=ms_to_ns(80)),
+            timeout_controller=StaticTimeoutController(
+                global_timeout=None, attempt_timeout=ms_to_ns(80)
+            ),
         ),
         service=d_node,  # type: ignore[arg-type]
     )
     b_to_c = ClientRuntime(
         cfg=ClientConfig(
             retry=FixedBackoffRetryPolicy(max_attempts=1, delay=ms_to_ns(10)),
-            timeout_controller=StaticTimeoutController(global_timeout=None, attempt_timeout=ms_to_ns(80)),
+            timeout_controller=StaticTimeoutController(
+                global_timeout=None, attempt_timeout=ms_to_ns(80)
+            ),
         ),
         service=c_node,  # type: ignore[arg-type]
     )
     a_to_b = ClientRuntime(
         cfg=ClientConfig(
             retry=FixedBackoffRetryPolicy(max_attempts=1, delay=ms_to_ns(10)),
-            timeout_controller=StaticTimeoutController(global_timeout=None, attempt_timeout=ms_to_ns(100)),
+            timeout_controller=StaticTimeoutController(
+                global_timeout=None, attempt_timeout=ms_to_ns(100)
+            ),
         ),
         service=b_node,  # type: ignore[arg-type]
     )
@@ -293,7 +318,9 @@ def test_queue_pressure_and_depth():
     top_client = ClientRuntime(
         cfg=ClientConfig(
             retry=FixedBackoffRetryPolicy(max_attempts=1, delay=ms_to_ns(10)),
-            timeout_controller=StaticTimeoutController(global_timeout=None, attempt_timeout=ms_to_ns(120)),
+            timeout_controller=StaticTimeoutController(
+                global_timeout=None, attempt_timeout=ms_to_ns(120)
+            ),
         ),
         service=a_node,  # type: ignore[arg-type]
     )
@@ -307,13 +334,17 @@ def test_queue_pressure_and_depth():
     B_sum = a_to_b.metrics().summary()
     C_sum = b_to_c.metrics().summary()
     D_sum = c_to_d.metrics().summary()
-    print({
-        "A": (A_sum.succeeded, A_sum.p95),
-        "B": (B_sum.succeeded, B_sum.p95),
-        "C": (C_sum.succeeded, C_sum.p95),
-        "D": (D_sum.succeeded, D_sum.p95),
-    })
-    assert A_sum.succeeded == B_sum.succeeded == C_sum.succeeded, "Depth chain: upstream should match all until leaf"
+    print(
+        {
+            "A": (A_sum.succeeded, A_sum.p95),
+            "B": (B_sum.succeeded, B_sum.p95),
+            "C": (C_sum.succeeded, C_sum.p95),
+            "D": (D_sum.succeeded, D_sum.p95),
+        }
+    )
+    assert A_sum.succeeded == B_sum.succeeded == C_sum.succeeded, (
+        "Depth chain: upstream should match all until leaf"
+    )
     assert C_sum.succeeded <= D_sum.succeeded, "Depth chain: limited by leaf"
 
     print("Deeper chain tests passed.")

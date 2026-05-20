@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
 
 import numpy as np
 
 from rl.env import RewardWeights
 from rl.models.lognormal import LogNormalModel
 from rl.policies.action_space import ActionGrid
-from rl.policies.model_based import _simulate_action, LatencyBuffer
+from rl.policies.model_based import LatencyBuffer, _simulate_action
 
 
 @dataclass
@@ -30,13 +29,11 @@ class NormalInverseGamma:
         mu_n = (self.kappa0 * self.mu0 + n * mean) / kappa_n
         alpha_n = self.alpha0 + n / 2.0
         beta_n = (
-            self.beta0
-            + 0.5 * ssd
-            + (self.kappa0 * n * (mean - self.mu0) ** 2) / (2.0 * kappa_n)
+            self.beta0 + 0.5 * ssd + (self.kappa0 * n * (mean - self.mu0) ** 2) / (2.0 * kappa_n)
         )
         return mu_n, kappa_n, alpha_n, beta_n
 
-    def sample(self, rng: np.random.Generator, data: np.ndarray) -> Tuple[float, float]:
+    def sample(self, rng: np.random.Generator, data: np.ndarray) -> tuple[float, float]:
         mu_n, kappa_n, alpha_n, beta_n = self.posterior(data)
         sigma2 = 1.0 / rng.gamma(shape=alpha_n, scale=1.0 / beta_n)
         mu = rng.normal(loc=mu_n, scale=np.sqrt(sigma2 / kappa_n))
@@ -58,12 +55,12 @@ class BayesianPolicy:
         self._buffer = LatencyBuffer(self.buffer_size)
         self._rng = np.random.default_rng(123)
 
-    def reset(self, seed: Optional[int] = None) -> None:
+    def reset(self, seed: int | None = None) -> None:
         self._buffer = LatencyBuffer(self.buffer_size)
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
-    def act(self, obs: np.ndarray, info: dict) -> Tuple[int, ...]:
+    def act(self, obs: np.ndarray, info: dict) -> tuple[int, ...]:
         self._buffer.ingest_info(info, self.use_censored)
         data = self._buffer.data()
         if data.size == 0:

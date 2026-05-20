@@ -1,5 +1,8 @@
 import unittest
 
+from caller import ClientConfig, ClientRuntime
+from core import DropReason, TimeInterval, s_to_ns
+from faults import PartialFailure
 from retry_policies import (
     BurstyRateLimiterPolicy,
     CountBasedCircuitBreakerPolicy,
@@ -8,9 +11,6 @@ from retry_policies import (
     NoRetryPolicy,
     RetryContext,
 )
-from caller import ClientConfig, ClientRuntime
-from core import DropReason, TimeInterval, s_to_ns
-from faults import PartialFailure
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import StaticTimeoutController

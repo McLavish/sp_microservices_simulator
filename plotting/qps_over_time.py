@@ -1,6 +1,7 @@
-import pandas as pd
-import matplotlib.pyplot as plt
 import argparse
+
+import matplotlib.pyplot as plt
+import pandas as pd
 
 from plotting.utils.fault_events import load_fault_events, plot_fault_events
 
@@ -59,11 +60,7 @@ def main(csv_file, output_file, fault_events_file=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Plot QPS over time from CSV")
     parser.add_argument("csv_file", help="Input CSV file path")
-    parser.add_argument(
-        "--output", "-o", default="qps_over_time.png", help="Output plot filename"
-    )
-    parser.add_argument(
-        "--fault-events", help="JSON file containing fault events (optional)"
-    )
+    parser.add_argument("--output", "-o", default="qps_over_time.png", help="Output plot filename")
+    parser.add_argument("--fault-events", help="JSON file containing fault events (optional)")
     args = parser.parse_args()
     main(args.csv_file, args.output, args.fault_events)

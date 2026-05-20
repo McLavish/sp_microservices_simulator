@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
@@ -15,10 +15,10 @@ from rl.policies.action_space import ActionGrid, ActionValues
 @dataclass
 class LatencyBuffer:
     max_samples: int
-    samples: List[float] = field(default_factory=list)
-    _array_cache: Optional[np.ndarray] = field(default=None, init=False, repr=False)
+    samples: list[float] = field(default_factory=list)
+    _array_cache: np.ndarray | None = field(default=None, init=False, repr=False)
 
-    def add(self, values: List[float]) -> None:
+    def add(self, values: list[float]) -> None:
         if not values:
             return
         self.samples.extend(values)
@@ -34,11 +34,7 @@ class LatencyBuffer:
             self.add([float(v) for v in latencies])
             return
         censored = info.get("attempt_censored", [])
-        filtered = [
-            float(v)
-            for v, is_censored in zip(latencies, censored)
-            if not is_censored
-        ]
+        filtered = [float(v) for v, is_censored in zip(latencies, censored) if not is_censored]
         self.add(filtered)
 
     def data(self) -> np.ndarray:
@@ -60,7 +56,7 @@ def _simulate_action(
     use_censored: bool,
     queue_delay_ms: float,
     queue_delay_mode: str,
-) -> Tuple[float, List[float]]:
+) -> tuple[float, list[float]]:
     successes = 0
     retries = 0
     latencies = []
@@ -69,9 +65,7 @@ def _simulate_action(
     timeout = float(action.attempt_timeout_ms)
     backoff = float(action.backoff_ms)
     max_attempts = int(action.max_attempts)
-    global_timeout = (
-        None if action.global_timeout_ms is None else float(action.global_timeout_ms)
-    )
+    global_timeout = None if action.global_timeout_ms is None else float(action.global_timeout_ms)
 
     for _ in range(n_roots):
         elapsed = 0.0
@@ -148,12 +142,12 @@ class ModelBasedPolicy:
         self._buffer = LatencyBuffer(self.buffer_size)
         self._rng = np.random.default_rng(123)
 
-    def reset(self, seed: Optional[int] = None) -> None:
+    def reset(self, seed: int | None = None) -> None:
         self._buffer = LatencyBuffer(self.buffer_size)
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
-    def act(self, obs: np.ndarray, info: dict) -> Tuple[int, ...]:
+    def act(self, obs: np.ndarray, info: dict) -> tuple[int, ...]:
         self._buffer.ingest_info(info, self.use_censored)
         data = self._buffer.data()
         if data.size == 0:
@@ -204,7 +198,7 @@ class ModelBasedPolicy:
                 queue_delay,
                 self.queue_delay_mode,
             )
-            total += (self.gamma ** h) * reward
+            total += (self.gamma**h) * reward
             if observed:
                 buffer.add(observed)
                 temp_model = self.model_factory().fit(buffer.data())
@@ -243,7 +237,7 @@ class ModelBasedPolicy:
         if rho >= 1.0:
             rho = self.queue_max_utilization
 
-        mean_s2_eff = mean_s2 / (workers ** 2)
+        mean_s2_eff = mean_s2 / (workers**2)
         denom = max(1e-6, 2.0 * (1.0 - rho))
         wq = lambda_rate * mean_s2_eff / denom
         return max(0.0, float(wq))

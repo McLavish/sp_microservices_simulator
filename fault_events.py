@@ -1,7 +1,8 @@
 import json
-from dataclasses import dataclass, asdict
-from typing import List, Dict, Any
-from core import TimePoint, TimeInterval, ns_to_s
+from dataclasses import asdict, dataclass
+from typing import Any
+
+from core import TimeInterval, ns_to_s
 
 
 @dataclass
@@ -9,16 +10,14 @@ class FaultEvent:
     event_type: str  # "latency_injection", "partial_failure", "load_spike"
     start_time_s: float
     end_time_s: float
-    parameters: Dict[str, Any]  # fault-specific parameters
+    parameters: dict[str, Any]  # fault-specific parameters
 
 
 class FaultEventsTracker:
     def __init__(self):
-        self.events: List[FaultEvent] = []
+        self.events: list[FaultEvent] = []
 
-    def add_latency_injection(
-        self, duration: TimeInterval, add_latency: int, multiplier: int = 1
-    ):
+    def add_latency_injection(self, duration: TimeInterval, add_latency: int, multiplier: int = 1):
         """Add a latency injection event"""
         params = {
             "add_latency_ms": add_latency / 1_000_000,  # Convert ns to ms

@@ -1,19 +1,19 @@
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
-from typing import List, Optional, Callable
 
 from core import (
+    DropReason,
     Request,
     RootRequest,
-    DropReason,
+    TimeDuration,
     TimeInterval,
     TimePoint,
-    TimeDuration,
 )
-from retry_policies import RetryPolicy, RetryContext
+from metrics import Metrics
+from retry_policies import RetryContext, RetryPolicy
 from service import ServiceRuntime
 from simulator import Simulator
-from metrics import Metrics
 from timeout_controllers import TimeoutController
 
 
@@ -36,21 +36,17 @@ class ClientRuntime:
     cfg: ClientConfig
     service: ServiceRuntime
 
-    roots: List[RootRequest] = field(default_factory=list)
+    roots: list[RootRequest] = field(default_factory=list)
     attempts_total: int = 0
 
-    def _min_deadline(
-        self, d1: Optional[TimePoint], d2: Optional[TimePoint]
-    ) -> Optional[TimePoint]:
+    def _min_deadline(self, d1: TimePoint | None, d2: TimePoint | None) -> TimePoint | None:
         if d1 is None:
             return d2
         if d2 is None:
             return d1
         return min(d1, d2)
 
-    def _update_policy_results(
-        self, policy: RetryPolicy, success: bool, now: TimePoint
-    ) -> None:
+    def _update_policy_results(self, policy: RetryPolicy, success: bool, now: TimePoint) -> None:
         """Update result tracking for policies that support it (e.g., circuit breakers, retry budget)."""
 
         if hasattr(policy, "add_result"):
@@ -76,14 +72,14 @@ class ClientRuntime:
     def start_request(
         self,
         sim: Simulator,
-        on_done: Optional[Callable[[RootRequest], None]] = None,
-        override_global_deadline: Optional[TimePoint] = None,
+        on_done: Callable[[RootRequest], None] | None = None,
+        override_global_deadline: TimePoint | None = None,
     ):
         root_req = RootRequest()
 
         # Compute global deadline: min(override, controller)
         global_timeout = self.cfg.timeout_controller.get_global_timeout()
-        computed_deadline: Optional[TimePoint] = None
+        computed_deadline: TimePoint | None = None
         if global_timeout is not None:
             computed_deadline = sim.timestep + global_timeout
         if override_global_deadline is not None:
@@ -116,9 +112,7 @@ class ClientRuntime:
             interval=TimeInterval(begin=sim.timestep, end=sim.timestep),
             deadline=None,
         )
-        initial_ctx = AttemptCtx(
-            root=root_req, req=dummy_req, last_delay=0, total_delay=0
-        )
+        initial_ctx = AttemptCtx(root=root_req, req=dummy_req, last_delay=0, total_delay=0)
         self._start_attempt(sim, initial_ctx)
 
     def _start_attempt(self, sim: Simulator, ctx: AttemptCtx):
@@ -161,9 +155,7 @@ class ClientRuntime:
         within_deadline = (ctx.req.deadline is None) or (end_time < ctx.req.deadline)
         if not within_deadline and drop_reason == DropReason.NONE:
             drop_reason = DropReason.DEADLINE
-        success_effective = (
-            success and within_deadline and drop_reason == DropReason.NONE
-        )
+        success_effective = success and within_deadline and drop_reason == DropReason.NONE
 
         # Update request state
         ctx.req.interval.end = end_time
@@ -198,8 +190,7 @@ class ClientRuntime:
         should_retry, delay = self.cfg.retry.next_delay(retry_context)
         next_start = sim.timestep + delay
         if (not should_retry) or (
-            ctx.root.global_deadline is not None
-            and next_start >= ctx.root.global_deadline
+            ctx.root.global_deadline is not None and next_start >= ctx.root.global_deadline
         ):
             self._complete_root(ctx.root)
             return

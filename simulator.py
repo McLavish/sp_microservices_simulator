@@ -1,7 +1,8 @@
 import heapq
 import random
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+
 from core import TimePoint
 
 
@@ -32,7 +33,7 @@ class Simulator:
         heapq.heappush(self._eventheap, ev)
         return ev
 
-    def run(self, until: Optional[TimePoint] = None):
+    def run(self, until: TimePoint | None = None):
         heap = self._eventheap
         while heap and (until is None or heap[0].at <= until):
             ev = heapq.heappop(heap)

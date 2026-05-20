@@ -1,10 +1,9 @@
 import math
 from dataclasses import dataclass
-from typing import Dict
 
 import numpy as np
 
-from rl.models.utils import ensure_positive, norm_cdf, norm_ppf, lognormal_logpdf
+from rl.models.utils import ensure_positive, lognormal_logpdf, norm_cdf, norm_ppf
 
 
 @dataclass
@@ -51,7 +50,7 @@ class LogNormalModel:
         second = math.exp(2.0 * self.mu + 2.0 * s2)
         return mean, second
 
-    def params(self) -> Dict[str, float]:
+    def params(self) -> dict[str, float]:
         return {"mu": self.mu, "sigma": self.sigma}
 
     def log_likelihood(self, samples: np.ndarray) -> float:

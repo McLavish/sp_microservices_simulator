@@ -1,5 +1,5 @@
 import math
-from typing import Iterable
+from collections.abc import Iterable
 
 import numpy as np
 from scipy.stats import norm
@@ -30,8 +30,4 @@ def ensure_positive(samples: Iterable[float]) -> np.ndarray:
 
 
 def lognormal_logpdf(logx: np.ndarray, mu: float, sigma: float) -> np.ndarray:
-    return (
-        -0.5 * ((logx - mu) / sigma) ** 2
-        - logx
-        - math.log(sigma * _SQRT_2PI)
-    )
+    return -0.5 * ((logx - mu) / sigma) ** 2 - logx - math.log(sigma * _SQRT_2PI)

@@ -1,19 +1,16 @@
-from core import TimeInterval, s_to_ns, ms_to_ns
-from faults import LatencyInjection, PartialFailure, LoadSpike
-from retry_policies import FixedBackoffRetryPolicy, NoRetryPolicy
+from caller import ClientConfig, ClientRuntime
+from chain import DownstreamEdge, ServiceNodeRuntime
+from core import TimeInterval, ms_to_ns, s_to_ns
+from fault_events import FaultEventsTracker
+from faults import PartialFailure
+from retry_policies import FixedBackoffRetryPolicy
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import StaticTimeoutController
 from workload import Workload
-from caller import ClientConfig, ClientRuntime
-from fault_events import FaultEventsTracker
-from metrics import Metrics
-from chain import ServiceNodeRuntime, DownstreamEdge
 
 
-def make_client_cfg(
-    attempt_timeout_ms: int, max_attempts: int, delay_ms: int
-) -> ClientConfig:
+def make_client_cfg(attempt_timeout_ms: int, max_attempts: int, delay_ms: int) -> ClientConfig:
     return ClientConfig(
         retry=FixedBackoffRetryPolicy(
             max_attempts=max_attempts,
@@ -51,9 +48,7 @@ if __name__ == "__main__":
         workers=16,
         queue_capacity=10000000,
         partial_failures=[
-            PartialFailure(
-                duration=TimeInterval(begin=s_to_ns(10), end=s_to_ns(20)), p_fail=0.5
-            )
+            PartialFailure(duration=TimeInterval(begin=s_to_ns(10), end=s_to_ns(20)), p_fail=0.5)
         ],
     )
     e_cfg = ServiceConfig(
@@ -114,8 +109,7 @@ if __name__ == "__main__":
     wl = Workload(
         base_rps=188.0,
         duration_s=60,
-        load_spikes=[
-        ],
+        load_spikes=[],
     )
 
     wl.drive(sim, lambda s: top_client.start_request(s))

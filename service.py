@@ -1,14 +1,13 @@
 import heapq
 import math
-from typing import List, Optional, Callable
-from core import TimePoint, TimeDuration, DropReason
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 
+from core import DropReason, TimeDuration, TimePoint
+from fault_events import FaultEventsTracker
 from faults import LatencyInjection, PartialFailure
 from simulator import Simulator
-from fault_events import FaultEventsTracker
-
-from functools import partial
 
 
 # https://en.wikipedia.org/wiki/Log-normal_distribution
@@ -20,9 +19,9 @@ class ServiceConfig:
     latency_median: TimeDuration
     latency_lognorm_sigma: float  # sigma of the underlying lognormal (shape)
     workers: int
-    queue_capacity: Optional[int] = None  # None means unbounded
-    latency_injections: List[LatencyInjection] = field(default_factory=list)
-    partial_failures: List[PartialFailure] = field(default_factory=list)
+    queue_capacity: int | None = None  # None means unbounded
+    latency_injections: list[LatencyInjection] = field(default_factory=list)
+    partial_failures: list[PartialFailure] = field(default_factory=list)
 
     def register_fault_events(self, tracker: FaultEventsTracker):
         """Register all fault events with the tracker"""
@@ -32,9 +31,7 @@ class ServiceConfig:
             )
 
         for partial_failure in self.partial_failures:
-            tracker.add_partial_failure(
-                partial_failure.duration, partial_failure.p_fail
-            )
+            tracker.add_partial_failure(partial_failure.duration, partial_failure.p_fail)
 
 
 @dataclass(order=True)
@@ -49,7 +46,7 @@ class QItem:
 class ServiceRuntime:
     cfg: ServiceConfig
     in_flight: int = 0
-    queue: List[QItem] = field(default_factory=list)
+    queue: list[QItem] = field(default_factory=list)
     _seq: int = 0
 
     def bind(self):
@@ -95,20 +92,19 @@ class ServiceRuntime:
         on_done: Callable[
             [bool, TimeDuration, DropReason, int], None
         ],  # success, service_time, whydropped, queue_size
-        attempt_deadline: Optional[TimePoint] = None,
-        behavior: Optional[
-            Callable[
-                [
-                    "ServiceRuntime",
-                    Simulator,
-                    Optional[TimePoint],
-                    Callable[[bool, TimeDuration, DropReason], None],
-                    TimePoint,
-                    Callable[[], None],
-                ],
-                None,
-            ]
-        ] = None,
+        attempt_deadline: TimePoint | None = None,
+        behavior: Callable[
+            [
+                "ServiceRuntime",
+                Simulator,
+                TimePoint | None,
+                Callable[[bool, TimeDuration, DropReason], None],
+                TimePoint,
+                Callable[[], None],
+            ],
+            None,
+        ]
+        | None = None,
     ):
         """
         Enqueue an attempt for this service.
@@ -130,13 +126,8 @@ class ServiceRuntime:
             return
 
         # Drop request if queue is full (load shedding)
-        if (
-            self.cfg.queue_capacity is not None
-            and len(self.queue) >= self.cfg.queue_capacity
-        ):
-            on_done(
-                False, 0, DropReason.QUEUE_FULL, len(self.queue)
-            )  # dropped from queue
+        if self.cfg.queue_capacity is not None and len(self.queue) >= self.cfg.queue_capacity:
+            on_done(False, 0, DropReason.QUEUE_FULL, len(self.queue))  # dropped from queue
             return
 
         # Enqueue the request
@@ -154,20 +145,19 @@ class ServiceRuntime:
         self,
         sim: Simulator,
         on_done: Callable[[bool, TimeDuration, DropReason, int], None],
-        attempt_deadline: Optional[TimePoint],
-        behavior: Optional[
-            Callable[
-                [
-                    "ServiceRuntime",
-                    Simulator,
-                    Optional[TimePoint],
-                    Callable[[bool, TimeDuration, DropReason], None],
-                    TimePoint,
-                    Callable[[], None],
-                ],
-                None,
-            ]
-        ] = None,
+        attempt_deadline: TimePoint | None,
+        behavior: Callable[
+            [
+                "ServiceRuntime",
+                Simulator,
+                TimePoint | None,
+                Callable[[bool, TimeDuration, DropReason], None],
+                TimePoint,
+                Callable[[], None],
+            ],
+            None,
+        ]
+        | None = None,
     ):
         # If the attempt expired while waiting in the queue, drop immediately without
         # consuming a worker. We make sure we are not scheduling an event in the past.
@@ -187,9 +177,7 @@ class ServiceRuntime:
                 else begin_at + service_time
             )
 
-            finish_cb = partial(
-                self._finish_service, sim, on_done, service_time, attempt_deadline
-            )
+            finish_cb = partial(self._finish_service, sim, on_done, service_time, attempt_deadline)
             sim.schedule(expiry, finish_cb)
         else:
             # Custom behavior can optionally release the worker early (for tandem queues)
@@ -216,7 +204,7 @@ class ServiceRuntime:
         sim: Simulator,
         on_done: Callable[[bool, TimeDuration, DropReason, int], None],
         service_time: TimeDuration,  # Time spent handling the request, excluding any queuing
-        attempt_deadline: Optional[TimePoint],
+        attempt_deadline: TimePoint | None,
     ):
         success = True
         drop_reason = DropReason.NONE

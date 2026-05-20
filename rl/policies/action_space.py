@@ -1,12 +1,13 @@
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any
 
 import numpy as np
 
 from rl.env import ActionSpec
 
 
-def coerce_action(action: Any) -> Tuple[int, ...]:
+def coerce_action(action: Any) -> tuple[int, ...]:
     if isinstance(action, np.ndarray):
         action = action.tolist()
     if isinstance(action, (list, tuple)):
@@ -19,14 +20,14 @@ class ActionValues:
     attempt_timeout_ms: int
     max_attempts: int
     backoff_ms: int
-    global_timeout_ms: Optional[int]
+    global_timeout_ms: int | None
 
 
 class ActionGrid:
     def __init__(self, spec: ActionSpec):
         self._spec = spec
-        self._indices: List[Tuple[int, ...]] = []
-        self._values: List[ActionValues] = []
+        self._indices: list[tuple[int, ...]] = []
+        self._values: list[ActionValues] = []
         self._build()
 
     @property
@@ -34,11 +35,11 @@ class ActionGrid:
         return self._spec
 
     @property
-    def indices(self) -> List[Tuple[int, ...]]:
+    def indices(self) -> list[tuple[int, ...]]:
         return self._indices
 
     @property
-    def values(self) -> List[ActionValues]:
+    def values(self) -> list[ActionValues]:
         return self._values
 
     def _build(self) -> None:
@@ -53,9 +54,7 @@ class ActionGrid:
                     else:
                         for g, global_timeout in enumerate(self._spec.global_timeout_ms):
                             indices = (i, j, k, g)
-                            values = ActionValues(
-                                timeout, max_attempts, backoff, global_timeout
-                            )
+                            values = ActionValues(timeout, max_attempts, backoff, global_timeout)
                             self._indices.append(indices)
                             self._values.append(values)
 
@@ -67,11 +66,7 @@ class ActionGrid:
             raise ValueError("Expected 4 indices for action")
         i, j, k = idx[:3]
         g_idx = idx[3] if len(idx) > 3 else None
-        global_timeout = (
-            None
-            if g_idx is None
-            else self._spec.global_timeout_ms[g_idx]
-        )
+        global_timeout = None if g_idx is None else self._spec.global_timeout_ms[g_idx]
         return ActionValues(
             self._spec.attempt_timeout_ms[i],
             self._spec.max_attempts[j],
@@ -84,9 +79,9 @@ class ActionGrid:
         attempt_timeout_ms: int,
         max_attempts: int,
         backoff_ms: int,
-        global_timeout_ms: Optional[int] = None,
-    ) -> Tuple[int, ...]:
-        def nearest(value: int, candidates: List[int]) -> int:
+        global_timeout_ms: int | None = None,
+    ) -> tuple[int, ...]:
+        def nearest(value: int, candidates: list[int]) -> int:
             return int(min(range(len(candidates)), key=lambda i: abs(candidates[i] - value)))
 
         i = nearest(attempt_timeout_ms, self._spec.attempt_timeout_ms)
@@ -98,8 +93,6 @@ class ActionGrid:
         if global_timeout_ms is None:
             g = 0
         else:
-            gt_candidates = [
-                v if v is not None else 0 for v in self._spec.global_timeout_ms
-            ]
+            gt_candidates = [v if v is not None else 0 for v in self._spec.global_timeout_ms]
             g = nearest(global_timeout_ms, gt_candidates)
         return (i, j, k, g)

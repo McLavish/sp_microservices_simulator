@@ -1,6 +1,7 @@
 import argparse
-import pandas as pd
+
 import matplotlib.pyplot as plt
+import pandas as pd
 
 from plotting.utils.fault_events import load_fault_events, plot_fault_events
 
@@ -43,8 +44,6 @@ if __name__ == "__main__":
         default="queue_size_over_time.png",
         help="Output plot filename",
     )
-    parser.add_argument(
-        "--fault-events", help="JSON file containing fault events (optional)"
-    )
+    parser.add_argument("--fault-events", help="JSON file containing fault events (optional)")
     args = parser.parse_args()
     main(args.csv_file, args.output, args.fault_events)

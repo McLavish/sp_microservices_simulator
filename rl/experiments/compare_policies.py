@@ -1,6 +1,6 @@
 import argparse
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -9,8 +9,8 @@ from rl.env import (
     EnvConfig,
     MicroservicesEnv,
     RewardWeights,
-    build_single_service_env,
     build_faulty_single_service_env,
+    build_single_service_env,
 )
 from rl.policies.action_space import ActionGrid
 from rl.policies.aimd import AIMDPolicy
@@ -18,7 +18,6 @@ from rl.policies.bayesian import BayesianPolicy
 from rl.policies.fixed import FixedPolicy, FixedValuePolicy
 from rl.policies.model_based import ModelBasedPolicy
 from rl.policies.sb3 import SB3Policy
-
 
 try:
     from stable_baselines3 import PPO
@@ -32,15 +31,15 @@ except Exception:  # pragma: no cover
 
 @dataclass
 class ExperimentConfig:
-    attempt_timeouts_ms: List[int]
-    max_attempts: List[int]
-    backoff_ms: List[int]
-    global_timeouts_ms: Optional[List[Optional[int]]]
+    attempt_timeouts_ms: list[int]
+    max_attempts: list[int]
+    backoff_ms: list[int]
+    global_timeouts_ms: list[int | None] | None
     step_duration_s: float
     episode_duration_s: float
     reward_weights: RewardWeights
-    train_seeds: List[int]
-    eval_seeds: List[int]
+    train_seeds: list[int]
+    eval_seeds: list[int]
     ppo_timesteps: int
     ppo_eval_interval: int
     ppo_eval_episodes: int
@@ -71,14 +70,14 @@ class ExperimentConfig:
     fault_scenario: str
 
 
-def _parse_ints(value: str) -> List[int]:
+def _parse_ints(value: str) -> list[int]:
     items = [v.strip() for v in value.split(",") if v.strip()]
     return [int(v) for v in items]
 
 
-def _parse_optional_int_list(value: str) -> List[Optional[int]]:
+def _parse_optional_int_list(value: str) -> list[int | None]:
     items = [v.strip() for v in value.split(",") if v.strip()]
-    parsed: List[Optional[int]] = []
+    parsed: list[int | None] = []
     for item in items:
         if item.lower() in ("none", "null"):
             parsed.append(None)
@@ -110,7 +109,7 @@ def _build_env(cfg: ExperimentConfig) -> MicroservicesEnv:
     return MicroservicesEnv(env_cfg)
 
 
-def _episode(env: MicroservicesEnv, policy, seed: int) -> Tuple[float, dict]:
+def _episode(env: MicroservicesEnv, policy, seed: int) -> tuple[float, dict]:
     obs, info = env.reset(seed=seed)
     policy.reset(seed=seed)
     total_reward = 0.0
@@ -140,7 +139,7 @@ def _evaluate(env: MicroservicesEnv, policy, seeds: Sequence[int]) -> dict:
             p95s.append(summary.p95)
             retries.append(summary.retries_per_root)
 
-    def avg(values: List[float]) -> float:
+    def avg(values: list[float]) -> float:
         return float(np.mean(values)) if values else 0.0
 
     return {
@@ -189,7 +188,7 @@ def _train_ppo(cfg: ExperimentConfig) -> SB3Policy:
     return SB3Policy(model=model, deterministic=True, name="ppo")
 
 
-def _best_fixed_action(cfg: ExperimentConfig, grid: ActionGrid) -> Tuple[int, ...]:
+def _best_fixed_action(cfg: ExperimentConfig, grid: ActionGrid) -> tuple[int, ...]:
     env = _build_env(cfg)
     best_reward = -float("inf")
     best_idx = grid.indices[0]
@@ -205,9 +204,7 @@ def _best_fixed_action(cfg: ExperimentConfig, grid: ActionGrid) -> Tuple[int, ..
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare policy baselines.")
-    parser.add_argument(
-        "--attempt-timeouts-ms", type=_parse_ints, default=[10, 30, 50, 80]
-    )
+    parser.add_argument("--attempt-timeouts-ms", type=_parse_ints, default=[10, 30, 50, 80])
     parser.add_argument("--max-attempts", type=_parse_ints, default=[1, 2, 3])
     parser.add_argument("--backoff-ms", type=_parse_ints, default=[0, 20, 50])
     parser.add_argument("--global-timeouts-ms", type=_parse_optional_int_list, default=None)
@@ -215,7 +212,11 @@ def main() -> None:
     parser.add_argument("--episode-duration-s", type=float, default=10.0)
     parser.add_argument("--train-seeds", type=_parse_ints, default="123,456,789")
     parser.add_argument("--eval-seeds", type=_parse_ints, default="321,654,987")
-    parser.add_argument("--policies", type=str, default="fixed,aimd,model_based,model_based_rl,bayesian,ppo,oracle_fixed")
+    parser.add_argument(
+        "--policies",
+        type=str,
+        default="fixed,aimd,model_based,model_based_rl,bayesian,ppo,oracle_fixed",
+    )
     parser.add_argument("--ppo-timesteps", type=int, default=5000)
     parser.add_argument("--ppo-eval-interval", type=int, default=1000)
     parser.add_argument("--ppo-eval-episodes", type=int, default=3)
@@ -228,7 +229,9 @@ def main() -> None:
     parser.add_argument("--model-buffer", type=int, default=2000)
     parser.add_argument("--model-horizon", type=int, default=3)
     parser.add_argument(
-        "--model-queue-delay-mode", choices=["deterministic", "exponential"], default="deterministic"
+        "--model-queue-delay-mode",
+        choices=["deterministic", "exponential"],
+        default="deterministic",
     )
     parser.add_argument("--model-queue-workers", type=int, default=16)
     parser.add_argument("--model-queue-max-utilization", type=float, default=0.95)

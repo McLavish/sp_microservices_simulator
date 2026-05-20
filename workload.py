@@ -1,20 +1,19 @@
+import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import List, Optional
-import random
 
-from core import TimePoint, TimeDuration, s_to_ns
+from core import TimeDuration, TimePoint, s_to_ns
+from fault_events import FaultEventsTracker
 from faults import LoadSpike
 from simulator import Simulator
-from fault_events import FaultEventsTracker
 
 
 @dataclass
 class Workload:
     base_rps: float
     duration_s: int
-    load_spikes: List[LoadSpike]
-    rng_seed: Optional[int] = None
+    load_spikes: list[LoadSpike]
+    rng_seed: int | None = None
     _rng: random.Random = field(init=False, repr=False)
 
     def __post_init__(self):
@@ -33,9 +32,7 @@ class Workload:
                 rps *= spike.rps_multiplier
         return max(0.0, rps)
 
-    def _sample_interarrival(
-        self, time: TimePoint, rps: Optional[float] = None
-    ) -> TimeDuration:
+    def _sample_interarrival(self, time: TimePoint, rps: float | None = None) -> TimeDuration:
         rps = self.rps_at(time) if rps is None else rps
         if rps <= 0.0:
             # No load right now - push a bit forward.

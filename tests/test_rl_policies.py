@@ -4,9 +4,9 @@ import numpy as np
 
 from rl.env import ActionSpec, RewardWeights
 from rl.policies.action_space import ActionGrid
+from rl.policies.aimd import AIMDPolicy
 from rl.policies.bayesian import BayesianPolicy
 from rl.policies.model_based import ModelBasedPolicy
-from rl.policies.aimd import AIMDPolicy
 
 
 class TestRLPolicies(unittest.TestCase):

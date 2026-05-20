@@ -1,7 +1,7 @@
 import unittest
 
-from chain import DownstreamEdge, ServiceNodeRuntime
 from caller import ClientConfig, ClientRuntime
+from chain import DownstreamEdge, ServiceNodeRuntime
 from core import DropReason, TimeInterval, s_to_ns
 from faults import PartialFailure
 from retry_policies import NoRetryPolicy
@@ -34,9 +34,7 @@ class TestChainFailureReason(unittest.TestCase):
 
         b_client_cfg = ClientConfig(
             retry=NoRetryPolicy(),
-            timeout_controller=StaticTimeoutController(
-                global_timeout=None, attempt_timeout=1
-            ),
+            timeout_controller=StaticTimeoutController(global_timeout=None, attempt_timeout=1),
         )
         b_client = ClientRuntime(cfg=b_client_cfg, service=b_node)  # type: ignore[arg-type]
 

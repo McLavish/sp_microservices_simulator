@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Tuple, Dict, Any
 
 import numpy as np
 
-from core import DropReason, TimeDuration, TimePoint, TimeInterval, ms_to_ns, ns_to_ms, ns_to_s, s_to_ns
-from caller import ClientRuntime, ClientConfig
-from faults import LatencyInjection, PartialFailure, LoadSpike
+from caller import ClientConfig, ClientRuntime
+from core import (
+    DropReason,
+    TimeDuration,
+    TimeInterval,
+    TimePoint,
+    ms_to_ns,
+    ns_to_ms,
+    ns_to_s,
+    s_to_ns,
+)
+from faults import LatencyInjection, LoadSpike, PartialFailure
 from retry_policies import FixedBackoffRetryPolicy
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
@@ -44,23 +53,23 @@ class RewardWeights:
 
 @dataclass
 class ActionSpec:
-    attempt_timeout_ms: List[int]
-    max_attempts: List[int]
-    backoff_ms: List[int]
-    global_timeout_ms: Optional[List[Optional[int]]] = None
+    attempt_timeout_ms: list[int]
+    max_attempts: list[int]
+    backoff_ms: list[int]
+    global_timeout_ms: list[int | None] | None = None
 
 
 @dataclass
 class EnvConfig:
-    build: Callable[[Optional[int]], EnvComponents]
+    build: Callable[[int | None], EnvComponents]
     action_spec: ActionSpec
     step_duration_s: float = 1.0
-    episode_duration_s: Optional[float] = None
+    episode_duration_s: float | None = None
     reward_weights: RewardWeights = field(default_factory=RewardWeights)
     drain_on_done: bool = True
-    initial_action: Optional[Tuple[int, ...]] = None
+    initial_action: tuple[int, ...] | None = None
     emit_latency_samples: bool = True
-    max_latency_samples: Optional[int] = None
+    max_latency_samples: int | None = None
 
 
 if gym is None:
@@ -76,9 +85,7 @@ class MicroservicesEnv(_GymEnvBase):
 
     def __init__(self, config: EnvConfig):
         if gym is None:
-            raise ImportError(
-                "gymnasium is required for MicroservicesEnv"
-            ) from _GYM_IMPORT_ERROR
+            raise ImportError("gymnasium is required for MicroservicesEnv") from _GYM_IMPORT_ERROR
         self._cfg = config
 
         self._action_sizes = [
@@ -96,16 +103,16 @@ class MicroservicesEnv(_GymEnvBase):
             low=0.0, high=np.inf, shape=(self._obs_size,), dtype=np.float32
         )
 
-        self._sim: Optional[Simulator] = None
-        self._workload: Optional[Workload] = None
-        self._client: Optional[ClientRuntime] = None
+        self._sim: Simulator | None = None
+        self._workload: Workload | None = None
+        self._client: ClientRuntime | None = None
         self._last_root_idx = 0
         self._current_time_ns: TimePoint = 0
         self._end_time_ns: TimePoint = 0
         self._step_ns: TimeDuration = 0
-        self._last_action_values: Dict[str, Optional[int]] = {}
+        self._last_action_values: dict[str, int | None] = {}
 
-    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+    def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
         components = self._build(seed)
         self._sim = components.sim
@@ -143,6 +150,7 @@ class MicroservicesEnv(_GymEnvBase):
 
     def step(self, action):
         from rl.policies.action_space import coerce_action
+
         action = coerce_action(action)
         self._apply_action(action)
 
@@ -165,10 +173,10 @@ class MicroservicesEnv(_GymEnvBase):
             info.update(self._collect_latency_samples(new_roots))
         return obs, reward, terminated, False, info
 
-    def _build(self, seed: Optional[int]) -> EnvComponents:
+    def _build(self, seed: int | None) -> EnvComponents:
         return self._cfg.build(seed)
 
-    def _apply_action(self, action: Tuple[int, ...]) -> None:
+    def _apply_action(self, action: tuple[int, ...]) -> None:
         spec = self._cfg.action_spec
         idx = 0
         attempt_timeout_ms = spec.attempt_timeout_ms[action[idx]]
@@ -185,13 +193,9 @@ class MicroservicesEnv(_GymEnvBase):
         retry_policy = self._client.cfg.retry
 
         if not isinstance(timeout_controller, StaticTimeoutController):
-            raise TypeError(
-                "MicroservicesEnv requires StaticTimeoutController for now"
-            )
+            raise TypeError("MicroservicesEnv requires StaticTimeoutController for now")
         if not isinstance(retry_policy, FixedBackoffRetryPolicy):
-            raise TypeError(
-                "MicroservicesEnv requires FixedBackoffRetryPolicy for now"
-            )
+            raise TypeError("MicroservicesEnv requires FixedBackoffRetryPolicy for now")
 
         timeout_controller.attempt_timeout = ms_to_ns(attempt_timeout_ms)
         timeout_controller.global_timeout = (
@@ -207,7 +211,7 @@ class MicroservicesEnv(_GymEnvBase):
             "backoff_ms": backoff_ms,
         }
 
-    def _reward_from_summary(self, summary: Dict[str, float]) -> float:
+    def _reward_from_summary(self, summary: dict[str, float]) -> float:
         w = self._cfg.reward_weights
         reward = (
             summary["success_rate"] * w.success
@@ -219,7 +223,7 @@ class MicroservicesEnv(_GymEnvBase):
         )
         return float(reward)
 
-    def _summarize_roots(self, roots) -> Dict[str, float]:
+    def _summarize_roots(self, roots) -> dict[str, float]:
         if not roots:
             return {
                 "completed": 0,
@@ -238,9 +242,9 @@ class MicroservicesEnv(_GymEnvBase):
         deadline_drops = 0
         queue_drops = 0
         server_drops = 0
-        latencies: List[int] = []
+        latencies: list[int] = []
         attempts_total = 0
-        queue_sizes: List[int] = []
+        queue_sizes: list[int] = []
 
         for root in roots:
             attempts_total += len(root.attempts)
@@ -268,13 +272,9 @@ class MicroservicesEnv(_GymEnvBase):
         server_rate = server_drops / completed if completed else 0.0
         avg_latency_ms = ns_to_ms(float(np.mean(latencies))) if latencies else 0.0
         p95_latency_ms = (
-            ns_to_ms(float(np.quantile(np.asarray(latencies), 0.95)))
-            if latencies
-            else 0.0
+            ns_to_ms(float(np.quantile(np.asarray(latencies), 0.95))) if latencies else 0.0
         )
-        retries_per_root = (
-            (attempts_total - completed) / completed if completed else 0.0
-        )
+        retries_per_root = (attempts_total - completed) / completed if completed else 0.0
         queue_avg = float(np.mean(queue_sizes)) if queue_sizes else 0.0
 
         return {
@@ -289,7 +289,7 @@ class MicroservicesEnv(_GymEnvBase):
             "queue_avg": queue_avg,
         }
 
-    def _build_observation(self, summary: Dict[str, float]) -> np.ndarray:
+    def _build_observation(self, summary: dict[str, float]) -> np.ndarray:
         time_s = ns_to_s(self._current_time_ns)
         obs = np.array(
             [
@@ -310,7 +310,7 @@ class MicroservicesEnv(_GymEnvBase):
         )
         return obs
 
-    def _collect_latency_samples(self, roots) -> Dict[str, list]:
+    def _collect_latency_samples(self, roots) -> dict[str, list]:
         attempt_latencies = []
         attempt_censored = []
         root_latencies = []
@@ -345,7 +345,7 @@ class MicroservicesEnv(_GymEnvBase):
 
 
 def build_single_service_env(
-    seed: Optional[int] = None, duration_s: Optional[int] = None
+    seed: int | None = None, duration_s: int | None = None
 ) -> EnvComponents:
     sim = Simulator(seed=1 if seed is None else seed)
     duration = 30 if duration_s is None else int(duration_s)
@@ -359,9 +359,7 @@ def build_single_service_env(
     )
     svc = ServiceRuntime(cfg=svc_cfg).bind()
 
-    timeout_ctrl = StaticTimeoutController(
-        global_timeout=None, attempt_timeout=ms_to_ns(50)
-    )
+    timeout_ctrl = StaticTimeoutController(global_timeout=None, attempt_timeout=ms_to_ns(50))
     retry = FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(50))
     client_cfg = ClientConfig(retry=retry, timeout_controller=timeout_ctrl)
     client = ClientRuntime(cfg=client_cfg, service=svc)
@@ -377,7 +375,7 @@ def build_single_service_env(
 
 
 def build_faulty_single_service_env(
-    seed: Optional[int] = None, duration_s: Optional[int] = None
+    seed: int | None = None, duration_s: int | None = None
 ) -> EnvComponents:
     sim = Simulator(seed=1 if seed is None else seed)
     duration = 30 if duration_s is None else int(duration_s)
@@ -402,9 +400,7 @@ def build_faulty_single_service_env(
     )
     svc = ServiceRuntime(cfg=svc_cfg).bind()
 
-    timeout_ctrl = StaticTimeoutController(
-        global_timeout=None, attempt_timeout=ms_to_ns(50)
-    )
+    timeout_ctrl = StaticTimeoutController(global_timeout=None, attempt_timeout=ms_to_ns(50))
     retry = FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(50))
     client_cfg = ClientConfig(retry=retry, timeout_controller=timeout_ctrl)
     client = ClientRuntime(cfg=client_cfg, service=svc)

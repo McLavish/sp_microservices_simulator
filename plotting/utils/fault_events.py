@@ -1,5 +1,6 @@
 import json
 import os
+
 import matplotlib.pyplot as plt
 
 
@@ -8,7 +9,7 @@ def load_fault_events(fault_events_file):
     if not fault_events_file or not os.path.exists(fault_events_file):
         return []
 
-    with open(fault_events_file, "r") as f:
+    with open(fault_events_file) as f:
         return json.load(f)
 
 
@@ -30,7 +31,7 @@ def plot_fault_events(events):
 
         elif event_type == "partial_failure":
             failure_rate = params.get("failure_rate", 0)
-            label = f"Partial Failure ({failure_rate*100:.0f}%)"
+            label = f"Partial Failure ({failure_rate * 100:.0f}%)"
             plt.axvspan(start_time, end_time, color="red", alpha=0.3, label=label)
 
         elif event_type == "load_spike":

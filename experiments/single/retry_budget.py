@@ -1,11 +1,11 @@
-from core import TimeInterval, s_to_ns, ms_to_ns, ns_to_ms
-from faults import LoadSpike, LatencyInjection, PartialFailure
-from retry_policies import RetryBudgetPolicy, ExponentialBackoffRetryPolicy
+from caller import ClientConfig, ClientRuntime
+from core import TimeInterval, ms_to_ns, s_to_ns
+from faults import LatencyInjection, LoadSpike, PartialFailure
+from retry_policies import ExponentialBackoffRetryPolicy, RetryBudgetPolicy
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import StaticTimeoutController
 from workload import Workload
-from caller import ClientConfig, ClientRuntime
 
 if __name__ == "__main__":
     sim = Simulator(seed=33445)
@@ -28,12 +28,8 @@ if __name__ == "__main__":
             ),
         ],
         partial_failures=[
-            PartialFailure(
-                duration=TimeInterval(begin=s_to_ns(30), end=s_to_ns(45)), p_fail=0.3
-            ),
-            PartialFailure(
-                duration=TimeInterval(begin=s_to_ns(80), end=s_to_ns(95)), p_fail=0.5
-            ),
+            PartialFailure(duration=TimeInterval(begin=s_to_ns(30), end=s_to_ns(45)), p_fail=0.3),
+            PartialFailure(duration=TimeInterval(begin=s_to_ns(80), end=s_to_ns(95)), p_fail=0.5),
         ],
     )
 

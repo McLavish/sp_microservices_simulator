@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
 import numpy as np
 
@@ -17,10 +16,10 @@ class SB3Policy:
     deterministic: bool = True
     name: str = "sb3"
 
-    def reset(self, seed: Optional[int] = None) -> None:
+    def reset(self, seed: int | None = None) -> None:
         return
 
-    def act(self, obs: np.ndarray, info: dict) -> Tuple[int, ...]:
+    def act(self, obs: np.ndarray, info: dict) -> tuple[int, ...]:
         action, _ = self.model.predict(obs, deterministic=self.deterministic)
         return coerce_action(action)
 
