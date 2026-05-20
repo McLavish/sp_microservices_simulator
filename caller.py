@@ -1,6 +1,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
+from typing import Protocol, runtime_checkable
 
 from core import (
     DropReason,
@@ -15,6 +16,16 @@ from retry_policies import RetryContext, RetryPolicy
 from service import ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import TimeoutController
+
+
+@runtime_checkable
+class _SupportsAddResult(Protocol):
+    def add_result(self, success: bool, now: TimePoint) -> None: ...
+
+
+@runtime_checkable
+class _SupportsUnderlying(Protocol):
+    underlying_strategy: RetryPolicy
 
 
 @dataclass(frozen=True)
@@ -49,25 +60,24 @@ class ClientRuntime:
     def _update_policy_results(self, policy: RetryPolicy, success: bool, now: TimePoint) -> None:
         """Update result tracking for policies that support it (e.g., circuit breakers, retry budget)."""
 
-        if hasattr(policy, "add_result"):
+        if isinstance(policy, _SupportsAddResult):
             policy.add_result(success, now)
 
-        # Update underlying strategy if it exists
-        if hasattr(policy, "underlying_strategy"):
+        if isinstance(policy, _SupportsUnderlying):
             self._update_policy_results(policy.underlying_strategy, success, now)
 
     def _allow_policy_request(self, policy: RetryPolicy, now: TimePoint) -> bool:
-        if hasattr(policy, "allow_request") and not policy.allow_request(now):
+        if not policy.allow_request(now):
             return False
-        if hasattr(policy, "underlying_strategy"):
+        if isinstance(policy, _SupportsUnderlying):
             return self._allow_policy_request(policy.underlying_strategy, now)
         return True
 
     def _complete_root(self, root: RootRequest) -> None:
         root.done = True
         self.roots.append(root)
-        if getattr(root, "on_done", None):
-            root.on_done(root)  # type: ignore[arg-type]
+        if root.on_done is not None:
+            root.on_done(root)
 
     def start_request(
         self,
