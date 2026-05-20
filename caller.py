@@ -13,7 +13,7 @@ from core import (
 )
 from metrics import Metrics
 from retry_policies import RetryContext, RetryPolicy
-from service import ServiceRuntime
+from service import ServiceConfig
 from simulator import Simulator
 from timeout_controllers import TimeoutController
 
@@ -26,6 +26,23 @@ class _SupportsAddResult(Protocol):
 @runtime_checkable
 class _SupportsUnderlying(Protocol):
     underlying_strategy: RetryPolicy
+
+
+class ServiceLike(Protocol):
+    """Structural type for anything ClientRuntime can submit attempts to.
+
+    Implemented by `ServiceRuntime` (single service) and `ServiceNodeRuntime`
+    (a chain node that fans out downstream).
+    """
+
+    cfg: ServiceConfig
+
+    def submit_attempt(
+        self,
+        sim: Simulator,
+        on_done: Callable[[bool, TimeDuration, DropReason, int], None],
+        attempt_deadline: TimePoint | None = None,
+    ) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -45,7 +62,7 @@ class AttemptCtx:
 @dataclass
 class ClientRuntime:
     cfg: ClientConfig
-    service: ServiceRuntime
+    service: ServiceLike
 
     roots: list[RootRequest] = field(default_factory=list)
     attempts_total: int = 0

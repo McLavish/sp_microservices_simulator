@@ -83,15 +83,15 @@ def run_scenario(seed: int, top_attempt_timeout_ms: int = 200):
     # Clients for edges
     b_to_c_client = ClientRuntime(
         cfg=make_client_cfg(attempt_timeout_ms=80, max_attempts=2, delay_ms=40),
-        service=c_node,  # type: ignore[arg-type]
+        service=c_node,
     )
     b_to_e_client = ClientRuntime(
         cfg=make_client_cfg(attempt_timeout_ms=80, max_attempts=2, delay_ms=40),
-        service=e_node,  # type: ignore[arg-type]
+        service=e_node,
     )
     a_to_b_client = ClientRuntime(
         cfg=make_client_cfg(attempt_timeout_ms=120, max_attempts=2, delay_ms=60),
-        service=b_node,  # type: ignore[arg-type]
+        service=b_node,
     )
 
     # Wire graph using tandem semantics on every edge
@@ -106,7 +106,7 @@ def run_scenario(seed: int, top_attempt_timeout_ms: int = 200):
             global_timeout=None, attempt_timeout=ms_to_ns(top_attempt_timeout_ms)
         ),
     )
-    top_client = ClientRuntime(cfg=top_client_cfg, service=a_node)  # type: ignore[arg-type]
+    top_client = ClientRuntime(cfg=top_client_cfg, service=a_node)
 
     # Workload
     wl = Workload(
@@ -214,7 +214,7 @@ def test_queue_pressure_and_depth():
                     global_timeout=None, attempt_timeout=ms_to_ns(20)
                 ),
             ),
-            service=b_node,  # type: ignore[arg-type]
+            service=b_node,
         )
         b_to_c_client = ClientRuntime(
             cfg=ClientConfig(
@@ -223,7 +223,7 @@ def test_queue_pressure_and_depth():
                     global_timeout=None, attempt_timeout=ms_to_ns(25)
                 ),
             ),
-            service=c_node,  # type: ignore[arg-type]
+            service=c_node,
         )
 
         # Wire downstream edges
@@ -237,7 +237,7 @@ def test_queue_pressure_and_depth():
                     global_timeout=None, attempt_timeout=ms_to_ns(30)
                 ),
             ),
-            service=a_node,  # type: ignore[arg-type]
+            service=a_node,
         )
 
         wl = Workload(base_rps=200.0, duration_s=10, load_spikes=[])
@@ -289,7 +289,7 @@ def test_queue_pressure_and_depth():
                 global_timeout=None, attempt_timeout=ms_to_ns(80)
             ),
         ),
-        service=d_node,  # type: ignore[arg-type]
+        service=d_node,
     )
     b_to_c = ClientRuntime(
         cfg=ClientConfig(
@@ -298,7 +298,7 @@ def test_queue_pressure_and_depth():
                 global_timeout=None, attempt_timeout=ms_to_ns(80)
             ),
         ),
-        service=c_node,  # type: ignore[arg-type]
+        service=c_node,
     )
     a_to_b = ClientRuntime(
         cfg=ClientConfig(
@@ -307,7 +307,7 @@ def test_queue_pressure_and_depth():
                 global_timeout=None, attempt_timeout=ms_to_ns(100)
             ),
         ),
-        service=b_node,  # type: ignore[arg-type]
+        service=b_node,
     )
 
     # Wire: D is leaf
@@ -322,7 +322,7 @@ def test_queue_pressure_and_depth():
                 global_timeout=None, attempt_timeout=ms_to_ns(120)
             ),
         ),
-        service=a_node,  # type: ignore[arg-type]
+        service=a_node,
     )
 
     wl = Workload(base_rps=100.0, duration_s=10, load_spikes=[])

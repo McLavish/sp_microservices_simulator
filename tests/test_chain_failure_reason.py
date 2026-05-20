@@ -36,7 +36,7 @@ class TestChainFailureReason(unittest.TestCase):
             retry=NoRetryPolicy(),
             timeout_controller=StaticTimeoutController(global_timeout=None, attempt_timeout=1),
         )
-        b_client = ClientRuntime(cfg=b_client_cfg, service=b_node)  # type: ignore[arg-type]
+        b_client = ClientRuntime(cfg=b_client_cfg, service=b_node)
 
         a_node.add_downstream(DownstreamEdge(client=b_client, target=b_node))
 
@@ -83,7 +83,7 @@ class TestChainFailureReason(unittest.TestCase):
                 retry=NoRetryPolicy(),
                 timeout_controller=StaticTimeoutController(),
             ),
-            service=b_node,  # type: ignore[arg-type]
+            service=b_node,
         )
         a_node.add_downstream(DownstreamEdge(client=b_client, target=b_node))
 

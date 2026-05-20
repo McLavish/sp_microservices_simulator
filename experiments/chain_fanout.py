@@ -74,17 +74,17 @@ if __name__ == "__main__":
     # B's client to C and E (fanout)
     b_to_c_client = ClientRuntime(
         cfg=make_client_cfg(attempt_timeout_ms=200, max_attempts=4, delay_ms=40),
-        service=c_node,  # type: ignore[arg-type]
+        service=c_node,
     )
     b_to_e_client = ClientRuntime(
         cfg=make_client_cfg(attempt_timeout_ms=200, max_attempts=4, delay_ms=40),
-        service=e_node,  # type: ignore[arg-type]
+        service=e_node,
     )
 
     # A's client to B
     a_to_b_client = ClientRuntime(
         cfg=make_client_cfg(attempt_timeout_ms=800, max_attempts=4, delay_ms=60),
-        service=b_node,  # type: ignore[arg-type]
+        service=b_node,
     )
 
     # Wire graph: B -> {C, E}; A -> B
@@ -104,7 +104,7 @@ if __name__ == "__main__":
             global_timeout=None, attempt_timeout=ms_to_ns(3200)
         ),
     )
-    top_client = ClientRuntime(cfg=top_client_cfg, service=a_node)  # type: ignore[arg-type]
+    top_client = ClientRuntime(cfg=top_client_cfg, service=a_node)
 
     wl = Workload(
         base_rps=188.0,
