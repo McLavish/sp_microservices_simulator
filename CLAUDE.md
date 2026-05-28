@@ -1,12 +1,12 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to the Agent when working with code in this repository.
 
 ## What this is
 
 Discrete-event simulator of microservice request flows: queues, retries, timeouts, partial failures, latency injections, load spikes. Simulates single services, chains, and fan-outs, exports per-bucket CSV metrics + fault-event JSON for plotting, and exposes the simulator as a Gymnasium environment for RL experiments on retry/timeout policies.
 
-There is no `pyproject.toml`, `requirements.txt`, or installable package — everything is run as `python -m <module>` from the repo root, against an in-tree `.venv`. Imports are flat (`from core import ...`, `from service import ...`), so cwd must be the repo root.
+The project is uv-managed but **not an installable package** (`pyproject.toml` sets `package = false`). Everything runs as `python -m <module>` from the repo root against the in-tree `.venv`. Imports are flat (`from core import ...`, `from service import ...`), so the cwd must be the repo root. The simulator core depends only on `numpy` + stdlib; `scipy`, `matplotlib`, `pandas`, `gymnasium`, `stable-baselines3` are dev/optional deps pulled in only by plotting and RL entry points.
 
 ## Architecture
 
@@ -21,7 +21,12 @@ The simulator is built around a single-threaded discrete-event loop. Events are 
 - **Half-open deadline semantics**: success requires `end_time < deadline` (strict). If a request *finishes* exactly at the deadline it counts as a deadline drop, not a success. Preserve this when adding new completion paths.
 - **Policy result fan-out**: `_update_policy_results` walks `policy.underlying_strategy` recursively and calls `add_result(success, now)` on every layer that has it. Circuit breakers and retry budgets *only* update through this path — if you add a new wrapping policy, it must expose `underlying_strategy` (or `add_result`) or it will silently never see results.
 
-**Chain / fan-out** (`chain.py`). `ServiceNodeRuntime` wraps a `ServiceRuntime` and a list of `DownstreamEdge`s. The node submits a custom `behavior` to its service that does (1) local service time, (2) launches downstream calls *concurrently*, (3) finalizes only when **all** downstreams succeed (AND semantics — first failure short-circuits the parent). The node calls `release_worker()` after the local stage so the upstream worker is freed while waiting on fan-out; this is the **tandem-queue** model and is the default. Don't change it to "hold the worker until downstreams finish" without understanding that capacity model — it's load-bearing for the multichain experiments.
+**Chain / fan-out** (`chain.py`). `ServiceNodeRuntime` wraps a `ServiceRuntime` and a list of `DownstreamEdge`s. The node submits a custom `behavior` to its service that does (1) local service time, (2) launches downstream calls *concurrently*, (3) finalizes only when **all** downstreams succeed (AND semantics — first failure short-circuits the parent). Worker occupancy during fan-out is controlled by `ServiceNodeRuntime.hold_worker_during_fanout`:
+
+- `False` (**default, tandem-queue**): `release_worker()` is called after the local stage, so the upstream worker is freed while waiting on downstreams. This is load-bearing for the multichain experiments — capacity is *not* consumed down the tree.
+- `True` (**synchronous thread-per-request**): the worker is held for the whole subtree (local work + downstream wait), so capacity is consumed all the way down.
+
+When adding completion paths in `behavior`, preserve AND semantics and route deadlines through `min(...)` rather than overwriting; the deadline guard schedules an `on_deadline` event that must be cancelled on success.
 
 **Workload** (`workload.py`) is a Poisson arrival process (`expovariate`) modulated by `LoadSpike.rps_multiplier`. RPS=0 means no arrivals but the tick keeps polling at 0.5s intervals.
 
@@ -38,17 +43,30 @@ The simulator is built around a single-threaded discrete-event loop. Events are 
 
 `MicroservicesEnv` (`rl/env.py`) wraps a build function (`build_single_service_env` or `build_faulty_single_service_env`) into a Gymnasium env. Each `step()` advances the simulator by `step_duration_s` and returns reward + observation summarized over roots that completed in that window. The action is a `MultiDiscrete` index into `ActionSpec` lists for `(attempt_timeout_ms, max_attempts, backoff_ms[, global_timeout_ms])`. Hard constraint: `_apply_action` mutates `StaticTimeoutController.attempt_timeout` and `FixedBackoffRetryPolicy.delay/max_attempts` directly — it raises `TypeError` on any other policy/controller types. If you swap the underlying policy in a `build_*` function, update `_apply_action` accordingly.
 
-`rl/policies/` ships baselines (Fixed, AIMD, ModelBased, Bayesian, SB3 PPO, oracle-fixed grid search). `ModelBasedPolicy` optionally adds an M/M/c queueing-delay term. `rl/models/` has the latency models used by Bayesian/ModelBased: lognormal, lognormal mixture, EVT tail.
+`rl/policies/` ships baselines (Fixed, AIMD, ModelBased, Bayesian, SB3 PPO, oracle-fixed grid search). `ModelBasedPolicy` optionally adds an M/M/c queueing-delay term. `rl/models/` has the latency models used by Bayesian/ModelBased: lognormal (`lognormal.py`), lognormal mixture (`lognormal_mixture.py`), EVT tail (`evt_tail.py`).
 
 `rl/policies/sb3.py` adapts a Stable-Baselines3 model to the `Policy` protocol. PPO training entry point is `rl.train_sb3`; multi-policy comparison (incl. early-stopped PPO and oracle search) is `rl.experiments.compare_policies`.
 
 ## Common commands
 
-Tests:
+Setup and quality gates (all run through `uv` so the `.venv` stays consistent):
 ```bash
-uv run pytest                    # full suite
-uv run pytest tests/test_rl_env  # single test module
-uv run pytest --cov              # with coverage report
+make install     # uv sync --group dev + install pre-commit hook
+make check       # lint + format check + ty type check + tests (the full gate)
+make lint        # ruff check
+make fmt         # ruff format
+make type        # ty check
+make test        # uv run pytest
+make cov         # pytest --cov
+make help        # list all targets
+```
+Pre-commit runs `ruff check --fix`, `ruff format`, and `ty check` on every commit.
+
+Tests (pytest; tests are `unittest`-style but run under pytest):
+```bash
+uv run pytest                              # full suite
+uv run pytest tests/test_rl_env.py        # single module
+uv run pytest -k chain_worker             # by keyword
 ```
 
 Single-service / chain experiments (write CSVs + JSON to repo root):
@@ -56,9 +74,11 @@ Single-service / chain experiments (write CSVs + JSON to repo root):
 python -m experiments.default
 python -m experiments.chain_fanout
 python -m experiments.multichain_retry_storm
+python -m experiments.test_chain_modes    # compares tandem vs hold-worker fan-out
 ```
+`experiments/single/` holds focused single-service demos (circuit breakers, backoff variants, rate limiters, retry budget).
 
-Plotting (consumes the CSV + matching fault-events JSON):
+Plotting (consumes a CSV + matching fault-events JSON; the time axis is shared):
 ```bash
 python -m plotting.failures_over_time chain_output.csv --fault-events chain_fault_events.json
 python -m plotting.latencies_over_time chain_output.csv --fault-events chain_fault_events.json
@@ -69,23 +89,19 @@ python -m plotting.qps_over_time chain_output.csv --fault-events chain_fault_eve
 
 RL:
 ```bash
-# Compare latency models on synthetic data
 python -m rl.experiments.compare_models --dist {lognormal,mixture,pareto}
-
-# Compare baseline policies (uses faulty env when --fault-scenario basic)
 python -m rl.experiments.compare_policies \
     --policies fixed,aimd,model_based,model_based_queue,bayesian,ppo,oracle_fixed \
     --fault-scenario basic
-
-# Train PPO standalone
 python -m rl.train_sb3 --timesteps 5000 --save-path rl_models/ppo.zip
 ```
-
-Optional dependencies (only required for the corresponding entry points): `gymnasium`, `stable-baselines3`. The simulator core has no external deps beyond `numpy` and the stdlib.
 
 ## Conventions when extending
 
 - New retry policies that wrap another should expose `underlying_strategy` so `_update_policy_results` reaches them. New stateful policies should implement `add_result(success, now)`.
 - New downstream-graph features must preserve AND semantics in `chain.py`'s `behavior` and route deadlines through `min(...)` rather than overwriting.
-- After running an experiment, call `Metrics.export_csv()` *and* `FaultEventsTracker.export_json()` so plotting overlays line up — the time axis is shared.
+- After running an experiment, call `Metrics.export_csv()` *and* `FaultEventsTracker.export_json()` so plotting overlays line up.
+- Keep internal time in nanoseconds; convert only at I/O / plotting boundaries.
+- `ty` is lenient on missing annotations but real type errors (None narrowing, protocol mismatches, numpy misuse) are kept clean — don't reintroduce them.
 - Generated artifacts (`*.csv`, `*.json`, `*.png`, `results/`) are gitignored. The committed `*_output.csv` / `*_fault_events.json` files at the repo root are sample outputs from prior runs; treat them as disposable.
+```
