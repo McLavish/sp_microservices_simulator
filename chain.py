@@ -24,6 +24,12 @@ class ServiceNodeRuntime:
 
     service: ServiceRuntime
     downstreams: list[DownstreamEdge] = field(default_factory=list)
+    # Worker-occupancy model during fan-out:
+    #   False (default) -> tandem-queue: release the local worker once local work is
+    #     done and downstream calls are launched, so the worker is free while waiting.
+    #   True -> synchronous thread-per-request: hold the worker for the full subtree
+    #     (local work + downstream fan-out wait), so capacity is consumed down the tree.
+    hold_worker_during_fanout: bool = False
 
     @property
     def cfg(self) -> ServiceConfig:
@@ -40,8 +46,11 @@ class ServiceNodeRuntime:
     ) -> None:
         """Submit a logical attempt to this node.
 
-        Uses a custom behavior to keep the worker busy across local work and downstream calls,
-        and completes only when the fanout (if any) finishes.
+        Uses a custom behavior that runs local service time, fans out to downstreams
+        concurrently (AND semantics), and completes only when the fanout finishes.
+        The local worker is released after the local stage unless
+        ``hold_worker_during_fanout`` is set, in which case it is held for the whole
+        subtree (synchronous thread-per-request model).
         """
 
         def behavior(
@@ -154,7 +163,7 @@ class ServiceNodeRuntime:
                         override_global_deadline=deadline,
                     )
 
-                if not done:
+                if not done and not self.hold_worker_during_fanout:
                     release_worker()
 
             sim2.schedule(end_local, after_local)
