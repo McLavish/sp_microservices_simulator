@@ -5,6 +5,7 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from rl.cli import parse_int_list, parse_optional_int_list
 from rl.env import ActionSpec, EnvConfig, MicroservicesEnv, build_single_service_env
 
 try:
@@ -35,22 +36,6 @@ class TrainConfig:
     save_path: str | None
     load_path: str | None
     eval_episodes: int
-
-
-def _parse_int_list(value: str) -> list[int]:
-    items = [v.strip() for v in value.split(",") if v.strip()]
-    return [int(v) for v in items]
-
-
-def _parse_optional_int_list(value: str) -> list[int | None]:
-    items = [v.strip() for v in value.split(",") if v.strip()]
-    parsed: list[int | None] = []
-    for item in items:
-        if item.lower() in ("none", "null"):
-            parsed.append(None)
-        else:
-            parsed.append(int(item))
-    return parsed
 
 
 def _make_env(cfg: TrainConfig) -> MicroservicesEnv:
@@ -139,10 +124,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-envs", type=int, default=1)
     parser.add_argument("--step-duration-s", type=float, default=1.0)
     parser.add_argument("--episode-duration-s", type=float, default=10.0)
-    parser.add_argument("--attempt-timeouts-ms", type=_parse_int_list, default=[10, 30, 50, 80])
-    parser.add_argument("--max-attempts", type=_parse_int_list, default=[1, 2, 3])
-    parser.add_argument("--backoff-ms", type=_parse_int_list, default=[0, 20, 50])
-    parser.add_argument("--global-timeouts-ms", type=_parse_optional_int_list, default=None)
+    parser.add_argument("--attempt-timeouts-ms", type=parse_int_list, default=[10, 30, 50, 80])
+    parser.add_argument("--max-attempts", type=parse_int_list, default=[1, 2, 3])
+    parser.add_argument("--backoff-ms", type=parse_int_list, default=[0, 20, 50])
+    parser.add_argument("--global-timeouts-ms", type=parse_optional_int_list, default=None)
     parser.add_argument("--n-steps", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--gamma", type=float, default=0.95)

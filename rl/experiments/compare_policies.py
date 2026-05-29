@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from core import Summary
+from rl.cli import parse_int_list, parse_optional_int_list
 from rl.env import (
     ActionSpec,
     EnvConfig,
@@ -71,22 +72,6 @@ class ExperimentConfig:
     aimd_ema_alpha: float
     aimd_min_completed: int
     fault_scenario: str
-
-
-def _parse_ints(value: str) -> list[int]:
-    items = [v.strip() for v in value.split(",") if v.strip()]
-    return [int(v) for v in items]
-
-
-def _parse_optional_int_list(value: str) -> list[int | None]:
-    items = [v.strip() for v in value.split(",") if v.strip()]
-    parsed: list[int | None] = []
-    for item in items:
-        if item.lower() in ("none", "null"):
-            parsed.append(None)
-        else:
-            parsed.append(int(item))
-    return parsed
 
 
 def _build_env(cfg: ExperimentConfig) -> MicroservicesEnv:
@@ -212,14 +197,14 @@ def _best_fixed_action(cfg: ExperimentConfig, grid: ActionGrid) -> tuple[int, ..
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare policy baselines.")
-    parser.add_argument("--attempt-timeouts-ms", type=_parse_ints, default=[10, 30, 50, 80])
-    parser.add_argument("--max-attempts", type=_parse_ints, default=[1, 2, 3])
-    parser.add_argument("--backoff-ms", type=_parse_ints, default=[0, 20, 50])
-    parser.add_argument("--global-timeouts-ms", type=_parse_optional_int_list, default=None)
+    parser.add_argument("--attempt-timeouts-ms", type=parse_int_list, default=[10, 30, 50, 80])
+    parser.add_argument("--max-attempts", type=parse_int_list, default=[1, 2, 3])
+    parser.add_argument("--backoff-ms", type=parse_int_list, default=[0, 20, 50])
+    parser.add_argument("--global-timeouts-ms", type=parse_optional_int_list, default=None)
     parser.add_argument("--step-duration-s", type=float, default=1.0)
     parser.add_argument("--episode-duration-s", type=float, default=10.0)
-    parser.add_argument("--train-seeds", type=_parse_ints, default="123,456,789")
-    parser.add_argument("--eval-seeds", type=_parse_ints, default="321,654,987")
+    parser.add_argument("--train-seeds", type=parse_int_list, default="123,456,789")
+    parser.add_argument("--eval-seeds", type=parse_int_list, default="321,654,987")
     parser.add_argument(
         "--policies",
         type=str,
