@@ -10,7 +10,7 @@ from core import TimeDuration, TimePoint
 @dataclass
 class RetryContext:
     attempt: int  # attempt starts at 1 (the original request is attempt 1)
-    now: TimePoint | None = None
+    now: TimePoint  # current simulation time; required (rate limiters need it)
     # last_delay: TimeDuration
     # total_delay: TimeDuration
     # last_result: Optional[bool] = None
@@ -246,8 +246,6 @@ class LeakyRateLimiterPolicy(RetryPolicy):
         return delay
 
     def next_delay(self, context: RetryContext) -> DelayDecision:
-        if context.now is None:
-            raise ValueError("LeakyRateLimiterPolicy requires context.now to be set")
         if context.attempt >= self.max_attempts:
             return DelayDecision(False, 0)
         delay = self.add_request(context.now)
@@ -333,9 +331,6 @@ class BurstyRateLimiterPolicy(RetryPolicy):
         return self._tokens >= 1.0
 
     def next_delay(self, context: RetryContext) -> DelayDecision:
-        if context.now is None:
-            raise ValueError("BurstyRateLimiterPolicy requires context.now to be set")
-
         if self.can_retry(context.now):
             can_retry, delay = self.underlying_strategy.next_delay(context)
             if can_retry:
@@ -377,9 +372,6 @@ class FixedWindowBurstyLimiterPolicy(RetryPolicy):
         return current_window_start + self.period
 
     def next_delay(self, context: RetryContext) -> DelayDecision:
-        if context.now is None:
-            raise ValueError("NewBurstyBuilderPolicy requires context.now to be set")
-
         self._refill_tokens(context.now)
 
         if self.can_retry(context.now):
