@@ -1,5 +1,6 @@
 from caller import ClientConfig, ClientRuntime
 from core import TimeInterval, ms_to_ns, s_to_ns
+from fault_events import FaultEventsTracker
 from faults import LatencyInjection, PartialFailure
 from retry_policies import (
     CountBasedCircuitBreakerPolicy,
@@ -12,6 +13,7 @@ from workload import Workload
 
 if __name__ == "__main__":
     sim = Simulator(seed=99887)
+    fault_tracker = FaultEventsTracker()
 
     svc_cfg = ServiceConfig(
         name="svc-cb-count",
@@ -32,6 +34,7 @@ if __name__ == "__main__":
     )
 
     svc = ServiceRuntime(cfg=svc_cfg).bind()
+    svc_cfg.register_fault_events(fault_tracker)
 
     # Circuit breaker: open after 4/6 failures, close after 3/4 successes
     cli_cfg = ClientConfig(
@@ -56,6 +59,7 @@ if __name__ == "__main__":
         duration_s=120,
         load_spikes=[],
     )
+    wl.register_fault_events(fault_tracker)
 
     wl.drive(sim, lambda s: client.start_request(s))
 
@@ -64,3 +68,4 @@ if __name__ == "__main__":
 
     m = client.metrics()
     m.export_csv(path="circuit_breaker_count_output.csv", granularity_s=1.0)
+    fault_tracker.export_json("circuit_breaker_count_fault_events.json")

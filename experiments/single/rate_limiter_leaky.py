@@ -1,5 +1,6 @@
 from caller import ClientConfig, ClientRuntime
 from core import TimeInterval, ms_to_ns, s_to_ns
+from fault_events import FaultEventsTracker
 from faults import LoadSpike, PartialFailure
 from retry_policies import LeakyRateLimiterPolicy
 from service import ServiceConfig, ServiceRuntime
@@ -9,6 +10,7 @@ from workload import Workload
 
 if __name__ == "__main__":
     sim = Simulator(seed=11223)
+    fault_tracker = FaultEventsTracker()
 
     svc_cfg = ServiceConfig(
         name="svc-leaky-limiter",
@@ -23,6 +25,7 @@ if __name__ == "__main__":
     )
 
     svc = ServiceRuntime(cfg=svc_cfg).bind()
+    svc_cfg.register_fault_events(fault_tracker)
 
     # Leaky bucket rate limiter: 100 requests per second max
     cli_cfg = ClientConfig(
@@ -52,6 +55,7 @@ if __name__ == "__main__":
             ),
         ],
     )
+    wl.register_fault_events(fault_tracker)
 
     wl.drive(sim, lambda s: client.start_request(s))
 
@@ -60,3 +64,4 @@ if __name__ == "__main__":
 
     m = client.metrics()
     m.export_csv(path="rate_limiter_leaky_output.csv", granularity_s=1.0)
+    fault_tracker.export_json("rate_limiter_leaky_fault_events.json")

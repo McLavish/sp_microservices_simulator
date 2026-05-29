@@ -54,19 +54,21 @@ policy, or workload. The building blocks are documented in
 ## Single-service policy demos (`experiments/single/`)
 
 Each isolates one retry/limiter/breaker policy (documented in
-[request-handling](request-handling.md)) under load and writes a CSV
-named after itself:
+[request-handling](request-handling.md)) under load and writes a CSV plus a
+matching fault-events JSON named after itself (`<name>_output.csv` and
+`<name>_fault_events.json`), so the [plotting](observability.md#plotting-plotting)
+overlays line up:
 
-| Module | Policy demonstrated | Output |
+| Module | Policy demonstrated | Output (`<name>` =) |
 | --- | --- | --- |
-| `single.exponential_backoff` | `ExponentialBackoffRetryPolicy` | `exponential_backoff_output.csv` |
-| `single.jittered_backoff` | `ExponentialBackoffWithJitterRetryPolicy` | `jittered_backoff_output.csv` |
-| `single.circuit_breaker_count` | `CountBasedCircuitBreakerPolicy` | `circuit_breaker_count_output.csv` |
-| `single.circuit_breaker_time` | `TimeBasedCircuitBreakerPolicy` | `circuit_breaker_time_output.csv` |
-| `single.rate_limiter_leaky` | `LeakyRateLimiterPolicy` | `rate_limiter_leaky_output.csv` |
-| `single.bursty_limiter` | `BurstyRateLimiterPolicy` | `bursty_limiter_output.csv` |
-| `single.fixed_window_limiter` | `FixedWindowBurstyLimiterPolicy` | `fixed_window_limiter_output.csv` |
-| `single.retry_budget` | `RetryBudgetPolicy` | `retry_budget_output.csv` |
+| `single.exponential_backoff` | `ExponentialBackoffRetryPolicy` | `exponential_backoff` |
+| `single.jittered_backoff` | `ExponentialBackoffWithJitterRetryPolicy` | `jittered_backoff` |
+| `single.circuit_breaker_count` | `CountBasedCircuitBreakerPolicy` | `circuit_breaker_count` |
+| `single.circuit_breaker_time` | `TimeBasedCircuitBreakerPolicy` | `circuit_breaker_time` |
+| `single.rate_limiter_leaky` | `LeakyRateLimiterPolicy` | `rate_limiter_leaky` |
+| `single.bursty_limiter` | `BurstyRateLimiterPolicy` | `bursty_limiter` |
+| `single.fixed_window_limiter` | `FixedWindowBurstyLimiterPolicy` | `fixed_window_limiter` |
+| `single.retry_budget` | `RetryBudgetPolicy` | `retry_budget` |
 
 ## Plotting the results
 
