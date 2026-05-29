@@ -1,18 +1,13 @@
-import argparse
-
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 from matplotlib.ticker import PercentFormatter
 
 from plotting.utils.fault_events import load_fault_events, plot_fault_events
+from plotting.utils.io import build_plot_parser, load_metrics
 
 
 def main(csv_file, output_file, fault_events_file=None):
-    df = pd.read_csv(csv_file).sort_values(by="timepoint")
-
-    # drop drain-phase partial bucket (events that landed after wl.duration_s)
-    df = df[:-1]
+    df = load_metrics(csv_file)
 
     t = df["timepoint"].astype(float).to_numpy()
 
@@ -73,16 +68,9 @@ def main(csv_file, output_file, fault_events_file=None):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Plot failure reason breakdown (top) and request amplification % (bottom) over time from CSV"
+    parser = build_plot_parser(
+        "Plot failure reason breakdown (top) and request amplification % (bottom) over time from CSV",
+        "reasons_and_request_amplification.png",
     )
-    parser.add_argument("csv_file", help="Input CSV file path")
-    parser.add_argument(
-        "--output",
-        "-o",
-        default="reasons_and_request_amplification.png",
-        help="Output plot filename",
-    )
-    parser.add_argument("--fault-events", help="JSON file containing fault events (optional)")
     args = parser.parse_args()
     main(args.csv_file, args.output, args.fault_events)
