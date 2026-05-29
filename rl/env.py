@@ -20,6 +20,7 @@ from core import (
 )
 from faults import LatencyInjection, LoadSpike, PartialFailure
 from retry_policies import FixedBackoffRetryPolicy
+from rl.spec import ActionSpec, RewardWeights, coerce_action
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import StaticTimeoutController
@@ -50,24 +51,6 @@ class EnvComponents:
     sim: Simulator
     workload: Workload
     client: ClientRuntime
-
-
-@dataclass
-class RewardWeights:
-    success: float = 1.0
-    deadline_drop: float = 1.0
-    queue_drop: float = 1.0
-    server_drop: float = 1.0
-    p95_latency_ms: float = 0.001
-    retries: float = 0.1
-
-
-@dataclass
-class ActionSpec:
-    attempt_timeout_ms: list[int]
-    max_attempts: list[int]
-    backoff_ms: list[int]
-    global_timeout_ms: list[int | None] | None = None
 
 
 @dataclass
@@ -172,8 +155,6 @@ class MicroservicesEnv(_GymEnvBase):
         return obs, info
 
     def step(self, action):
-        from rl.policies.action_space import coerce_action
-
         action = coerce_action(action)
         self._apply_action(action)
 

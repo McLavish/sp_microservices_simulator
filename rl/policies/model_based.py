@@ -6,10 +6,10 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from rl.env import RewardWeights
 from rl.models.base import LatencyModel
 from rl.models.lognormal import LogNormalModel
 from rl.policies.action_space import ActionGrid, ActionValues
+from rl.spec import RewardWeights
 
 
 @dataclass

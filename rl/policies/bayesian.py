@@ -4,10 +4,10 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from rl.env import RewardWeights
 from rl.models.lognormal import LogNormalModel
 from rl.policies.action_space import ActionGrid
 from rl.policies.model_based import LatencyBuffer, _simulate_action
+from rl.spec import RewardWeights
 
 
 @dataclass

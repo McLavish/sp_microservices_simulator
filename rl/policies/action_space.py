@@ -1,18 +1,9 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
 
-import numpy as np
+from rl.spec import ActionSpec, coerce_action
 
-from rl.env import ActionSpec
-
-
-def coerce_action(action: Any) -> tuple[int, ...]:
-    if isinstance(action, np.ndarray):
-        action = action.tolist()
-    if isinstance(action, (list, tuple)):
-        return tuple(int(a) for a in action)
-    return (int(action),)
+__all__ = ["ActionGrid", "ActionValues", "coerce_action"]
 
 
 @dataclass(frozen=True)
