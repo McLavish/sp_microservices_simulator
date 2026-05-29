@@ -214,9 +214,9 @@ class ClientRuntime:
             now=sim.timestep,
         )
 
-        should_retry, delay = self.cfg.retry.next_delay(retry_context)
-        next_start = sim.timestep + delay
-        if (not should_retry) or (
+        decision = self.cfg.retry.next_delay(retry_context)
+        next_start = sim.timestep + decision.delay
+        if (not decision.allow) or (
             ctx.root.global_deadline is not None and next_start >= ctx.root.global_deadline
         ):
             self._complete_root(ctx.root)

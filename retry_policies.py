@@ -16,7 +16,6 @@ class RetryContext:
     # last_result: Optional[bool] = None
 
 
-# TODO: refactor to return a named tuple instead of a tuple
 class DelayDecision(NamedTuple):
     allow: bool
     delay: TimeDuration
@@ -26,7 +25,7 @@ class RetryPolicy:
     def allow_request(self, now: TimePoint) -> bool:
         return True
 
-    def next_delay(self, context: RetryContext) -> tuple[bool, TimeDuration]:
+    def next_delay(self, context: RetryContext) -> DelayDecision:
         raise NotImplementedError
 
 
@@ -35,16 +34,16 @@ class FixedBackoffRetryPolicy(RetryPolicy):
     max_attempts: int  # total attempts including the initial try
     delay: TimeDuration
 
-    def next_delay(self, context: RetryContext) -> tuple[bool, TimeDuration]:
+    def next_delay(self, context: RetryContext) -> DelayDecision:
         if context.attempt < self.max_attempts:
-            return True, self.delay
-        return False, 0
+            return DelayDecision(True, self.delay)
+        return DelayDecision(False, 0)
 
 
 @dataclass
 class NoRetryPolicy(RetryPolicy):
-    def next_delay(self, context: RetryContext) -> tuple[bool, TimeDuration]:
-        return False, 0
+    def next_delay(self, context: RetryContext) -> DelayDecision:
+        return DelayDecision(False, 0)
 
 
 @dataclass
@@ -53,11 +52,11 @@ class ExponentialBackoffRetryPolicy(RetryPolicy):
     initial_delay: TimeDuration
     max_delay: TimeDuration
 
-    def next_delay(self, context: RetryContext) -> tuple[bool, TimeDuration]:
+    def next_delay(self, context: RetryContext) -> DelayDecision:
         if context.attempt < self.max_attempts:
             delay = min(self.initial_delay * (2 ** (context.attempt - 1)), self.max_delay)
-            return True, delay
-        return False, 0
+            return DelayDecision(True, delay)
+        return DelayDecision(False, 0)
 
 
 class JitterMode(Enum):
@@ -75,7 +74,7 @@ class ExponentialBackoffWithJitterRetryPolicy(RetryPolicy):
     jitter_mode: JitterMode = JitterMode.FULL
     # _prev: TimeDuration = 0
 
-    def next_delay(self, context: RetryContext) -> tuple[bool, TimeDuration]:
+    def next_delay(self, context: RetryContext) -> DelayDecision:
         if context.attempt < self.max_attempts:
             exp_delay = min(self.initial_delay * (2 ** (context.attempt - 1)), self.max_delay)
             if self.jitter_mode == JitterMode.FULL:
@@ -86,8 +85,8 @@ class ExponentialBackoffWithJitterRetryPolicy(RetryPolicy):
                 raise NotImplementedError("Decorrelated jitter not implemented")
             else:
                 raise ValueError("Unknown jitter mode")
-            return True, int(delay)
-        return False, 0
+            return DelayDecision(True, int(delay))
+        return DelayDecision(False, 0)
 
 
 class CBState(Enum):
@@ -160,9 +159,9 @@ class CountBasedCircuitBreakerPolicy(RetryPolicy):
             return True
         return False
 
-    def next_delay(self, context: RetryContext) -> tuple[bool, TimeDuration]:
+    def next_delay(self, context: RetryContext) -> DelayDecision:
         if self._state != CBState.CLOSED:
-            return False, 0
+            return DelayDecision(False, 0)
         return self.underlying_strategy.next_delay(context)
 
 
@@ -223,9 +222,9 @@ class TimeBasedCircuitBreakerPolicy(RetryPolicy):
             return True
         return False
 
-    def next_delay(self, context: RetryContext) -> tuple[bool, TimeDuration]:
+    def next_delay(self, context: RetryContext) -> DelayDecision:
         if self._state != CBState.CLOSED:
-            return False, 0
+            return DelayDecision(False, 0)
 
         return self.underlying_strategy.next_delay(context)
 
@@ -246,13 +245,13 @@ class LeakyRateLimiterPolicy(RetryPolicy):
         self._next_at = round(start_at + self.period / self.max_requests)
         return delay
 
-    def next_delay(self, context: RetryContext) -> tuple[bool, TimeDuration]:
+    def next_delay(self, context: RetryContext) -> DelayDecision:
         if context.now is None:
             raise ValueError("LeakyRateLimiterPolicy requires context.now to be set")
         if context.attempt >= self.max_attempts:
-            return False, 0
+            return DelayDecision(False, 0)
         delay = self.add_request(context.now)
-        return True, delay
+        return DelayDecision(True, delay)
 
 
 @dataclass
@@ -289,14 +288,14 @@ class RetryBudgetPolicy(RetryPolicy):
     def get_token_balance(self) -> float:
         return self._tokens
 
-    def next_delay(self, context: RetryContext) -> tuple[bool, TimeDuration]:
+    def next_delay(self, context: RetryContext) -> DelayDecision:
         if self.can_retry():
             can_retry, delay = self.underlying_strategy.next_delay(context)
             if can_retry:
                 self._tokens -= self._retry_cost
-                return True, delay
-            return False, 0
-        return False, 0
+                return DelayDecision(True, delay)
+            return DelayDecision(False, 0)
+        return DelayDecision(False, 0)
 
 
 # TODO: Refill logic is broken in this branch
@@ -333,7 +332,7 @@ class BurstyRateLimiterPolicy(RetryPolicy):
         self._refill_tokens(now)
         return self._tokens >= 1.0
 
-    def next_delay(self, context: RetryContext) -> tuple[bool, TimeDuration]:
+    def next_delay(self, context: RetryContext) -> DelayDecision:
         if context.now is None:
             raise ValueError("BurstyRateLimiterPolicy requires context.now to be set")
 
@@ -341,9 +340,9 @@ class BurstyRateLimiterPolicy(RetryPolicy):
             can_retry, delay = self.underlying_strategy.next_delay(context)
             if can_retry:
                 self._tokens -= 1
-                return True, delay
-            return False, 0
-        return False, 0
+                return DelayDecision(True, delay)
+            return DelayDecision(False, 0)
+        return DelayDecision(False, 0)
 
 
 @dataclass
@@ -377,7 +376,7 @@ class FixedWindowBurstyLimiterPolicy(RetryPolicy):
         current_window_start = self._get_current_window_start(now)
         return current_window_start + self.period
 
-    def next_delay(self, context: RetryContext) -> tuple[bool, TimeDuration]:
+    def next_delay(self, context: RetryContext) -> DelayDecision:
         if context.now is None:
             raise ValueError("NewBurstyBuilderPolicy requires context.now to be set")
 
@@ -387,9 +386,9 @@ class FixedWindowBurstyLimiterPolicy(RetryPolicy):
             can_retry, delay = self.underlying_strategy.next_delay(context)
             if can_retry:
                 self._tokens -= 1
-                return True, delay
-            return False, 0
-        return False, 0
+                return DelayDecision(True, delay)
+            return DelayDecision(False, 0)
+        return DelayDecision(False, 0)
 
 
 # class HedgePolicy:
