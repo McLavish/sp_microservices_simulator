@@ -20,7 +20,7 @@ def main(csv_file, output_file, fault_events_file=None):
     plt.plot(t, df["p90"], label="p90")
     plt.plot(t, df["p95"], label="p95")
     plt.plot(t, df["p99"], label="p99")
-    plt.plot(t, df["Max"], label="max")
+    plt.plot(t, df["max"], label="max")
 
     if fault_events_file:
         fault_events = load_fault_events(fault_events_file)

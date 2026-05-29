@@ -47,7 +47,7 @@ column is bucketed by** — start vs. end:
 | `failure_queue_full` / `failure_deadline` / `failure_server` / `failure_circuit_open` | end | failed roots by final drop reason |
 | `total_request` | start (cumulative) | running sum of started roots |
 | `total_failure` | end (cumulative) | running sum of failed roots |
-| `p50 p90 p95 p99 p99.9 p99.99 Min Max` | end | latency stats over **successful roots** completing in the bucket (ms) |
+| `p50 p90 p95 p99 p99.9 p99.99 min max` | end | latency stats over **successful roots** completing in the bucket (ms) |
 | `queue_avg_at_attempt_end` | end | mean `queue_size_at_end` over attempts ending in the bucket |
 
 Latency/queue cells are `nan` for buckets with no qualifying data. Because roots
@@ -63,7 +63,7 @@ With `--fault-events`, the active fault windows are shaded/annotated over the se
 | Script | Reads (CSV columns) | Renders |
 | --- | --- | --- |
 | `failures_over_time` | `failure_*`, request counts | stacked failure reasons + request amplification over time |
-| `latencies_over_time` | `p50/p90/p95/p99/Max` | latency percentile bands over time |
+| `latencies_over_time` | `p50/p90/p95/p99/max` | latency percentile bands over time |
 | `qps_over_time` | `root_requests`, `retries`, `failure_root` | throughput, retries, failures over time |
 | `queue_size_over_time` | `queue_avg_at_attempt_end` | average queue depth over time |
 | `latency_distribution` | *(none — synthetic)* | lognormal PDF/CDF for `--median-ms` / `--sigma` |

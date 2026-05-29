@@ -1,3 +1,4 @@
+import csv
 from dataclasses import dataclass
 
 import numpy as np
@@ -118,8 +119,6 @@ class Metrics:
         - failure_retry_count counts failed RETRY attempts (after the first), bucketed by attempt end.
         - latencies are for successful roots completed in the bucket.
         """
-        import csv
-
         if granularity_s <= 0:
             raise ValueError("granularity_s must be > 0")
         bucket_ns = s_to_ns(granularity_s)
@@ -149,8 +148,8 @@ class Metrics:
                     "p99",
                     "p99.9",
                     "p99.99",
-                    "Min",
-                    "Max",
+                    "min",
+                    "max",
                     "queue_avg_at_attempt_end",
                 ]
             )
