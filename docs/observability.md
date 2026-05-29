@@ -1,0 +1,90 @@
+# Observability: metrics, CSV export & plotting
+
+How a run becomes numbers and pictures. `Metrics` aggregates completed
+`RootRequest`s into a summary and a per-bucket CSV; the `plotting/` scripts render
+that CSV (optionally overlaid with the fault-event JSON).
+
+```
+ClientRuntime.roots --> Metrics.summary()      --> console stats
+                    \-> Metrics.export_csv()    --> <name>_output.csv  --\
+FaultEventsTracker  ---> export_json()          --> <name>_fault.json  --+--> plotting/*.py --> PNG
+```
+
+The CSV and the fault JSON share a **seconds** time axis, so they align when plotted
+together. Always export both from the same run.
+
+## `Metrics` (`metrics.py`)
+
+Construct via `client.metrics()` (it wraps `roots` + `attempts_total`).
+
+### `summary()` (`metrics.py:39`)
+
+Returns a `Summary` (`core.py:79`): `total`, `succeeded`, `dropped_*` by reason,
+latency percentiles `p50..p99_99`, `mean`, `max`, `retries_per_root`,
+`attempts_total`. Notes:
+
+- A root's **latency is wall-clock**: `max(attempt.end) - min(attempt.begin)`, i.e.
+  including queueing and every retry, counted only for **successful** roots.
+- A failed root is attributed to its **last attempt's** `drop_reason`.
+- `retries_per_root = (attempts_total - total) / total`.
+
+`print_stats()` (`metrics.py:95`) dumps the summary to stdout.
+
+### `export_csv(path, granularity_s=1.0)` (`metrics.py:113`)
+
+Writes one row per time bucket (default 1 s). The subtlety is **which event time a
+column is bucketed by** — start vs. end:
+
+| Column | Bucketed by | Meaning |
+| --- | --- | --- |
+| `timepoint` | — | bucket start, seconds |
+| `root_requests` | start | roots that *started* in the bucket |
+| `retries` | start | retry attempts (after the first) that started |
+| `success_root` | end | successful roots completing in the bucket |
+| `completed` | end | all attempts ending in the bucket |
+| `failure_root` | end | failed roots completing in the bucket |
+| `failure_retry` | end | failed *retry* attempts ending in the bucket |
+| `failure_queue_full` / `failure_deadline` / `failure_server` / `failure_circuit_open` | end | failed roots by final drop reason |
+| `total_request` | start (cumulative) | running sum of started roots |
+| `total_failure` | end (cumulative) | running sum of failed roots |
+| `p50 p90 p95 p99 p99.9 p99.99 Min Max` | end | latency stats over **successful roots** completing in the bucket (ms) |
+| `queue_avg_at_attempt_end` | end | mean `queue_size_at_end` over attempts ending in the bucket |
+
+Latency/queue cells are `nan` for buckets with no qualifying data. Because roots
+bucket by start but completions/latency by end, a spike of starts and the resulting
+completions can land in different rows — expected, not a bug.
+
+## Plotting (`plotting/`)
+
+Each script is `python -m plotting.<name> <csv> [--fault-events JSON] [--output PNG]`.
+With `--fault-events`, the active fault windows are shaded/annotated over the series
+(via `plotting/utils/fault_events.py`).
+
+| Script | Reads (CSV columns) | Renders |
+| --- | --- | --- |
+| `failures_over_time` | `failure_*`, request counts | stacked failure reasons + request amplification over time |
+| `latencies_over_time` | `p50/p90/p95/p99/Max` | latency percentile bands over time |
+| `qps_over_time` | `root_requests`, `retries`, `failure_root` | throughput, retries, failures over time |
+| `queue_size_over_time` | `queue_avg_at_attempt_end` | average queue depth over time |
+| `latency_distribution` | *(none — synthetic)* | lognormal PDF/CDF for `--median-ms` / `--sigma` |
+
+Each script writes a PNG via `--output`/`-o` (defaults: `latencies_over_time.png`,
+`qps_over_time.png`, `queue_size_over_time.png`, `latency_distribution.png`, and
+`reasons_and_request_amplification.png` for `failures_over_time`).
+`latency_distribution` takes `--median-ms` and `--sigma` instead of a CSV.
+`plot.sh` batch-renders the standard chain figures.
+
+### Example
+
+```bash
+python -m experiments.default        # writes output.csv + fault_events.json
+python -m plotting.failures_over_time output.csv --fault-events fault_events.json
+python -m plotting.latencies_over_time output.csv --fault-events fault_events.json -o lat.png
+```
+
+## See also
+
+- [services-and-workload](services-and-workload.md) — registering faults into the
+  tracker that produces the overlay JSON.
+- [experiments](experiments.md) — what each scenario writes (filenames differ per
+  experiment).

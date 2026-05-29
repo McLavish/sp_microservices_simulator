@@ -104,4 +104,11 @@ python -m rl.train_sb3 --timesteps 5000 --save-path rl_models/ppo.zip
 - Keep internal time in nanoseconds; convert only at I/O / plotting boundaries.
 - `ty` is lenient on missing annotations but real type errors (None narrowing, protocol mismatches, numpy misuse) are kept clean — don't reintroduce them.
 - Generated artifacts (`*.csv`, `*.json`, `*.png`, `results/`) are gitignored. The committed `*_output.csv` / `*_fault_events.json` files at the repo root are sample outputs from prior runs; treat them as disposable.
-```
+
+## Git Commits
+
+- Commit after every meaningful, self-contained change — don't batch unrelated work.
+- Each commit should leave the codebase in a working state.
+- Write short, clear commit messages that describe what changed.
+- If a task involves multiple logical steps, make a separate commit for each step.
+- Stage only the files relevant to the current change.
