@@ -99,6 +99,32 @@ class TestRLPolicies(unittest.TestCase):
         action = policy.act(np.zeros(12, dtype=np.float32), info)
         self.assertIn(action, self.grid.indices)
 
+    def test_aimd_policy_emits_global_timeout_dimension(self):
+        spec = ActionSpec(
+            attempt_timeout_ms=[10, 20],
+            max_attempts=[1, 2],
+            backoff_ms=[0],
+            global_timeout_ms=[100, 200],
+        )
+        grid = ActionGrid(spec)
+        policy = AIMDPolicy(
+            grid=grid,
+            initial_timeout_ms=10,
+            initial_max_attempts=1,
+            initial_backoff_ms=0,
+            initial_global_timeout_ms=100,
+        )
+        info = {
+            "summary": {
+                "completed": 5,
+                "success_rate": 0.8,
+                "deadline_drop_rate": 0.2,
+            }
+        }
+        action = policy.act(np.zeros(12, dtype=np.float32), info)
+        self.assertEqual(len(action), 4)
+        self.assertIn(action, grid.indices)
+
 
 if __name__ == "__main__":
     unittest.main()

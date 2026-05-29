@@ -201,6 +201,11 @@ class MicroservicesEnv(_GymEnvBase):
 
     def _apply_action(self, action: tuple[int, ...]) -> None:
         spec = self._cfg.action_spec
+        if len(action) != len(self._action_sizes):
+            raise ValueError(
+                f"Action has {len(action)} entries but the action space expects "
+                f"{len(self._action_sizes)} (did a policy emit the wrong dimensionality?)"
+            )
         idx = 0
         attempt_timeout_ms = spec.attempt_timeout_ms[action[idx]]
         idx += 1

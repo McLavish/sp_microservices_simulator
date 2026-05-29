@@ -11,6 +11,7 @@ class AIMDPolicy:
     initial_timeout_ms: int | None = None
     initial_max_attempts: int | None = None
     initial_backoff_ms: int | None = None
+    initial_global_timeout_ms: int | None = None
     initial_action: tuple[int, ...] | None = None
     timeout_increase_step: int = 1
     timeout_decrease_step: int = 1
@@ -25,15 +26,22 @@ class AIMDPolicy:
     name: str = "aimd_v2"
 
     def __post_init__(self):
+        self._has_global = self.grid.spec.global_timeout_ms is not None
         self._ema_success = None
         self._ema_deadline = None
-        self._timeout_idx, self._max_attempts_idx, self._backoff_idx = self._init_indices()
-        self._action = self._build_action()
+        self._init_state()
 
     def reset(self, seed: int | None = None) -> None:
         self._ema_success = None
         self._ema_deadline = None
-        self._timeout_idx, self._max_attempts_idx, self._backoff_idx = self._init_indices()
+        self._init_state()
+
+    def _init_state(self) -> None:
+        idx = self._init_indices()
+        self._timeout_idx, self._max_attempts_idx, self._backoff_idx = idx[0], idx[1], idx[2]
+        # Global timeout is not adapted by AIMD; it is held at its initial index so
+        # the emitted action matches the (3- or 4-dim) MultiDiscrete action space.
+        self._global_idx = idx[3] if len(idx) > 3 else None
         self._action = self._build_action()
 
     def act(self, obs: np.ndarray, info: dict) -> tuple[int, ...]:
@@ -81,12 +89,13 @@ class AIMDPolicy:
             return value
         return (1.0 - self.ema_alpha) * current + self.ema_alpha * value
 
-    def _init_indices(self) -> tuple[int, int, int]:
+    def _init_indices(self) -> tuple[int, ...]:
+        expected = 4 if self._has_global else 3
         if self.initial_action is not None:
             idx = tuple(int(v) for v in self.initial_action)
-            if len(idx) != 3:
-                raise ValueError("AIMDPolicy initial_action must be 3 indices")
-            return idx[0], idx[1], idx[2]
+            if len(idx) != expected:
+                raise ValueError(f"AIMDPolicy initial_action must be {expected} indices")
+            return idx
 
         timeout_ms = self.initial_timeout_ms
         if timeout_ms is None:
@@ -98,10 +107,13 @@ class AIMDPolicy:
         if backoff_ms is None:
             backoff_ms = self.grid.spec.backoff_ms[0]
 
-        idx = self.grid.nearest_indices(timeout_ms, max_attempts, backoff_ms)
-        return idx[0], idx[1], idx[2]
+        return self.grid.nearest_indices(
+            timeout_ms, max_attempts, backoff_ms, self.initial_global_timeout_ms
+        )
 
-    def _build_action(self) -> tuple[int, int, int]:
+    def _build_action(self) -> tuple[int, ...]:
+        if self._global_idx is not None:
+            return (self._timeout_idx, self._max_attempts_idx, self._backoff_idx, self._global_idx)
         return (self._timeout_idx, self._max_attempts_idx, self._backoff_idx)
 
     def _max_timeout_idx(self) -> int:
