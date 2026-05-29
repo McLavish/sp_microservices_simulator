@@ -195,8 +195,7 @@ worker: [local]                    worker: [local .... waiting on B,C ....]
 - **`True` (synchronous thread-per-request):** the worker is held for the whole
   subtree, so capacity is consumed all the way down.
 
-`experiments/test_chain_modes.py` contrasts the two; `tests/test_chain_worker_model.py`
-asserts the in-flight counts.
+`tests/test_chain_worker_model.py` asserts the in-flight counts for both modes.
 
 ### Example: a node fanning out to two services
 

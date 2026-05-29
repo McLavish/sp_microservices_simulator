@@ -49,7 +49,11 @@ policy, or workload. The building blocks are documented in
 | `experiments.nofaults` | Same single service, **no faults** — a clean baseline; 300 rps for 100 s | `nofaults_output.csv` |
 | `experiments.chain_fanout` | Fan-out `A -> B -> {C, E}` (all 60 ms; A/B wide, C/E 16 workers); `C` has a partial failure `[10,20)s p=0.5` | `chain_output.csv`, `chain_fault_events.json`, and `svc-{A,B,C,E}_output.csv` |
 | `experiments.multichain_retry_storm` | Two chains `A->B->C` and `X->Y->C` sharing a bottleneck `C`; `C` outage `[40,60)s` (+30 ms latency **and** `p=0.4`) drives a metastable retry storm; 120 s | `multichain_{A,X}_output.csv`, `multichain_{B_to_C,Y_to_C}.csv`, `multichain_fault_events.json` |
-| `experiments.test_chain_modes` | Demo/comparison of **tandem vs hold-worker** fan-out (prints results; see [request-handling](request-handling.md#worker-occupancy-tandem-vs-hold-worker)) | console output |
+
+The **tandem vs hold-worker** fan-out occupancy model (see
+[request-handling](request-handling.md#worker-occupancy-tandem-vs-hold-worker)) is
+exercised by `tests/test_chain_worker_model.py`; broader chain scenarios live in
+`tests/test_chain_scenarios.py`.
 
 ## Single-service policy demos (`experiments/single/`)
 

@@ -74,8 +74,11 @@ Single-service / chain experiments (write CSVs + JSON to repo root):
 python -m experiments.default
 python -m experiments.chain_fanout
 python -m experiments.multichain_retry_storm
-python -m experiments.test_chain_modes    # compares tandem vs hold-worker fan-out
 ```
+The tandem vs hold-worker fan-out behaviour is covered by
+`tests/test_chain_worker_model.py`; broader chain scenarios (fan-out
+monotonicity, deadline propagation, queue pressure) live in
+`tests/test_chain_scenarios.py`.
 `experiments/single/` holds focused single-service demos (circuit breakers, backoff variants, rate limiters, retry budget).
 
 Plotting (consumes a CSV + matching fault-events JSON; the time axis is shared):
