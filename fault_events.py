@@ -2,7 +2,7 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from core import TimeInterval, ns_to_s
+from core import TimeInterval, ns_to_ms, ns_to_s
 
 
 @dataclass
@@ -20,7 +20,7 @@ class FaultEventsTracker:
     def add_latency_injection(self, duration: TimeInterval, add_latency: int, multiplier: int = 1):
         """Add a latency injection event"""
         params = {
-            "add_latency_ms": add_latency / 1_000_000,  # Convert ns to ms
+            "add_latency_ms": ns_to_ms(add_latency),
             "multiplier": multiplier,
         }
         event = FaultEvent(

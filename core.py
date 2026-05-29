@@ -43,7 +43,7 @@ class DropReason(Enum):
     QUEUE_FULL = auto()
     DEADLINE = auto()
     SERVER_FAILURE = auto()
-    CIRCUIT_OPEN = auto()  # unused for now
+    CIRCUIT_OPEN = auto()
 
 
 @dataclass
