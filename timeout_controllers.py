@@ -1,7 +1,8 @@
-import statistics
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
+
+import numpy as np
 
 from core import TimeDuration
 
@@ -74,16 +75,13 @@ class AdaptiveTimeoutController(TimeoutController):
         self._current_attempt_timeout = self.initial_attempt_timeout
 
     def _calculate_percentile_timeout(self) -> TimeDuration | None:
-        """Calculate timeout based on latency percentiles using statistics.quantiles"""
+        """Calculate timeout based on the target latency percentile (numpy)."""
         if len(self._latencies) < self.min_samples:
             return None
 
-        # Use the same method as statistics.quantiles
-        p = int(round(self.target_percentile * 100))
-        p = max(1, min(99, p))  # clamp to [1, 99]
-
-        q = statistics.quantiles(self._latencies, n=100, method="inclusive")
-        percentile_latency = q[p - 1]
+        percentile_latency = float(
+            np.quantile(np.fromiter(self._latencies, dtype=np.float64), self.target_percentile)
+        )
         adapted_timeout = int(percentile_latency * self.safety_margin)
 
         # Apply min/max constraints
