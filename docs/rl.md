@@ -11,7 +11,8 @@ those policies, and provides comparison/training entry points.
 | --- | --- |
 | `gymnasium` | `MicroservicesEnv` (anything that builds the env) |
 | `stable-baselines3` | PPO training/policy (`rl.train_sb3`, the `ppo`/`sb3` policy) |
-| `scipy` | latency-model fitting / `compare_models` |
+| `scipy` | latency-model distributions (`scipy.stats`) / `compare_models` |
+| `scikit-learn` | lognormal-mixture fitting (`GaussianMixture`) |
 
 ## The environment (`rl/env.py`)
 
@@ -104,8 +105,8 @@ All implement `LatencyModel` (`rl/models/base.py`): `fit`, `logpdf`, `cdf`,
 
 | Model | Captures |
 | --- | --- |
-| `LogNormalModel` (`lognormal.py`) | a single lognormal (`mu`, `sigma`); also exposes `moments()` for queueing math |
-| `LogNormalMixtureModel` (`lognormal_mixture.py`) | a K-component lognormal mixture (EM-fit) for multi-modal latency |
+| `LogNormalModel` (`lognormal.py`) | a single lognormal (`mu`, `sigma`) backed by `scipy.stats.lognorm`; also exposes `moments()` for queueing math |
+| `LogNormalMixtureModel` (`lognormal_mixture.py`) | a K-component lognormal mixture fit in log-space with `sklearn.mixture.GaussianMixture`, for multi-modal latency |
 | `EVTTailModel` (`evt_tail.py`) | a lognormal **body** plus a Pareto (power-law) **tail** above a threshold quantile, for heavy tails |
 
 ## Entry points

@@ -2,13 +2,10 @@ import math
 from dataclasses import dataclass, field
 
 import numpy as np
+from scipy.stats import norm
+from sklearn.mixture import GaussianMixture
 
-from rl.models.utils import (
-    ensure_positive,
-    lognormal_logpdf,
-    logsumexp,
-    norm_cdf,
-)
+from rl.models.utils import ensure_positive
 
 
 @dataclass
@@ -22,55 +19,29 @@ class LogNormalMixtureModel:
     sigmas: np.ndarray | None = field(default=None, init=False)
     _min_sample: float = field(default=0.0, init=False)
     _max_sample: float = field(default=0.0, init=False)
+    _gmm: GaussianMixture | None = field(default=None, init=False, repr=False)
 
     def fit(self, samples: np.ndarray) -> "LogNormalMixtureModel":
         data = ensure_positive(samples)
         self._min_sample = float(np.min(data))
         self._max_sample = float(np.max(data))
         logx = np.log(data)
-        n = logx.size
-        if n < self.n_components:
+        if logx.size < self.n_components:
             raise ValueError("Not enough samples for mixture components")
 
-        qs = np.linspace(0.2, 0.8, self.n_components)
-        mus = np.quantile(logx, qs)
-        sigma_init = float(np.std(logx, ddof=1)) if n > 1 else 1.0
-        sigmas = np.full(self.n_components, max(sigma_init, self.min_sigma))
-        weights = np.full(self.n_components, 1.0 / self.n_components)
+        gmm = GaussianMixture(
+            n_components=self.n_components,
+            max_iter=self.max_iter,
+            tol=self.tol,
+            random_state=0,
+        )
+        gmm.fit(logx.reshape(-1, 1))
 
-        log_2pi_half = 0.5 * math.log(2.0 * math.pi)
-        prev_ll = -math.inf
-        for _ in range(self.max_iter):
-            z = (logx[:, None] - mus[None, :]) / sigmas[None, :]
-            log_probs = (
-                -0.5 * z * z - (np.log(sigmas) + log_2pi_half)[None, :] + np.log(weights)[None, :]
-            )
-            log_sum = logsumexp(log_probs, axis=1)
-            ll = float(np.sum(log_sum))
-
-            resp = np.exp(log_probs - log_sum[:, None])
-            r_sum = resp.sum(axis=0)
-            r_sum_safe = np.where(r_sum > 0, r_sum, 1.0)
-
-            weights = r_sum / n
-            weights = weights / weights.sum()
-
-            new_mus = (resp * logx[:, None]).sum(axis=0) / r_sum_safe
-            diff = logx[:, None] - new_mus[None, :]
-            var = (resp * diff * diff).sum(axis=0) / r_sum_safe
-            new_sigmas = np.maximum(np.sqrt(var), self.min_sigma)
-
-            active = r_sum > 0
-            mus = np.where(active, new_mus, mus)
-            sigmas = np.where(active, new_sigmas, sigmas)
-
-            if abs(ll - prev_ll) < self.tol:
-                break
-            prev_ll = ll
-
-        self.weights = weights
-        self.mus = mus
-        self.sigmas = sigmas
+        self.weights = np.asarray(gmm.weights_, dtype=np.float64)
+        self.mus = np.asarray(gmm.means_, dtype=np.float64).ravel()
+        covariances = np.asarray(gmm.covariances_, dtype=np.float64).ravel()
+        self.sigmas = np.maximum(np.sqrt(covariances), self.min_sigma)
+        self._gmm = gmm
         return self
 
     def _fitted_params(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -79,23 +50,21 @@ class LogNormalMixtureModel:
             raise RuntimeError("LogNormalMixtureModel must be fit() before use")
         return self.weights, self.mus, self.sigmas
 
-    def _logpdf_components(self, x: np.ndarray) -> np.ndarray:
-        weights, mus, sigmas = self._fitted_params()
-        x = np.asarray(x, dtype=np.float64)
-        logx = np.log(x, where=x > 0, out=np.full_like(x, -math.inf))
-        logpdf = []
-        for w, mu, sigma in zip(weights, mus, sigmas, strict=False):
-            logpdf.append(np.log(w) + lognormal_logpdf(logx, float(mu), float(sigma)))
-        return np.vstack(logpdf).T
+    def _fitted_gmm(self) -> GaussianMixture:
+        """Return the fitted sklearn model, narrowing the Optional field after fit()."""
+        if self._gmm is None:
+            raise RuntimeError("LogNormalMixtureModel must be fit() before use")
+        return self._gmm
 
     def logpdf(self, x: np.ndarray) -> np.ndarray:
+        gmm = self._fitted_gmm()
         x = np.asarray(x, dtype=np.float64)
         out = np.full_like(x, -math.inf, dtype=np.float64)
         mask = x > 0
         if not np.any(mask):
             return out
-        log_comp = self._logpdf_components(x[mask])
-        out[mask] = logsumexp(log_comp, axis=1)
+        logx = np.log(x[mask])
+        out[mask] = gmm.score_samples(logx.reshape(-1, 1)) - logx
         return out
 
     def cdf(self, x: np.ndarray) -> np.ndarray:
@@ -107,7 +76,7 @@ class LogNormalMixtureModel:
             return out
         logx = np.log(x[mask])
         z = (logx[:, None] - mus[None, :]) / sigmas[None, :]
-        cdfs = norm_cdf(z)
+        cdfs = norm.cdf(z)
         out[mask] = np.sum(cdfs * weights[None, :], axis=1)
         return out
 

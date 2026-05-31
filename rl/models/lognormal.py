@@ -2,8 +2,9 @@ import math
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.stats import lognorm
 
-from rl.models.utils import ensure_positive, lognormal_logpdf, norm_cdf, norm_ppf
+from rl.models.utils import ensure_positive
 
 
 @dataclass
@@ -22,22 +23,18 @@ class LogNormalModel:
 
     def logpdf(self, x: np.ndarray) -> np.ndarray:
         x = np.asarray(x, dtype=np.float64)
-        logx = np.log(x, where=x > 0, out=np.full_like(x, -math.inf))
-        out = lognormal_logpdf(logx, self.mu, self.sigma)
-        return np.where(x > 0, out, -math.inf)
+        return lognorm.logpdf(x, s=self.sigma, scale=math.exp(self.mu))
 
     def cdf(self, x: np.ndarray) -> np.ndarray:
         x = np.asarray(x, dtype=np.float64)
-        logx = np.log(x, where=x > 0, out=np.full_like(x, -math.inf))
-        z = (logx - self.mu) / self.sigma
-        return np.where(x > 0, norm_cdf(z), 0.0)
+        return lognorm.cdf(x, s=self.sigma, scale=math.exp(self.mu))
 
     def quantile(self, q: float) -> float:
         if q <= 0.0:
             return 0.0
         if q >= 1.0:
             return math.inf
-        return float(math.exp(self.mu + self.sigma * norm_ppf(q)))
+        return float(lognorm.ppf(q, s=self.sigma, scale=math.exp(self.mu)))
 
     def sample(self, rng: np.random.Generator, size: int) -> np.ndarray:
         return rng.lognormal(mean=self.mu, sigma=self.sigma, size=size)

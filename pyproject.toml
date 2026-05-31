@@ -15,6 +15,7 @@ dev = [
     "pytest",
     "pytest-cov",
     "scipy",
+    "scikit-learn",
     "matplotlib",
     "pandas",
     "gymnasium",
