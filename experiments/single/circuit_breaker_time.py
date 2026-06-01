@@ -1,17 +1,19 @@
-from core import TimeInterval, s_to_ns, ms_to_ns, ns_to_ms
-from faults import LoadSpike, LatencyInjection, PartialFailure
+from caller import ClientConfig, ClientRuntime
+from core import TimeInterval, ms_to_ns, s_to_ns
+from fault_events import FaultEventsTracker
+from faults import LatencyInjection, LoadSpike, PartialFailure
 from retry_policies import (
-    TimeBasedCircuitBreakerPolicy,
     ExponentialBackoffRetryPolicy,
+    TimeBasedCircuitBreakerPolicy,
 )
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import StaticTimeoutController
 from workload import Workload
-from caller import ClientConfig, ClientRuntime
 
 if __name__ == "__main__":
     sim = Simulator(seed=77432)
+    fault_tracker = FaultEventsTracker()
 
     # Service with prolonged failure periods
     svc_cfg = ServiceConfig(
@@ -27,13 +29,12 @@ if __name__ == "__main__":
             ),
         ],
         partial_failures=[
-            PartialFailure(
-                duration=TimeInterval(begin=s_to_ns(35), end=s_to_ns(75)), p_fail=0.7
-            ),
+            PartialFailure(duration=TimeInterval(begin=s_to_ns(35), end=s_to_ns(75)), p_fail=0.7),
         ],
     )
 
     svc = ServiceRuntime(cfg=svc_cfg).bind()
+    svc_cfg.register_fault_events(fault_tracker)
 
     cli_cfg = ClientConfig(
         retry=TimeBasedCircuitBreakerPolicy(
@@ -65,6 +66,7 @@ if __name__ == "__main__":
             ),
         ],
     )
+    wl.register_fault_events(fault_tracker)
 
     wl.drive(sim, lambda s: client.start_request(s))
 
@@ -73,3 +75,4 @@ if __name__ == "__main__":
 
     m = client.metrics()
     m.export_csv(path="circuit_breaker_time_output.csv", granularity_s=1.0)
+    fault_tracker.export_json("circuit_breaker_time_fault_events.json")

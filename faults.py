@@ -1,5 +1,6 @@
 from dataclasses import dataclass
-from core import TimeDuration, TimePoint, TimeInterval
+
+from core import TimeDuration, TimeInterval, TimePoint
 
 
 @dataclass

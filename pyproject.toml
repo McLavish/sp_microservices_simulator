@@ -1,0 +1,122 @@
+[project]
+name = "microservices-simulator"
+version = "0.0.0"
+description = "Discrete-event simulator of microservice request flows."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+]
+
+[dependency-groups]
+dev = [
+    "ruff",
+    "ty",
+    "pre-commit",
+    "pytest",
+    "pytest-cov",
+    "scipy",
+    "scikit-learn",
+    "matplotlib",
+    "pandas",
+    "gymnasium",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = [
+    ".venv",
+    "results",
+    "__pycache__",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+    "C4",   # flake8-comprehensions
+    "RET",  # flake8-return
+]
+ignore = [
+    "E501",  # line length handled by formatter
+]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "core",
+    "caller",
+    "chain",
+    "service",
+    "simulator",
+    "workload",
+    "metrics",
+    "fault_events",
+    "faults",
+    "retry_policies",
+    "timeout_controllers",
+    "experiments",
+    "plotting",
+    "rl",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.ty.environment]
+root = ["."]
+
+[tool.ty.rules]
+# Enforced via pre-commit. Lenient on missing annotations for now,
+# but real type errors (None narrowing, protocol mismatches, numpy
+# misuse) are kept clean.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+pythonpath = ["."]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+
+[tool.coverage.run]
+source = [
+    "core",
+    "caller",
+    "chain",
+    "service",
+    "simulator",
+    "workload",
+    "metrics",
+    "fault_events",
+    "faults",
+    "retry_policies",
+    "timeout_controllers",
+    "experiments",
+    "plotting",
+    "rl",
+]
+omit = [
+    "*/tests/*",
+    "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+show_missing = true
+skip_covered = false

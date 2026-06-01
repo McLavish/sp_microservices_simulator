@@ -1,5 +1,7 @@
-from core import TimeInterval, s_to_ns, ms_to_ns, ns_to_ms
-from faults import LoadSpike, LatencyInjection, PartialFailure
+from caller import ClientConfig, ClientRuntime
+from core import TimeInterval, ms_to_ns, s_to_ns
+from fault_events import FaultEventsTracker
+from faults import LatencyInjection, PartialFailure
 from retry_policies import (
     CountBasedCircuitBreakerPolicy,
     FixedBackoffRetryPolicy,
@@ -8,10 +10,10 @@ from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import StaticTimeoutController
 from workload import Workload
-from caller import ClientConfig, ClientRuntime
 
 if __name__ == "__main__":
     sim = Simulator(seed=99887)
+    fault_tracker = FaultEventsTracker()
 
     svc_cfg = ServiceConfig(
         name="svc-cb-count",
@@ -26,16 +28,13 @@ if __name__ == "__main__":
             ),
         ],
         partial_failures=[
-            PartialFailure(
-                duration=TimeInterval(begin=s_to_ns(30), end=s_to_ns(50)), p_fail=0.8
-            ),
-            PartialFailure(
-                duration=TimeInterval(begin=s_to_ns(70), end=s_to_ns(85)), p_fail=0.6
-            ),
+            PartialFailure(duration=TimeInterval(begin=s_to_ns(30), end=s_to_ns(50)), p_fail=0.8),
+            PartialFailure(duration=TimeInterval(begin=s_to_ns(70), end=s_to_ns(85)), p_fail=0.6),
         ],
     )
 
     svc = ServiceRuntime(cfg=svc_cfg).bind()
+    svc_cfg.register_fault_events(fault_tracker)
 
     # Circuit breaker: open after 4/6 failures, close after 3/4 successes
     cli_cfg = ClientConfig(
@@ -60,6 +59,7 @@ if __name__ == "__main__":
         duration_s=120,
         load_spikes=[],
     )
+    wl.register_fault_events(fault_tracker)
 
     wl.drive(sim, lambda s: client.start_request(s))
 
@@ -68,3 +68,4 @@ if __name__ == "__main__":
 
     m = client.metrics()
     m.export_csv(path="circuit_breaker_count_output.csv", granularity_s=1.0)
+    fault_tracker.export_json("circuit_breaker_count_fault_events.json")

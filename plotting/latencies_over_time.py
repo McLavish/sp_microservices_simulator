@@ -1,14 +1,11 @@
-import argparse
-import pandas as pd
 import matplotlib.pyplot as plt
+
 from plotting.utils.fault_events import load_fault_events, plot_fault_events
+from plotting.utils.io import build_plot_parser, load_metrics
 
 
 def main(csv_file, output_file, fault_events_file=None):
-    df = pd.read_csv(csv_file)
-    df = df.sort_values(by="timepoint")
-
-    df = df[:-1]
+    df = load_metrics(csv_file)
 
     t = df["timepoint"].astype(float)
 
@@ -17,7 +14,7 @@ def main(csv_file, output_file, fault_events_file=None):
     plt.plot(t, df["p90"], label="p90")
     plt.plot(t, df["p95"], label="p95")
     plt.plot(t, df["p99"], label="p99")
-    plt.plot(t, df["Max"], label="max")
+    plt.plot(t, df["max"], label="max")
 
     if fault_events_file:
         fault_events = load_fault_events(fault_events_file)
@@ -38,13 +35,6 @@ def main(csv_file, output_file, fault_events_file=None):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Plot latencies over time from CSV")
-    parser.add_argument("csv_file", help="Input CSV file path")
-    parser.add_argument(
-        "--output", "-o", default="latencies_over_time.png", help="Output plot filename"
-    )
-    parser.add_argument(
-        "--fault-events", help="JSON file containing fault events (optional)"
-    )
+    parser = build_plot_parser("Plot latencies over time from CSV", "latencies_over_time.png")
     args = parser.parse_args()
     main(args.csv_file, args.output, args.fault_events)

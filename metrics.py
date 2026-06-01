@@ -1,24 +1,26 @@
+import csv
 from dataclasses import dataclass
-from typing import List
+
 import numpy as np
 
 from core import (
+    MS_TO_NS,
+    DropReason,
     RootRequest,
     Summary,
     TimeInterval,
     ns_to_ms,
-    DropReason,
+    ns_to_s,
     s_to_ns,
-    MS_TO_NS,
 )
 
 
 @dataclass
 class Metrics:
-    roots: List[RootRequest]
+    roots: list[RootRequest]
     attempts_total: int
 
-    def _percentile_ms(self, p: float, vals: List[int]) -> float:
+    def _percentile_ms(self, p: float, vals: list[int]) -> float:
         if not vals:
             return float("nan")
 
@@ -26,9 +28,7 @@ class Metrics:
         q_ns = np.quantile(arr, p)
         return float(q_ns) / MS_TO_NS
 
-    def _compute_time_interval_from_attempts(
-        self, root_request: RootRequest
-    ) -> TimeInterval:
+    def _compute_time_interval_from_attempts(self, root_request: RootRequest) -> TimeInterval:
         if not root_request.attempts:
             raise ValueError("No attempts found in RootRequest")
 
@@ -39,29 +39,37 @@ class Metrics:
 
     def summary(self) -> Summary:
         total = len(self.roots)
-        succ_lat: List[int] = []
+        succ_lat: list[int] = []
         succeeded = 0
         dropped_q = 0
         dropped_deadline = 0
         dropped_server_failure = 0
+        dropped_circuit_open = 0
         for request in self.roots:
+            if not request.attempts:
+                continue
+
             success = False
             for attempt in request.attempts:
-                if attempt.drop_reason == DropReason.QUEUE_FULL:
-                    dropped_q += 1
-                if attempt.drop_reason == DropReason.DEADLINE:
-                    dropped_deadline += 1
-                if attempt.drop_reason == DropReason.SERVER_FAILURE:
-                    dropped_server_failure += 1
-
                 if attempt.success:  # there should be only 1 success per root request
                     if success:
                         raise ValueError("Multiple successful attempts in RootRequest")
                     success = True
                     succeeded += 1
-                    succ_lat.append(
-                        self._compute_time_interval_from_attempts(request).duration()
-                    )
+                    succ_lat.append(self._compute_time_interval_from_attempts(request).duration())
+
+            if success:
+                continue
+
+            last_attempt = max(request.attempts, key=lambda a: a.interval.end)
+            if last_attempt.drop_reason == DropReason.QUEUE_FULL:
+                dropped_q += 1
+            elif last_attempt.drop_reason == DropReason.DEADLINE:
+                dropped_deadline += 1
+            elif last_attempt.drop_reason == DropReason.CIRCUIT_OPEN:
+                dropped_circuit_open += 1
+            else:
+                dropped_server_failure += 1
 
         mean_ms = ns_to_ms(int(sum(succ_lat) / len(succ_lat))) if succ_lat else 0.0
         max_ms = ns_to_ms(max(succ_lat)) if succ_lat else 0.0
@@ -72,6 +80,7 @@ class Metrics:
             dropped_queue=dropped_q,
             dropped_deadline=dropped_deadline,
             dropped_server_failure=dropped_server_failure,
+            dropped_circuit_open=dropped_circuit_open,
             p50=self._percentile_ms(0.5, succ_lat),
             p90=self._percentile_ms(0.9, succ_lat),
             p95=self._percentile_ms(0.95, succ_lat),
@@ -91,6 +100,7 @@ class Metrics:
         print(f"Dropped (Queue Full): {summary.dropped_queue}")
         print(f"Dropped (Deadline): {summary.dropped_deadline}")
         print(f"Dropped (Server Failure): {summary.dropped_server_failure}")
+        print(f"Dropped (Circuit Open): {summary.dropped_circuit_open}")
         print(f"P50 Latency (ms): {summary.p50:.2f}")
         print(f"P95 Latency (ms): {summary.p95:.2f}")
         print(f"P99 Latency (ms): {summary.p99:.2f}")
@@ -109,8 +119,6 @@ class Metrics:
         - failure_retry_count counts failed RETRY attempts (after the first), bucketed by attempt end.
         - latencies are for successful roots completed in the bucket.
         """
-        import csv
-
         if granularity_s <= 0:
             raise ValueError("granularity_s must be > 0")
         bucket_ns = s_to_ns(granularity_s)
@@ -131,6 +139,7 @@ class Metrics:
                     "failure_queue_full",
                     "failure_deadline",
                     "failure_server",
+                    "failure_circuit_open",
                     "total_request",  # bucketed at the start. rename total_started_roots?
                     "total_failure",  # bucketed at the end. rename total_failed_roots_completed?
                     "p50",  # percentiles are all bucketed at the end
@@ -139,11 +148,14 @@ class Metrics:
                     "p99",
                     "p99.9",
                     "p99.99",
-                    "Min",
-                    "Max",
+                    "min",
+                    "max",
                     "queue_avg_at_attempt_end",
                 ]
             )
+
+            if not all_attempts:
+                return
 
             min_begin = min(a.interval.begin for a in all_attempts)
             max_end = max(a.interval.end for a in all_attempts)
@@ -165,14 +177,13 @@ class Metrics:
             failure_q_counts = [0] * nbuckets  # failed ROOTS by reason
             failure_dead_counts = [0] * nbuckets
             failure_srv_counts = [0] * nbuckets
-            retry_fail_counts = [
-                0
-            ] * nbuckets  # failed RETRY attempts that END in bucket
+            failure_co_counts = [0] * nbuckets
+            retry_fail_counts = [0] * nbuckets  # failed RETRY attempts that END in bucket
             completed_counts = [0] * nbuckets  # all attempts that END in bucket
-            latencies_by_bucket: List[List[int]] = [
+            latencies_by_bucket: list[list[int]] = [
                 [] for _ in range(nbuckets)
             ]  # successful ROOT latencies (ns), by completion bucket
-            queue_sizes_by_bucket: List[List[int]] = [
+            queue_sizes_by_bucket: list[list[int]] = [
                 [] for _ in range(nbuckets)
             ]  # queue size at attempt END, by completion bucket
 
@@ -184,7 +195,7 @@ class Metrics:
                 b_end = bin_of(a.interval.end)
                 if 0 <= b_end < nbuckets:
                     completed_counts[b_end] += 1
-                    if getattr(a, "queue_size_at_end", None) is not None:
+                    if a.queue_size_at_end is not None:
                         queue_sizes_by_bucket[b_end].append(int(a.queue_size_at_end))
 
             # Populate buckets
@@ -192,9 +203,7 @@ class Metrics:
                 if not root.attempts:
                     continue
 
-                attempts_by_begin = sorted(
-                    root.attempts, key=lambda a: a.interval.begin
-                )
+                attempts_by_begin = sorted(root.attempts, key=lambda a: a.interval.begin)
                 attempts_by_end = sorted(root.attempts, key=lambda a: a.interval.end)
 
                 root_begin = attempts_by_begin[0].interval.begin
@@ -232,15 +241,16 @@ class Metrics:
                             failure_q_counts[b_done] += 1
                         elif last_attempt.drop_reason == DropReason.DEADLINE:
                             failure_dead_counts[b_done] += 1
+                        elif last_attempt.drop_reason == DropReason.CIRCUIT_OPEN:
+                            failure_co_counts[b_done] += 1
                         elif last_attempt.drop_reason == DropReason.SERVER_FAILURE:
                             failure_srv_counts[b_done] += 1
 
-            seconds_per_bucket = granularity_s
             total_requests_so_far = 0
             total_failures_so_far = 0
 
             for i in range(nbuckets):
-                tp_sec = i * seconds_per_bucket
+                tp_sec = ns_to_s(start_ns + i * bucket_ns)
 
                 n_roots = root_counts[i]
                 n_retries = retry_counts[i]
@@ -264,9 +274,7 @@ class Metrics:
                     min_ms = ns_to_ms(min(lats))
                     max_ms = ns_to_ms(max(lats))
                 else:
-                    p50 = p90 = p95 = p99 = p999 = p9999 = min_ms = max_ms = float(
-                        "nan"
-                    )
+                    p50 = p90 = p95 = p99 = p999 = p9999 = min_ms = max_ms = float("nan")
 
                 # Queue size stats for attempts ending in this bucket
                 if queue_sizes_by_bucket[i]:
@@ -286,6 +294,7 @@ class Metrics:
                         str(failure_q_counts[i]),
                         str(failure_dead_counts[i]),
                         str(failure_srv_counts[i]),
+                        str(failure_co_counts[i]),
                         str(total_requests_so_far),
                         str(total_failures_so_far),
                         f"{p50:.3f}",

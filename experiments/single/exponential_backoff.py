@@ -1,14 +1,16 @@
-from core import TimeInterval, s_to_ns, ms_to_ns, ns_to_ms
-from faults import LoadSpike, LatencyInjection, PartialFailure
+from caller import ClientConfig, ClientRuntime
+from core import TimeInterval, ms_to_ns, s_to_ns
+from fault_events import FaultEventsTracker
+from faults import LatencyInjection, PartialFailure
 from retry_policies import ExponentialBackoffRetryPolicy
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import StaticTimeoutController
 from workload import Workload
-from caller import ClientConfig, ClientRuntime
 
 if __name__ == "__main__":
     sim = Simulator(seed=12345)
+    fault_tracker = FaultEventsTracker()
 
     svc_cfg = ServiceConfig(
         name="svc-exponential",
@@ -23,13 +25,12 @@ if __name__ == "__main__":
             ),
         ],
         partial_failures=[
-            PartialFailure(
-                duration=TimeInterval(begin=s_to_ns(60), end=s_to_ns(80)), p_fail=0.3
-            ),
+            PartialFailure(duration=TimeInterval(begin=s_to_ns(60), end=s_to_ns(80)), p_fail=0.3),
         ],
     )
 
     svc = ServiceRuntime(cfg=svc_cfg).bind()
+    svc_cfg.register_fault_events(fault_tracker)
 
     # Exponential backoff: 5 attempts, starting at 10ms, max 500ms
     cli_cfg = ClientConfig(
@@ -50,6 +51,7 @@ if __name__ == "__main__":
         duration_s=120,
         load_spikes=[],
     )
+    wl.register_fault_events(fault_tracker)
 
     wl.drive(sim, lambda s: client.start_request(s))
 
@@ -58,3 +60,4 @@ if __name__ == "__main__":
 
     m = client.metrics()
     m.export_csv(path="exponential_backoff_output.csv", granularity_s=1.0)
+    fault_tracker.export_json("exponential_backoff_fault_events.json")

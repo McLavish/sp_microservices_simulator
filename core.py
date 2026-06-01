@@ -1,6 +1,5 @@
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import List, Optional
-
 from enum import Enum, auto
 
 TimePoint = int  # nanoseconds
@@ -44,28 +43,31 @@ class DropReason(Enum):
     QUEUE_FULL = auto()
     DEADLINE = auto()
     SERVER_FAILURE = auto()
-    CIRCUIT_OPEN = auto()  # unused for now
+    CIRCUIT_OPEN = auto()
 
 
 @dataclass
 class Request:
     service: str  # name of the service that handled the request
     interval: TimeInterval  # indicates the lifespan of the request
-    deadline: Optional[TimePoint] = None  # maybe refactor into a policy
+    deadline: TimePoint | None = None  # maybe refactor into a policy
     valid: bool = True  # unused for now. TODO: add invalid requests
     success: bool = False
     drop_reason: DropReason = DropReason.NONE
     # Captured at attempt end by the service: current queue length
-    queue_size_at_end: Optional[int] = None
+    queue_size_at_end: int | None = None
 
 
 @dataclass
 class RootRequest:
     """Represents a client request that may consist of multiple attempts."""
 
-    attempts: List[Request] = field(default_factory=list)
-    global_deadline: Optional[TimePoint] = None
+    attempts: list[Request] = field(default_factory=list)
+    global_deadline: TimePoint | None = None
     done: bool = False  # indicated if the request was handled
+    # Optional: callback invoked exactly once when the root completes
+    # Not used by metrics; safe to leave None in existing flows
+    on_done: Callable[..., object] | None = None
 
     def add_attempt(self, attempt: Request):
         self.attempts.append(attempt)
@@ -81,6 +83,7 @@ class Summary:
     dropped_queue: int
     dropped_deadline: int
     dropped_server_failure: int
+    dropped_circuit_open: int
     p50: float
     p90: float
     p95: float

@@ -5,3 +5,11 @@ __pycache__
 *.csv
 *.json
 *.png
+.ruff_cache/
+.ty_cache/
+uv.lock.tmp
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml

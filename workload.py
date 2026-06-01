@@ -1,23 +1,23 @@
+import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import List, Optional
-import random
 
-from core import TimePoint, TimeDuration, s_to_ns
+from core import TimeDuration, TimePoint, s_to_ns
+from fault_events import FaultEventsTracker
 from faults import LoadSpike
 from simulator import Simulator
-from fault_events import FaultEventsTracker
 
 
 @dataclass
 class Workload:
     base_rps: float
     duration_s: int
-    load_spikes: List[LoadSpike]
-    rng_seed: Optional[int] = None
+    load_spikes: list[LoadSpike]
+    rng_seed: int | None = None
     _rng: random.Random = field(init=False, repr=False)
 
     def __post_init__(self):
+        # rng_seed=None falls back to seed 0 for cross-experiment determinism; pass an int explicitly to vary.
         self._rng = random.Random(self.rng_seed if self.rng_seed is not None else 0)
 
     def register_fault_events(self, tracker: FaultEventsTracker):
@@ -32,10 +32,11 @@ class Workload:
                 rps *= spike.rps_multiplier
         return max(0.0, rps)
 
-    def _sample_interarrival(self, time: TimePoint) -> TimeDuration:
-        rps = self.rps_at(time)
+    def _sample_interarrival(self, time: TimePoint, rps: float | None = None) -> TimeDuration:
+        rps = self.rps_at(time) if rps is None else rps
         if rps <= 0.0:
-            # No load now
+            # No load right now - push a bit forward.
+            # RNG is intentionally NOT consumed here; arrivals stay identical across experiments only when RPS-positive intervals match.
             return s_to_ns(0.5)
         return s_to_ns(self._rng.expovariate(rps))
 
@@ -45,8 +46,10 @@ class Workload:
         def tick():
             if sim.timestep >= end_at:
                 return
-            on_arrival(sim)
-            ia = max(1, self._sample_interarrival(sim.timestep))
+            rps = self.rps_at(sim.timestep)
+            if rps > 0.0:
+                on_arrival(sim)
+            ia = max(1, self._sample_interarrival(sim.timestep, rps))
             sim.schedule(sim.timestep + ia, tick)
 
         # start at t=0

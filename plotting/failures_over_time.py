@@ -1,16 +1,13 @@
-import argparse
-import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 from matplotlib.ticker import PercentFormatter
+
 from plotting.utils.fault_events import load_fault_events, plot_fault_events
-from fault_events import FaultEventsTracker
+from plotting.utils.io import build_plot_parser, load_metrics
 
 
 def main(csv_file, output_file, fault_events_file=None):
-    df = pd.read_csv(csv_file).sort_values(by="timepoint")
-
-    df = df[:-1]
+    df = load_metrics(csv_file)
 
     t = df["timepoint"].astype(float).to_numpy()
 
@@ -22,6 +19,7 @@ def main(csv_file, output_file, fault_events_file=None):
     reasons_pct = df[reason_cols].div(completed, axis=0) * 100.0
     reasons_pct = reasons_pct.fillna(0.0)
 
+    # Request amplification % (extra requests due to retries relative to root)
     root = df["root_requests"].replace(0, np.nan)
     retries = df["retries"]
     amplification_pct = (retries / root) * 100.0
@@ -70,18 +68,9 @@ def main(csv_file, output_file, fault_events_file=None):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Plot failure reason breakdown (top) and request amplification % (bottom) over time from CSV"
-    )
-    parser.add_argument("csv_file", help="Input CSV file path")
-    parser.add_argument(
-        "--output",
-        "-o",
-        default="reasons_and_request_amplification.png",
-        help="Output plot filename",
-    )
-    parser.add_argument(
-        "--fault-events", help="JSON file containing fault events (optional)"
+    parser = build_plot_parser(
+        "Plot failure reason breakdown (top) and request amplification % (bottom) over time from CSV",
+        "reasons_and_request_amplification.png",
     )
     args = parser.parse_args()
     main(args.csv_file, args.output, args.fault_events)

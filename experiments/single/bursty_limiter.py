@@ -1,14 +1,16 @@
-from core import TimeInterval, s_to_ns, ms_to_ns, ns_to_ms
-from faults import LoadSpike, LatencyInjection, PartialFailure
+from caller import ClientConfig, ClientRuntime
+from core import TimeInterval, ms_to_ns, s_to_ns
+from fault_events import FaultEventsTracker
+from faults import LatencyInjection, LoadSpike, PartialFailure
 from retry_policies import BurstyRateLimiterPolicy, FixedBackoffRetryPolicy
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import StaticTimeoutController
 from workload import Workload
-from caller import ClientConfig, ClientRuntime
 
 if __name__ == "__main__":
     sim = Simulator(seed=43232)
+    fault_tracker = FaultEventsTracker()
 
     svc_cfg = ServiceConfig(
         name="svc-bursty-limiter",
@@ -23,13 +25,12 @@ if __name__ == "__main__":
             ),
         ],
         partial_failures=[
-            PartialFailure(
-                duration=TimeInterval(begin=s_to_ns(60), end=s_to_ns(70)), p_fail=0.5
-            ),
+            PartialFailure(duration=TimeInterval(begin=s_to_ns(60), end=s_to_ns(70)), p_fail=0.5),
         ],
     )
 
     svc = ServiceRuntime(cfg=svc_cfg).bind()
+    svc_cfg.register_fault_events(fault_tracker)
 
     # Bursty rate limiter: 200 max requests, refills at 50/sec
     cli_cfg = ClientConfig(
@@ -68,6 +69,7 @@ if __name__ == "__main__":
             ),
         ],
     )
+    wl.register_fault_events(fault_tracker)
 
     wl.drive(sim, lambda s: client.start_request(s))
 
@@ -76,3 +78,4 @@ if __name__ == "__main__":
 
     m = client.metrics()
     m.export_csv(path="bursty_limiter_output.csv", granularity_s=1.0)
+    fault_tracker.export_json("bursty_limiter_fault_events.json")

@@ -1,15 +1,12 @@
-import argparse
-import pandas as pd
 import matplotlib.pyplot as plt
+import pandas as pd
 
 from plotting.utils.fault_events import load_fault_events, plot_fault_events
+from plotting.utils.io import build_plot_parser, load_metrics
 
 
 def main(csv_file, output_file, fault_events_file=None):
-    df = pd.read_csv(csv_file)
-    df = df.sort_values(by="timepoint")
-
-    df = df[:-1]
+    df = load_metrics(csv_file)
 
     t = df["timepoint"].astype(float).to_numpy()
 
@@ -34,16 +31,6 @@ def main(csv_file, output_file, fault_events_file=None):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Plot queue size over time from CSV")
-    parser.add_argument("csv_file", help="Input CSV file path")
-    parser.add_argument(
-        "--output",
-        "-o",
-        default="queue_size_over_time.png",
-        help="Output plot filename",
-    )
-    parser.add_argument(
-        "--fault-events", help="JSON file containing fault events (optional)"
-    )
+    parser = build_plot_parser("Plot queue size over time from CSV", "queue_size_over_time.png")
     args = parser.parse_args()
     main(args.csv_file, args.output, args.fault_events)
