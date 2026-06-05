@@ -4,9 +4,13 @@ import json
 from experiments.hotel_matched import (
     DEFAULT_PROFILE_FAULT,
     HotelMatchedConfig,
+    _build_runtime,
     config_from_args,
     run_hotel_matched,
 )
+from core import ms_to_ns
+from retry_policies import ExponentialBackoffWithJitterRetryPolicy, JitterMode, NoRetryPolicy
+from simulator import Simulator
 
 
 def test_config_from_args_accepts_calibration_fault_and_load_spike(tmp_path):
@@ -137,6 +141,48 @@ def test_run_hotel_matched_uses_default_profile_fault_when_no_calibration(tmp_pa
     assert fault_events[0]["end_time_s"] == DEFAULT_PROFILE_FAULT[0][1]
 
 
+def test_hotel_matched_retry_policies_follow_real_resilience_profiles():
+    run = _build_runtime(
+        Simulator(seed=123),
+        calibration={},
+        profile_faults=[],
+        seed=123,
+    )
+
+    _assert_no_retry(run.per_service_clients["search"][0], attempt_timeout_ms=900)
+    _assert_exp_jitter(
+        run.per_service_clients["geo"][0],
+        attempt_timeout_ms=500,
+        initial_delay_ms=20,
+        max_delay_ms=150,
+    )
+    _assert_exp_jitter(
+        run.per_service_clients["rate"][0],
+        attempt_timeout_ms=500,
+        initial_delay_ms=20,
+        max_delay_ms=150,
+    )
+    _assert_exp_jitter(
+        run.per_service_clients["reservation"][0],
+        attempt_timeout_ms=750,
+        initial_delay_ms=25,
+        max_delay_ms=200,
+    )
+    _assert_exp_jitter(
+        run.per_service_clients["recommendation"][0],
+        attempt_timeout_ms=750,
+        initial_delay_ms=25,
+        max_delay_ms=200,
+    )
+    for profile_client in run.per_service_clients["profile"]:
+        _assert_exp_jitter(
+            profile_client,
+            attempt_timeout_ms=750,
+            initial_delay_ms=25,
+            max_delay_ms=200,
+        )
+
+
 def _service(median_ms, *, workers):
     return {
         "median_ms": median_ms,
@@ -151,3 +197,18 @@ def _service(median_ms, *, workers):
 def _read_rows(path):
     with open(path, newline="") as fh:
         return list(csv.DictReader(fh))
+
+
+def _assert_no_retry(client, *, attempt_timeout_ms):
+    assert isinstance(client.cfg.retry, NoRetryPolicy)
+    assert client.cfg.timeout_controller.get_attempt_timeout() == ms_to_ns(attempt_timeout_ms)
+
+
+def _assert_exp_jitter(client, *, attempt_timeout_ms, initial_delay_ms, max_delay_ms):
+    retry = client.cfg.retry
+    assert isinstance(retry, ExponentialBackoffWithJitterRetryPolicy)
+    assert retry.max_attempts == 3
+    assert retry.initial_delay == ms_to_ns(initial_delay_ms)
+    assert retry.max_delay == ms_to_ns(max_delay_ms)
+    assert retry.jitter_mode == JitterMode.EQUAL
+    assert client.cfg.timeout_controller.get_attempt_timeout() == ms_to_ns(attempt_timeout_ms)

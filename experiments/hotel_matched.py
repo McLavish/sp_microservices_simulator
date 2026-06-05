@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,7 +27,7 @@ from core import TimeInterval, ms_to_ns, s_to_ns
 from fault_events import FaultEventsTracker
 from faults import LatencyInjection, LoadSpike, PartialFailure
 from metrics import Metrics
-from retry_policies import FixedBackoffRetryPolicy, NoRetryPolicy
+from retry_policies import ExponentialBackoffWithJitterRetryPolicy, JitterMode, NoRetryPolicy
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import StaticTimeoutController
@@ -149,7 +150,6 @@ def _build_runtime(
     profile_faults: list[tuple[float, float, float, float]],
     seed: int,
 ) -> HotelMatchedRun:
-    del sim
     fault_tracker = FaultEventsTracker()
 
     profile_injections = [
@@ -194,17 +194,21 @@ def _build_runtime(
 
     nodes = {name: ServiceNodeRuntime(ServiceRuntime(cfg=cfg).bind()) for name, cfg in cfgs.items()}
 
-    top_cfg = _client_cfg(attempt_timeout_ms=1000, max_attempts=1, delay_ms=0)
-    leaf_cfg = _client_cfg(attempt_timeout_ms=250, max_attempts=3, delay_ms=10)
-    mid_cfg = _client_cfg(attempt_timeout_ms=500, max_attempts=2, delay_ms=20)
+    policies = _client_policies(seed)
 
-    hotels_to_search = ClientRuntime(mid_cfg, nodes["search"])
-    search_to_geo = ClientRuntime(leaf_cfg, nodes["geo"])
-    search_to_rate = ClientRuntime(leaf_cfg, nodes["rate"])
-    hotels_to_reservation = ClientRuntime(leaf_cfg, nodes["reservation"])
-    hotels_to_profile = ClientRuntime(leaf_cfg, nodes["profile"])
-    recommendations_to_recommendation = ClientRuntime(leaf_cfg, nodes["recommendation"])
-    recommendations_to_profile = ClientRuntime(leaf_cfg, nodes["profile"])
+    hotels_to_search = ClientRuntime(policies["aggregator_no_retry"], nodes["search"])
+    search_to_geo = ClientRuntime(policies["search_downstream_geo"], nodes["geo"])
+    search_to_rate = ClientRuntime(policies["search_downstream_rate"], nodes["rate"])
+    hotels_to_reservation = ClientRuntime(policies["leaf_reservation"], nodes["reservation"])
+    hotels_to_profile = ClientRuntime(policies["leaf_hotels_profile"], nodes["profile"])
+    recommendations_to_recommendation = ClientRuntime(
+        policies["leaf_recommendation"],
+        nodes["recommendation"],
+    )
+    recommendations_to_profile = ClientRuntime(
+        policies["leaf_recommendations_profile"],
+        nodes["profile"],
+    )
 
     nodes["search"].add_downstream(DownstreamEdge(client=search_to_geo, target=nodes["geo"]))
     nodes["search"].add_downstream(DownstreamEdge(client=search_to_rate, target=nodes["rate"]))
@@ -227,8 +231,8 @@ def _build_runtime(
         DownstreamEdge(client=recommendations_to_profile, target=nodes["profile"])
     )
 
-    hotels_client = ClientRuntime(top_cfg, nodes["hotels-root"])
-    recommendations_client = ClientRuntime(top_cfg, nodes["recommendations-root"])
+    hotels_client = ClientRuntime(policies["top"], nodes["hotels-root"])
+    recommendations_client = ClientRuntime(policies["top"], nodes["recommendations-root"])
 
     return HotelMatchedRun(
         hotels_client=hotels_client,
@@ -245,14 +249,67 @@ def _build_runtime(
     )
 
 
-def _client_cfg(attempt_timeout_ms: int, max_attempts: int, delay_ms: int) -> ClientConfig:
-    retry = (
-        NoRetryPolicy()
-        if max_attempts <= 1
-        else FixedBackoffRetryPolicy(max_attempts=max_attempts, delay=ms_to_ns(delay_ms))
+def _client_policies(seed: int) -> dict[str, ClientConfig]:
+    return {
+        "top": _no_retry_cfg(attempt_timeout_ms=1000),
+        "aggregator_no_retry": _no_retry_cfg(attempt_timeout_ms=900),
+        "search_downstream_geo": _exp_jitter_cfg(
+            seed=seed + 101,
+            attempt_timeout_ms=500,
+            max_attempts=3,
+            initial_delay_ms=20,
+            max_delay_ms=150,
+        ),
+        "search_downstream_rate": _exp_jitter_cfg(
+            seed=seed + 102,
+            attempt_timeout_ms=500,
+            max_attempts=3,
+            initial_delay_ms=20,
+            max_delay_ms=150,
+        ),
+        "leaf_reservation": _leaf_read_cfg(seed=seed + 201),
+        "leaf_hotels_profile": _leaf_read_cfg(seed=seed + 202),
+        "leaf_recommendation": _leaf_read_cfg(seed=seed + 203),
+        "leaf_recommendations_profile": _leaf_read_cfg(seed=seed + 204),
+    }
+
+
+def _leaf_read_cfg(seed: int) -> ClientConfig:
+    return _exp_jitter_cfg(
+        seed=seed,
+        attempt_timeout_ms=750,
+        max_attempts=3,
+        initial_delay_ms=25,
+        max_delay_ms=200,
     )
+
+
+def _no_retry_cfg(attempt_timeout_ms: int) -> ClientConfig:
     return ClientConfig(
-        retry=retry,
+        retry=NoRetryPolicy(),
+        timeout_controller=StaticTimeoutController(
+            global_timeout=None,
+            attempt_timeout=ms_to_ns(attempt_timeout_ms),
+        ),
+    )
+
+
+def _exp_jitter_cfg(
+    *,
+    seed: int,
+    attempt_timeout_ms: int,
+    max_attempts: int,
+    initial_delay_ms: int,
+    max_delay_ms: int,
+) -> ClientConfig:
+    return ClientConfig(
+        retry=ExponentialBackoffWithJitterRetryPolicy(
+            max_attempts=max_attempts,
+            initial_delay=ms_to_ns(initial_delay_ms),
+            max_delay=ms_to_ns(max_delay_ms),
+            rng=random.Random(seed),
+            jitter_mode=JitterMode.EQUAL,
+        ),
         timeout_controller=StaticTimeoutController(
             global_timeout=None,
             attempt_timeout=ms_to_ns(attempt_timeout_ms),
