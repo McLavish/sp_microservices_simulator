@@ -92,7 +92,13 @@ class ExponentialBackoffWithJitterRetryPolicy(RetryPolicy):
 class CBState(Enum):
     CLOSED = 0
     OPEN = 1
-    HALF_OPEN = 2  # admitting probe requests to decide whether to close again
+    # Trial stage after the open delay. NOTE: the transitions work and are tested
+    # (open -> half-open -> closed/open), but probe admission is *not* capped:
+    # allow_request admits every request while half-open instead of permitting a
+    # fixed number of trial calls and rejecting the rest until they complete, the
+    # way resilience4j / failsafe-go / gobreaker do. So half-open currently offers
+    # no load protection on the recovering service. See allow_request below.
+    HALF_OPEN = 2
 
 
 @dataclass
@@ -147,6 +153,7 @@ class CountBasedCircuitBreakerPolicy(RetryPolicy):
                     self._opened_at = now
 
     def allow_request(self, now: TimePoint) -> bool:
+        # NOTE: half-open admits *every* request (no probe cap) — see CBState.HALF_OPEN.
         if self._state != CBState.OPEN:
             return True
         if (
@@ -210,6 +217,7 @@ class TimeBasedCircuitBreakerPolicy(RetryPolicy):
                 self._window.clear()
 
     def allow_request(self, now: TimePoint) -> bool:
+        # NOTE: half-open admits *every* request (no probe cap) — see CBState.HALF_OPEN.
         if self._state != CBState.OPEN:
             return True
         if (
