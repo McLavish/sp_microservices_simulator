@@ -92,7 +92,7 @@ class ExponentialBackoffWithJitterRetryPolicy(RetryPolicy):
 class CBState(Enum):
     CLOSED = 0
     OPEN = 1
-    HALF_OPEN = 2  # Probing stage not implemented properly
+    HALF_OPEN = 2  # admitting probe requests to decide whether to close again
 
 
 @dataclass
@@ -296,7 +296,6 @@ class RetryBudgetPolicy(RetryPolicy):
         return DelayDecision(False, 0)
 
 
-# TODO: Refill logic is broken in this branch
 @dataclass
 class BurstyRateLimiterPolicy(RetryPolicy):
     max_requests: int  # maximum requests in the bucket
