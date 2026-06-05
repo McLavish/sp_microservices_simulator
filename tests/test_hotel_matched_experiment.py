@@ -1,6 +1,7 @@
 import csv
 import json
 
+from core import ms_to_ns
 from experiments.hotel_matched import (
     DEFAULT_PROFILE_FAULT,
     HotelMatchedConfig,
@@ -8,7 +9,6 @@ from experiments.hotel_matched import (
     config_from_args,
     run_hotel_matched,
 )
-from core import ms_to_ns
 from retry_policies import ExponentialBackoffWithJitterRetryPolicy, JitterMode, NoRetryPolicy
 from simulator import Simulator
 
