@@ -30,7 +30,7 @@ from rl.policies.sb3 import SB3Policy
 from rl.sb3_support import import_sb3
 from rl.spec import ActionSpec, RewardWeights
 
-PPO, make_vec_env, _, _SB3_IMPORT_ERROR = import_sb3()
+PPO, make_vec_env, _, SubprocVecEnv, _SB3_IMPORT_ERROR = import_sb3()
 
 
 @dataclass
@@ -44,6 +44,7 @@ class ConstrainedTrainConfig:
     episode_duration_s: float = 10.0
     timesteps: int = 30_000
     chunk_timesteps: int = 5_000
+    n_envs: int = 8
     eval_episodes: int = 3
     eval_seed: int = 10_000
     seed: int = 123
@@ -112,9 +113,6 @@ def train_constrained_ppo(cfg: ConstrainedTrainConfig) -> SB3Policy:
             "stable-baselines3 is required for constrained training"
         ) from _SB3_IMPORT_ERROR
 
-    # One mutable weights object shared by every env this trainer builds: the
-    # envs read it at each step, so writing lambda into weights.cost between
-    # chunks takes effect immediately, without rebuilding anything.
     weights = replace(
         cfg.base_weights,
         retries=0.0 if cfg.zero_retry_penalty else cfg.base_weights.retries,
@@ -122,17 +120,25 @@ def train_constrained_ppo(cfg: ConstrainedTrainConfig) -> SB3Policy:
     )
 
     def make_env() -> MicroservicesEnv:
+        # Each env gets its own weights copy: lambda updates are broadcast via
+        # env_method (works across SubprocVecEnv process boundaries, where a
+        # shared mutable object would not).
         return MicroservicesEnv(
             EnvConfig(
                 build=cfg.build,
                 action_spec=cfg.action_spec,
                 step_duration_s=cfg.step_duration_s,
                 episode_duration_s=cfg.episode_duration_s,
-                reward_weights=weights,
+                reward_weights=replace(weights),
             )
         )
 
-    vec_env = make_vec_env(make_env, n_envs=1, seed=cfg.seed)
+    vec_env = make_vec_env(
+        make_env,
+        n_envs=cfg.n_envs,
+        seed=cfg.seed,
+        vec_env_cls=SubprocVecEnv if cfg.n_envs > 1 else None,
+    )
     model = PPO(
         "MlpPolicy",
         vec_env,
@@ -158,7 +164,7 @@ def train_constrained_ppo(cfg: ConstrainedTrainConfig) -> SB3Policy:
             model, eval_env, cfg.eval_episodes, cfg.base_weights
         )
         lam = dual_ascent_update(lam, eval_cost, cfg.budget, cfg.lambda_lr)
-        weights.cost = lam
+        vec_env.env_method("set_cost_weight", lam)
         curve.append((trained, eval_objective, eval_cost, lam))
 
     if cfg.learning_curve_csv and curve:

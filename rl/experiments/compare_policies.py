@@ -23,7 +23,7 @@ from rl.policies.model_based import ModelBasedPolicy
 from rl.policies.sb3 import SB3Policy
 from rl.sb3_support import import_sb3
 
-PPO, make_vec_env, sb3_evaluate, _ = import_sb3()
+PPO, make_vec_env, sb3_evaluate, _SubprocVecEnv, _ = import_sb3()
 
 
 @dataclass

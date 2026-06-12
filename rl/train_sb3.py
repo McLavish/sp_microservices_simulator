@@ -9,7 +9,7 @@ from rl.cli import parse_int_list, parse_optional_int_list
 from rl.env import SCENARIO_BUILDERS, ActionSpec, EnvConfig, MicroservicesEnv
 from rl.sb3_support import import_sb3
 
-PPO, make_vec_env, _, _SB3_IMPORT_ERROR = import_sb3()
+PPO, make_vec_env, _, SubprocVecEnv, _SB3_IMPORT_ERROR = import_sb3()
 
 
 @dataclass
@@ -87,7 +87,14 @@ def train(cfg: TrainConfig) -> None:
     def env_factory():
         return _make_env(cfg)
 
-    vec_env = make_vec_env(env_factory, n_envs=cfg.n_envs, seed=cfg.seed)
+    vec_env = make_vec_env(
+        env_factory,
+        n_envs=cfg.n_envs,
+        seed=cfg.seed,
+        # Parallel rollout collection: the simulator dominates wall-clock, so
+        # worker processes are the only meaningful speedup for tiny MLPs.
+        vec_env_cls=SubprocVecEnv if cfg.n_envs > 1 else None,
+    )
 
     if cfg.load_path:
         model = PPO.load(cfg.load_path, env=vec_env, device=cfg.device)

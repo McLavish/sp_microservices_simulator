@@ -33,7 +33,7 @@ from rl.policies.fixed import FixedPolicy
 from rl.sb3_support import import_sb3
 from rl.spec import RewardWeights
 
-PPO, _, _, _SB3_IMPORT_ERROR = import_sb3()
+PPO, _, _, _, _SB3_IMPORT_ERROR = import_sb3()
 
 BASE_WEIGHTS = RewardWeights()
 
@@ -122,6 +122,7 @@ def main() -> None:
     parser.add_argument("--budgets", type=parse_float_list, default=[0.05, 0.1, 0.2])
     parser.add_argument("--timesteps", type=int, default=30_000)
     parser.add_argument("--chunk-timesteps", type=int, default=5_000)
+    parser.add_argument("--n-envs", type=int, default=8)
     parser.add_argument("--episode-duration-s", type=float, default=10.0)
     parser.add_argument("--lambda-lr", type=float, default=0.5)
     parser.add_argument("--lambda-init", type=float, default=0.0)
@@ -160,6 +161,7 @@ def main() -> None:
             "episode_duration_s": args.episode_duration_s,
             "timesteps": args.timesteps,
             "chunk_timesteps": args.chunk_timesteps,
+            "n_envs": args.n_envs,
             "seed": args.train_seed,
             "eval_seed": args.train_seed + 10_000,
             "device": args.device,

@@ -432,6 +432,15 @@ class MicroservicesEnv(_GymEnvBase):
             return None
         return self._client.metrics().summary()
 
+    def set_cost_weight(self, value: float) -> None:
+        """Set the constraint-cost reward weight (the Lagrange multiplier).
+
+        Exists as a method so constrained training can broadcast lambda into
+        SubprocVecEnv workers via ``vec_env.env_method`` — mutating a shared
+        RewardWeights object does not cross process boundaries.
+        """
+        self._cfg.reward_weights.cost = float(value)
+
 
 def _static_knob_applier(
     timeout_ctrl: StaticTimeoutController, retry: FixedBackoffRetryPolicy

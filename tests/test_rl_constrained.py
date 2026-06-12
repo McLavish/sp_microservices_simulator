@@ -58,6 +58,7 @@ class TestConstrainedTraining(unittest.TestCase):
                 episode_duration_s=3.0,
                 timesteps=128,
                 chunk_timesteps=64,
+                n_envs=1,  # keep the unit test single-process and fast
                 eval_episodes=1,
                 budget=5.0,  # generous: always slack
                 lambda_init=1.0,
@@ -71,6 +72,28 @@ class TestConstrainedTraining(unittest.TestCase):
             self.assertEqual(lines[0], "timesteps,eval_J,eval_cost,lambda")
             final_lambda = float(lines[-1].split(",")[-1])
             self.assertLess(final_lambda, 1.0)
+
+    def test_subproc_workers_receive_lambda_broadcast(self):
+        # Exercises the SubprocVecEnv path: env factories must survive
+        # cloudpickle and lambda must reach workers via env_method.
+        cfg = ConstrainedTrainConfig(
+            build=lambda seed: build_chain_env(seed, duration_s=3),
+            action_spec=ActionSpec(
+                attempt_timeout_ms=[50, 80],
+                max_attempts=[1, 2],
+                backoff_ms=[20],
+            ),
+            episode_duration_s=3.0,
+            timesteps=128,
+            chunk_timesteps=64,
+            n_envs=2,
+            eval_episodes=1,
+            budget=0.001,  # tight: lambda must rise above its init
+            lambda_init=0.0,
+            lambda_lr=1.0,
+        )
+        policy = train_constrained_ppo(cfg)
+        self.assertEqual(policy.name, "constrained_ppo")
 
 
 if __name__ == "__main__":
