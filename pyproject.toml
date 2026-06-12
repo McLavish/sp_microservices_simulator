@@ -20,6 +20,11 @@ dev = [
     "pandas",
     "gymnasium",
 ]
+# Opt-in: PPO baseline + rl.train_sb3 (pulls in torch, ~GBs).
+# Install with `uv sync --group dev --group rl`.
+rl = [
+    "stable-baselines3",
+]
 
 [tool.uv]
 package = false
