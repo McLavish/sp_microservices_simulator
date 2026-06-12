@@ -19,6 +19,30 @@ class TestRLModels(unittest.TestCase):
         ll = model.log_likelihood(data)
         self.assertTrue(np.isfinite(ll))
 
+    def test_lognormal_censored_fit_recovers_parameters(self):
+        true_mu, true_sigma = 3.0, 0.5
+        x = self.rng.lognormal(mean=true_mu, sigma=true_sigma, size=1500)
+        cutoff = float(np.quantile(x, 0.6))  # right-censor the slowest 40%
+        censored = x > cutoff
+        observed = np.minimum(x, cutoff)
+
+        censored_fit = LogNormalModel().fit_censored(observed, censored)
+        naive_fit = LogNormalModel().fit(observed[~censored])
+
+        # Censored MLE recovers the true parameters; dropping censored samples
+        # is badly biased optimistic (naive mu ~2.7 for these settings).
+        self.assertLess(abs(censored_fit.mu - true_mu), 0.1)
+        self.assertLess(abs(censored_fit.sigma - true_sigma), 0.1)
+        self.assertLess(abs(censored_fit.mu - true_mu), abs(naive_fit.mu - true_mu))
+
+    def test_lognormal_censored_fit_without_censored_samples(self):
+        x = self.rng.lognormal(mean=3.0, sigma=0.5, size=500)
+        flags = np.zeros(x.size, dtype=bool)
+        model = LogNormalModel().fit_censored(x, flags)
+        reference = LogNormalModel().fit(x)
+        self.assertAlmostEqual(model.mu, reference.mu, places=12)
+        self.assertAlmostEqual(model.sigma, reference.sigma, places=12)
+
     def test_lognormal_mixture_model(self):
         data = np.concatenate(
             [

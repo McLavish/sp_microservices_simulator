@@ -13,39 +13,54 @@ from rl.spec import RewardWeights
 
 @dataclass
 class LatencyBuffer:
+    """Sliding window of attempt latencies with right-censoring flags.
+
+    Censored entries are timeout-truncated observations: the recorded value is
+    the timeout, a lower bound on the true latency. Keeping them (with flags)
+    lets models do right-censored MLE instead of silently dropping the slow
+    tail, which would bias the fitted distribution optimistic.
+    """
+
     max_samples: int
     samples: list[float] = field(default_factory=list)
-    _array_cache: np.ndarray | None = field(default=None, init=False, repr=False)
+    censored: list[bool] = field(default_factory=list)
+    _cache: tuple[np.ndarray, np.ndarray] | None = field(default=None, init=False, repr=False)
 
-    def add(self, values: list[float]) -> None:
+    def add(self, values: list[float], censored: list[bool] | None = None) -> None:
         if not values:
             return
+        flags = censored if censored is not None else [False] * len(values)
+        if len(flags) != len(values):
+            raise ValueError("censored flags must match values length")
         self.samples.extend(values)
+        self.censored.extend(flags)
         if len(self.samples) > self.max_samples:
             self.samples = self.samples[-self.max_samples :]
-        self._array_cache = None
+            self.censored = self.censored[-self.max_samples :]
+        self._cache = None
 
-    def ingest_info(self, info: dict, use_censored: bool) -> None:
+    def ingest_info(self, info: dict) -> None:
         latencies = info.get("attempt_latencies_ms", [])
         if not latencies:
             return
-        if use_censored:
-            self.add([float(v) for v in latencies])
-            return
-        censored = info.get("attempt_censored", [])
-        filtered = [
-            float(v) for v, is_censored in zip(latencies, censored, strict=False) if not is_censored
-        ]
-        self.add(filtered)
+        flags = [bool(f) for f in info.get("attempt_censored", [])]
+        if len(flags) != len(latencies):
+            flags = [False] * len(latencies)
+        self.add([float(v) for v in latencies], flags)
+
+    def censored_data(self) -> tuple[np.ndarray, np.ndarray]:
+        """All samples plus their right-censoring flags."""
+        if self._cache is None:
+            self._cache = (
+                np.asarray(self.samples, dtype=np.float64),
+                np.asarray(self.censored, dtype=bool),
+            )
+        return self._cache
 
     def data(self) -> np.ndarray:
-        if self._array_cache is None:
-            self._array_cache = (
-                np.array([], dtype=np.float64)
-                if not self.samples
-                else np.asarray(self.samples, dtype=np.float64)
-            )
-        return self._array_cache
+        """Uncensored samples only."""
+        values, flags = self.censored_data()
+        return values[~flags]
 
 
 def _simulate_action(
@@ -125,7 +140,6 @@ class ModelBasedPolicy:
     reward_weights: RewardWeights = field(default_factory=RewardWeights)
     sample_size: int = 500
     buffer_size: int = 2000
-    use_censored: bool = False
     include_queue_delay: bool = False
     queue_delay_mode: str = "deterministic"
     queue_workers: int = 16
@@ -145,12 +159,20 @@ class ModelBasedPolicy:
             self._rng = np.random.default_rng(seed)
 
     def act(self, obs: np.ndarray, info: dict) -> tuple[int, ...]:
-        self._buffer.ingest_info(info, self.use_censored)
-        data = self._buffer.data()
-        if data.size == 0:
+        self._buffer.ingest_info(info)
+        values, censored = self._buffer.censored_data()
+        uncensored = values[~censored]
+        if uncensored.size == 0:
             return self.grid.indices[0]
 
-        base_model = self.model_factory().fit(data)
+        base_model = self.model_factory()
+        fit_censored = getattr(base_model, "fit_censored", None)
+        if callable(fit_censored) and bool(np.any(censored)):
+            base_model = fit_censored(values, censored)
+        else:
+            # Model without censored-MLE support: fall back to uncensored
+            # samples only (biased optimistic when timeouts are frequent).
+            base_model = base_model.fit(uncensored)
         queue_delay = self._estimate_queue_delay(info, base_model)
         best_idx = self.grid.indices[0]
         best_value = -float("inf")
