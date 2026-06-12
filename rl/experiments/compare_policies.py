@@ -7,6 +7,7 @@ import numpy as np
 
 from core import Summary
 from rl.cli import parse_int_list, parse_optional_int_list
+from rl.constrained import ConstrainedTrainConfig, train_constrained_ppo
 from rl.env import (
     SCENARIO_BUILDERS,
     ActionSpec,
@@ -94,19 +95,21 @@ def _episode(
     policy,
     seed: int,
     trace_rows: list[dict] | None = None,
-) -> tuple[float, Summary | None]:
+) -> tuple[float, Summary | None, float]:
     obs, info = env.reset(seed=seed)
     policy.reset(seed=seed)
     total_reward = 0.0
     terminated = False
     truncated = False
     step_idx = 0
+    window_costs: list[float] = []
     while not (terminated or truncated):
         action = policy.act(obs, info)
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += float(reward)
+        summary = info["summary"]
+        window_costs.append(summary["cost"])
         if trace_rows is not None:
-            summary = info["summary"]
             applied = info["action"]
             trace_rows.append(
                 {
@@ -125,13 +128,14 @@ def _episode(
                     "server_drop_rate": summary["server_drop_rate"],
                     "p95_latency_ms": summary["p95_latency_ms"],
                     "retries_per_root": summary["retries_per_root"],
+                    "cost": summary["cost"],
                 }
             )
         step_idx += 1
         policy.update(obs, reward, terminated or truncated, info)
 
-    summary = env.metrics_summary()
-    return total_reward, summary
+    cost_mean = float(np.mean(window_costs)) if window_costs else 0.0
+    return total_reward, env.metrics_summary(), cost_mean
 
 
 def _evaluate(
@@ -144,10 +148,12 @@ def _evaluate(
     successes = []
     p95s = []
     retries = []
+    costs = []
 
     for seed in seeds:
-        total_reward, summary = _episode(env, policy, seed, trace_rows=trace_rows)
+        total_reward, summary, cost_mean = _episode(env, policy, seed, trace_rows=trace_rows)
         rewards.append(total_reward)
+        costs.append(cost_mean)
         if summary:
             successes.append(summary.succeeded / summary.total if summary.total else 0.0)
             p95s.append(summary.p95)
@@ -162,6 +168,7 @@ def _evaluate(
         "success_rate": avg(successes),
         "p95_ms": avg(p95s),
         "retries_per_root": avg(retries),
+        "cost_mean": avg(costs),
     }
 
 
@@ -318,6 +325,15 @@ def main() -> None:
         default=None,
         help="Load a trained PPO model instead of training (cross-scenario eval).",
     )
+    parser.add_argument("--retry-budget", type=float, default=0.1)
+    parser.add_argument("--lambda-lr", type=float, default=0.5)
+    parser.add_argument("--lambda-init", type=float, default=0.0)
+    parser.add_argument(
+        "--constrained-curve-csv",
+        type=str,
+        default="rl_constrained_curve.csv",
+        help="Constrained-PPO dual-ascent trajectory (timesteps, eval_J, eval_cost, lambda).",
+    )
     args = parser.parse_args()
 
     reward_weights = RewardWeights(
@@ -458,6 +474,30 @@ def main() -> None:
                 print(f"Saved PPO model to {args.ppo_save_path}")
             policies.append(ppo_policy)
 
+    if "constrained_ppo" in policy_names:
+        duration_s = int(round(cfg.episode_duration_s)) if cfg.episode_duration_s else None
+        builder = SCENARIO_BUILDERS[cfg.fault_scenario]
+        constrained_cfg = ConstrainedTrainConfig(
+            build=lambda seed: builder(seed, duration_s),
+            action_spec=action_spec,
+            budget=args.retry_budget,
+            lambda_init=args.lambda_init,
+            lambda_lr=args.lambda_lr,
+            step_duration_s=cfg.step_duration_s,
+            episode_duration_s=cfg.episode_duration_s,
+            timesteps=cfg.ppo_timesteps,
+            chunk_timesteps=cfg.ppo_eval_interval,
+            eval_episodes=cfg.ppo_eval_episodes,
+            eval_seed=cfg.train_seeds[0] + 10_000,
+            seed=cfg.train_seeds[0],
+            n_steps=cfg.ppo_n_steps,
+            batch_size=cfg.ppo_batch_size,
+            gamma=cfg.ppo_gamma,
+            base_weights=cfg.reward_weights,
+            learning_curve_csv=args.constrained_curve_csv,
+        )
+        policies.append(train_constrained_ppo(constrained_cfg))
+
     if "oracle_fixed" in policy_names:
         best_idx = _best_fixed_action(cfg, grid)
         policies.append(FixedPolicy(action=best_idx, name="oracle_fixed"))
@@ -469,11 +509,12 @@ def main() -> None:
         metrics = _evaluate(env, policy, cfg.eval_seeds, trace_rows=trace_rows)
         results.append({"policy": policy.name, **metrics})
         print(
-            f"{policy.name:14s} reward={metrics['reward_mean']:.4f} "
+            f"{policy.name:16s} reward={metrics['reward_mean']:.4f} "
             f"+/-{metrics['reward_std']:.4f} "
             f"success={metrics['success_rate']:.3f} "
             f"p95={metrics['p95_ms']:.2f} "
-            f"retries={metrics['retries_per_root']:.3f}"
+            f"retries={metrics['retries_per_root']:.3f} "
+            f"cost={metrics['cost_mean']:.3f}"
         )
 
     if args.output_csv and results:
