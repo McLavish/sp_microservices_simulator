@@ -4,23 +4,12 @@ import argparse
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
 
 from rl.cli import parse_int_list, parse_optional_int_list
 from rl.env import SCENARIO_BUILDERS, ActionSpec, EnvConfig, MicroservicesEnv
+from rl.sb3_support import import_sb3
 
-
-def _import_sb3() -> tuple[Any, Any, Exception | None]:
-    """Optional dependency: returns (PPO, make_vec_env, import error)."""
-    try:
-        from stable_baselines3 import PPO
-        from stable_baselines3.common.env_util import make_vec_env
-    except Exception as exc:  # pragma: no cover - depends on optional dependency
-        return None, None, exc
-    return PPO, make_vec_env, None
-
-
-PPO, make_vec_env, _SB3_IMPORT_ERROR = _import_sb3()
+PPO, make_vec_env, _, _SB3_IMPORT_ERROR = import_sb3()
 
 
 @dataclass

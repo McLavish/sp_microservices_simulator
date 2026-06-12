@@ -2,7 +2,6 @@ import argparse
 import csv
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
 
 import numpy as np
 
@@ -21,20 +20,9 @@ from rl.policies.bayesian import BayesianPolicy
 from rl.policies.fixed import FixedPolicy, FixedValuePolicy
 from rl.policies.model_based import ModelBasedPolicy
 from rl.policies.sb3 import SB3Policy
+from rl.sb3_support import import_sb3
 
-
-def _import_sb3() -> tuple[Any, Any, Any]:
-    """Optional dependency: returns (PPO, make_vec_env, evaluate_policy) or Nones."""
-    try:
-        from stable_baselines3 import PPO
-        from stable_baselines3.common.env_util import make_vec_env
-        from stable_baselines3.common.evaluation import evaluate_policy
-    except Exception:  # pragma: no cover
-        return None, None, None
-    return PPO, make_vec_env, evaluate_policy
-
-
-PPO, make_vec_env, sb3_evaluate = _import_sb3()
+PPO, make_vec_env, sb3_evaluate, _ = import_sb3()
 
 
 @dataclass
