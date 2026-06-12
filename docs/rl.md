@@ -63,6 +63,15 @@ reward = success_rate
        - retries_per_root * 0.1            (each term scaled by its RewardWeights)
 ```
 
+### Constraint cost
+
+`EnvComponents.cost_client` (set by the chain builders to the B→C edge client)
+defines where the constraint cost is measured: `summary["cost"]` is the edge's
+retry amplification (retries per edge root) over each window — distinct from
+`retries_per_root`, which measures the top-level client. The reward subtracts
+`cost * RewardWeights.cost`; the weight defaults to 0 and doubles as the
+Lagrange multiplier in constrained training.
+
 ### Applying an action
 
 Knob application is owned by the **builder**: each `build_*` function returns
@@ -80,6 +89,7 @@ wires its own `apply_knobs`.
 | `basic` | `build_faulty_single_service_env` | same plus a latency injection, partial failure, and 2x load spike at **fixed** episode fractions — memorizable via the time feature; prefer `randomized` for training |
 | `randomized` | `build_randomized_faulty_single_service_env` | fault onset/duration/intensity drawn from the seed, so policies must react to observed degradation |
 | `chain` | `build_chain_env` | A → B → C with bottleneck C degrading in a randomized window; the agent tunes the **B→C edge** retry/timeout knobs while reward comes from the **top-level** client (end-to-end goodput) — the retry-storm setting |
+| `chain_budget` | `build_chain_env(retry_budget_ratio=0.1)` | same, with the edge policy wrapped in the hand-coded `RetryBudgetPolicy` (knobs still reach the inner fixed-backoff policy) |
 
 ## Policies (`rl/policies/`)
 
@@ -125,6 +135,32 @@ lists, `--n-steps 64`, `--batch-size 64`, `--gamma 0.95`, `--save-path`,
 python -m rl.train_sb3 --timesteps 100000 --fault-scenario randomized \
     --save-path rl_models/ppo.zip
 ```
+
+### Constrained training (`rl/constrained.py`)
+
+`train_constrained_ppo(ConstrainedTrainConfig(...))` is Lagrangian PPO: the
+env reward acts as the Lagrangian, with `RewardWeights.cost` as the multiplier
+λ on the edge-amplification cost, updated by projected dual ascent between
+training chunks (`λ ← max(0, λ + lr·(cost − budget))`). The hand `retries`
+penalty is zeroed during constrained training; evaluation always reports the
+base objective **J** (reward with retry/cost penalties zeroed) so arms with
+different training weights stay comparable. Honest caveats: the constraint is
+enforced **in expectation** (not per episode/window — report violation rates),
+and `RetryBudgetPolicy.budget_ratio` limits retries against *successes*, which
+approximates retries-per-root only at high success rates.
+
+`compare_policies` accepts `constrained_ppo` as a policy name
+(`--retry-budget`, `--lambda-lr`, `--lambda-init`); the three-arm study is:
+
+```bash
+python -m rl.experiments.constrained_retry --budgets 0.05,0.1,0.2 --device cpu
+```
+
+which trains **unconstrained PPO** (default weights), **constrained PPO** per
+budget, and grid-searches fixed knobs on the budget-wrapped chain env
+(**retry_budget**, the hand-coded baseline), evaluating all arms on the same
+seeds. Outputs `rl_constrained_comparison.csv` and per-budget dual-ascent
+curves (`rl_constrained_curve_b*.csv`).
 
 ### `python -m rl.experiments.compare_models`
 
