@@ -211,6 +211,13 @@ class ModelBasedPolicy:
         return
 
     def _estimate_queue_delay(self, info: dict, model: LatencyModel) -> float:
+        """Expected queueing delay in ms via the Allen-Cunneen M/G/c approximation:
+
+        Wq(M/G/c) ~= Wq(M/M/c) * (1 + CV_s^2) / 2,  Wq(M/M/c) from Erlang C.
+
+        The latency model is fitted on millisecond samples, so the arrival rate
+        must be per millisecond as well.
+        """
         if not self.include_queue_delay:
             return 0.0
         summary = info.get("summary")
@@ -220,27 +227,41 @@ class ModelBasedPolicy:
         if completed <= 0 or self.step_duration_s <= 0:
             return 0.0
 
-        lambda_rate = completed / float(self.step_duration_s)
+        lambda_per_ms = completed / (float(self.step_duration_s) * 1000.0)
         if self.use_retries_in_lambda:
-            lambda_rate *= 1.0 + float(summary.get("retries_per_root", 0.0))
+            lambda_per_ms *= 1.0 + float(summary.get("retries_per_root", 0.0))
 
         moments_fn = getattr(model, "moments", None)
         if callable(moments_fn):
-            mean_s, mean_s2 = moments_fn()
-            mean_s = float(mean_s)
-            mean_s2 = float(mean_s2)
+            mean_s, mean_s2 = (float(m) for m in moments_fn())
         else:
             sample_count = max(10, int(self.queue_moment_samples))
             samples = model.sample(self._rng, sample_count)
             mean_s = float(np.mean(samples))
             mean_s2 = float(np.dot(samples, samples) / samples.size)
-        workers = max(1, int(self.queue_workers))
-        rho = (lambda_rate * mean_s) / workers if mean_s > 0 else 0.0
-        rho = min(max(rho, 0.0), self.queue_max_utilization)
-        if rho >= 1.0:
-            rho = self.queue_max_utilization
+        if mean_s <= 0:
+            return 0.0
 
-        mean_s2_eff = mean_s2 / (workers**2)
-        denom = max(1e-6, 2.0 * (1.0 - rho))
-        wq = lambda_rate * mean_s2_eff / denom
-        return max(0.0, float(wq))
+        workers = max(1, int(self.queue_workers))
+        rho = min((lambda_per_ms * mean_s) / workers, self.queue_max_utilization)
+        offered = rho * workers  # erlangs, consistent with the clamped utilization
+
+        p_wait = _erlang_c(workers, offered)
+        wq_mmc = p_wait * mean_s / (workers * (1.0 - rho))
+        var_s = max(0.0, mean_s2 - mean_s * mean_s)
+        cv2 = var_s / (mean_s * mean_s)
+        return max(0.0, float(wq_mmc * (1.0 + cv2) / 2.0))
+
+
+def _erlang_c(c: int, offered: float) -> float:
+    """Erlang C waiting probability for an M/M/c queue with offered load in erlangs."""
+    if offered <= 0:
+        return 0.0
+    rho = offered / c
+    if rho >= 1.0:
+        return 1.0
+    # Iterative Erlang B recurrence, then the standard B -> C conversion.
+    b = 1.0
+    for k in range(1, c + 1):
+        b = offered * b / (k + offered * b)
+    return b / (1.0 - rho + rho * b)

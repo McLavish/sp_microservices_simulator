@@ -1,8 +1,10 @@
+import math
 import unittest
 
 import numpy as np
 
 from rl.env import ActionSpec, RewardWeights
+from rl.models.lognormal import LogNormalModel
 from rl.policies.action_space import ActionGrid
 from rl.policies.aimd import AIMDPolicy
 from rl.policies.bayesian import BayesianPolicy
@@ -61,6 +63,33 @@ class TestRLPolicies(unittest.TestCase):
         }
         action = policy.act(np.zeros(12, dtype=np.float32), info)
         self.assertIn(action, self.grid.indices)
+
+    def test_queue_delay_matches_mm1_closed_form(self):
+        # Lognormal with E[S] = 1 ms and E[S^2] = 2 ms^2 (CV^2 = 1, the
+        # exponential moments), lambda = 0.5/ms, c = 1: the Allen-Cunneen
+        # approximation must reduce to the exact M/M/1 result
+        # Wq = rho / (1 - rho) * E[S] = 1.0 ms.
+        policy = ModelBasedPolicy(
+            grid=self.grid,
+            include_queue_delay=True,
+            queue_workers=1,
+            step_duration_s=1.0,
+            use_retries_in_lambda=False,
+        )
+        model = LogNormalModel(mu=-math.log(2) / 2, sigma=math.sqrt(math.log(2)))
+        info = {"summary": {"completed": 500, "retries_per_root": 0.0}}
+        wq = policy._estimate_queue_delay(info, model)
+        self.assertAlmostEqual(wq, 1.0, places=9)
+
+    def test_queue_delay_zero_without_traffic(self):
+        policy = ModelBasedPolicy(
+            grid=self.grid,
+            include_queue_delay=True,
+            queue_workers=1,
+        )
+        model = LogNormalModel(mu=0.0, sigma=0.5)
+        self.assertEqual(policy._estimate_queue_delay({"summary": {"completed": 0}}, model), 0.0)
+        self.assertEqual(policy._estimate_queue_delay({}, model), 0.0)
 
     def test_bayesian_policy_act(self):
         policy = BayesianPolicy(
