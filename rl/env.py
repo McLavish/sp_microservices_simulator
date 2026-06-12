@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from caller import ClientConfig, ClientRuntime
+from chain import DownstreamEdge, ServiceNodeRuntime
 from core import (
     DropReason,
     Summary,
@@ -526,9 +527,103 @@ def build_randomized_faulty_single_service_env(
     )
 
 
+def build_chain_env(seed: int | None = None, duration_s: int | None = None) -> EnvComponents:
+    """Chain A -> B -> C with bottleneck C degrading in a randomized fault window.
+
+    The agent tunes the B->C edge client's retry/timeout knobs — the edge where
+    retry storms amplify — while reward and observation come from the
+    *top-level* client, so the agent is judged on end-to-end goodput. Fault
+    onset, duration, and intensity are drawn from the seed (see the randomized
+    single-service builder for why).
+    """
+    build_seed = 1 if seed is None else int(seed)
+    sim = Simulator(seed=build_seed)
+    duration = 30 if duration_s is None else int(duration_s)
+    rng = random.Random(build_seed)
+
+    onset = rng.uniform(0.1, 0.5) * duration
+    length = rng.uniform(0.15, 0.35) * duration
+    fault_window = TimeInterval(begin=s_to_ns(onset), end=s_to_ns(min(onset + length, duration)))
+
+    c_cfg = ServiceConfig(
+        name="svc-C",
+        latency_median=ms_to_ns(20),
+        latency_lognorm_sigma=0.7,
+        workers=24,
+        queue_capacity=800,
+        latency_injections=[
+            LatencyInjection(duration=fault_window, add_latency=ms_to_ns(rng.uniform(15, 45)))
+        ],
+        partial_failures=[PartialFailure(duration=fault_window, p_fail=rng.uniform(0.2, 0.5))],
+    )
+    a_cfg = ServiceConfig(
+        name="svc-A",
+        latency_median=ms_to_ns(12),
+        latency_lognorm_sigma=0.4,
+        workers=48,
+        queue_capacity=2000,
+    )
+    b_cfg = ServiceConfig(
+        name="svc-B",
+        latency_median=ms_to_ns(12),
+        latency_lognorm_sigma=0.4,
+        workers=48,
+        queue_capacity=2000,
+    )
+
+    a_node = ServiceNodeRuntime(service=ServiceRuntime(cfg=a_cfg).bind())
+    b_node = ServiceNodeRuntime(service=ServiceRuntime(cfg=b_cfg).bind())
+    c_node = ServiceNodeRuntime(service=ServiceRuntime(cfg=c_cfg).bind())
+
+    # Tunable edge: B -> C, where aggressive retries hammer the bottleneck.
+    edge_timeout = StaticTimeoutController(global_timeout=None, attempt_timeout=ms_to_ns(60))
+    edge_retry = FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(20))
+    b_to_c = ClientRuntime(
+        cfg=ClientConfig(retry=edge_retry, timeout_controller=edge_timeout), service=c_node
+    )
+
+    a_to_b = ClientRuntime(
+        cfg=ClientConfig(
+            retry=FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(20)),
+            timeout_controller=StaticTimeoutController(
+                global_timeout=None, attempt_timeout=ms_to_ns(150)
+            ),
+        ),
+        service=b_node,
+    )
+
+    b_node.add_downstream(DownstreamEdge(client=b_to_c, target=c_node))
+    a_node.add_downstream(DownstreamEdge(client=a_to_b, target=b_node))
+
+    top_client = ClientRuntime(
+        cfg=ClientConfig(
+            retry=FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(30)),
+            timeout_controller=StaticTimeoutController(
+                global_timeout=None, attempt_timeout=ms_to_ns(300)
+            ),
+        ),
+        service=a_node,
+    )
+
+    workload = Workload(
+        base_rps=180.0,
+        duration_s=duration,
+        load_spikes=[],
+        rng_seed=seed,
+    )
+
+    return EnvComponents(
+        sim=sim,
+        workload=workload,
+        client=top_client,
+        apply_knobs=_static_knob_applier(edge_timeout, edge_retry),
+    )
+
+
 # Scenario name -> builder, shared by the CLI entry points (--fault-scenario).
 SCENARIO_BUILDERS: dict[str, Callable[[int | None, int | None], EnvComponents]] = {
     "none": build_single_service_env,
     "basic": build_faulty_single_service_env,
     "randomized": build_randomized_faulty_single_service_env,
+    "chain": build_chain_env,
 }

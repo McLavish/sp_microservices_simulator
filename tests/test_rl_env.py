@@ -7,14 +7,16 @@ try:
 except Exception:
     gymnasium = None  # ty: ignore[invalid-assignment]
 
-from core import s_to_ns
+from core import ms_to_ns, s_to_ns
 from rl.env import (
     ActionSpec,
     EnvConfig,
     MicroservicesEnv,
+    build_chain_env,
     build_randomized_faulty_single_service_env,
     build_single_service_env,
 )
+from rl.spec import ActionValues
 
 
 @unittest.skipIf(gymnasium is None, "gymnasium not installed")
@@ -150,6 +152,46 @@ class TestMicroservicesEnv(unittest.TestCase):
                 self.assertGreaterEqual(interval.begin, 0)
                 self.assertLess(interval.begin, interval.end)
                 self.assertLessEqual(interval.end, s_to_ns(30))
+
+    def test_chain_env_knobs_reach_inner_edge(self):
+        from chain import ServiceNodeRuntime
+        from retry_policies import FixedBackoffRetryPolicy
+        from timeout_controllers import StaticTimeoutController
+
+        components = build_chain_env(3, duration_s=10)
+        components.apply_knobs(
+            ActionValues(
+                attempt_timeout_ms=80, max_attempts=3, backoff_ms=50, global_timeout_ms=None
+            )
+        )
+
+        a_node = components.client.service
+        assert isinstance(a_node, ServiceNodeRuntime)
+        b_node = a_node.downstreams[0].target
+        edge_client = b_node.downstreams[0].client
+        edge_retry = edge_client.cfg.retry
+        edge_timeout = edge_client.cfg.timeout_controller
+        assert isinstance(edge_retry, FixedBackoffRetryPolicy)
+        assert isinstance(edge_timeout, StaticTimeoutController)
+        self.assertEqual(edge_retry.max_attempts, 3)
+        self.assertEqual(edge_retry.delay, ms_to_ns(50))
+        self.assertEqual(edge_timeout.attempt_timeout, ms_to_ns(80))
+        # The top-level client (reward source) keeps its own fixed knobs.
+        top_timeout = components.client.cfg.timeout_controller
+        assert isinstance(top_timeout, StaticTimeoutController)
+        self.assertEqual(top_timeout.attempt_timeout, ms_to_ns(300))
+
+    def test_chain_env_episode_runs(self):
+        env = self._make_env(build_chain_env, episode_duration_s=3.0)
+        obs, _ = env.reset(seed=11)
+        terminated = False
+        steps = 0
+        while not terminated and steps < 10:
+            obs, reward, terminated, _, info = env.step(np.array([1, 1, 1]))
+            steps += 1
+        self.assertTrue(terminated)
+        self.assertTrue(env.observation_space.contains(obs))
+        self.assertGreater(info["summary"]["completed"], 0)
 
     def test_drained_roots_reported_separately_from_final_summary(self):
         env = self._make_env(build_single_service_env, episode_duration_s=1.0)
