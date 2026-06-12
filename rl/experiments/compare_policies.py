@@ -54,7 +54,6 @@ class ExperimentConfig:
     ppo_gamma: float
     model_samples: int
     model_buffer: int
-    model_horizon: int
     model_queue_delay_mode: str
     model_queue_workers: int
     model_queue_max_utilization: float
@@ -208,7 +207,7 @@ def main() -> None:
     parser.add_argument(
         "--policies",
         type=str,
-        default="fixed,aimd,model_based,model_based_rl,bayesian,ppo,oracle_fixed",
+        default="fixed,aimd,model_based,model_based_queue,bayesian,ppo,oracle_fixed",
     )
     parser.add_argument("--ppo-timesteps", type=int, default=5000)
     parser.add_argument("--ppo-eval-interval", type=int, default=1000)
@@ -220,7 +219,6 @@ def main() -> None:
     parser.add_argument("--ppo-gamma", type=float, default=0.95)
     parser.add_argument("--model-samples", type=int, default=500)
     parser.add_argument("--model-buffer", type=int, default=2000)
-    parser.add_argument("--model-horizon", type=int, default=3)
     parser.add_argument(
         "--model-queue-delay-mode",
         choices=["deterministic", "exponential"],
@@ -279,7 +277,6 @@ def main() -> None:
         ppo_gamma=args.ppo_gamma,
         model_samples=args.model_samples,
         model_buffer=args.model_buffer,
-        model_horizon=args.model_horizon,
         model_queue_delay_mode=args.model_queue_delay_mode,
         model_queue_workers=args.model_queue_workers,
         model_queue_max_utilization=args.model_queue_max_utilization,
@@ -345,21 +342,9 @@ def main() -> None:
             reward_weights=cfg.reward_weights,
             sample_size=cfg.model_samples,
             buffer_size=cfg.model_buffer,
-            horizon=1,
             name="model_based",
         )
         policies.append(model_based)
-
-    if "model_based_rl" in policy_names:
-        model_based_rl = ModelBasedPolicy(
-            grid=grid,
-            reward_weights=cfg.reward_weights,
-            sample_size=cfg.model_samples,
-            buffer_size=cfg.model_buffer,
-            horizon=max(2, cfg.model_horizon),
-            name="model_based_rl",
-        )
-        policies.append(model_based_rl)
 
     if "model_based_queue" in policy_names:
         model_based_queue = ModelBasedPolicy(
@@ -367,7 +352,6 @@ def main() -> None:
             reward_weights=cfg.reward_weights,
             sample_size=cfg.model_samples,
             buffer_size=cfg.model_buffer,
-            horizon=1,
             include_queue_delay=True,
             queue_delay_mode=cfg.model_queue_delay_mode,
             queue_workers=cfg.model_queue_workers,
@@ -378,24 +362,6 @@ def main() -> None:
             name="model_based_queue",
         )
         policies.append(model_based_queue)
-
-    if "model_based_rl_queue" in policy_names:
-        model_based_rl_queue = ModelBasedPolicy(
-            grid=grid,
-            reward_weights=cfg.reward_weights,
-            sample_size=cfg.model_samples,
-            buffer_size=cfg.model_buffer,
-            horizon=max(2, cfg.model_horizon),
-            include_queue_delay=True,
-            queue_delay_mode=cfg.model_queue_delay_mode,
-            queue_workers=cfg.model_queue_workers,
-            queue_max_utilization=cfg.model_queue_max_utilization,
-            queue_moment_samples=cfg.model_queue_moment_samples,
-            use_retries_in_lambda=cfg.model_queue_use_retries,
-            step_duration_s=cfg.step_duration_s,
-            name="model_based_rl_queue",
-        )
-        policies.append(model_based_rl_queue)
 
     if "bayesian" in policy_names:
         bayes = BayesianPolicy(

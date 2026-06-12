@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -55,14 +54,18 @@ def _simulate_action(
     weights: RewardWeights,
     rng: np.random.Generator,
     n_roots: int,
-    use_censored: bool,
     queue_delay_ms: float,
     queue_delay_mode: str,
-) -> tuple[float, list[float]]:
+) -> float:
+    """Monte-Carlo reward estimate for one knob setting under the latency model.
+
+    The surrogate only models attempt latency vs. timeout: queue-full drops and
+    server failures in the real simulator are outside its vocabulary, so its
+    failure mode is always "deadline".
+    """
     successes = 0
     retries = 0
     latencies = []
-    observed = []
 
     timeout = float(action.attempt_timeout_ms)
     backoff = float(action.backoff_ms)
@@ -87,12 +90,7 @@ def _simulate_action(
             attempt_latency = min(total_sample, timeout)
             elapsed += attempt_latency
 
-            timed_out = total_sample > timeout
-            if timed_out:
-                if use_censored:
-                    observed.append(attempt_latency)
-            else:
-                observed.append(attempt_latency)
+            if total_sample <= timeout:
                 success = True
                 latencies.append(elapsed)
                 break
@@ -112,13 +110,12 @@ def _simulate_action(
     retries_per_root = retries / n_roots if n_roots else 0.0
     p95 = float(np.quantile(latencies, 0.95)) if latencies else 0.0
 
-    reward = (
+    return (
         success_rate * weights.success
         - deadline_rate * weights.deadline_drop
         - p95 * weights.p95_latency_ms
         - retries_per_root * weights.retries
     )
-    return reward, observed
 
 
 @dataclass
@@ -129,8 +126,6 @@ class ModelBasedPolicy:
     sample_size: int = 500
     buffer_size: int = 2000
     use_censored: bool = False
-    horizon: int = 1
-    gamma: float = 0.95
     include_queue_delay: bool = False
     queue_delay_mode: str = "deterministic"
     queue_workers: int = 16
@@ -161,51 +156,20 @@ class ModelBasedPolicy:
         best_value = -float("inf")
 
         for action_idx, action_vals in zip(self.grid.indices, self.grid.values, strict=False):
-            value = self._evaluate_action(base_model, action_vals, queue_delay)
+            value = _simulate_action(
+                base_model,
+                action_vals,
+                self.reward_weights,
+                self._rng,
+                self.sample_size,
+                queue_delay,
+                self.queue_delay_mode,
+            )
             if value > best_value:
                 best_value = value
                 best_idx = action_idx
 
         return best_idx
-
-    def _evaluate_action(
-        self, model: LatencyModel, action_vals: ActionValues, queue_delay: float
-    ) -> float:
-        if self.horizon <= 1:
-            reward, _ = _simulate_action(
-                model,
-                action_vals,
-                self.reward_weights,
-                self._rng,
-                self.sample_size,
-                self.use_censored,
-                queue_delay,
-                self.queue_delay_mode,
-            )
-            return reward
-
-        total = 0.0
-        temp_model = copy.deepcopy(model)
-        buffer = LatencyBuffer(self.buffer_size)
-        buffer.add(list(self._buffer.samples))
-
-        for h in range(self.horizon):
-            reward, observed = _simulate_action(
-                temp_model,
-                action_vals,
-                self.reward_weights,
-                self._rng,
-                self.sample_size,
-                self.use_censored,
-                queue_delay,
-                self.queue_delay_mode,
-            )
-            total += (self.gamma**h) * reward
-            if observed:
-                buffer.add(observed)
-                temp_model = self.model_factory().fit(buffer.data())
-
-        return total
 
     def update(self, obs: np.ndarray, reward: float, done: bool, info: dict) -> None:
         return

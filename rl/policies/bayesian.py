@@ -73,13 +73,12 @@ class BayesianPolicy:
         best_idx = self.grid.indices[0]
         best_value = -float("inf")
         for action_idx, action_vals in zip(self.grid.indices, self.grid.values, strict=False):
-            reward, _ = _simulate_action(
+            reward = _simulate_action(
                 model,
                 action_vals,
                 self.reward_weights,
                 self._rng,
                 self.sample_size,
-                self.use_censored,
                 0.0,
                 "deterministic",
             )
