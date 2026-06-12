@@ -79,6 +79,35 @@ class TestMicroservicesEnv(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertNotEqual(first, second)
 
+    def test_apply_knobs_reaches_policy_and_controller(self):
+        from core import ms_to_ns
+        from timeout_controllers import StaticTimeoutController
+
+        action_spec = ActionSpec(
+            attempt_timeout_ms=[10, 50],
+            max_attempts=[1, 2],
+            backoff_ms=[0, 50],
+            global_timeout_ms=[100, 200],
+        )
+        cfg = EnvConfig(
+            build=build_single_service_env,
+            action_spec=action_spec,
+            step_duration_s=1.0,
+            episode_duration_s=2.0,
+        )
+        env = MicroservicesEnv(cfg)
+        env.reset(seed=3)
+        _, _, _, _, info = env.step(np.array([1, 1, 0, 1]))
+
+        self.assertEqual(info["action"]["attempt_timeout_ms"], 50)
+        self.assertEqual(info["action"]["global_timeout_ms"], 200)
+        client = env._client
+        assert client is not None
+        controller = client.cfg.timeout_controller
+        assert isinstance(controller, StaticTimeoutController)
+        self.assertEqual(controller.attempt_timeout, ms_to_ns(50))
+        self.assertEqual(controller.global_timeout, ms_to_ns(200))
+
     def test_drained_roots_reported_separately_from_final_summary(self):
         env = self._make_env(build_single_service_env, episode_duration_s=1.0)
         env.reset(seed=7)

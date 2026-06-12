@@ -20,7 +20,7 @@ from core import (
 )
 from faults import LatencyInjection, LoadSpike, PartialFailure
 from retry_policies import FixedBackoffRetryPolicy
-from rl.spec import ActionSpec, RewardWeights, coerce_action
+from rl.spec import ActionSpec, ActionValues, RewardWeights, coerce_action
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import StaticTimeoutController
@@ -51,6 +51,10 @@ class EnvComponents:
     sim: Simulator
     workload: Workload
     client: ClientRuntime
+    # Maps decoded knob values onto this scenario's policy/timeout objects.
+    # The builder owns the knowledge of which concrete types it constructed,
+    # so the env stays agnostic of retry-policy and controller classes.
+    apply_knobs: Callable[[ActionValues], None]
 
 
 @dataclass
@@ -95,6 +99,7 @@ class MicroservicesEnv(_GymEnvBase):
         self._sim: Simulator | None = None
         self._workload: Workload | None = None
         self._client: ClientRuntime | None = None
+        self._components: EnvComponents | None = None
         self._last_root_idx = 0
         self._current_time_ns: TimePoint = 0
         self._end_time_ns: TimePoint = 0
@@ -116,6 +121,11 @@ class MicroservicesEnv(_GymEnvBase):
             raise RuntimeError("Workload not initialized; call reset() first.")
         return self._workload
 
+    def _require_components(self) -> EnvComponents:
+        if self._components is None:
+            raise RuntimeError("Components not initialized; call reset() first.")
+        return self._components
+
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
         # Unseeded resets must still vary across episodes. The builders fall back
@@ -124,6 +134,7 @@ class MicroservicesEnv(_GymEnvBase):
         # to one identical deterministic episode.
         build_seed = seed if seed is not None else int(self.np_random.integers(2**31 - 1))
         components = self._build(build_seed)
+        self._components = components
         self._sim = components.sim
         self._workload = components.workload
         self._client = components.client
@@ -208,20 +219,14 @@ class MicroservicesEnv(_GymEnvBase):
         if spec.global_timeout_ms is not None:
             global_timeout_ms = spec.global_timeout_ms[action[idx]]
 
-        timeout_controller = self._require_client().cfg.timeout_controller
-        retry_policy = self._require_client().cfg.retry
-
-        if not isinstance(timeout_controller, StaticTimeoutController):
-            raise TypeError("MicroservicesEnv requires StaticTimeoutController for now")
-        if not isinstance(retry_policy, FixedBackoffRetryPolicy):
-            raise TypeError("MicroservicesEnv requires FixedBackoffRetryPolicy for now")
-
-        timeout_controller.attempt_timeout = ms_to_ns(attempt_timeout_ms)
-        timeout_controller.global_timeout = (
-            None if global_timeout_ms is None else ms_to_ns(global_timeout_ms)
+        self._require_components().apply_knobs(
+            ActionValues(
+                attempt_timeout_ms=attempt_timeout_ms,
+                max_attempts=max_attempts,
+                backoff_ms=backoff_ms,
+                global_timeout_ms=global_timeout_ms,
+            )
         )
-        retry_policy.max_attempts = max_attempts
-        retry_policy.delay = ms_to_ns(backoff_ms)
 
         self._last_action_values = {
             "attempt_timeout_ms": attempt_timeout_ms,
@@ -372,6 +377,20 @@ class MicroservicesEnv(_GymEnvBase):
         return self._client.metrics().summary()
 
 
+def _static_knob_applier(
+    timeout_ctrl: StaticTimeoutController, retry: FixedBackoffRetryPolicy
+) -> Callable[[ActionValues], None]:
+    def apply_knobs(values: ActionValues) -> None:
+        timeout_ctrl.attempt_timeout = ms_to_ns(values.attempt_timeout_ms)
+        timeout_ctrl.global_timeout = (
+            None if values.global_timeout_ms is None else ms_to_ns(values.global_timeout_ms)
+        )
+        retry.max_attempts = values.max_attempts
+        retry.delay = ms_to_ns(values.backoff_ms)
+
+    return apply_knobs
+
+
 def build_single_service_env(
     seed: int | None = None, duration_s: int | None = None
 ) -> EnvComponents:
@@ -399,7 +418,12 @@ def build_single_service_env(
         rng_seed=seed,
     )
 
-    return EnvComponents(sim=sim, workload=workload, client=client)
+    return EnvComponents(
+        sim=sim,
+        workload=workload,
+        client=client,
+        apply_knobs=_static_knob_applier(timeout_ctrl, retry),
+    )
 
 
 def build_faulty_single_service_env(
@@ -445,4 +469,9 @@ def build_faulty_single_service_env(
         rng_seed=seed,
     )
 
-    return EnvComponents(sim=sim, workload=workload, client=client)
+    return EnvComponents(
+        sim=sim,
+        workload=workload,
+        client=client,
+        apply_knobs=_static_knob_applier(timeout_ctrl, retry),
+    )

@@ -32,6 +32,16 @@ class ActionSpec:
     global_timeout_ms: list[int | None] | None = None
 
 
+@dataclass(frozen=True)
+class ActionValues:
+    """Decoded knob values for one action (indices resolved against ActionSpec)."""
+
+    attempt_timeout_ms: int
+    max_attempts: int
+    backoff_ms: int
+    global_timeout_ms: int | None
+
+
 def coerce_action(action: Any) -> tuple[int, ...]:
     if isinstance(action, np.ndarray):
         action = action.tolist()
