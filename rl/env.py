@@ -118,7 +118,12 @@ class MicroservicesEnv(_GymEnvBase):
 
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
-        components = self._build(seed)
+        # Unseeded resets must still vary across episodes. The builders fall back
+        # to fixed seeds on None, and SB3 vector envs only seed the *first* reset
+        # (auto-resets are unseeded) — without this draw, training would collapse
+        # to one identical deterministic episode.
+        build_seed = seed if seed is not None else int(self.np_random.integers(2**31 - 1))
+        components = self._build(build_seed)
         self._sim = components.sim
         self._workload = components.workload
         self._client = components.client
@@ -162,9 +167,6 @@ class MicroservicesEnv(_GymEnvBase):
         self._require_sim().run(until=next_time)
         self._current_time_ns = next_time
 
-        if self._current_time_ns >= self._end_time_ns and self._cfg.drain_on_done:
-            self._require_sim().run()
-
         new_roots = self._require_client().roots[self._last_root_idx :]
         self._last_root_idx = len(self._require_client().roots)
 
@@ -175,6 +177,14 @@ class MicroservicesEnv(_GymEnvBase):
         info: dict[str, object] = {"summary": summary, "action": self._last_action_values.copy()}
         if self._cfg.emit_latency_samples:
             info.update(self._collect_latency_samples(new_roots))
+
+        # Drain in-flight work after the reward is computed: drained roots complete
+        # past the episode horizon and must not be credited to the final action.
+        if terminated and self._cfg.drain_on_done:
+            self._require_sim().run()
+            drained = self._require_client().roots[self._last_root_idx :]
+            self._last_root_idx = len(self._require_client().roots)
+            info["drained_summary"] = self._summarize_roots(drained)
         return obs, reward, terminated, False, info
 
     def _build(self, seed: int | None) -> EnvComponents:
@@ -227,6 +237,7 @@ class MicroservicesEnv(_GymEnvBase):
             - summary["deadline_drop_rate"] * w.deadline_drop
             - summary["queue_drop_rate"] * w.queue_drop
             - summary["server_drop_rate"] * w.server_drop
+            - summary["circuit_open_drop_rate"] * w.circuit_open_drop
             - summary["p95_latency_ms"] * w.p95_latency_ms
             - summary["retries_per_root"] * w.retries
         )
@@ -240,6 +251,7 @@ class MicroservicesEnv(_GymEnvBase):
                 "deadline_drop_rate": 0.0,
                 "queue_drop_rate": 0.0,
                 "server_drop_rate": 0.0,
+                "circuit_open_drop_rate": 0.0,
                 "avg_latency_ms": 0.0,
                 "p95_latency_ms": 0.0,
                 "retries_per_root": 0.0,
@@ -251,6 +263,7 @@ class MicroservicesEnv(_GymEnvBase):
         deadline_drops = 0
         queue_drops = 0
         server_drops = 0
+        circuit_open_drops = 0
         latencies: list[int] = []
         attempts_total = 0
         queue_sizes: list[int] = []
@@ -268,6 +281,8 @@ class MicroservicesEnv(_GymEnvBase):
                     deadline_drops += 1
                 elif last_attempt.drop_reason == DropReason.QUEUE_FULL:
                     queue_drops += 1
+                elif last_attempt.drop_reason == DropReason.CIRCUIT_OPEN:
+                    circuit_open_drops += 1
                 else:
                     server_drops += 1
 
@@ -279,6 +294,7 @@ class MicroservicesEnv(_GymEnvBase):
         deadline_rate = deadline_drops / completed if completed else 0.0
         queue_rate = queue_drops / completed if completed else 0.0
         server_rate = server_drops / completed if completed else 0.0
+        circuit_open_rate = circuit_open_drops / completed if completed else 0.0
         avg_latency_ms = ns_to_ms(int(np.mean(latencies))) if latencies else 0.0
         p95_latency_ms = (
             ns_to_ms(int(np.quantile(np.asarray(latencies), 0.95))) if latencies else 0.0
@@ -292,6 +308,7 @@ class MicroservicesEnv(_GymEnvBase):
             "deadline_drop_rate": deadline_rate,
             "queue_drop_rate": queue_rate,
             "server_drop_rate": server_rate,
+            "circuit_open_drop_rate": circuit_open_rate,
             "avg_latency_ms": avg_latency_ms,
             "p95_latency_ms": p95_latency_ms,
             "retries_per_root": retries_per_root,

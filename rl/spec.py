@@ -19,6 +19,7 @@ class RewardWeights:
     deadline_drop: float = 1.0
     queue_drop: float = 1.0
     server_drop: float = 1.0
+    circuit_open_drop: float = 1.0
     p95_latency_ms: float = 0.001
     retries: float = 0.1
 

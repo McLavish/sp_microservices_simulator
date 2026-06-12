@@ -45,6 +45,49 @@ class TestMicroservicesEnv(unittest.TestCase):
         _, _, terminated, _, _ = env.step(action)
         self.assertTrue(terminated)
 
+    def _make_env(self, build, episode_duration_s=2.0):
+        action_spec = ActionSpec(
+            attempt_timeout_ms=[10, 50],
+            max_attempts=[1, 2],
+            backoff_ms=[0, 50],
+        )
+        cfg = EnvConfig(
+            build=build,
+            action_spec=action_spec,
+            step_duration_s=1.0,
+            episode_duration_s=episode_duration_s,
+        )
+        return MicroservicesEnv(cfg)
+
+    def test_unseeded_resets_use_distinct_build_seeds(self):
+        # Regression: SB3 vector envs only seed the first reset; unseeded resets
+        # must not collapse to the builders' fixed fallback seeds.
+        build_seeds = []
+
+        def build(seed):
+            build_seeds.append(seed)
+            return build_single_service_env(seed)
+
+        env = self._make_env(build)
+        env.reset(seed=123)
+        self.assertEqual(build_seeds[-1], 123)
+
+        env.reset()
+        env.reset()
+        first, second = build_seeds[-2], build_seeds[-1]
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(first, second)
+
+    def test_drained_roots_reported_separately_from_final_summary(self):
+        env = self._make_env(build_single_service_env, episode_duration_s=1.0)
+        env.reset(seed=7)
+        _, _, terminated, _, info = env.step(np.array([0, 0, 0]))
+        self.assertTrue(terminated)
+        # Drained roots are reported separately, not folded into the step summary.
+        self.assertIn("drained_summary", info)
+        self.assertIsInstance(info["drained_summary"], dict)
+
 
 if __name__ == "__main__":
     unittest.main()
