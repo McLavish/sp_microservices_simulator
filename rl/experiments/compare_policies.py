@@ -63,7 +63,7 @@ class ExperimentConfig:
     aimd_success_target: float
     aimd_deadline_target: float
     aimd_timeout_increase_step: int
-    aimd_timeout_decrease_step: int
+    aimd_timeout_decrease_factor: float
     aimd_max_attempts_step: int
     aimd_backoff_step: int
     aimd_adjust_max_attempts: bool
@@ -232,7 +232,7 @@ def main() -> None:
     parser.add_argument("--aimd-success-target", type=float, default=0.98)
     parser.add_argument("--aimd-deadline-target", type=float, default=0.01)
     parser.add_argument("--aimd-timeout-increase-step", type=int, default=1)
-    parser.add_argument("--aimd-timeout-decrease-step", type=int, default=1)
+    parser.add_argument("--aimd-timeout-decrease-factor", type=float, default=0.5)
     parser.add_argument("--aimd-max-attempts-step", type=int, default=1)
     parser.add_argument("--aimd-backoff-step", type=int, default=1)
     parser.add_argument("--aimd-adjust-max-attempts", action="store_true")
@@ -286,7 +286,7 @@ def main() -> None:
         aimd_success_target=args.aimd_success_target,
         aimd_deadline_target=args.aimd_deadline_target,
         aimd_timeout_increase_step=args.aimd_timeout_increase_step,
-        aimd_timeout_decrease_step=args.aimd_timeout_decrease_step,
+        aimd_timeout_decrease_factor=args.aimd_timeout_decrease_factor,
         aimd_max_attempts_step=args.aimd_max_attempts_step,
         aimd_backoff_step=args.aimd_backoff_step,
         aimd_adjust_max_attempts=args.aimd_adjust_max_attempts,
@@ -324,7 +324,7 @@ def main() -> None:
             initial_max_attempts=cfg.max_attempts[0],
             initial_backoff_ms=cfg.backoff_ms[0],
             timeout_increase_step=cfg.aimd_timeout_increase_step,
-            timeout_decrease_step=cfg.aimd_timeout_decrease_step,
+            timeout_decrease_factor=cfg.aimd_timeout_decrease_factor,
             max_attempts_step=cfg.aimd_max_attempts_step,
             backoff_step=cfg.aimd_backoff_step,
             adjust_max_attempts=cfg.aimd_adjust_max_attempts,

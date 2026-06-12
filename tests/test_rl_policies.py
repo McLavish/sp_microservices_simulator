@@ -116,7 +116,6 @@ class TestRLPolicies(unittest.TestCase):
             adjust_backoff=False,
             ema_alpha=0.5,
             timeout_increase_step=1,
-            timeout_decrease_step=1,
         )
         info = {
             "summary": {
@@ -127,6 +126,27 @@ class TestRLPolicies(unittest.TestCase):
         }
         action = policy.act(np.zeros(12, dtype=np.float32), info)
         self.assertIn(action, self.grid.indices)
+
+    def test_aimd_multiplicative_decrease_snaps_to_grid(self):
+        spec = ActionSpec(
+            attempt_timeout_ms=[10, 30, 50, 80],
+            max_attempts=[1],
+            backoff_ms=[0],
+        )
+        grid = ActionGrid(spec)
+        policy = AIMDPolicy(grid=grid, initial_timeout_ms=80)
+        healthy = {"summary": {"completed": 10, "success_rate": 1.0, "deadline_drop_rate": 0.0}}
+
+        action = policy.act(np.zeros(15, dtype=np.float32), healthy)
+        self.assertEqual(spec.attempt_timeout_ms[action[0]], 30)  # 80 * 0.5 = 40 -> snap down
+        action = policy.act(np.zeros(15, dtype=np.float32), healthy)
+        self.assertEqual(spec.attempt_timeout_ms[action[0]], 10)  # 30 * 0.5 = 15 -> snap down
+        action = policy.act(np.zeros(15, dtype=np.float32), healthy)
+        self.assertEqual(spec.attempt_timeout_ms[action[0]], 10)  # stays at the floor
+
+    def test_aimd_rejects_invalid_decrease_factor(self):
+        with self.assertRaises(ValueError):
+            AIMDPolicy(grid=self.grid, timeout_decrease_factor=1.0)
 
     def test_aimd_policy_emits_global_timeout_dimension(self):
         spec = ActionSpec(
