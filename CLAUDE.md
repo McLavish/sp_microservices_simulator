@@ -41,11 +41,11 @@ When adding completion paths in `behavior`, preserve AND semantics and route dea
 
 ## RL layer (`rl/`)
 
-`MicroservicesEnv` (`rl/env.py`) wraps a build function (`build_single_service_env` or `build_faulty_single_service_env`) into a Gymnasium env. Each `step()` advances the simulator by `step_duration_s` and returns reward + observation summarized over roots that completed in that window; on episode end, in-flight work is drained *after* the final reward and reported under `info["drained_summary"]`. The action is a `MultiDiscrete` index into `ActionSpec` lists for `(attempt_timeout_ms, max_attempts, backoff_ms[, global_timeout_ms])`. Knob application is owned by the builder: each `build_*` function returns `EnvComponents` with an `apply_knobs` callback that maps decoded `ActionValues` onto its own policy/controller objects — the env itself is policy-agnostic, so new scenarios (chains, other retry policies) only need a builder that wires its own `apply_knobs`. Unseeded `reset()` draws a fresh build seed from the gym RNG; never make builders fall back to fixed seeds on the env path or SB3 training collapses to one episode.
+`MicroservicesEnv` (`rl/env.py`) wraps a build function into a Gymnasium env; `SCENARIO_BUILDERS` maps the `--fault-scenario` names: `none`, `basic` (fixed fault windows — memorizable, prefer `randomized` for training), `randomized` (fault onset/duration/intensity drawn from the seed), and `chain` (A→B→C retry-storm topology: the agent tunes the B→C edge knobs, reward comes from the top-level client). Each `step()` advances the simulator by `step_duration_s` and returns reward + observation summarized over roots that completed in that window; on episode end, in-flight work is drained *after* the final reward and reported under `info["drained_summary"]`. The action is a `MultiDiscrete` index into `ActionSpec` lists for `(attempt_timeout_ms, max_attempts, backoff_ms[, global_timeout_ms])`. Knob application is owned by the builder: each `build_*` function returns `EnvComponents` with an `apply_knobs` callback that maps decoded `ActionValues` onto its own policy/controller objects — the env itself is policy-agnostic, so new scenarios (chains, other retry policies) only need a builder that wires its own `apply_knobs`. Unseeded `reset()` draws a fresh build seed from the gym RNG; never make builders fall back to fixed seeds on the env path or SB3 training collapses to one episode.
 
 `rl/policies/` ships baselines (Fixed, AIMD, ModelBased, Bayesian, SB3 PPO, oracle-fixed grid search). `ModelBasedPolicy` optionally adds an M/G/c queueing-delay term (Erlang-C / Allen-Cunneen, arrival rate per millisecond to match the ms latency models); timed-out attempts are kept as right-censored samples and fitted via censored MLE (`LogNormalModel.fit_censored`). `rl/models/` has the latency models used by Bayesian/ModelBased: lognormal (`lognormal.py`), lognormal mixture (`lognormal_mixture.py`), EVT tail (`evt_tail.py`).
 
-`rl/policies/sb3.py` adapts a Stable-Baselines3 model to the `Policy` protocol. PPO training entry point is `rl.train_sb3`; multi-policy comparison (incl. early-stopped PPO and oracle search) is `rl.experiments.compare_policies`.
+`rl/policies/sb3.py` adapts a Stable-Baselines3 model to the `Policy` protocol. PPO training entry point is `rl.train_sb3`; multi-policy comparison (incl. early-stopped PPO and oracle search) is `rl.experiments.compare_policies`, which writes results/trace/learning-curve CSVs and supports `--ppo-save-path`/`--ppo-load-path` for cross-scenario evaluation. stable-baselines3 lives in the opt-in `rl` dependency group (`uv sync --group dev --group rl`; pulls in torch).
 
 ## Common commands
 
@@ -95,8 +95,8 @@ RL:
 python -m rl.experiments.compare_models --dist {lognormal,mixture,pareto}
 python -m rl.experiments.compare_policies \
     --policies fixed,aimd,model_based,model_based_queue,bayesian,ppo,oracle_fixed \
-    --fault-scenario basic
-python -m rl.train_sb3 --timesteps 5000 --save-path rl_models/ppo.zip
+    --fault-scenario randomized   # choices: none, basic, randomized, chain
+python -m rl.train_sb3 --timesteps 100000 --fault-scenario randomized --save-path rl_models/ppo.zip
 ```
 
 ## Conventions when extending
