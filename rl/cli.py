@@ -8,6 +8,11 @@ def parse_int_list(value: str) -> list[int]:
     return [int(v) for v in items]
 
 
+def parse_float_list(value: str) -> list[float]:
+    items = [v.strip() for v in value.split(",") if v.strip()]
+    return [float(v) for v in items]
+
+
 def parse_optional_int_list(value: str) -> list[int | None]:
     items = [v.strip() for v in value.split(",") if v.strip()]
     parsed: list[int | None] = []
