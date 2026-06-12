@@ -7,7 +7,14 @@ try:
 except Exception:
     gymnasium = None  # ty: ignore[invalid-assignment]
 
-from rl.env import ActionSpec, EnvConfig, MicroservicesEnv, build_single_service_env
+from core import s_to_ns
+from rl.env import (
+    ActionSpec,
+    EnvConfig,
+    MicroservicesEnv,
+    build_randomized_faulty_single_service_env,
+    build_single_service_env,
+)
 
 
 @unittest.skipIf(gymnasium is None, "gymnasium not installed")
@@ -108,6 +115,41 @@ class TestMicroservicesEnv(unittest.TestCase):
         assert isinstance(controller, StaticTimeoutController)
         self.assertEqual(controller.attempt_timeout, ms_to_ns(50))
         self.assertEqual(controller.global_timeout, ms_to_ns(200))
+
+    def test_randomized_faults_deterministic_per_seed(self):
+        def fault_params(components):
+            cfg = components.client.service.cfg
+            inj = cfg.latency_injections[0]
+            pf = cfg.partial_failures[0]
+            spike = components.workload.load_spikes[0]
+            return (
+                inj.duration.begin,
+                inj.duration.end,
+                inj.add_latency,
+                pf.duration.begin,
+                pf.p_fail,
+                spike.duration.begin,
+                spike.rps_multiplier,
+            )
+
+        a = fault_params(build_randomized_faulty_single_service_env(5, duration_s=30))
+        b = fault_params(build_randomized_faulty_single_service_env(5, duration_s=30))
+        c = fault_params(build_randomized_faulty_single_service_env(6, duration_s=30))
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, c)
+
+    def test_randomized_fault_windows_stay_inside_episode(self):
+        for seed in range(20):
+            components = build_randomized_faulty_single_service_env(seed, duration_s=30)
+            cfg = components.client.service.cfg
+            for interval in (
+                cfg.latency_injections[0].duration,
+                cfg.partial_failures[0].duration,
+                components.workload.load_spikes[0].duration,
+            ):
+                self.assertGreaterEqual(interval.begin, 0)
+                self.assertLess(interval.begin, interval.end)
+                self.assertLessEqual(interval.end, s_to_ns(30))
 
     def test_drained_roots_reported_separately_from_final_summary(self):
         env = self._make_env(build_single_service_env, episode_duration_s=1.0)

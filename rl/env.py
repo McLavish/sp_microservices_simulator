@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -416,30 +417,36 @@ def _static_knob_applier(
     return apply_knobs
 
 
-def build_single_service_env(
-    seed: int | None = None, duration_s: int | None = None
+def _single_service_components(
+    seed: int | None,
+    duration: int,
+    *,
+    latency_injections: list[LatencyInjection] | None = None,
+    partial_failures: list[PartialFailure] | None = None,
+    load_spikes: list[LoadSpike] | None = None,
 ) -> EnvComponents:
     sim = Simulator(seed=1 if seed is None else seed)
-    duration = 30 if duration_s is None else int(duration_s)
-
     svc_cfg = ServiceConfig(
         name="svc-A",
         latency_median=ms_to_ns(20),
         latency_lognorm_sigma=0.5,
         workers=16,
         queue_capacity=200,
+        latency_injections=latency_injections or [],
+        partial_failures=partial_failures or [],
     )
     svc = ServiceRuntime(cfg=svc_cfg).bind()
 
     timeout_ctrl = StaticTimeoutController(global_timeout=None, attempt_timeout=ms_to_ns(50))
     retry = FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(50))
-    client_cfg = ClientConfig(retry=retry, timeout_controller=timeout_ctrl)
-    client = ClientRuntime(cfg=client_cfg, service=svc)
+    client = ClientRuntime(
+        cfg=ClientConfig(retry=retry, timeout_controller=timeout_ctrl), service=svc
+    )
 
     workload = Workload(
         base_rps=200.0,
         duration_s=duration,
-        load_spikes=[],
+        load_spikes=load_spikes or [],
         rng_seed=seed,
     )
 
@@ -451,52 +458,77 @@ def build_single_service_env(
     )
 
 
+def build_single_service_env(
+    seed: int | None = None, duration_s: int | None = None
+) -> EnvComponents:
+    duration = 30 if duration_s is None else int(duration_s)
+    return _single_service_components(seed, duration)
+
+
 def build_faulty_single_service_env(
     seed: int | None = None, duration_s: int | None = None
 ) -> EnvComponents:
-    sim = Simulator(seed=1 if seed is None else seed)
+    """Faulty single service with fault windows at *fixed* episode fractions.
+
+    Because the observation includes the episode-time fraction, policies can
+    memorize these windows; use the randomized variant for training.
+    """
     duration = 30 if duration_s is None else int(duration_s)
-
-    latency_injection = LatencyInjection(
-        duration=TimeInterval(begin=s_to_ns(0.2 * duration), end=s_to_ns(0.35 * duration)),
-        add_latency=ms_to_ns(30),
-    )
-    partial_failure = PartialFailure(
-        duration=TimeInterval(begin=s_to_ns(0.5 * duration), end=s_to_ns(0.65 * duration)),
-        p_fail=0.3,
-    )
-
-    svc_cfg = ServiceConfig(
-        name="svc-A",
-        latency_median=ms_to_ns(20),
-        latency_lognorm_sigma=0.5,
-        workers=16,
-        queue_capacity=200,
-        latency_injections=[latency_injection],
-        partial_failures=[partial_failure],
-    )
-    svc = ServiceRuntime(cfg=svc_cfg).bind()
-
-    timeout_ctrl = StaticTimeoutController(global_timeout=None, attempt_timeout=ms_to_ns(50))
-    retry = FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(50))
-    client_cfg = ClientConfig(retry=retry, timeout_controller=timeout_ctrl)
-    client = ClientRuntime(cfg=client_cfg, service=svc)
-
-    workload = Workload(
-        base_rps=200.0,
-        duration_s=duration,
+    return _single_service_components(
+        seed,
+        duration,
+        latency_injections=[
+            LatencyInjection(
+                duration=TimeInterval(begin=s_to_ns(0.2 * duration), end=s_to_ns(0.35 * duration)),
+                add_latency=ms_to_ns(30),
+            )
+        ],
+        partial_failures=[
+            PartialFailure(
+                duration=TimeInterval(begin=s_to_ns(0.5 * duration), end=s_to_ns(0.65 * duration)),
+                p_fail=0.3,
+            )
+        ],
         load_spikes=[
             LoadSpike(
                 duration=TimeInterval(begin=s_to_ns(0.3 * duration), end=s_to_ns(0.45 * duration)),
                 rps_multiplier=2.0,
             )
         ],
-        rng_seed=seed,
     )
 
-    return EnvComponents(
-        sim=sim,
-        workload=workload,
-        client=client,
-        apply_knobs=_static_knob_applier(timeout_ctrl, retry),
+
+def build_randomized_faulty_single_service_env(
+    seed: int | None = None, duration_s: int | None = None
+) -> EnvComponents:
+    """Faulty single service with fault windows drawn from the seed.
+
+    Onset, duration, and intensity vary per episode, so a policy cannot
+    memorize the episode clock via the time-fraction feature — it has to react
+    to observed degradation. Same seed reproduces the same fault draw.
+    """
+    duration = 30 if duration_s is None else int(duration_s)
+    rng = random.Random(1 if seed is None else seed)
+
+    def window() -> TimeInterval:
+        onset = rng.uniform(0.05, 0.6) * duration
+        length = rng.uniform(0.1, 0.3) * duration
+        return TimeInterval(begin=s_to_ns(onset), end=s_to_ns(min(onset + length, duration)))
+
+    return _single_service_components(
+        seed,
+        duration,
+        latency_injections=[
+            LatencyInjection(duration=window(), add_latency=ms_to_ns(rng.uniform(10, 60)))
+        ],
+        partial_failures=[PartialFailure(duration=window(), p_fail=rng.uniform(0.1, 0.6))],
+        load_spikes=[LoadSpike(duration=window(), rps_multiplier=rng.uniform(1.5, 3.0))],
     )
+
+
+# Scenario name -> builder, shared by the CLI entry points (--fault-scenario).
+SCENARIO_BUILDERS: dict[str, Callable[[int | None, int | None], EnvComponents]] = {
+    "none": build_single_service_env,
+    "basic": build_faulty_single_service_env,
+    "randomized": build_randomized_faulty_single_service_env,
+}

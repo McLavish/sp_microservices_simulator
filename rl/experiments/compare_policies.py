@@ -2,18 +2,18 @@ import argparse
 import csv
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
 from core import Summary
 from rl.cli import parse_int_list, parse_optional_int_list
 from rl.env import (
+    SCENARIO_BUILDERS,
     ActionSpec,
     EnvConfig,
     MicroservicesEnv,
     RewardWeights,
-    build_faulty_single_service_env,
-    build_single_service_env,
 )
 from rl.policies.action_space import ActionGrid
 from rl.policies.aimd import AIMDPolicy
@@ -22,16 +22,19 @@ from rl.policies.fixed import FixedPolicy, FixedValuePolicy
 from rl.policies.model_based import ModelBasedPolicy
 from rl.policies.sb3 import SB3Policy
 
-try:
-    from stable_baselines3 import PPO  # ty: ignore[unresolved-import]
-    from stable_baselines3.common.env_util import make_vec_env  # ty: ignore[unresolved-import]
-    from stable_baselines3.common.evaluation import (  # ty: ignore[unresolved-import]
-        evaluate_policy as sb3_evaluate,
-    )
-except Exception:  # pragma: no cover
-    PPO = None
-    make_vec_env = None
-    sb3_evaluate = None
+
+def _import_sb3() -> tuple[Any, Any, Any]:
+    """Optional dependency: returns (PPO, make_vec_env, evaluate_policy) or Nones."""
+    try:
+        from stable_baselines3 import PPO
+        from stable_baselines3.common.env_util import make_vec_env
+        from stable_baselines3.common.evaluation import evaluate_policy
+    except Exception:  # pragma: no cover
+        return None, None, None
+    return PPO, make_vec_env, evaluate_policy
+
+
+PPO, make_vec_env, sb3_evaluate = _import_sb3()
 
 
 @dataclass
@@ -76,14 +79,10 @@ class ExperimentConfig:
 
 def _build_env(cfg: ExperimentConfig) -> MicroservicesEnv:
     duration_s = int(round(cfg.episode_duration_s)) if cfg.episode_duration_s else None
-    if cfg.fault_scenario == "basic":
+    builder = SCENARIO_BUILDERS[cfg.fault_scenario]
 
-        def build_fn(seed):
-            return build_faulty_single_service_env(seed, duration_s=duration_s)
-    else:
-
-        def build_fn(seed):
-            return build_single_service_env(seed, duration_s=duration_s)
+    def build_fn(seed):
+        return builder(seed, duration_s)
 
     action_spec = ActionSpec(
         attempt_timeout_ms=cfg.attempt_timeouts_ms,
@@ -174,7 +173,9 @@ def _train_ppo(cfg: ExperimentConfig) -> SB3Policy:
         step = min(cfg.ppo_eval_interval, cfg.ppo_timesteps - trained)
         model.learn(total_timesteps=step)
         trained += step
-        mean_reward, _ = sb3_evaluate(model, eval_env, n_eval_episodes=cfg.ppo_eval_episodes)
+        mean_reward = float(
+            np.mean(sb3_evaluate(model, eval_env, n_eval_episodes=cfg.ppo_eval_episodes)[0])
+        )
         if mean_reward > best_mean + cfg.ppo_min_delta:
             best_mean = mean_reward
             no_improve = 0
@@ -245,7 +246,7 @@ def main() -> None:
     parser.add_argument("--aimd-adjust-backoff", action="store_true")
     parser.add_argument("--aimd-ema-alpha", type=float, default=0.2)
     parser.add_argument("--aimd-min-completed", type=int, default=1)
-    parser.add_argument("--fault-scenario", choices=["none", "basic"], default="none")
+    parser.add_argument("--fault-scenario", choices=sorted(SCENARIO_BUILDERS), default="none")
     parser.add_argument("--reward-success", type=float, default=1.0)
     parser.add_argument("--reward-deadline", type=float, default=1.0)
     parser.add_argument("--reward-queue", type=float, default=1.0)
