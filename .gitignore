@@ -13,3 +13,4 @@ uv.lock.tmp
 .coverage.*
 htmlcov/
 coverage.xml
+rl_models/
