@@ -318,6 +318,18 @@ def main() -> None:
         default="rl_ppo_learning_curve.csv",
         help="PPO early-stopping eval reward per timestep budget.",
     )
+    parser.add_argument(
+        "--ppo-save-path",
+        type=str,
+        default=None,
+        help="Save the trained PPO model (e.g. to reuse across fault scenarios).",
+    )
+    parser.add_argument(
+        "--ppo-load-path",
+        type=str,
+        default=None,
+        help="Load a trained PPO model instead of training (cross-scenario eval).",
+    )
     args = parser.parse_args()
 
     reward_weights = RewardWeights(
@@ -446,7 +458,17 @@ def main() -> None:
         policies.append(bayes)
 
     if "ppo" in policy_names:
-        policies.append(_train_ppo(cfg, learning_curve_csv=args.ppo_learning_curve_csv))
+        if args.ppo_load_path:
+            if PPO is None:
+                raise ImportError("stable-baselines3 is required for PPO baseline")
+            model = PPO.load(args.ppo_load_path)
+            policies.append(SB3Policy(model=model, deterministic=True, name="ppo"))
+        else:
+            ppo_policy = _train_ppo(cfg, learning_curve_csv=args.ppo_learning_curve_csv)
+            if args.ppo_save_path:
+                ppo_policy.model.save(args.ppo_save_path)
+                print(f"Saved PPO model to {args.ppo_save_path}")
+            policies.append(ppo_policy)
 
     if "oracle_fixed" in policy_names:
         best_idx = _best_fixed_action(cfg, grid)
