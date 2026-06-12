@@ -22,6 +22,9 @@ class RewardWeights:
     circuit_open_drop: float = 1.0
     p95_latency_ms: float = 0.001
     retries: float = 0.1
+    # Weight on the constraint cost (cost-client retry amplification). Acts as
+    # the Lagrange multiplier in constrained training; 0 disables the term.
+    cost: float = 0.0
 
 
 @dataclass

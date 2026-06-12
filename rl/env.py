@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -21,7 +22,7 @@ from core import (
     s_to_ns,
 )
 from faults import LatencyInjection, LoadSpike, PartialFailure
-from retry_policies import FixedBackoffRetryPolicy
+from retry_policies import FixedBackoffRetryPolicy, RetryBudgetPolicy, RetryPolicy
 from rl.spec import ActionSpec, ActionValues, RewardWeights, coerce_action
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
@@ -57,6 +58,10 @@ class EnvComponents:
     # The builder owns the knowledge of which concrete types it constructed,
     # so the env stays agnostic of retry-policy and controller classes.
     apply_knobs: Callable[[ActionValues], None]
+    # Where the constraint cost (retry amplification) is measured. In the chain
+    # scenario this is the tunable B->C edge client, whose amplification is
+    # invisible in the top-level client's summary. None -> cost is 0.
+    cost_client: ClientRuntime | None = None
 
 
 @dataclass
@@ -95,7 +100,7 @@ class MicroservicesEnv(_GymEnvBase):
 
         # See _build_observation for the feature list; the optional global-timeout
         # dimension adds one action-echo feature.
-        self._obs_size = 15 + (1 if config.action_spec.global_timeout_ms is not None else 0)
+        self._obs_size = 16 + (1 if config.action_spec.global_timeout_ms is not None else 0)
         self.observation_space = spaces.Box(
             low=0.0, high=np.inf, shape=(self._obs_size,), dtype=np.float32
         )
@@ -108,6 +113,7 @@ class MicroservicesEnv(_GymEnvBase):
         self._client: ClientRuntime | None = None
         self._components: EnvComponents | None = None
         self._last_root_idx = 0
+        self._last_cost_root_idx = 0
         self._current_time_ns: TimePoint = 0
         self._end_time_ns: TimePoint = 0
         self._step_ns: TimeDuration = 0
@@ -157,6 +163,7 @@ class MicroservicesEnv(_GymEnvBase):
         self._end_time_ns = s_to_ns(episode_s)
 
         self._last_root_idx = 0
+        self._last_cost_root_idx = 0
         self._require_workload().drive(
             self._require_sim(), lambda s: self._require_client().start_request(s)
         )
@@ -190,6 +197,7 @@ class MicroservicesEnv(_GymEnvBase):
         self._last_root_idx = len(self._require_client().roots)
 
         summary = self._summarize_roots(new_roots)
+        summary["cost"] = self._window_cost()
         obs = self._build_observation(summary)
         reward = self._reward_from_summary(summary)
         terminated = self._current_time_ns >= self._end_time_ns
@@ -203,11 +211,26 @@ class MicroservicesEnv(_GymEnvBase):
             self._require_sim().run()
             drained = self._require_client().roots[self._last_root_idx :]
             self._last_root_idx = len(self._require_client().roots)
-            info["drained_summary"] = self._summarize_roots(drained)
+            drained_summary = self._summarize_roots(drained)
+            drained_summary["cost"] = self._window_cost()
+            info["drained_summary"] = drained_summary
         return obs, reward, terminated, False, info
 
     def _build(self, seed: int | None) -> EnvComponents:
         return self._cfg.build(seed)
+
+    def _window_cost(self) -> float:
+        """Constraint cost: retry amplification (retries per root) at the cost
+        client over the roots it completed since the last call."""
+        components = self._components
+        if components is None or components.cost_client is None:
+            return 0.0
+        roots = components.cost_client.roots[self._last_cost_root_idx :]
+        self._last_cost_root_idx = len(components.cost_client.roots)
+        if not roots:
+            return 0.0
+        attempts = sum(len(root.attempts) for root in roots)
+        return (attempts - len(roots)) / len(roots)
 
     def _apply_action(self, action: tuple[int, ...]) -> None:
         spec = self._cfg.action_spec
@@ -254,6 +277,7 @@ class MicroservicesEnv(_GymEnvBase):
             - summary["circuit_open_drop_rate"] * w.circuit_open_drop
             - summary["p95_latency_ms"] * w.p95_latency_ms
             - summary["retries_per_root"] * w.retries
+            - summary["cost"] * w.cost
         )
         return float(reward)
 
@@ -270,6 +294,7 @@ class MicroservicesEnv(_GymEnvBase):
                 "p95_latency_ms": 0.0,
                 "retries_per_root": 0.0,
                 "queue_avg": 0.0,
+                "cost": 0.0,
             }
 
         completed = len(roots)
@@ -327,6 +352,8 @@ class MicroservicesEnv(_GymEnvBase):
             "p95_latency_ms": p95_latency_ms,
             "retries_per_root": retries_per_root,
             "queue_avg": queue_avg,
+            # Overridden by step() with the cost-client window when one exists.
+            "cost": 0.0,
         }
 
     def _build_observation(self, summary: dict[str, float]) -> np.ndarray:
@@ -335,8 +362,9 @@ class MicroservicesEnv(_GymEnvBase):
         Features: has_data flag (disambiguates "no traffic" from "all failed"),
         log-scaled throughput, the five outcome rates, latencies scaled by the
         largest attempt timeout in the spec, retries scaled by the max retry
-        budget, log-scaled queue depth, the last action echoed as index
-        fractions, and the episode-time fraction.
+        budget, constraint cost (cost-client retry amplification, same scaling),
+        log-scaled queue depth, the last action echoed as index fractions, and
+        the episode-time fraction.
         """
         completed = float(summary["completed"])
 
@@ -357,6 +385,7 @@ class MicroservicesEnv(_GymEnvBase):
             summary["avg_latency_ms"] / self._timeout_norm_ms,
             summary["p95_latency_ms"] / self._timeout_norm_ms,
             summary["retries_per_root"] / self._retries_norm,
+            summary["cost"] / self._retries_norm,
             float(np.log1p(summary["queue_avg"])) / 10.0,
             idx_frac(0),
             idx_frac(1),
@@ -527,14 +556,25 @@ def build_randomized_faulty_single_service_env(
     )
 
 
-def build_chain_env(seed: int | None = None, duration_s: int | None = None) -> EnvComponents:
+def build_chain_env(
+    seed: int | None = None,
+    duration_s: int | None = None,
+    *,
+    retry_budget_ratio: float | None = None,
+) -> EnvComponents:
     """Chain A -> B -> C with bottleneck C degrading in a randomized fault window.
 
     The agent tunes the B->C edge client's retry/timeout knobs — the edge where
     retry storms amplify — while reward and observation come from the
     *top-level* client, so the agent is judged on end-to-end goodput. Fault
     onset, duration, and intensity are drawn from the seed (see the randomized
-    single-service builder for why).
+    single-service builder for why). The edge client is exposed as the env's
+    ``cost_client`` so its retry amplification can serve as a constraint cost.
+
+    ``retry_budget_ratio`` wraps the edge policy in a ``RetryBudgetPolicy``
+    (the hand-coded baseline for constrained-RL comparisons). Note the wrapper
+    limits retries against *successes* (token award), which approximates
+    retries-per-root only at high success rates.
     """
     build_seed = 1 if seed is None else int(seed)
     sim = Simulator(seed=build_seed)
@@ -578,8 +618,17 @@ def build_chain_env(seed: int | None = None, duration_s: int | None = None) -> E
     # Tunable edge: B -> C, where aggressive retries hammer the bottleneck.
     edge_timeout = StaticTimeoutController(global_timeout=None, attempt_timeout=ms_to_ns(60))
     edge_retry = FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(20))
+    edge_policy: RetryPolicy = edge_retry
+    if retry_budget_ratio is not None:
+        # Knobs still route to the inner FixedBackoffRetryPolicy via
+        # apply_knobs; the wrapper sees results through underlying_strategy.
+        edge_policy = RetryBudgetPolicy(
+            budget_ratio=retry_budget_ratio,
+            max_retries=5,
+            underlying_strategy=edge_retry,
+        )
     b_to_c = ClientRuntime(
-        cfg=ClientConfig(retry=edge_retry, timeout_controller=edge_timeout), service=c_node
+        cfg=ClientConfig(retry=edge_policy, timeout_controller=edge_timeout), service=c_node
     )
 
     a_to_b = ClientRuntime(
@@ -617,6 +666,7 @@ def build_chain_env(seed: int | None = None, duration_s: int | None = None) -> E
         workload=workload,
         client=top_client,
         apply_knobs=_static_knob_applier(edge_timeout, edge_retry),
+        cost_client=b_to_c,
     )
 
 
@@ -626,4 +676,5 @@ SCENARIO_BUILDERS: dict[str, Callable[[int | None, int | None], EnvComponents]] 
     "basic": build_faulty_single_service_env,
     "randomized": build_randomized_faulty_single_service_env,
     "chain": build_chain_env,
+    "chain_budget": functools.partial(build_chain_env, retry_budget_ratio=0.1),
 }

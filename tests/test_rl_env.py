@@ -181,6 +181,72 @@ class TestMicroservicesEnv(unittest.TestCase):
         assert isinstance(top_timeout, StaticTimeoutController)
         self.assertEqual(top_timeout.attempt_timeout, ms_to_ns(300))
 
+    def test_cost_zero_without_cost_client(self):
+        env = self._make_env(build_single_service_env, episode_duration_s=2.0)
+        env.reset(seed=5)
+        _, _, _, _, info = env.step(np.array([1, 0, 0]))
+        self.assertEqual(info["summary"]["cost"], 0.0)
+
+    def test_chain_env_cost_measures_edge_amplification(self):
+        env = self._make_env(build_chain_env, episode_duration_s=5.0)
+        env.reset(seed=11)
+        # Aggressive knobs: 10 ms edge timeout vs C's 20 ms median forces edge
+        # timeouts, so the max-attempts setting produces real retries.
+        costs = []
+        terminated = False
+        while not terminated:
+            _, _, terminated, _, info = env.step(np.array([0, 1, 0]))
+            costs.append(info["summary"]["cost"])
+        self.assertGreater(max(costs), 0.0)
+
+    def test_reward_penalizes_cost(self):
+        env = self._make_env(build_single_service_env)
+        summary = env._summarize_roots([])
+        summary["success_rate"] = 1.0
+        baseline = env._reward_from_summary(summary)
+        env._cfg.reward_weights.cost = 2.0
+        summary["cost"] = 0.5
+        self.assertAlmostEqual(env._reward_from_summary(summary), baseline - 1.0)
+
+    def test_chain_budget_knobs_route_through_wrapper(self):
+        from retry_policies import FixedBackoffRetryPolicy, RetryBudgetPolicy
+
+        components = build_chain_env(3, duration_s=10, retry_budget_ratio=0.1)
+        components.apply_knobs(
+            ActionValues(
+                attempt_timeout_ms=80, max_attempts=3, backoff_ms=50, global_timeout_ms=None
+            )
+        )
+        edge_client = components.cost_client
+        assert edge_client is not None
+        wrapper = edge_client.cfg.retry
+        assert isinstance(wrapper, RetryBudgetPolicy)
+        inner = wrapper.underlying_strategy
+        assert isinstance(inner, FixedBackoffRetryPolicy)
+        self.assertEqual(inner.max_attempts, 3)
+        self.assertEqual(inner.delay, ms_to_ns(50))
+
+    def test_retry_budget_wrapper_throttles_edge_retries(self):
+        def mean_cost(retry_budget_ratio):
+            env = self._make_env(
+                lambda seed: build_chain_env(
+                    seed, duration_s=5, retry_budget_ratio=retry_budget_ratio
+                ),
+                episode_duration_s=5.0,
+            )
+            env.reset(seed=11)
+            costs = []
+            terminated = False
+            while not terminated:
+                _, _, terminated, _, info = env.step(np.array([0, 1, 0]))
+                costs.append(info["summary"]["cost"])
+            return float(np.mean(costs))
+
+        unbudgeted = mean_cost(None)
+        budgeted = mean_cost(0.05)
+        self.assertGreater(unbudgeted, 0.0)
+        self.assertLess(budgeted, unbudgeted)
+
     def test_chain_env_episode_runs(self):
         env = self._make_env(build_chain_env, episode_duration_s=3.0)
         obs, _ = env.reset(seed=11)
