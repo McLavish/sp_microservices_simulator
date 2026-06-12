@@ -1,4 +1,5 @@
 import argparse
+import csv
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -161,6 +162,11 @@ def _train_ppo(cfg: ExperimentConfig) -> SB3Policy:
         seed=cfg.train_seeds[0],
     )
 
+    # Seed the early-stopping eval env once: its unseeded resets then draw a
+    # reproducible scenario sequence from the gym RNG instead of fresh entropy.
+    eval_env = _build_env(cfg)
+    eval_env.reset(seed=cfg.train_seeds[0] + 10_000)
+
     best_mean = -float("inf")
     no_improve = 0
     trained = 0
@@ -168,7 +174,7 @@ def _train_ppo(cfg: ExperimentConfig) -> SB3Policy:
         step = min(cfg.ppo_eval_interval, cfg.ppo_timesteps - trained)
         model.learn(total_timesteps=step)
         trained += step
-        mean_reward, _ = sb3_evaluate(model, _build_env(cfg), n_eval_episodes=cfg.ppo_eval_episodes)
+        mean_reward, _ = sb3_evaluate(model, eval_env, n_eval_episodes=cfg.ppo_eval_episodes)
         if mean_reward > best_mean + cfg.ppo_min_delta:
             best_mean = mean_reward
             no_improve = 0
@@ -246,6 +252,12 @@ def main() -> None:
     parser.add_argument("--reward-server", type=float, default=1.0)
     parser.add_argument("--reward-p95", type=float, default=0.001)
     parser.add_argument("--reward-retries", type=float, default=0.1)
+    parser.add_argument(
+        "--output-csv",
+        type=str,
+        default="rl_compare_policies.csv",
+        help="Per-policy evaluation results (repo convention: CSV at repo root).",
+    )
     args = parser.parse_args()
 
     reward_weights = RewardWeights(
@@ -381,8 +393,10 @@ def main() -> None:
         policies.append(FixedPolicy(action=best_idx, name="oracle_fixed"))
 
     print("=== Evaluation ===")
+    results = []
     for policy in policies:
         metrics = _evaluate(env, policy, cfg.eval_seeds)
+        results.append({"policy": policy.name, **metrics})
         print(
             f"{policy.name:14s} reward={metrics['reward_mean']:.4f} "
             f"+/-{metrics['reward_std']:.4f} "
@@ -390,6 +404,14 @@ def main() -> None:
             f"p95={metrics['p95_ms']:.2f} "
             f"retries={metrics['retries_per_root']:.3f}"
         )
+
+    if args.output_csv and results:
+        fieldnames = list(results[0].keys())
+        with open(args.output_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(results)
+        print(f"Wrote results to {args.output_csv}")
 
 
 if __name__ == "__main__":
