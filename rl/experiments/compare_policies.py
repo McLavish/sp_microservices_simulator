@@ -101,30 +101,64 @@ def _build_env(cfg: ExperimentConfig) -> MicroservicesEnv:
     return MicroservicesEnv(env_cfg)
 
 
-def _episode(env: MicroservicesEnv, policy, seed: int) -> tuple[float, Summary | None]:
+def _episode(
+    env: MicroservicesEnv,
+    policy,
+    seed: int,
+    trace_rows: list[dict] | None = None,
+) -> tuple[float, Summary | None]:
     obs, info = env.reset(seed=seed)
     policy.reset(seed=seed)
     total_reward = 0.0
     terminated = False
     truncated = False
+    step_idx = 0
     while not (terminated or truncated):
         action = policy.act(obs, info)
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += float(reward)
+        if trace_rows is not None:
+            summary = info["summary"]
+            applied = info["action"]
+            trace_rows.append(
+                {
+                    "policy": policy.name,
+                    "seed": seed,
+                    "step": step_idx,
+                    "attempt_timeout_ms": applied["attempt_timeout_ms"],
+                    "max_attempts": applied["max_attempts"],
+                    "backoff_ms": applied["backoff_ms"],
+                    "global_timeout_ms": applied["global_timeout_ms"],
+                    "reward": float(reward),
+                    "completed": summary["completed"],
+                    "success_rate": summary["success_rate"],
+                    "deadline_drop_rate": summary["deadline_drop_rate"],
+                    "queue_drop_rate": summary["queue_drop_rate"],
+                    "server_drop_rate": summary["server_drop_rate"],
+                    "p95_latency_ms": summary["p95_latency_ms"],
+                    "retries_per_root": summary["retries_per_root"],
+                }
+            )
+        step_idx += 1
         policy.update(obs, reward, terminated or truncated, info)
 
     summary = env.metrics_summary()
     return total_reward, summary
 
 
-def _evaluate(env: MicroservicesEnv, policy, seeds: Sequence[int]) -> dict:
+def _evaluate(
+    env: MicroservicesEnv,
+    policy,
+    seeds: Sequence[int],
+    trace_rows: list[dict] | None = None,
+) -> dict:
     rewards = []
     successes = []
     p95s = []
     retries = []
 
     for seed in seeds:
-        total_reward, summary = _episode(env, policy, seed)
+        total_reward, summary = _episode(env, policy, seed, trace_rows=trace_rows)
         rewards.append(total_reward)
         if summary:
             successes.append(summary.succeeded / summary.total if summary.total else 0.0)
@@ -143,7 +177,7 @@ def _evaluate(env: MicroservicesEnv, policy, seeds: Sequence[int]) -> dict:
     }
 
 
-def _train_ppo(cfg: ExperimentConfig) -> SB3Policy:
+def _train_ppo(cfg: ExperimentConfig, learning_curve_csv: str | None = None) -> SB3Policy:
     if PPO is None or make_vec_env is None or sb3_evaluate is None:
         raise ImportError("stable-baselines3 is required for PPO baseline")
 
@@ -169,6 +203,7 @@ def _train_ppo(cfg: ExperimentConfig) -> SB3Policy:
     best_mean = -float("inf")
     no_improve = 0
     trained = 0
+    curve: list[tuple[int, float]] = []
     while trained < cfg.ppo_timesteps:
         step = min(cfg.ppo_eval_interval, cfg.ppo_timesteps - trained)
         model.learn(total_timesteps=step)
@@ -176,6 +211,7 @@ def _train_ppo(cfg: ExperimentConfig) -> SB3Policy:
         mean_reward = float(
             np.mean(sb3_evaluate(model, eval_env, n_eval_episodes=cfg.ppo_eval_episodes)[0])
         )
+        curve.append((trained, mean_reward))
         if mean_reward > best_mean + cfg.ppo_min_delta:
             best_mean = mean_reward
             no_improve = 0
@@ -183,6 +219,13 @@ def _train_ppo(cfg: ExperimentConfig) -> SB3Policy:
             no_improve += 1
         if no_improve >= cfg.ppo_patience:
             break
+
+    if learning_curve_csv and curve:
+        with open(learning_curve_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["timesteps", "eval_reward"])
+            writer.writerows(curve)
+        print(f"Wrote PPO learning curve to {learning_curve_csv}")
 
     return SB3Policy(model=model, deterministic=True, name="ppo")
 
@@ -210,7 +253,11 @@ def main() -> None:
     parser.add_argument("--step-duration-s", type=float, default=1.0)
     parser.add_argument("--episode-duration-s", type=float, default=10.0)
     parser.add_argument("--train-seeds", type=parse_int_list, default="123,456,789")
-    parser.add_argument("--eval-seeds", type=parse_int_list, default="321,654,987")
+    parser.add_argument(
+        "--eval-seeds",
+        type=parse_int_list,
+        default="321,654,987,1320,1653,1986,2319,2652,2985,3318",
+    )
     parser.add_argument(
         "--policies",
         type=str,
@@ -258,6 +305,18 @@ def main() -> None:
         type=str,
         default="rl_compare_policies.csv",
         help="Per-policy evaluation results (repo convention: CSV at repo root).",
+    )
+    parser.add_argument(
+        "--traces-csv",
+        type=str,
+        default="rl_policy_traces.csv",
+        help="Per-step evaluation traces (action/reward/rates per policy and seed).",
+    )
+    parser.add_argument(
+        "--ppo-learning-curve-csv",
+        type=str,
+        default="rl_ppo_learning_curve.csv",
+        help="PPO early-stopping eval reward per timestep budget.",
     )
     args = parser.parse_args()
 
@@ -387,7 +446,7 @@ def main() -> None:
         policies.append(bayes)
 
     if "ppo" in policy_names:
-        policies.append(_train_ppo(cfg))
+        policies.append(_train_ppo(cfg, learning_curve_csv=args.ppo_learning_curve_csv))
 
     if "oracle_fixed" in policy_names:
         best_idx = _best_fixed_action(cfg, grid)
@@ -395,8 +454,9 @@ def main() -> None:
 
     print("=== Evaluation ===")
     results = []
+    trace_rows: list[dict] = []
     for policy in policies:
-        metrics = _evaluate(env, policy, cfg.eval_seeds)
+        metrics = _evaluate(env, policy, cfg.eval_seeds, trace_rows=trace_rows)
         results.append({"policy": policy.name, **metrics})
         print(
             f"{policy.name:14s} reward={metrics['reward_mean']:.4f} "
@@ -413,6 +473,13 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(results)
         print(f"Wrote results to {args.output_csv}")
+
+    if args.traces_csv and trace_rows:
+        with open(args.traces_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(trace_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(trace_rows)
+        print(f"Wrote per-step traces to {args.traces_csv}")
 
 
 if __name__ == "__main__":
