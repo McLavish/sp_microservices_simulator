@@ -91,10 +91,15 @@ class MicroservicesEnv(_GymEnvBase):
 
         self.action_space = spaces.MultiDiscrete(self._action_sizes)
 
-        self._obs_size = 12
+        # See _build_observation for the feature list; the optional global-timeout
+        # dimension adds one action-echo feature.
+        self._obs_size = 15 + (1 if config.action_spec.global_timeout_ms is not None else 0)
         self.observation_space = spaces.Box(
             low=0.0, high=np.inf, shape=(self._obs_size,), dtype=np.float32
         )
+        # Normalization constants so an MLP sees features of comparable magnitude.
+        self._timeout_norm_ms = float(max(config.action_spec.attempt_timeout_ms))
+        self._retries_norm = float(max(1, max(config.action_spec.max_attempts) - 1))
 
         self._sim: Simulator | None = None
         self._workload: Workload | None = None
@@ -105,6 +110,7 @@ class MicroservicesEnv(_GymEnvBase):
         self._end_time_ns: TimePoint = 0
         self._step_ns: TimeDuration = 0
         self._last_action_values: dict[str, int | None] = {}
+        self._last_action_indices: tuple[int, ...] = tuple(0 for _ in self._action_sizes)
 
     def _require_sim(self) -> Simulator:
         if self._sim is None:
@@ -234,6 +240,7 @@ class MicroservicesEnv(_GymEnvBase):
             "max_attempts": max_attempts,
             "backoff_ms": backoff_ms,
         }
+        self._last_action_indices = tuple(int(a) for a in action)
 
     def _reward_from_summary(self, summary: dict[str, float]) -> float:
         w = self._cfg.reward_weights
@@ -321,27 +328,45 @@ class MicroservicesEnv(_GymEnvBase):
         }
 
     def _build_observation(self, summary: dict[str, float]) -> np.ndarray:
+        """Normalized observation vector.
+
+        Features: has_data flag (disambiguates "no traffic" from "all failed"),
+        log-scaled throughput, the five outcome rates, latencies scaled by the
+        largest attempt timeout in the spec, retries scaled by the max retry
+        budget, log-scaled queue depth, the last action echoed as index
+        fractions, and the episode-time fraction.
+        """
+        completed = float(summary["completed"])
+
+        def idx_frac(position: int) -> float:
+            size = self._action_sizes[position]
+            if size <= 1:
+                return 0.0
+            return float(self._last_action_indices[position]) / float(size - 1)
+
+        features = [
+            1.0 if completed > 0 else 0.0,
+            float(np.log1p(completed)) / 10.0,
+            summary["success_rate"],
+            summary["deadline_drop_rate"],
+            summary["queue_drop_rate"],
+            summary["server_drop_rate"],
+            summary["circuit_open_drop_rate"],
+            summary["avg_latency_ms"] / self._timeout_norm_ms,
+            summary["p95_latency_ms"] / self._timeout_norm_ms,
+            summary["retries_per_root"] / self._retries_norm,
+            float(np.log1p(summary["queue_avg"])) / 10.0,
+            idx_frac(0),
+            idx_frac(1),
+            idx_frac(2),
+        ]
+        if len(self._action_sizes) > 3:
+            features.append(idx_frac(3))
         time_s = ns_to_s(self._current_time_ns)
-        return np.array(
-            [
-                summary["success_rate"],
-                summary["deadline_drop_rate"],
-                summary["queue_drop_rate"],
-                summary["server_drop_rate"],
-                summary["avg_latency_ms"],
-                summary["p95_latency_ms"],
-                summary["retries_per_root"],
-                summary["queue_avg"],
-                float(self._last_action_values.get("attempt_timeout_ms") or 0),
-                float(self._last_action_values.get("max_attempts") or 0),
-                float(self._last_action_values.get("backoff_ms") or 0),
-                float(
-                    time_s
-                    / max(1.0, self._cfg.episode_duration_s or self._require_workload().duration_s)
-                ),
-            ],
-            dtype=np.float32,
+        features.append(
+            time_s / max(1.0, self._cfg.episode_duration_s or self._require_workload().duration_s)
         )
+        return np.array(features, dtype=np.float32)
 
     def _collect_latency_samples(self, roots) -> dict[str, list]:
         attempt_latencies = []

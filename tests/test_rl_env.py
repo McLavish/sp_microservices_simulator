@@ -29,6 +29,7 @@ class TestMicroservicesEnv(unittest.TestCase):
         obs, info = env.reset(seed=123)
         self.assertTrue(env.observation_space.contains(obs))
         self.assertIn("action", info)
+        self.assertEqual(obs[0], 0.0)  # has_data flag: nothing completed yet
 
         action = np.array([1, 0, 1])
         obs, reward, terminated, truncated, info = env.step(action)
