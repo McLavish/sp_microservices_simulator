@@ -135,8 +135,7 @@ class CountBasedCircuitBreakerPolicy(RetryPolicy):
                 if failures >= self.failure_threshold_ratio[0]:
                     self._state = CBState.OPEN
                     self._open_window.clear()
-                    if now is not None:
-                        self._opened_at = now
+                    self._opened_at = now
         elif self._state == CBState.OPEN:
             return
         elif self._state == CBState.HALF_OPEN:
@@ -211,6 +210,10 @@ class TimeBasedCircuitBreakerPolicy(RetryPolicy):
             if total >= self.min_requests and rate < (1 - self.success_threshold_rate):
                 self._state = CBState.CLOSED
                 self._opened_at = None
+                # Fresh metrics after recovery (resilience4j resets the sliding
+                # window on transition to CLOSED); otherwise half-open probe
+                # results would seed the closed-state failure rate.
+                self._window.clear()
             elif total >= self.min_requests:
                 self._state = CBState.OPEN
                 self._opened_at = now

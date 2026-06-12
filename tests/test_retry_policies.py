@@ -241,6 +241,27 @@ class TestRetryPolicies(unittest.TestCase):
         policy.add_result(True, now=52)
         self.assertEqual(policy.get_state(), CBState.CLOSED)
 
+    def test_time_circuit_breaker_resets_window_on_close(self):
+        policy = TimeBasedCircuitBreakerPolicy(
+            failure_threshold_rate=0.5,
+            success_threshold_rate=0.5,
+            min_requests=2,
+            window_duration=10_000,
+            underlying_strategy=NoRetryPolicy(),
+            half_open_delay=50,
+        )
+        policy.add_result(False, now=0)
+        policy.add_result(False, now=1)
+        self.assertTrue(policy.allow_request(now=51))
+        policy.add_result(True, now=51)
+        policy.add_result(True, now=52)
+        self.assertEqual(policy.get_state(), CBState.CLOSED)
+        # The half-open probes must not seed the closed window: two fresh
+        # failures alone (100% rate over min_requests) re-open the circuit.
+        policy.add_result(False, now=53)
+        policy.add_result(False, now=54)
+        self.assertEqual(policy.get_state(), CBState.OPEN)
+
     # --- rate limiters / budget ----------------------------------------------
 
     def test_leaky_rate_limiter_spacing(self):
