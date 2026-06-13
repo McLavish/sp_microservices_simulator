@@ -14,8 +14,13 @@ def main(csv_file, output_file, fault_events_file=None):
     # Per-window completed requests
     completed = (df["success_root"] + df["failure_root"]).replace(0, np.nan)
 
-    # Breakdown by reason (deadline, server, queue_full) as % of completed
-    reason_cols = ["failure_deadline", "failure_server", "failure_queue_full"]
+    # Breakdown by reason as % of completed
+    reason_cols = [
+        "failure_deadline",
+        "failure_server",
+        "failure_queue_full",
+        "failure_circuit_open",
+    ]
     reasons_pct = df[reason_cols].div(completed, axis=0) * 100.0
     reasons_pct = reasons_pct.fillna(0.0)
 
@@ -31,9 +36,9 @@ def main(csv_file, output_file, fault_events_file=None):
     ax_top.stackplot(
         t,
         *[reasons_pct[c].to_numpy() for c in reason_cols],
-        labels=["deadline", "server", "queue_full"],
+        labels=["deadline", "server", "queue_full", "circuit_open"],
     )
-    ax_top.legend(loc="upper left", ncol=3, frameon=True)
+    ax_top.legend(loc="upper left", ncol=4, frameon=True)
     ax_top.set_ylabel("Failure rate (%)")
     ax_top.set_xlim(left=0)
     ax_top.set_ylim(0, 100)

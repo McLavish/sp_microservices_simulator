@@ -7,7 +7,16 @@ try:
 except Exception:
     gymnasium = None  # ty: ignore[invalid-assignment]
 
-from rl.env import ActionSpec, EnvConfig, MicroservicesEnv, build_single_service_env
+from core import ms_to_ns, s_to_ns
+from rl.env import (
+    ActionSpec,
+    EnvConfig,
+    MicroservicesEnv,
+    build_chain_env,
+    build_randomized_faulty_single_service_env,
+    build_single_service_env,
+)
+from rl.spec import ActionValues
 
 
 @unittest.skipIf(gymnasium is None, "gymnasium not installed")
@@ -29,6 +38,7 @@ class TestMicroservicesEnv(unittest.TestCase):
         obs, info = env.reset(seed=123)
         self.assertTrue(env.observation_space.contains(obs))
         self.assertIn("action", info)
+        self.assertEqual(obs[0], 0.0)  # has_data flag: nothing completed yet
 
         action = np.array([1, 0, 1])
         obs, reward, terminated, truncated, info = env.step(action)
@@ -44,6 +54,219 @@ class TestMicroservicesEnv(unittest.TestCase):
 
         _, _, terminated, _, _ = env.step(action)
         self.assertTrue(terminated)
+
+    def _make_env(self, build, episode_duration_s=2.0):
+        action_spec = ActionSpec(
+            attempt_timeout_ms=[10, 50],
+            max_attempts=[1, 2],
+            backoff_ms=[0, 50],
+        )
+        cfg = EnvConfig(
+            build=build,
+            action_spec=action_spec,
+            step_duration_s=1.0,
+            episode_duration_s=episode_duration_s,
+        )
+        return MicroservicesEnv(cfg)
+
+    def test_unseeded_resets_use_distinct_build_seeds(self):
+        # Regression: SB3 vector envs only seed the first reset; unseeded resets
+        # must not collapse to the builders' fixed fallback seeds.
+        build_seeds = []
+
+        def build(seed):
+            build_seeds.append(seed)
+            return build_single_service_env(seed)
+
+        env = self._make_env(build)
+        env.reset(seed=123)
+        self.assertEqual(build_seeds[-1], 123)
+
+        env.reset()
+        env.reset()
+        first, second = build_seeds[-2], build_seeds[-1]
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(first, second)
+
+    def test_apply_knobs_reaches_policy_and_controller(self):
+        from core import ms_to_ns
+        from timeout_controllers import StaticTimeoutController
+
+        action_spec = ActionSpec(
+            attempt_timeout_ms=[10, 50],
+            max_attempts=[1, 2],
+            backoff_ms=[0, 50],
+            global_timeout_ms=[100, 200],
+        )
+        cfg = EnvConfig(
+            build=build_single_service_env,
+            action_spec=action_spec,
+            step_duration_s=1.0,
+            episode_duration_s=2.0,
+        )
+        env = MicroservicesEnv(cfg)
+        env.reset(seed=3)
+        _, _, _, _, info = env.step(np.array([1, 1, 0, 1]))
+
+        self.assertEqual(info["action"]["attempt_timeout_ms"], 50)
+        self.assertEqual(info["action"]["global_timeout_ms"], 200)
+        client = env._client
+        assert client is not None
+        controller = client.cfg.timeout_controller
+        assert isinstance(controller, StaticTimeoutController)
+        self.assertEqual(controller.attempt_timeout, ms_to_ns(50))
+        self.assertEqual(controller.global_timeout, ms_to_ns(200))
+
+    def test_randomized_faults_deterministic_per_seed(self):
+        def fault_params(components):
+            cfg = components.client.service.cfg
+            inj = cfg.latency_injections[0]
+            pf = cfg.partial_failures[0]
+            spike = components.workload.load_spikes[0]
+            return (
+                inj.duration.begin,
+                inj.duration.end,
+                inj.add_latency,
+                pf.duration.begin,
+                pf.p_fail,
+                spike.duration.begin,
+                spike.rps_multiplier,
+            )
+
+        a = fault_params(build_randomized_faulty_single_service_env(5, duration_s=30))
+        b = fault_params(build_randomized_faulty_single_service_env(5, duration_s=30))
+        c = fault_params(build_randomized_faulty_single_service_env(6, duration_s=30))
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, c)
+
+    def test_randomized_fault_windows_stay_inside_episode(self):
+        for seed in range(20):
+            components = build_randomized_faulty_single_service_env(seed, duration_s=30)
+            cfg = components.client.service.cfg
+            for interval in (
+                cfg.latency_injections[0].duration,
+                cfg.partial_failures[0].duration,
+                components.workload.load_spikes[0].duration,
+            ):
+                self.assertGreaterEqual(interval.begin, 0)
+                self.assertLess(interval.begin, interval.end)
+                self.assertLessEqual(interval.end, s_to_ns(30))
+
+    def test_chain_env_knobs_reach_inner_edge(self):
+        from chain import ServiceNodeRuntime
+        from retry_policies import FixedBackoffRetryPolicy
+        from timeout_controllers import StaticTimeoutController
+
+        components = build_chain_env(3, duration_s=10)
+        components.apply_knobs(
+            ActionValues(
+                attempt_timeout_ms=80, max_attempts=3, backoff_ms=50, global_timeout_ms=None
+            )
+        )
+
+        a_node = components.client.service
+        assert isinstance(a_node, ServiceNodeRuntime)
+        b_node = a_node.downstreams[0].target
+        edge_client = b_node.downstreams[0].client
+        edge_retry = edge_client.cfg.retry
+        edge_timeout = edge_client.cfg.timeout_controller
+        assert isinstance(edge_retry, FixedBackoffRetryPolicy)
+        assert isinstance(edge_timeout, StaticTimeoutController)
+        self.assertEqual(edge_retry.max_attempts, 3)
+        self.assertEqual(edge_retry.delay, ms_to_ns(50))
+        self.assertEqual(edge_timeout.attempt_timeout, ms_to_ns(80))
+        # The top-level client (reward source) keeps its own fixed knobs.
+        top_timeout = components.client.cfg.timeout_controller
+        assert isinstance(top_timeout, StaticTimeoutController)
+        self.assertEqual(top_timeout.attempt_timeout, ms_to_ns(300))
+
+    def test_cost_zero_without_cost_client(self):
+        env = self._make_env(build_single_service_env, episode_duration_s=2.0)
+        env.reset(seed=5)
+        _, _, _, _, info = env.step(np.array([1, 0, 0]))
+        self.assertEqual(info["summary"]["cost"], 0.0)
+
+    def test_chain_env_cost_measures_edge_amplification(self):
+        env = self._make_env(build_chain_env, episode_duration_s=5.0)
+        env.reset(seed=11)
+        # Aggressive knobs: 10 ms edge timeout vs C's 20 ms median forces edge
+        # timeouts, so the max-attempts setting produces real retries.
+        costs = []
+        terminated = False
+        while not terminated:
+            _, _, terminated, _, info = env.step(np.array([0, 1, 0]))
+            costs.append(info["summary"]["cost"])
+        self.assertGreater(max(costs), 0.0)
+
+    def test_reward_penalizes_cost(self):
+        env = self._make_env(build_single_service_env)
+        summary = env._summarize_roots([])
+        summary["success_rate"] = 1.0
+        baseline = env._reward_from_summary(summary)
+        env._cfg.reward_weights.cost = 2.0
+        summary["cost"] = 0.5
+        self.assertAlmostEqual(env._reward_from_summary(summary), baseline - 1.0)
+
+    def test_chain_budget_knobs_route_through_wrapper(self):
+        from retry_policies import FixedBackoffRetryPolicy, RetryBudgetPolicy
+
+        components = build_chain_env(3, duration_s=10, retry_budget_ratio=0.1)
+        components.apply_knobs(
+            ActionValues(
+                attempt_timeout_ms=80, max_attempts=3, backoff_ms=50, global_timeout_ms=None
+            )
+        )
+        edge_client = components.cost_client
+        assert edge_client is not None
+        wrapper = edge_client.cfg.retry
+        assert isinstance(wrapper, RetryBudgetPolicy)
+        inner = wrapper.underlying_strategy
+        assert isinstance(inner, FixedBackoffRetryPolicy)
+        self.assertEqual(inner.max_attempts, 3)
+        self.assertEqual(inner.delay, ms_to_ns(50))
+
+    def test_retry_budget_wrapper_throttles_edge_retries(self):
+        def mean_cost(retry_budget_ratio):
+            env = self._make_env(
+                lambda seed: build_chain_env(
+                    seed, duration_s=5, retry_budget_ratio=retry_budget_ratio
+                ),
+                episode_duration_s=5.0,
+            )
+            env.reset(seed=11)
+            costs = []
+            terminated = False
+            while not terminated:
+                _, _, terminated, _, info = env.step(np.array([0, 1, 0]))
+                costs.append(info["summary"]["cost"])
+            return float(np.mean(costs))
+
+        unbudgeted = mean_cost(None)
+        budgeted = mean_cost(0.05)
+        self.assertGreater(unbudgeted, 0.0)
+        self.assertLess(budgeted, unbudgeted)
+
+    def test_chain_env_episode_runs(self):
+        env = self._make_env(build_chain_env, episode_duration_s=3.0)
+        obs, _ = env.reset(seed=11)
+        terminated = False
+        steps = 0
+        while not terminated and steps < 10:
+            obs, reward, terminated, _, info = env.step(np.array([1, 1, 1]))
+            steps += 1
+        self.assertTrue(terminated)
+        self.assertTrue(env.observation_space.contains(obs))
+        self.assertGreater(info["summary"]["completed"], 0)
+
+    def test_drained_roots_reported_separately_from_final_summary(self):
+        env = self._make_env(build_single_service_env, episode_duration_s=1.0)
+        env.reset(seed=7)
+        _, _, terminated, _, info = env.step(np.array([0, 0, 0]))
+        self.assertTrue(terminated)
+        # Drained roots are reported separately, not folded into the step summary.
+        self.assertIn("drained_summary", info)
+        self.assertIsInstance(info["drained_summary"], dict)
 
 
 if __name__ == "__main__":

@@ -19,8 +19,12 @@ class RewardWeights:
     deadline_drop: float = 1.0
     queue_drop: float = 1.0
     server_drop: float = 1.0
+    circuit_open_drop: float = 1.0
     p95_latency_ms: float = 0.001
     retries: float = 0.1
+    # Weight on the constraint cost (cost-client retry amplification). Acts as
+    # the Lagrange multiplier in constrained training; 0 disables the term.
+    cost: float = 0.0
 
 
 @dataclass
@@ -29,6 +33,16 @@ class ActionSpec:
     max_attempts: list[int]
     backoff_ms: list[int]
     global_timeout_ms: list[int | None] | None = None
+
+
+@dataclass(frozen=True)
+class ActionValues:
+    """Decoded knob values for one action (indices resolved against ActionSpec)."""
+
+    attempt_timeout_ms: int
+    max_attempts: int
+    backoff_ms: int
+    global_timeout_ms: int | None
 
 
 def coerce_action(action: Any) -> tuple[int, ...]:

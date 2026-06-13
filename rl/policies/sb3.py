@@ -6,7 +6,7 @@ import numpy as np
 from rl.policies.action_space import coerce_action
 
 if TYPE_CHECKING:
-    from stable_baselines3.common.base_class import BaseAlgorithm  # ty: ignore[unresolved-import]
+    from stable_baselines3.common.base_class import BaseAlgorithm
 else:
     try:
         from stable_baselines3.common.base_class import BaseAlgorithm

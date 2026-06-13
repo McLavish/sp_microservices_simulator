@@ -43,11 +43,18 @@ class NormalInverseGamma:
 
 @dataclass
 class BayesianPolicy:
+    """Thompson-sampling policy with a Normal-Inverse-Gamma prior on log-latency.
+
+    Known limitation: the conjugate update needs exact observations, so
+    timeout-censored attempts are dropped from the posterior. Under frequent
+    timeouts the posterior is biased optimistic (compare `LogNormalModel.
+    fit_censored`, which the model-based policy uses instead).
+    """
+
     grid: ActionGrid
     reward_weights: RewardWeights = field(default_factory=RewardWeights)
     sample_size: int = 500
     buffer_size: int = 2000
-    use_censored: bool = False
     prior: NormalInverseGamma = field(default_factory=NormalInverseGamma)
     name: str = "bayesian"
 
@@ -61,7 +68,7 @@ class BayesianPolicy:
             self._rng = np.random.default_rng(seed)
 
     def act(self, obs: np.ndarray, info: dict) -> tuple[int, ...]:
-        self._buffer.ingest_info(info, self.use_censored)
+        self._buffer.ingest_info(info)
         data = self._buffer.data()
         if data.size == 0:
             return self.grid.indices[0]
@@ -73,13 +80,12 @@ class BayesianPolicy:
         best_idx = self.grid.indices[0]
         best_value = -float("inf")
         for action_idx, action_vals in zip(self.grid.indices, self.grid.values, strict=False):
-            reward, _ = _simulate_action(
+            reward = _simulate_action(
                 model,
                 action_vals,
                 self.reward_weights,
                 self._rng,
                 self.sample_size,
-                self.use_censored,
                 0.0,
                 "deterministic",
             )

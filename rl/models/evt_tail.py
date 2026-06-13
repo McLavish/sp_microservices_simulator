@@ -9,6 +9,13 @@ from rl.models.utils import ensure_positive
 
 @dataclass
 class EVTTailModel:
+    """Lognormal body with a Pareto tail above a quantile threshold.
+
+    The tail index is the Hill estimator (MLE for a pure Pareto tail), not a
+    generalized-Pareto peaks-over-threshold fit — despite the EVT name, this
+    assumes the tail is exactly power-law above ``u``.
+    """
+
     threshold_quantile: float = 0.95
     min_alpha: float = 0.1
     body: LogNormalModel = field(default_factory=LogNormalModel)

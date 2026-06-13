@@ -1,4 +1,5 @@
 import argparse
+import csv
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -6,13 +7,13 @@ import numpy as np
 
 from core import Summary
 from rl.cli import parse_int_list, parse_optional_int_list
+from rl.constrained import ConstrainedTrainConfig, train_constrained_ppo
 from rl.env import (
+    SCENARIO_BUILDERS,
     ActionSpec,
     EnvConfig,
     MicroservicesEnv,
     RewardWeights,
-    build_faulty_single_service_env,
-    build_single_service_env,
 )
 from rl.policies.action_space import ActionGrid
 from rl.policies.aimd import AIMDPolicy
@@ -20,17 +21,9 @@ from rl.policies.bayesian import BayesianPolicy
 from rl.policies.fixed import FixedPolicy, FixedValuePolicy
 from rl.policies.model_based import ModelBasedPolicy
 from rl.policies.sb3 import SB3Policy
+from rl.sb3_support import import_sb3
 
-try:
-    from stable_baselines3 import PPO  # ty: ignore[unresolved-import]
-    from stable_baselines3.common.env_util import make_vec_env  # ty: ignore[unresolved-import]
-    from stable_baselines3.common.evaluation import (  # ty: ignore[unresolved-import]
-        evaluate_policy as sb3_evaluate,
-    )
-except Exception:  # pragma: no cover
-    PPO = None
-    make_vec_env = None
-    sb3_evaluate = None
+PPO, make_vec_env, sb3_evaluate, _SubprocVecEnv, _ = import_sb3()
 
 
 @dataclass
@@ -54,7 +47,6 @@ class ExperimentConfig:
     ppo_gamma: float
     model_samples: int
     model_buffer: int
-    model_horizon: int
     model_queue_delay_mode: str
     model_queue_workers: int
     model_queue_max_utilization: float
@@ -64,7 +56,7 @@ class ExperimentConfig:
     aimd_success_target: float
     aimd_deadline_target: float
     aimd_timeout_increase_step: int
-    aimd_timeout_decrease_step: int
+    aimd_timeout_decrease_factor: float
     aimd_max_attempts_step: int
     aimd_backoff_step: int
     aimd_adjust_max_attempts: bool
@@ -76,14 +68,10 @@ class ExperimentConfig:
 
 def _build_env(cfg: ExperimentConfig) -> MicroservicesEnv:
     duration_s = int(round(cfg.episode_duration_s)) if cfg.episode_duration_s else None
-    if cfg.fault_scenario == "basic":
+    builder = SCENARIO_BUILDERS[cfg.fault_scenario]
 
-        def build_fn(seed):
-            return build_faulty_single_service_env(seed, duration_s=duration_s)
-    else:
-
-        def build_fn(seed):
-            return build_single_service_env(seed, duration_s=duration_s)
+    def build_fn(seed):
+        return builder(seed, duration_s)
 
     action_spec = ActionSpec(
         attempt_timeout_ms=cfg.attempt_timeouts_ms,
@@ -102,31 +90,70 @@ def _build_env(cfg: ExperimentConfig) -> MicroservicesEnv:
     return MicroservicesEnv(env_cfg)
 
 
-def _episode(env: MicroservicesEnv, policy, seed: int) -> tuple[float, Summary | None]:
+def _episode(
+    env: MicroservicesEnv,
+    policy,
+    seed: int,
+    trace_rows: list[dict] | None = None,
+) -> tuple[float, Summary | None, float]:
     obs, info = env.reset(seed=seed)
     policy.reset(seed=seed)
     total_reward = 0.0
     terminated = False
     truncated = False
+    step_idx = 0
+    window_costs: list[float] = []
     while not (terminated or truncated):
         action = policy.act(obs, info)
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += float(reward)
+        summary = info["summary"]
+        window_costs.append(summary["cost"])
+        if trace_rows is not None:
+            applied = info["action"]
+            trace_rows.append(
+                {
+                    "policy": policy.name,
+                    "seed": seed,
+                    "step": step_idx,
+                    "attempt_timeout_ms": applied["attempt_timeout_ms"],
+                    "max_attempts": applied["max_attempts"],
+                    "backoff_ms": applied["backoff_ms"],
+                    "global_timeout_ms": applied["global_timeout_ms"],
+                    "reward": float(reward),
+                    "completed": summary["completed"],
+                    "success_rate": summary["success_rate"],
+                    "deadline_drop_rate": summary["deadline_drop_rate"],
+                    "queue_drop_rate": summary["queue_drop_rate"],
+                    "server_drop_rate": summary["server_drop_rate"],
+                    "p95_latency_ms": summary["p95_latency_ms"],
+                    "retries_per_root": summary["retries_per_root"],
+                    "cost": summary["cost"],
+                }
+            )
+        step_idx += 1
         policy.update(obs, reward, terminated or truncated, info)
 
-    summary = env.metrics_summary()
-    return total_reward, summary
+    cost_mean = float(np.mean(window_costs)) if window_costs else 0.0
+    return total_reward, env.metrics_summary(), cost_mean
 
 
-def _evaluate(env: MicroservicesEnv, policy, seeds: Sequence[int]) -> dict:
+def _evaluate(
+    env: MicroservicesEnv,
+    policy,
+    seeds: Sequence[int],
+    trace_rows: list[dict] | None = None,
+) -> dict:
     rewards = []
     successes = []
     p95s = []
     retries = []
+    costs = []
 
     for seed in seeds:
-        total_reward, summary = _episode(env, policy, seed)
+        total_reward, summary, cost_mean = _episode(env, policy, seed, trace_rows=trace_rows)
         rewards.append(total_reward)
+        costs.append(cost_mean)
         if summary:
             successes.append(summary.succeeded / summary.total if summary.total else 0.0)
             p95s.append(summary.p95)
@@ -141,10 +168,11 @@ def _evaluate(env: MicroservicesEnv, policy, seeds: Sequence[int]) -> dict:
         "success_rate": avg(successes),
         "p95_ms": avg(p95s),
         "retries_per_root": avg(retries),
+        "cost_mean": avg(costs),
     }
 
 
-def _train_ppo(cfg: ExperimentConfig) -> SB3Policy:
+def _train_ppo(cfg: ExperimentConfig, learning_curve_csv: str | None = None) -> SB3Policy:
     if PPO is None or make_vec_env is None or sb3_evaluate is None:
         raise ImportError("stable-baselines3 is required for PPO baseline")
 
@@ -162,14 +190,23 @@ def _train_ppo(cfg: ExperimentConfig) -> SB3Policy:
         seed=cfg.train_seeds[0],
     )
 
+    # Seed the early-stopping eval env once: its unseeded resets then draw a
+    # reproducible scenario sequence from the gym RNG instead of fresh entropy.
+    eval_env = _build_env(cfg)
+    eval_env.reset(seed=cfg.train_seeds[0] + 10_000)
+
     best_mean = -float("inf")
     no_improve = 0
     trained = 0
+    curve: list[tuple[int, float]] = []
     while trained < cfg.ppo_timesteps:
         step = min(cfg.ppo_eval_interval, cfg.ppo_timesteps - trained)
         model.learn(total_timesteps=step)
         trained += step
-        mean_reward, _ = sb3_evaluate(model, _build_env(cfg), n_eval_episodes=cfg.ppo_eval_episodes)
+        mean_reward = float(
+            np.mean(sb3_evaluate(model, eval_env, n_eval_episodes=cfg.ppo_eval_episodes)[0])
+        )
+        curve.append((trained, mean_reward))
         if mean_reward > best_mean + cfg.ppo_min_delta:
             best_mean = mean_reward
             no_improve = 0
@@ -177,6 +214,13 @@ def _train_ppo(cfg: ExperimentConfig) -> SB3Policy:
             no_improve += 1
         if no_improve >= cfg.ppo_patience:
             break
+
+    if learning_curve_csv and curve:
+        with open(learning_curve_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["timesteps", "eval_reward"])
+            writer.writerows(curve)
+        print(f"Wrote PPO learning curve to {learning_curve_csv}")
 
     return SB3Policy(model=model, deterministic=True, name="ppo")
 
@@ -204,11 +248,15 @@ def main() -> None:
     parser.add_argument("--step-duration-s", type=float, default=1.0)
     parser.add_argument("--episode-duration-s", type=float, default=10.0)
     parser.add_argument("--train-seeds", type=parse_int_list, default="123,456,789")
-    parser.add_argument("--eval-seeds", type=parse_int_list, default="321,654,987")
+    parser.add_argument(
+        "--eval-seeds",
+        type=parse_int_list,
+        default="321,654,987,1320,1653,1986,2319,2652,2985,3318",
+    )
     parser.add_argument(
         "--policies",
         type=str,
-        default="fixed,aimd,model_based,model_based_rl,bayesian,ppo,oracle_fixed",
+        default="fixed,aimd,model_based,model_based_queue,bayesian,ppo,oracle_fixed",
     )
     parser.add_argument("--ppo-timesteps", type=int, default=5000)
     parser.add_argument("--ppo-eval-interval", type=int, default=1000)
@@ -220,7 +268,6 @@ def main() -> None:
     parser.add_argument("--ppo-gamma", type=float, default=0.95)
     parser.add_argument("--model-samples", type=int, default=500)
     parser.add_argument("--model-buffer", type=int, default=2000)
-    parser.add_argument("--model-horizon", type=int, default=3)
     parser.add_argument(
         "--model-queue-delay-mode",
         choices=["deterministic", "exponential"],
@@ -234,20 +281,59 @@ def main() -> None:
     parser.add_argument("--aimd-success-target", type=float, default=0.98)
     parser.add_argument("--aimd-deadline-target", type=float, default=0.01)
     parser.add_argument("--aimd-timeout-increase-step", type=int, default=1)
-    parser.add_argument("--aimd-timeout-decrease-step", type=int, default=1)
+    parser.add_argument("--aimd-timeout-decrease-factor", type=float, default=0.5)
     parser.add_argument("--aimd-max-attempts-step", type=int, default=1)
     parser.add_argument("--aimd-backoff-step", type=int, default=1)
     parser.add_argument("--aimd-adjust-max-attempts", action="store_true")
     parser.add_argument("--aimd-adjust-backoff", action="store_true")
     parser.add_argument("--aimd-ema-alpha", type=float, default=0.2)
     parser.add_argument("--aimd-min-completed", type=int, default=1)
-    parser.add_argument("--fault-scenario", choices=["none", "basic"], default="none")
+    parser.add_argument("--fault-scenario", choices=sorted(SCENARIO_BUILDERS), default="none")
     parser.add_argument("--reward-success", type=float, default=1.0)
     parser.add_argument("--reward-deadline", type=float, default=1.0)
     parser.add_argument("--reward-queue", type=float, default=1.0)
     parser.add_argument("--reward-server", type=float, default=1.0)
     parser.add_argument("--reward-p95", type=float, default=0.001)
     parser.add_argument("--reward-retries", type=float, default=0.1)
+    parser.add_argument(
+        "--output-csv",
+        type=str,
+        default="rl_compare_policies.csv",
+        help="Per-policy evaluation results (repo convention: CSV at repo root).",
+    )
+    parser.add_argument(
+        "--traces-csv",
+        type=str,
+        default="rl_policy_traces.csv",
+        help="Per-step evaluation traces (action/reward/rates per policy and seed).",
+    )
+    parser.add_argument(
+        "--ppo-learning-curve-csv",
+        type=str,
+        default="rl_ppo_learning_curve.csv",
+        help="PPO early-stopping eval reward per timestep budget.",
+    )
+    parser.add_argument(
+        "--ppo-save-path",
+        type=str,
+        default=None,
+        help="Save the trained PPO model (e.g. to reuse across fault scenarios).",
+    )
+    parser.add_argument(
+        "--ppo-load-path",
+        type=str,
+        default=None,
+        help="Load a trained PPO model instead of training (cross-scenario eval).",
+    )
+    parser.add_argument("--retry-budget", type=float, default=0.1)
+    parser.add_argument("--lambda-lr", type=float, default=0.5)
+    parser.add_argument("--lambda-init", type=float, default=0.0)
+    parser.add_argument(
+        "--constrained-curve-csv",
+        type=str,
+        default="rl_constrained_curve.csv",
+        help="Constrained-PPO dual-ascent trajectory (timesteps, eval_J, eval_cost, lambda).",
+    )
     args = parser.parse_args()
 
     reward_weights = RewardWeights(
@@ -279,7 +365,6 @@ def main() -> None:
         ppo_gamma=args.ppo_gamma,
         model_samples=args.model_samples,
         model_buffer=args.model_buffer,
-        model_horizon=args.model_horizon,
         model_queue_delay_mode=args.model_queue_delay_mode,
         model_queue_workers=args.model_queue_workers,
         model_queue_max_utilization=args.model_queue_max_utilization,
@@ -289,7 +374,7 @@ def main() -> None:
         aimd_success_target=args.aimd_success_target,
         aimd_deadline_target=args.aimd_deadline_target,
         aimd_timeout_increase_step=args.aimd_timeout_increase_step,
-        aimd_timeout_decrease_step=args.aimd_timeout_decrease_step,
+        aimd_timeout_decrease_factor=args.aimd_timeout_decrease_factor,
         aimd_max_attempts_step=args.aimd_max_attempts_step,
         aimd_backoff_step=args.aimd_backoff_step,
         aimd_adjust_max_attempts=args.aimd_adjust_max_attempts,
@@ -327,7 +412,7 @@ def main() -> None:
             initial_max_attempts=cfg.max_attempts[0],
             initial_backoff_ms=cfg.backoff_ms[0],
             timeout_increase_step=cfg.aimd_timeout_increase_step,
-            timeout_decrease_step=cfg.aimd_timeout_decrease_step,
+            timeout_decrease_factor=cfg.aimd_timeout_decrease_factor,
             max_attempts_step=cfg.aimd_max_attempts_step,
             backoff_step=cfg.aimd_backoff_step,
             adjust_max_attempts=cfg.aimd_adjust_max_attempts,
@@ -345,21 +430,9 @@ def main() -> None:
             reward_weights=cfg.reward_weights,
             sample_size=cfg.model_samples,
             buffer_size=cfg.model_buffer,
-            horizon=1,
             name="model_based",
         )
         policies.append(model_based)
-
-    if "model_based_rl" in policy_names:
-        model_based_rl = ModelBasedPolicy(
-            grid=grid,
-            reward_weights=cfg.reward_weights,
-            sample_size=cfg.model_samples,
-            buffer_size=cfg.model_buffer,
-            horizon=max(2, cfg.model_horizon),
-            name="model_based_rl",
-        )
-        policies.append(model_based_rl)
 
     if "model_based_queue" in policy_names:
         model_based_queue = ModelBasedPolicy(
@@ -367,7 +440,6 @@ def main() -> None:
             reward_weights=cfg.reward_weights,
             sample_size=cfg.model_samples,
             buffer_size=cfg.model_buffer,
-            horizon=1,
             include_queue_delay=True,
             queue_delay_mode=cfg.model_queue_delay_mode,
             queue_workers=cfg.model_queue_workers,
@@ -378,24 +450,6 @@ def main() -> None:
             name="model_based_queue",
         )
         policies.append(model_based_queue)
-
-    if "model_based_rl_queue" in policy_names:
-        model_based_rl_queue = ModelBasedPolicy(
-            grid=grid,
-            reward_weights=cfg.reward_weights,
-            sample_size=cfg.model_samples,
-            buffer_size=cfg.model_buffer,
-            horizon=max(2, cfg.model_horizon),
-            include_queue_delay=True,
-            queue_delay_mode=cfg.model_queue_delay_mode,
-            queue_workers=cfg.model_queue_workers,
-            queue_max_utilization=cfg.model_queue_max_utilization,
-            queue_moment_samples=cfg.model_queue_moment_samples,
-            use_retries_in_lambda=cfg.model_queue_use_retries,
-            step_duration_s=cfg.step_duration_s,
-            name="model_based_rl_queue",
-        )
-        policies.append(model_based_rl_queue)
 
     if "bayesian" in policy_names:
         bayes = BayesianPolicy(
@@ -408,22 +462,75 @@ def main() -> None:
         policies.append(bayes)
 
     if "ppo" in policy_names:
-        policies.append(_train_ppo(cfg))
+        if args.ppo_load_path:
+            if PPO is None:
+                raise ImportError("stable-baselines3 is required for PPO baseline")
+            model = PPO.load(args.ppo_load_path)
+            policies.append(SB3Policy(model=model, deterministic=True, name="ppo"))
+        else:
+            ppo_policy = _train_ppo(cfg, learning_curve_csv=args.ppo_learning_curve_csv)
+            if args.ppo_save_path:
+                ppo_policy.model.save(args.ppo_save_path)
+                print(f"Saved PPO model to {args.ppo_save_path}")
+            policies.append(ppo_policy)
+
+    if "constrained_ppo" in policy_names:
+        duration_s = int(round(cfg.episode_duration_s)) if cfg.episode_duration_s else None
+        builder = SCENARIO_BUILDERS[cfg.fault_scenario]
+        constrained_cfg = ConstrainedTrainConfig(
+            build=lambda seed: builder(seed, duration_s),
+            action_spec=action_spec,
+            budget=args.retry_budget,
+            lambda_init=args.lambda_init,
+            lambda_lr=args.lambda_lr,
+            step_duration_s=cfg.step_duration_s,
+            episode_duration_s=cfg.episode_duration_s,
+            timesteps=cfg.ppo_timesteps,
+            chunk_timesteps=cfg.ppo_eval_interval,
+            eval_episodes=cfg.ppo_eval_episodes,
+            eval_seed=cfg.train_seeds[0] + 10_000,
+            seed=cfg.train_seeds[0],
+            n_steps=cfg.ppo_n_steps,
+            batch_size=cfg.ppo_batch_size,
+            gamma=cfg.ppo_gamma,
+            base_weights=cfg.reward_weights,
+            learning_curve_csv=args.constrained_curve_csv,
+        )
+        policies.append(train_constrained_ppo(constrained_cfg))
 
     if "oracle_fixed" in policy_names:
         best_idx = _best_fixed_action(cfg, grid)
         policies.append(FixedPolicy(action=best_idx, name="oracle_fixed"))
 
     print("=== Evaluation ===")
+    results = []
+    trace_rows: list[dict] = []
     for policy in policies:
-        metrics = _evaluate(env, policy, cfg.eval_seeds)
+        metrics = _evaluate(env, policy, cfg.eval_seeds, trace_rows=trace_rows)
+        results.append({"policy": policy.name, **metrics})
         print(
-            f"{policy.name:14s} reward={metrics['reward_mean']:.4f} "
+            f"{policy.name:16s} reward={metrics['reward_mean']:.4f} "
             f"+/-{metrics['reward_std']:.4f} "
             f"success={metrics['success_rate']:.3f} "
             f"p95={metrics['p95_ms']:.2f} "
-            f"retries={metrics['retries_per_root']:.3f}"
+            f"retries={metrics['retries_per_root']:.3f} "
+            f"cost={metrics['cost_mean']:.3f}"
         )
+
+    if args.output_csv and results:
+        fieldnames = list(results[0].keys())
+        with open(args.output_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(results)
+        print(f"Wrote results to {args.output_csv}")
+
+    if args.traces_csv and trace_rows:
+        with open(args.traces_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(trace_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(trace_rows)
+        print(f"Wrote per-step traces to {args.traces_csv}")
 
 
 if __name__ == "__main__":

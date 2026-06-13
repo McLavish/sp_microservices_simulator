@@ -92,7 +92,13 @@ class ExponentialBackoffWithJitterRetryPolicy(RetryPolicy):
 class CBState(Enum):
     CLOSED = 0
     OPEN = 1
-    HALF_OPEN = 2  # Probing stage not implemented properly
+    # Trial stage after the open delay. NOTE: the transitions work and are tested
+    # (open -> half-open -> closed/open), but probe admission is *not* capped:
+    # allow_request admits every request while half-open instead of permitting a
+    # fixed number of trial calls and rejecting the rest until they complete, the
+    # way resilience4j / failsafe-go / gobreaker do. So half-open currently offers
+    # no load protection on the recovering service. See allow_request below.
+    HALF_OPEN = 2
 
 
 @dataclass
@@ -129,8 +135,7 @@ class CountBasedCircuitBreakerPolicy(RetryPolicy):
                 if failures >= self.failure_threshold_ratio[0]:
                     self._state = CBState.OPEN
                     self._open_window.clear()
-                    if now is not None:
-                        self._opened_at = now
+                    self._opened_at = now
         elif self._state == CBState.OPEN:
             return
         elif self._state == CBState.HALF_OPEN:
@@ -147,6 +152,7 @@ class CountBasedCircuitBreakerPolicy(RetryPolicy):
                     self._opened_at = now
 
     def allow_request(self, now: TimePoint) -> bool:
+        # NOTE: half-open admits *every* request (no probe cap) — see CBState.HALF_OPEN.
         if self._state != CBState.OPEN:
             return True
         if (
@@ -204,12 +210,17 @@ class TimeBasedCircuitBreakerPolicy(RetryPolicy):
             if total >= self.min_requests and rate < (1 - self.success_threshold_rate):
                 self._state = CBState.CLOSED
                 self._opened_at = None
+                # Fresh metrics after recovery (resilience4j resets the sliding
+                # window on transition to CLOSED); otherwise half-open probe
+                # results would seed the closed-state failure rate.
+                self._window.clear()
             elif total >= self.min_requests:
                 self._state = CBState.OPEN
                 self._opened_at = now
                 self._window.clear()
 
     def allow_request(self, now: TimePoint) -> bool:
+        # NOTE: half-open admits *every* request (no probe cap) — see CBState.HALF_OPEN.
         if self._state != CBState.OPEN:
             return True
         if (
@@ -296,7 +307,6 @@ class RetryBudgetPolicy(RetryPolicy):
         return DelayDecision(False, 0)
 
 
-# TODO: Refill logic is broken in this branch
 @dataclass
 class BurstyRateLimiterPolicy(RetryPolicy):
     max_requests: int  # maximum requests in the bucket

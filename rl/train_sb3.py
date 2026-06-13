@@ -6,17 +6,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from rl.cli import parse_int_list, parse_optional_int_list
-from rl.env import ActionSpec, EnvConfig, MicroservicesEnv, build_single_service_env
+from rl.env import SCENARIO_BUILDERS, ActionSpec, EnvConfig, MicroservicesEnv
+from rl.sb3_support import import_sb3
 
-try:
-    from stable_baselines3 import PPO  # ty: ignore[unresolved-import]
-    from stable_baselines3.common.env_util import make_vec_env  # ty: ignore[unresolved-import]
-except Exception as exc:  # pragma: no cover - depends on optional dependency
-    PPO = None
-    make_vec_env = None
-    _SB3_IMPORT_ERROR = exc
-else:
-    _SB3_IMPORT_ERROR = None
+PPO, make_vec_env, _, SubprocVecEnv, _SB3_IMPORT_ERROR = import_sb3()
 
 
 @dataclass
@@ -36,9 +29,17 @@ class TrainConfig:
     save_path: str | None
     load_path: str | None
     eval_episodes: int
+    fault_scenario: str = "none"
+    device: str = "auto"
 
 
 def _make_env(cfg: TrainConfig) -> MicroservicesEnv:
+    builder = SCENARIO_BUILDERS[cfg.fault_scenario]
+    duration_s = int(round(cfg.episode_duration_s)) if cfg.episode_duration_s else None
+
+    def build_fn(seed):
+        return builder(seed, duration_s)
+
     action_spec = ActionSpec(
         attempt_timeout_ms=cfg.attempt_timeouts_ms,
         max_attempts=cfg.max_attempts,
@@ -46,7 +47,7 @@ def _make_env(cfg: TrainConfig) -> MicroservicesEnv:
         global_timeout_ms=cfg.global_timeouts_ms,
     )
     env_cfg = EnvConfig(
-        build=build_single_service_env,
+        build=build_fn,
         action_spec=action_spec,
         step_duration_s=cfg.step_duration_s,
         episode_duration_s=cfg.episode_duration_s,
@@ -86,10 +87,17 @@ def train(cfg: TrainConfig) -> None:
     def env_factory():
         return _make_env(cfg)
 
-    vec_env = make_vec_env(env_factory, n_envs=cfg.n_envs, seed=cfg.seed)
+    vec_env = make_vec_env(
+        env_factory,
+        n_envs=cfg.n_envs,
+        seed=cfg.seed,
+        # Parallel rollout collection: the simulator dominates wall-clock, so
+        # worker processes are the only meaningful speedup for tiny MLPs.
+        vec_env_cls=SubprocVecEnv if cfg.n_envs > 1 else None,
+    )
 
     if cfg.load_path:
-        model = PPO.load(cfg.load_path, env=vec_env)
+        model = PPO.load(cfg.load_path, env=vec_env, device=cfg.device)
     else:
         model = PPO(
             "MlpPolicy",
@@ -99,6 +107,7 @@ def train(cfg: TrainConfig) -> None:
             batch_size=cfg.batch_size,
             gamma=cfg.gamma,
             seed=cfg.seed,
+            device=cfg.device,
         )
 
     if cfg.timesteps > 0:
@@ -134,6 +143,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-path", type=str, default=None)
     parser.add_argument("--load-path", type=str, default=None)
     parser.add_argument("--eval-episodes", type=int, default=1)
+    parser.add_argument("--fault-scenario", choices=sorted(SCENARIO_BUILDERS), default="none")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help='PPO device ("auto", "cpu", "cuda"); SB3 recommends cpu for small MLPs.',
+    )
     return parser
 
 
@@ -161,6 +177,8 @@ def main() -> None:
         save_path=args.save_path,
         load_path=args.load_path,
         eval_episodes=args.eval_episodes,
+        fault_scenario=args.fault_scenario,
+        device=args.device,
     )
     train(cfg)
 

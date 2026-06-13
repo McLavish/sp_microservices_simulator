@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import functools
+import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -7,6 +9,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from caller import ClientConfig, ClientRuntime
+from chain import DownstreamEdge, ServiceNodeRuntime
 from core import (
     DropReason,
     Summary,
@@ -19,8 +22,8 @@ from core import (
     s_to_ns,
 )
 from faults import LatencyInjection, LoadSpike, PartialFailure
-from retry_policies import FixedBackoffRetryPolicy
-from rl.spec import ActionSpec, RewardWeights, coerce_action
+from retry_policies import FixedBackoffRetryPolicy, RetryBudgetPolicy, RetryPolicy
+from rl.spec import ActionSpec, ActionValues, RewardWeights, coerce_action
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import StaticTimeoutController
@@ -51,6 +54,14 @@ class EnvComponents:
     sim: Simulator
     workload: Workload
     client: ClientRuntime
+    # Maps decoded knob values onto this scenario's policy/timeout objects.
+    # The builder owns the knowledge of which concrete types it constructed,
+    # so the env stays agnostic of retry-policy and controller classes.
+    apply_knobs: Callable[[ActionValues], None]
+    # Where the constraint cost (retry amplification) is measured. In the chain
+    # scenario this is the tunable B->C edge client, whose amplification is
+    # invisible in the top-level client's summary. None -> cost is 0.
+    cost_client: ClientRuntime | None = None
 
 
 @dataclass
@@ -87,19 +98,27 @@ class MicroservicesEnv(_GymEnvBase):
 
         self.action_space = spaces.MultiDiscrete(self._action_sizes)
 
-        self._obs_size = 12
+        # See _build_observation for the feature list; the optional global-timeout
+        # dimension adds one action-echo feature.
+        self._obs_size = 16 + (1 if config.action_spec.global_timeout_ms is not None else 0)
         self.observation_space = spaces.Box(
             low=0.0, high=np.inf, shape=(self._obs_size,), dtype=np.float32
         )
+        # Normalization constants so an MLP sees features of comparable magnitude.
+        self._timeout_norm_ms = float(max(config.action_spec.attempt_timeout_ms))
+        self._retries_norm = float(max(1, max(config.action_spec.max_attempts) - 1))
 
         self._sim: Simulator | None = None
         self._workload: Workload | None = None
         self._client: ClientRuntime | None = None
+        self._components: EnvComponents | None = None
         self._last_root_idx = 0
+        self._last_cost_root_idx = 0
         self._current_time_ns: TimePoint = 0
         self._end_time_ns: TimePoint = 0
         self._step_ns: TimeDuration = 0
         self._last_action_values: dict[str, int | None] = {}
+        self._last_action_indices: tuple[int, ...] = tuple(0 for _ in self._action_sizes)
 
     def _require_sim(self) -> Simulator:
         if self._sim is None:
@@ -116,9 +135,20 @@ class MicroservicesEnv(_GymEnvBase):
             raise RuntimeError("Workload not initialized; call reset() first.")
         return self._workload
 
+    def _require_components(self) -> EnvComponents:
+        if self._components is None:
+            raise RuntimeError("Components not initialized; call reset() first.")
+        return self._components
+
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
-        components = self._build(seed)
+        # Unseeded resets must still vary across episodes. The builders fall back
+        # to fixed seeds on None, and SB3 vector envs only seed the *first* reset
+        # (auto-resets are unseeded) — without this draw, training would collapse
+        # to one identical deterministic episode.
+        build_seed = seed if seed is not None else int(self.np_random.integers(2**31 - 1))
+        components = self._build(build_seed)
+        self._components = components
         self._sim = components.sim
         self._workload = components.workload
         self._client = components.client
@@ -133,6 +163,7 @@ class MicroservicesEnv(_GymEnvBase):
         self._end_time_ns = s_to_ns(episode_s)
 
         self._last_root_idx = 0
+        self._last_cost_root_idx = 0
         self._require_workload().drive(
             self._require_sim(), lambda s: self._require_client().start_request(s)
         )
@@ -162,23 +193,44 @@ class MicroservicesEnv(_GymEnvBase):
         self._require_sim().run(until=next_time)
         self._current_time_ns = next_time
 
-        if self._current_time_ns >= self._end_time_ns and self._cfg.drain_on_done:
-            self._require_sim().run()
-
         new_roots = self._require_client().roots[self._last_root_idx :]
         self._last_root_idx = len(self._require_client().roots)
 
         summary = self._summarize_roots(new_roots)
+        summary["cost"] = self._window_cost()
         obs = self._build_observation(summary)
         reward = self._reward_from_summary(summary)
         terminated = self._current_time_ns >= self._end_time_ns
         info: dict[str, object] = {"summary": summary, "action": self._last_action_values.copy()}
         if self._cfg.emit_latency_samples:
             info.update(self._collect_latency_samples(new_roots))
+
+        # Drain in-flight work after the reward is computed: drained roots complete
+        # past the episode horizon and must not be credited to the final action.
+        if terminated and self._cfg.drain_on_done:
+            self._require_sim().run()
+            drained = self._require_client().roots[self._last_root_idx :]
+            self._last_root_idx = len(self._require_client().roots)
+            drained_summary = self._summarize_roots(drained)
+            drained_summary["cost"] = self._window_cost()
+            info["drained_summary"] = drained_summary
         return obs, reward, terminated, False, info
 
     def _build(self, seed: int | None) -> EnvComponents:
         return self._cfg.build(seed)
+
+    def _window_cost(self) -> float:
+        """Constraint cost: retry amplification (retries per root) at the cost
+        client over the roots it completed since the last call."""
+        components = self._components
+        if components is None or components.cost_client is None:
+            return 0.0
+        roots = components.cost_client.roots[self._last_cost_root_idx :]
+        self._last_cost_root_idx = len(components.cost_client.roots)
+        if not roots:
+            return 0.0
+        attempts = sum(len(root.attempts) for root in roots)
+        return (attempts - len(roots)) / len(roots)
 
     def _apply_action(self, action: tuple[int, ...]) -> None:
         spec = self._cfg.action_spec
@@ -198,20 +250,14 @@ class MicroservicesEnv(_GymEnvBase):
         if spec.global_timeout_ms is not None:
             global_timeout_ms = spec.global_timeout_ms[action[idx]]
 
-        timeout_controller = self._require_client().cfg.timeout_controller
-        retry_policy = self._require_client().cfg.retry
-
-        if not isinstance(timeout_controller, StaticTimeoutController):
-            raise TypeError("MicroservicesEnv requires StaticTimeoutController for now")
-        if not isinstance(retry_policy, FixedBackoffRetryPolicy):
-            raise TypeError("MicroservicesEnv requires FixedBackoffRetryPolicy for now")
-
-        timeout_controller.attempt_timeout = ms_to_ns(attempt_timeout_ms)
-        timeout_controller.global_timeout = (
-            None if global_timeout_ms is None else ms_to_ns(global_timeout_ms)
+        self._require_components().apply_knobs(
+            ActionValues(
+                attempt_timeout_ms=attempt_timeout_ms,
+                max_attempts=max_attempts,
+                backoff_ms=backoff_ms,
+                global_timeout_ms=global_timeout_ms,
+            )
         )
-        retry_policy.max_attempts = max_attempts
-        retry_policy.delay = ms_to_ns(backoff_ms)
 
         self._last_action_values = {
             "attempt_timeout_ms": attempt_timeout_ms,
@@ -219,6 +265,7 @@ class MicroservicesEnv(_GymEnvBase):
             "max_attempts": max_attempts,
             "backoff_ms": backoff_ms,
         }
+        self._last_action_indices = tuple(int(a) for a in action)
 
     def _reward_from_summary(self, summary: dict[str, float]) -> float:
         w = self._cfg.reward_weights
@@ -227,8 +274,10 @@ class MicroservicesEnv(_GymEnvBase):
             - summary["deadline_drop_rate"] * w.deadline_drop
             - summary["queue_drop_rate"] * w.queue_drop
             - summary["server_drop_rate"] * w.server_drop
+            - summary["circuit_open_drop_rate"] * w.circuit_open_drop
             - summary["p95_latency_ms"] * w.p95_latency_ms
             - summary["retries_per_root"] * w.retries
+            - summary["cost"] * w.cost
         )
         return float(reward)
 
@@ -240,10 +289,12 @@ class MicroservicesEnv(_GymEnvBase):
                 "deadline_drop_rate": 0.0,
                 "queue_drop_rate": 0.0,
                 "server_drop_rate": 0.0,
+                "circuit_open_drop_rate": 0.0,
                 "avg_latency_ms": 0.0,
                 "p95_latency_ms": 0.0,
                 "retries_per_root": 0.0,
                 "queue_avg": 0.0,
+                "cost": 0.0,
             }
 
         completed = len(roots)
@@ -251,6 +302,7 @@ class MicroservicesEnv(_GymEnvBase):
         deadline_drops = 0
         queue_drops = 0
         server_drops = 0
+        circuit_open_drops = 0
         latencies: list[int] = []
         attempts_total = 0
         queue_sizes: list[int] = []
@@ -268,6 +320,8 @@ class MicroservicesEnv(_GymEnvBase):
                     deadline_drops += 1
                 elif last_attempt.drop_reason == DropReason.QUEUE_FULL:
                     queue_drops += 1
+                elif last_attempt.drop_reason == DropReason.CIRCUIT_OPEN:
+                    circuit_open_drops += 1
                 else:
                     server_drops += 1
 
@@ -279,6 +333,7 @@ class MicroservicesEnv(_GymEnvBase):
         deadline_rate = deadline_drops / completed if completed else 0.0
         queue_rate = queue_drops / completed if completed else 0.0
         server_rate = server_drops / completed if completed else 0.0
+        circuit_open_rate = circuit_open_drops / completed if completed else 0.0
         avg_latency_ms = ns_to_ms(int(np.mean(latencies))) if latencies else 0.0
         p95_latency_ms = (
             ns_to_ms(int(np.quantile(np.asarray(latencies), 0.95))) if latencies else 0.0
@@ -292,34 +347,57 @@ class MicroservicesEnv(_GymEnvBase):
             "deadline_drop_rate": deadline_rate,
             "queue_drop_rate": queue_rate,
             "server_drop_rate": server_rate,
+            "circuit_open_drop_rate": circuit_open_rate,
             "avg_latency_ms": avg_latency_ms,
             "p95_latency_ms": p95_latency_ms,
             "retries_per_root": retries_per_root,
             "queue_avg": queue_avg,
+            # Overridden by step() with the cost-client window when one exists.
+            "cost": 0.0,
         }
 
     def _build_observation(self, summary: dict[str, float]) -> np.ndarray:
+        """Normalized observation vector.
+
+        Features: has_data flag (disambiguates "no traffic" from "all failed"),
+        log-scaled throughput, the five outcome rates, latencies scaled by the
+        largest attempt timeout in the spec, retries scaled by the max retry
+        budget, constraint cost (cost-client retry amplification, same scaling),
+        log-scaled queue depth, the last action echoed as index fractions, and
+        the episode-time fraction.
+        """
+        completed = float(summary["completed"])
+
+        def idx_frac(position: int) -> float:
+            size = self._action_sizes[position]
+            if size <= 1:
+                return 0.0
+            return float(self._last_action_indices[position]) / float(size - 1)
+
+        features = [
+            1.0 if completed > 0 else 0.0,
+            float(np.log1p(completed)) / 10.0,
+            summary["success_rate"],
+            summary["deadline_drop_rate"],
+            summary["queue_drop_rate"],
+            summary["server_drop_rate"],
+            summary["circuit_open_drop_rate"],
+            summary["avg_latency_ms"] / self._timeout_norm_ms,
+            summary["p95_latency_ms"] / self._timeout_norm_ms,
+            summary["retries_per_root"] / self._retries_norm,
+            summary["cost"] / self._retries_norm,
+            float(np.log1p(summary["queue_avg"])) / 10.0,
+            idx_frac(0),
+            idx_frac(1),
+            idx_frac(2),
+        ]
+        if len(self._action_sizes) > 3:
+            features.append(idx_frac(3))
         time_s = ns_to_s(self._current_time_ns)
-        return np.array(
-            [
-                summary["success_rate"],
-                summary["deadline_drop_rate"],
-                summary["queue_drop_rate"],
-                summary["server_drop_rate"],
-                summary["avg_latency_ms"],
-                summary["p95_latency_ms"],
-                summary["retries_per_root"],
-                summary["queue_avg"],
-                float(self._last_action_values.get("attempt_timeout_ms") or 0),
-                float(self._last_action_values.get("max_attempts") or 0),
-                float(self._last_action_values.get("backoff_ms") or 0),
-                float(
-                    time_s
-                    / max(1.0, self._cfg.episode_duration_s or self._require_workload().duration_s)
-                ),
-            ],
-            dtype=np.float32,
+        features.append(
+            time_s / max(1.0, self._cfg.episode_duration_s or self._require_workload().duration_s)
         )
+        return np.array(features, dtype=np.float32)
 
     def _collect_latency_samples(self, roots) -> dict[str, list]:
         attempt_latencies = []
@@ -354,78 +432,258 @@ class MicroservicesEnv(_GymEnvBase):
             return None
         return self._client.metrics().summary()
 
+    def set_cost_weight(self, value: float) -> None:
+        """Set the constraint-cost reward weight (the Lagrange multiplier).
 
-def build_single_service_env(
-    seed: int | None = None, duration_s: int | None = None
+        Exists as a method so constrained training can broadcast lambda into
+        SubprocVecEnv workers via ``vec_env.env_method`` — mutating a shared
+        RewardWeights object does not cross process boundaries.
+        """
+        self._cfg.reward_weights.cost = float(value)
+
+
+def _static_knob_applier(
+    timeout_ctrl: StaticTimeoutController, retry: FixedBackoffRetryPolicy
+) -> Callable[[ActionValues], None]:
+    def apply_knobs(values: ActionValues) -> None:
+        timeout_ctrl.attempt_timeout = ms_to_ns(values.attempt_timeout_ms)
+        timeout_ctrl.global_timeout = (
+            None if values.global_timeout_ms is None else ms_to_ns(values.global_timeout_ms)
+        )
+        retry.max_attempts = values.max_attempts
+        retry.delay = ms_to_ns(values.backoff_ms)
+
+    return apply_knobs
+
+
+def _single_service_components(
+    seed: int | None,
+    duration: int,
+    *,
+    latency_injections: list[LatencyInjection] | None = None,
+    partial_failures: list[PartialFailure] | None = None,
+    load_spikes: list[LoadSpike] | None = None,
 ) -> EnvComponents:
     sim = Simulator(seed=1 if seed is None else seed)
-    duration = 30 if duration_s is None else int(duration_s)
-
     svc_cfg = ServiceConfig(
         name="svc-A",
         latency_median=ms_to_ns(20),
         latency_lognorm_sigma=0.5,
         workers=16,
         queue_capacity=200,
+        latency_injections=latency_injections or [],
+        partial_failures=partial_failures or [],
     )
     svc = ServiceRuntime(cfg=svc_cfg).bind()
 
     timeout_ctrl = StaticTimeoutController(global_timeout=None, attempt_timeout=ms_to_ns(50))
     retry = FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(50))
-    client_cfg = ClientConfig(retry=retry, timeout_controller=timeout_ctrl)
-    client = ClientRuntime(cfg=client_cfg, service=svc)
+    client = ClientRuntime(
+        cfg=ClientConfig(retry=retry, timeout_controller=timeout_ctrl), service=svc
+    )
 
     workload = Workload(
         base_rps=200.0,
         duration_s=duration,
-        load_spikes=[],
+        load_spikes=load_spikes or [],
         rng_seed=seed,
     )
 
-    return EnvComponents(sim=sim, workload=workload, client=client)
+    return EnvComponents(
+        sim=sim,
+        workload=workload,
+        client=client,
+        apply_knobs=_static_knob_applier(timeout_ctrl, retry),
+    )
+
+
+def build_single_service_env(
+    seed: int | None = None, duration_s: int | None = None
+) -> EnvComponents:
+    duration = 30 if duration_s is None else int(duration_s)
+    return _single_service_components(seed, duration)
 
 
 def build_faulty_single_service_env(
     seed: int | None = None, duration_s: int | None = None
 ) -> EnvComponents:
-    sim = Simulator(seed=1 if seed is None else seed)
+    """Faulty single service with fault windows at *fixed* episode fractions.
+
+    Because the observation includes the episode-time fraction, policies can
+    memorize these windows; use the randomized variant for training.
+    """
     duration = 30 if duration_s is None else int(duration_s)
-
-    latency_injection = LatencyInjection(
-        duration=TimeInterval(begin=s_to_ns(0.2 * duration), end=s_to_ns(0.35 * duration)),
-        add_latency=ms_to_ns(30),
-    )
-    partial_failure = PartialFailure(
-        duration=TimeInterval(begin=s_to_ns(0.5 * duration), end=s_to_ns(0.65 * duration)),
-        p_fail=0.3,
-    )
-
-    svc_cfg = ServiceConfig(
-        name="svc-A",
-        latency_median=ms_to_ns(20),
-        latency_lognorm_sigma=0.5,
-        workers=16,
-        queue_capacity=200,
-        latency_injections=[latency_injection],
-        partial_failures=[partial_failure],
-    )
-    svc = ServiceRuntime(cfg=svc_cfg).bind()
-
-    timeout_ctrl = StaticTimeoutController(global_timeout=None, attempt_timeout=ms_to_ns(50))
-    retry = FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(50))
-    client_cfg = ClientConfig(retry=retry, timeout_controller=timeout_ctrl)
-    client = ClientRuntime(cfg=client_cfg, service=svc)
-
-    workload = Workload(
-        base_rps=200.0,
-        duration_s=duration,
+    return _single_service_components(
+        seed,
+        duration,
+        latency_injections=[
+            LatencyInjection(
+                duration=TimeInterval(begin=s_to_ns(0.2 * duration), end=s_to_ns(0.35 * duration)),
+                add_latency=ms_to_ns(30),
+            )
+        ],
+        partial_failures=[
+            PartialFailure(
+                duration=TimeInterval(begin=s_to_ns(0.5 * duration), end=s_to_ns(0.65 * duration)),
+                p_fail=0.3,
+            )
+        ],
         load_spikes=[
             LoadSpike(
                 duration=TimeInterval(begin=s_to_ns(0.3 * duration), end=s_to_ns(0.45 * duration)),
                 rps_multiplier=2.0,
             )
         ],
+    )
+
+
+def build_randomized_faulty_single_service_env(
+    seed: int | None = None, duration_s: int | None = None
+) -> EnvComponents:
+    """Faulty single service with fault windows drawn from the seed.
+
+    Onset, duration, and intensity vary per episode, so a policy cannot
+    memorize the episode clock via the time-fraction feature — it has to react
+    to observed degradation. Same seed reproduces the same fault draw.
+    """
+    duration = 30 if duration_s is None else int(duration_s)
+    rng = random.Random(1 if seed is None else seed)
+
+    def window() -> TimeInterval:
+        onset = rng.uniform(0.05, 0.6) * duration
+        length = rng.uniform(0.1, 0.3) * duration
+        return TimeInterval(begin=s_to_ns(onset), end=s_to_ns(min(onset + length, duration)))
+
+    return _single_service_components(
+        seed,
+        duration,
+        latency_injections=[
+            LatencyInjection(duration=window(), add_latency=ms_to_ns(rng.uniform(10, 60)))
+        ],
+        partial_failures=[PartialFailure(duration=window(), p_fail=rng.uniform(0.1, 0.6))],
+        load_spikes=[LoadSpike(duration=window(), rps_multiplier=rng.uniform(1.5, 3.0))],
+    )
+
+
+def build_chain_env(
+    seed: int | None = None,
+    duration_s: int | None = None,
+    *,
+    retry_budget_ratio: float | None = None,
+) -> EnvComponents:
+    """Chain A -> B -> C with bottleneck C degrading in a randomized fault window.
+
+    The agent tunes the B->C edge client's retry/timeout knobs — the edge where
+    retry storms amplify — while reward and observation come from the
+    *top-level* client, so the agent is judged on end-to-end goodput. Fault
+    onset, duration, and intensity are drawn from the seed (see the randomized
+    single-service builder for why). The edge client is exposed as the env's
+    ``cost_client`` so its retry amplification can serve as a constraint cost.
+
+    ``retry_budget_ratio`` wraps the edge policy in a ``RetryBudgetPolicy``
+    (the hand-coded baseline for constrained-RL comparisons). Note the wrapper
+    limits retries against *successes* (token award), which approximates
+    retries-per-root only at high success rates.
+    """
+    build_seed = 1 if seed is None else int(seed)
+    sim = Simulator(seed=build_seed)
+    duration = 30 if duration_s is None else int(duration_s)
+    rng = random.Random(build_seed)
+
+    onset = rng.uniform(0.1, 0.5) * duration
+    length = rng.uniform(0.15, 0.35) * duration
+    fault_window = TimeInterval(begin=s_to_ns(onset), end=s_to_ns(min(onset + length, duration)))
+
+    c_cfg = ServiceConfig(
+        name="svc-C",
+        latency_median=ms_to_ns(20),
+        latency_lognorm_sigma=0.7,
+        workers=24,
+        queue_capacity=800,
+        latency_injections=[
+            LatencyInjection(duration=fault_window, add_latency=ms_to_ns(rng.uniform(15, 45)))
+        ],
+        partial_failures=[PartialFailure(duration=fault_window, p_fail=rng.uniform(0.2, 0.5))],
+    )
+    a_cfg = ServiceConfig(
+        name="svc-A",
+        latency_median=ms_to_ns(12),
+        latency_lognorm_sigma=0.4,
+        workers=48,
+        queue_capacity=2000,
+    )
+    b_cfg = ServiceConfig(
+        name="svc-B",
+        latency_median=ms_to_ns(12),
+        latency_lognorm_sigma=0.4,
+        workers=48,
+        queue_capacity=2000,
+    )
+
+    a_node = ServiceNodeRuntime(service=ServiceRuntime(cfg=a_cfg).bind())
+    b_node = ServiceNodeRuntime(service=ServiceRuntime(cfg=b_cfg).bind())
+    c_node = ServiceNodeRuntime(service=ServiceRuntime(cfg=c_cfg).bind())
+
+    # Tunable edge: B -> C, where aggressive retries hammer the bottleneck.
+    edge_timeout = StaticTimeoutController(global_timeout=None, attempt_timeout=ms_to_ns(60))
+    edge_retry = FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(20))
+    edge_policy: RetryPolicy = edge_retry
+    if retry_budget_ratio is not None:
+        # Knobs still route to the inner FixedBackoffRetryPolicy via
+        # apply_knobs; the wrapper sees results through underlying_strategy.
+        edge_policy = RetryBudgetPolicy(
+            budget_ratio=retry_budget_ratio,
+            max_retries=5,
+            underlying_strategy=edge_retry,
+        )
+    b_to_c = ClientRuntime(
+        cfg=ClientConfig(retry=edge_policy, timeout_controller=edge_timeout), service=c_node
+    )
+
+    a_to_b = ClientRuntime(
+        cfg=ClientConfig(
+            retry=FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(20)),
+            timeout_controller=StaticTimeoutController(
+                global_timeout=None, attempt_timeout=ms_to_ns(150)
+            ),
+        ),
+        service=b_node,
+    )
+
+    b_node.add_downstream(DownstreamEdge(client=b_to_c, target=c_node))
+    a_node.add_downstream(DownstreamEdge(client=a_to_b, target=b_node))
+
+    top_client = ClientRuntime(
+        cfg=ClientConfig(
+            retry=FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(30)),
+            timeout_controller=StaticTimeoutController(
+                global_timeout=None, attempt_timeout=ms_to_ns(300)
+            ),
+        ),
+        service=a_node,
+    )
+
+    workload = Workload(
+        base_rps=180.0,
+        duration_s=duration,
+        load_spikes=[],
         rng_seed=seed,
     )
 
-    return EnvComponents(sim=sim, workload=workload, client=client)
+    return EnvComponents(
+        sim=sim,
+        workload=workload,
+        client=top_client,
+        apply_knobs=_static_knob_applier(edge_timeout, edge_retry),
+        cost_client=b_to_c,
+    )
+
+
+# Scenario name -> builder, shared by the CLI entry points (--fault-scenario).
+SCENARIO_BUILDERS: dict[str, Callable[[int | None, int | None], EnvComponents]] = {
+    "none": build_single_service_env,
+    "basic": build_faulty_single_service_env,
+    "randomized": build_randomized_faulty_single_service_env,
+    "chain": build_chain_env,
+    "chain_budget": functools.partial(build_chain_env, retry_budget_ratio=0.1),
+}

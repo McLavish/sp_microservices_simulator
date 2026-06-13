@@ -1,17 +1,8 @@
 from collections.abc import Sequence
-from dataclasses import dataclass
 
-from rl.spec import ActionSpec, coerce_action
+from rl.spec import ActionSpec, ActionValues, coerce_action
 
 __all__ = ["ActionGrid", "ActionValues", "coerce_action"]
-
-
-@dataclass(frozen=True)
-class ActionValues:
-    attempt_timeout_ms: int
-    max_attempts: int
-    backoff_ms: int
-    global_timeout_ms: int | None
 
 
 class ActionGrid:

@@ -1,8 +1,10 @@
+import math
 import unittest
 
 import numpy as np
 
 from rl.env import ActionSpec, RewardWeights
+from rl.models.lognormal import LogNormalModel
 from rl.policies.action_space import ActionGrid
 from rl.policies.aimd import AIMDPolicy
 from rl.policies.bayesian import BayesianPolicy
@@ -62,6 +64,33 @@ class TestRLPolicies(unittest.TestCase):
         action = policy.act(np.zeros(12, dtype=np.float32), info)
         self.assertIn(action, self.grid.indices)
 
+    def test_queue_delay_matches_mm1_closed_form(self):
+        # Lognormal with E[S] = 1 ms and E[S^2] = 2 ms^2 (CV^2 = 1, the
+        # exponential moments), lambda = 0.5/ms, c = 1: the Allen-Cunneen
+        # approximation must reduce to the exact M/M/1 result
+        # Wq = rho / (1 - rho) * E[S] = 1.0 ms.
+        policy = ModelBasedPolicy(
+            grid=self.grid,
+            include_queue_delay=True,
+            queue_workers=1,
+            step_duration_s=1.0,
+            use_retries_in_lambda=False,
+        )
+        model = LogNormalModel(mu=-math.log(2) / 2, sigma=math.sqrt(math.log(2)))
+        info = {"summary": {"completed": 500, "retries_per_root": 0.0}}
+        wq = policy._estimate_queue_delay(info, model)
+        self.assertAlmostEqual(wq, 1.0, places=9)
+
+    def test_queue_delay_zero_without_traffic(self):
+        policy = ModelBasedPolicy(
+            grid=self.grid,
+            include_queue_delay=True,
+            queue_workers=1,
+        )
+        model = LogNormalModel(mu=0.0, sigma=0.5)
+        self.assertEqual(policy._estimate_queue_delay({"summary": {"completed": 0}}, model), 0.0)
+        self.assertEqual(policy._estimate_queue_delay({}, model), 0.0)
+
     def test_bayesian_policy_act(self):
         policy = BayesianPolicy(
             grid=self.grid,
@@ -87,7 +116,6 @@ class TestRLPolicies(unittest.TestCase):
             adjust_backoff=False,
             ema_alpha=0.5,
             timeout_increase_step=1,
-            timeout_decrease_step=1,
         )
         info = {
             "summary": {
@@ -98,6 +126,27 @@ class TestRLPolicies(unittest.TestCase):
         }
         action = policy.act(np.zeros(12, dtype=np.float32), info)
         self.assertIn(action, self.grid.indices)
+
+    def test_aimd_multiplicative_decrease_snaps_to_grid(self):
+        spec = ActionSpec(
+            attempt_timeout_ms=[10, 30, 50, 80],
+            max_attempts=[1],
+            backoff_ms=[0],
+        )
+        grid = ActionGrid(spec)
+        policy = AIMDPolicy(grid=grid, initial_timeout_ms=80)
+        healthy = {"summary": {"completed": 10, "success_rate": 1.0, "deadline_drop_rate": 0.0}}
+
+        action = policy.act(np.zeros(15, dtype=np.float32), healthy)
+        self.assertEqual(spec.attempt_timeout_ms[action[0]], 30)  # 80 * 0.5 = 40 -> snap down
+        action = policy.act(np.zeros(15, dtype=np.float32), healthy)
+        self.assertEqual(spec.attempt_timeout_ms[action[0]], 10)  # 30 * 0.5 = 15 -> snap down
+        action = policy.act(np.zeros(15, dtype=np.float32), healthy)
+        self.assertEqual(spec.attempt_timeout_ms[action[0]], 10)  # stays at the floor
+
+    def test_aimd_rejects_invalid_decrease_factor(self):
+        with self.assertRaises(ValueError):
+            AIMDPolicy(grid=self.grid, timeout_decrease_factor=1.0)
 
     def test_aimd_policy_emits_global_timeout_dimension(self):
         spec = ActionSpec(

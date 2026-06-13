@@ -151,7 +151,7 @@ class ClientRuntime:
 
         req_deadline = self._min_deadline(
             ctx.root.global_deadline,
-            (sim.timestep + attempt_timeout) if attempt_timeout else None,
+            (sim.timestep + attempt_timeout) if attempt_timeout is not None else None,
         )
         req = Request(
             service=self.service.cfg.name,

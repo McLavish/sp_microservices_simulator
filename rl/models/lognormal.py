@@ -2,7 +2,7 @@ import math
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.stats import lognorm
+from scipy.stats import CensoredData, FitError, lognorm
 
 from rl.models.utils import ensure_positive
 
@@ -19,6 +19,31 @@ class LogNormalModel:
         self.mu = float(np.mean(logx))
         sigma = float(np.std(logx, ddof=1)) if logx.size > 1 else self.min_sigma
         self.sigma = max(sigma, self.min_sigma)
+        return self
+
+    def fit_censored(self, samples: np.ndarray, censored: np.ndarray) -> "LogNormalModel":
+        """Right-censored MLE: censored entries are timeout-truncated, i.e. the
+        true latency exceeds the recorded value."""
+        values = np.asarray(samples, dtype=np.float64)
+        flags = np.asarray(censored, dtype=bool)
+        positive = values > 0
+        values, flags = values[positive], flags[positive]
+        uncensored = values[~flags]
+        right = values[flags]
+        if uncensored.size == 0:
+            raise ValueError("Censored MLE requires at least one uncensored sample")
+        if right.size == 0:
+            return self.fit(uncensored)
+        try:
+            shape, _loc, scale = lognorm.fit(
+                CensoredData(uncensored=uncensored, right=right), floc=0
+            )
+        except FitError:
+            # Numerical MLE failed to converge; fall back to the (optimistically
+            # biased) uncensored-only fit rather than crashing a long experiment.
+            return self.fit(uncensored)
+        self.sigma = max(float(shape), self.min_sigma)
+        self.mu = float(math.log(scale))
         return self
 
     def logpdf(self, x: np.ndarray) -> np.ndarray:

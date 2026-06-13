@@ -7,6 +7,16 @@ from rl.policies.action_space import ActionGrid
 
 @dataclass
 class AIMDPolicy:
+    """Additive-increase / multiplicative-decrease control of the attempt timeout.
+
+    Unhealthy windows (deadline rate or success rate past target) bump the
+    timeout up one grid index (additive increase); healthy windows multiply the
+    timeout value by ``timeout_decrease_factor`` and snap to the nearest grid
+    index (multiplicative decrease), the same shape as TCP congestion control
+    and Netflix's adaptive concurrency limits. The optional max-attempts /
+    backoff adjustments remain additive in both directions.
+    """
+
     grid: ActionGrid
     initial_timeout_ms: int | None = None
     initial_max_attempts: int | None = None
@@ -14,7 +24,7 @@ class AIMDPolicy:
     initial_global_timeout_ms: int | None = None
     initial_action: tuple[int, ...] | None = None
     timeout_increase_step: int = 1
-    timeout_decrease_step: int = 1
+    timeout_decrease_factor: float = 0.5
     max_attempts_step: int = 1
     backoff_step: int = 1
     adjust_max_attempts: bool = False
@@ -23,9 +33,11 @@ class AIMDPolicy:
     success_target: float = 0.98
     deadline_target: float = 0.01
     min_completed: int = 1
-    name: str = "aimd_v2"
+    name: str = "aimd"
 
     def __post_init__(self):
+        if not 0.0 < self.timeout_decrease_factor < 1.0:
+            raise ValueError("timeout_decrease_factor must be in (0, 1)")
         self._has_global = self.grid.spec.global_timeout_ms is not None
         self._ema_success = None
         self._ema_deadline = None
@@ -72,7 +84,7 @@ class AIMDPolicy:
                         self._backoff_max_idx(),
                     )
             else:
-                self._timeout_idx = max(self._timeout_idx - self.timeout_decrease_step, 0)
+                self._timeout_idx = self._decreased_timeout_idx()
                 if self.adjust_max_attempts:
                     self._max_attempts_idx = max(self._max_attempts_idx - self.max_attempts_step, 0)
                 if self.adjust_backoff:
@@ -83,6 +95,19 @@ class AIMDPolicy:
 
     def update(self, obs: np.ndarray, reward: float, done: bool, info: dict) -> None:
         return
+
+    def _decreased_timeout_idx(self) -> int:
+        """Multiplicative decrease in value space, snapped to the grid.
+
+        Guarantees at least one index of progress when rounding would stall
+        above the minimum.
+        """
+        candidates = self.grid.spec.attempt_timeout_ms
+        target = candidates[self._timeout_idx] * self.timeout_decrease_factor
+        idx = min(range(len(candidates)), key=lambda i: abs(candidates[i] - target))
+        if idx >= self._timeout_idx and self._timeout_idx > 0:
+            idx = self._timeout_idx - 1
+        return idx
 
     def _update_ema(self, current: float | None, value: float) -> float:
         if current is None:
