@@ -1,16 +1,18 @@
-"""Three-arm constrained-retry comparison on the chain scenario.
+"""Three-arm constrained-retry comparison on the chain or multichain scenario.
 
 Arms, per retry budget b:
   A. unconstrained PPO  — trained with the default hand-weighted reward
      (budget-independent, trained once);
   B. constrained PPO    — Lagrangian PPO with edge-amplification budget b;
-  C. retry_budget       — best fixed knobs (oracle grid search) on the chain
-     env whose B->C edge is wrapped in the hand-coded RetryBudgetPolicy(b).
+  C. retry_budget       — best fixed knobs (oracle grid search) on the env
+     whose B->C edge is wrapped in the hand-coded RetryBudgetPolicy(b).
 
 All arms are evaluated on the same seeds and reported on the base objective J
 (reward with retry/cost penalties zeroed) plus the edge-amplification cost, so
-training-weight differences cannot skew the comparison. Output: one CSV row
-per (arm, budget), plus per-budget dual-ascent curves.
+training-weight differences cannot skew the comparison. On the multichain
+scenario the bystander chain's success rate is reported alongside, gauging the
+externality each arm's retries impose on the shared bottleneck. Output: one
+CSV row per (arm, budget), plus per-budget dual-ascent curves.
 """
 
 from __future__ import annotations
@@ -27,7 +29,14 @@ from rl.constrained import (
     objective_from_summary,
     train_constrained_ppo,
 )
-from rl.env import ActionSpec, EnvComponents, EnvConfig, MicroservicesEnv, build_chain_env
+from rl.env import (
+    ActionSpec,
+    EnvComponents,
+    EnvConfig,
+    MicroservicesEnv,
+    build_chain_env,
+    build_multichain_env,
+)
 from rl.policies.action_space import ActionGrid
 from rl.policies.fixed import FixedPolicy
 from rl.sb3_support import import_sb3
@@ -36,6 +45,12 @@ from rl.spec import RewardWeights
 PPO, _, _, _, _SB3_IMPORT_ERROR = import_sb3()
 
 BASE_WEIGHTS = RewardWeights()
+
+# Both builders share the (seed, duration, *, retry_budget_ratio) signature.
+SCENARIO_TO_BUILDER = {
+    "chain": build_chain_env,
+    "multichain": build_multichain_env,
+}
 
 
 def _make_env(
@@ -66,6 +81,7 @@ def _eval_arm(
     successes: list[float] = []
     p95s: list[float] = []
     violations: list[float] = []
+    bystander_successes: list[float] = []
 
     for seed in seeds:
         obs, info = env.reset(seed=seed)
@@ -88,6 +104,11 @@ def _eval_arm(
         if metrics:
             successes.append(metrics.succeeded / metrics.total if metrics.total else 0.0)
             p95s.append(metrics.p95)
+        bystander = env.bystander_metrics_summary()
+        if bystander is not None:
+            bystander_successes.append(
+                bystander.succeeded / bystander.total if bystander.total else 0.0
+            )
 
     return {
         "J_mean": float(np.mean(objectives)),
@@ -96,6 +117,11 @@ def _eval_arm(
         "p95_ms": float(np.mean(p95s)) if p95s else 0.0,
         "cost_mean": float(np.mean(costs)),
         "violation_rate": float(np.mean(violations)) if violations else "",
+        # Empty when the scenario has no bystander chain (CSV-shape convention
+        # shared with violation_rate).
+        "bystander_success_rate": (
+            float(np.mean(bystander_successes)) if bystander_successes else ""
+        ),
     }
 
 
@@ -113,12 +139,8 @@ def _best_fixed_policy(
 
 
 def main() -> None:
-    if PPO is None:
-        raise ImportError(
-            "stable-baselines3 is required for this experiment"
-        ) from _SB3_IMPORT_ERROR
-
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--scenario", choices=sorted(SCENARIO_TO_BUILDER), default="chain")
     parser.add_argument("--budgets", type=parse_float_list, default=[0.05, 0.1, 0.2])
     parser.add_argument("--timesteps", type=int, default=30_000)
     parser.add_argument("--chunk-timesteps", type=int, default=5_000)
@@ -137,9 +159,25 @@ def main() -> None:
     parser.add_argument("--attempt-timeouts-ms", type=parse_int_list, default=[10, 30, 50, 80])
     parser.add_argument("--max-attempts", type=parse_int_list, default=[1, 2, 3])
     parser.add_argument("--backoff-ms", type=parse_int_list, default=[0, 20, 50])
-    parser.add_argument("--output-csv", type=str, default="rl_constrained_comparison.csv")
-    parser.add_argument("--curve-prefix", type=str, default="rl_constrained_curve")
+    parser.add_argument(
+        "--output-csv",
+        type=str,
+        default=None,
+        help="default: rl_constrained_comparison_<scenario>.csv",
+    )
+    parser.add_argument(
+        "--curve-prefix", type=str, default=None, help="default: rl_constrained_curve_<scenario>"
+    )
     args = parser.parse_args()
+
+    if PPO is None:
+        raise ImportError(
+            "stable-baselines3 is required for this experiment"
+        ) from _SB3_IMPORT_ERROR
+
+    builder = SCENARIO_TO_BUILDER[args.scenario]
+    output_csv = args.output_csv or f"rl_constrained_comparison_{args.scenario}.csv"
+    curve_prefix = args.curve_prefix or f"rl_constrained_curve_{args.scenario}"
 
     action_spec = ActionSpec(
         attempt_timeout_ms=list(args.attempt_timeouts_ms),
@@ -150,7 +188,7 @@ def main() -> None:
     duration = int(round(args.episode_duration_s))
 
     def plain_build(seed):
-        return build_chain_env(seed, duration)
+        return builder(seed, duration)
 
     plain_env = _make_env(plain_build, action_spec, args.episode_duration_s)
     rows: list[dict] = []
@@ -176,14 +214,17 @@ def main() -> None:
             lambda_init=0.0,
             lambda_lr=0.0,
             zero_retry_penalty=False,
-            learning_curve_csv=f"{args.curve_prefix}_unconstrained.csv",
+            learning_curve_csv=f"{curve_prefix}_unconstrained.csv",
             name="unconstrained_ppo",
             **common_train_kwargs(),
         )
     )
     metrics = _eval_arm(plain_env, unconstrained, args.eval_seeds, budget=None)
     rows.append({"arm": "unconstrained_ppo", "budget": "", **metrics})
-    print(f"[arm A] J={metrics['J_mean']:.3f} cost={metrics['cost_mean']:.3f}")
+    print(
+        f"[arm A] J={metrics['J_mean']:.3f} cost={metrics['cost_mean']:.3f} "
+        f"bystander={metrics['bystander_success_rate']}"
+    )
 
     for budget in args.budgets:
         # Arm B: Lagrangian PPO with edge-amplification budget.
@@ -194,7 +235,7 @@ def main() -> None:
                 budget=budget,
                 lambda_init=args.lambda_init,
                 lambda_lr=args.lambda_lr,
-                learning_curve_csv=f"{args.curve_prefix}_b{budget}.csv",
+                learning_curve_csv=f"{curve_prefix}_b{budget}.csv",
                 **common_train_kwargs(),
             )
         )
@@ -202,12 +243,13 @@ def main() -> None:
         rows.append({"arm": "constrained_ppo", "budget": budget, **metrics})
         print(
             f"[arm B] b={budget} J={metrics['J_mean']:.3f} cost={metrics['cost_mean']:.3f} "
-            f"violations={metrics['violation_rate']}"
+            f"violations={metrics['violation_rate']} "
+            f"bystander={metrics['bystander_success_rate']}"
         )
 
         # Arm C: hand-coded RetryBudgetPolicy on the edge, best fixed knobs.
         def budget_build(seed, _b=budget):
-            return build_chain_env(seed, duration, retry_budget_ratio=_b)
+            return builder(seed, duration, retry_budget_ratio=_b)
 
         budget_env = _make_env(budget_build, action_spec, args.episode_duration_s)
         oracle = _best_fixed_policy(budget_env, grid, args.oracle_seeds)
@@ -215,14 +257,15 @@ def main() -> None:
         rows.append({"arm": "retry_budget", "budget": budget, **metrics})
         print(
             f"[arm C] b={budget} J={metrics['J_mean']:.3f} cost={metrics['cost_mean']:.3f} "
-            f"violations={metrics['violation_rate']}"
+            f"violations={metrics['violation_rate']} "
+            f"bystander={metrics['bystander_success_rate']}"
         )
 
-    with open(args.output_csv, "w", newline="") as f:
+    with open(output_csv, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
-    print(f"Wrote comparison to {args.output_csv}")
+    print(f"Wrote comparison to {output_csv}")
 
 
 if __name__ == "__main__":
