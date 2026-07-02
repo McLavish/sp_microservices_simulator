@@ -186,6 +186,48 @@ budgets must trade J for cost beyond eval noise, and the retries must
 measurably hurt the bystander. Run it after touching the builder's fault or
 capacity constants; the FAIL messages name the knob to turn.
 
+#### Findings (multichain sweep, 30k timesteps, 10 eval seeds)
+
+Reference run of the commands above (defaults; sample output committed as
+`rl_constrained_comparison_multichain.csv`):
+
+| arm | budget | J | edge cost | violations | bystander | p95 |
+| --- | --- | --- | --- | --- | --- | --- |
+| unconstrained PPO | — | **6.74** | 0.318 | — | 0.797 | 242 ms |
+| constrained PPO | 0.05 | 6.25 | 0.000 | 0% | 0.865 | 135 ms |
+| retry_budget | 0.05 | 6.29 | 0.011 | 0% | 0.861 | 137 ms |
+| constrained PPO | 0.1 | 6.25 | 0.000 | 0% | 0.865 | 135 ms |
+| retry_budget | 0.1 | 6.30 | 0.016 | 0% | 0.861 | 135 ms |
+| constrained PPO | 0.2 | 6.55 | 0.251 | 70% | 0.818 | 262 ms |
+| retry_budget | 0.2 | 6.46 | 0.029 | 0% | 0.858 | 147 ms |
+
+Three results worth keeping:
+
+1. **The trade-off is real and two-sided.** J rises monotonically with
+   amplification (6.25 → 6.55 → 6.74) and the bystander chain pays for it
+   symmetrically (0.865 → 0.818 → 0.797, ~7 p.p. at the unconstrained
+   optimum) — the externality production retry budgets exist to bound.
+   Contrast with `chain`, where every arm sits at cost 0 and the same study
+   shows nothing.
+2. **Dual ascent behaves as designed but only enforces the mean.** λ climbs
+   while eval cost exceeds the budget, decays under slack, and holds an
+   interior point at b=0.2 — yet that arm violates its budget on 7/10 eval
+   seeds (mean cost 0.251 vs 0.2), and the curve shows λ still rising at 30k
+   steps. Longer training tightens this; per-episode guarantees need more
+   than a Lagrangian.
+3. **The hand-coded token bucket is competitive where it matters.** At tight
+   budgets constrained PPO retreats to the zero-retry corner (it cannot see
+   the budget in its observation) and `RetryBudgetPolicy` edges it out while
+   never violating; constrained PPO only wins at the loose budget. RL earns
+   its keep in adaptivity, not in replacing the 30-line mechanism.
+
+Calibration history (why the builder's constants look the way they do): at
+p_fail U(0.3, 0.6) and retrying relay edges, upstream layers recovered blips
+for free and the no-retry arm won — relay edges are now retry-free and blips
+are U(0.5, 0.8); at 12 workers C saturated during blips and retries timed
+out, eroding their value — C has 14. Re-run `--calibrate` before trusting
+results after touching any of these.
+
 ### `python -m rl.experiments.compare_models`
 
 Fit all three latency models to synthetic samples and report NLL + p95/p99 quantile
