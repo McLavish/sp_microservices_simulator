@@ -90,6 +90,8 @@ wires its own `apply_knobs`.
 | `randomized` | `build_randomized_faulty_single_service_env` | fault onset/duration/intensity drawn from the seed, so policies must react to observed degradation |
 | `chain` | `build_chain_env` | A → B → C with bottleneck C degrading in a randomized window; the agent tunes the **B→C edge** retry/timeout knobs while reward comes from the **top-level** client (end-to-end goodput) — the retry-storm setting |
 | `chain_budget` | `build_chain_env(retry_budget_ratio=0.1)` | same, with the edge policy wrapped in the hand-coded `RetryBudgetPolicy` (knobs still reach the inner fixed-backoff policy) |
+| `multichain` | `build_multichain_env` | two chains A → B → C and X → Y → C share bottleneck C (one worker pool + queue); C degrades with randomized **pure partial-failure blips** (no latency injection), so an edge retry genuinely recovers a failed call while burning shared capacity. The agent tunes its own B→C edge; the fixed, retry-free bystander chain is exposed as `EnvComponents.bystander_client` and its success rate gauges the externality — the scenario where a retry budget actually binds |
+| `multichain_budget` | `build_multichain_env(retry_budget_ratio=0.1)` | same, with the agent's edge wrapped in `RetryBudgetPolicy` |
 
 ## Policies (`rl/policies/`)
 
@@ -153,14 +155,36 @@ approximates retries-per-root only at high success rates.
 (`--retry-budget`, `--lambda-lr`, `--lambda-init`); the three-arm study is:
 
 ```bash
-python -m rl.experiments.constrained_retry --budgets 0.05,0.1,0.2 --device cpu
+python -m rl.experiments.constrained_retry --scenario multichain --calibrate --device cpu
+python -m rl.experiments.constrained_retry --scenario multichain --budgets 0.05,0.1,0.2 --device cpu
 ```
 
 which trains **unconstrained PPO** (default weights), **constrained PPO** per
-budget, and grid-searches fixed knobs on the budget-wrapped chain env
+budget, and grid-searches fixed knobs on the budget-wrapped env
 (**retry_budget**, the hand-coded baseline), evaluating all arms on the same
-seeds. Outputs `rl_constrained_comparison.csv` and per-budget dual-ascent
-curves (`rl_constrained_curve_b*.csv`).
+seeds. Outputs `rl_constrained_comparison_<scenario>.csv` and per-budget
+dual-ascent curves (`rl_constrained_curve_<scenario>_b*.csv`); plot with
+`python -m plotting.rl_pareto <csv>`.
+
+`--scenario` picks the environment. On `chain`, C's fault couples a latency
+injection with `p_fail`, so retries rarely beat the deadline and every PPO
+arm converges to zero edge retries — the constraint is vacuous there (a
+finding, not a bug). `multichain` is built so the budget binds: C fails with
+pure blips (retries genuinely recover successes), and two chains share C, so
+amplification steals bottleneck capacity from the bystander chain. The
+selfish reward (own chain only) plus a budget on edge amplification mirrors
+production retry budgets, which bound exactly this externality — Finagle's
+`retryBudget` defaults to 20% of requests, gRPC retry throttling to a ~10%
+token ratio. `_eval_arm` reports `bystander_success_rate` alongside J and
+cost, and the Pareto plot adds an externality panel when the column is
+present.
+
+`--calibrate` grid-sweeps all fixed actions (no training) and verdicts
+whether the scenario supports the study at all: the unconstrained optimum
+must retry (max_attempts ≥ 2) at a cost above the smallest budget, tighter
+budgets must trade J for cost beyond eval noise, and the retries must
+measurably hurt the bystander. Run it after touching the builder's fault or
+capacity constants; the FAIL messages name the knob to turn.
 
 ### `python -m rl.experiments.compare_models`
 
