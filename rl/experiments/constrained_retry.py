@@ -74,8 +74,13 @@ def _eval_arm(
     policy,
     seeds: Sequence[int],
     budget: float | None,
+    keep_per_seed: bool = False,
 ) -> dict:
-    """Evaluate one arm on the base objective J plus the constraint cost."""
+    """Evaluate one arm on the base objective J plus the constraint cost.
+
+    ``keep_per_seed`` adds the raw per-seed objectives under ``J_per_seed``
+    (calibration pairs them across arms; the CSV paths leave it off).
+    """
     objectives: list[float] = []
     costs: list[float] = []
     successes: list[float] = []
@@ -110,7 +115,7 @@ def _eval_arm(
                 bystander.succeeded / bystander.total if bystander.total else 0.0
             )
 
-    return {
+    result: dict[str, object] = {
         "J_mean": float(np.mean(objectives)),
         "J_std": float(np.std(objectives)),
         "success_rate": float(np.mean(successes)) if successes else 0.0,
@@ -123,6 +128,9 @@ def _eval_arm(
             float(np.mean(bystander_successes)) if bystander_successes else ""
         ),
     }
+    if keep_per_seed:
+        result["J_per_seed"] = objectives
+    return result
 
 
 def _best_fixed_policy(
@@ -169,7 +177,9 @@ def _run_calibration(
         )
 
     def re_eval(action_idx: tuple[int, ...]) -> dict:
-        return _eval_arm(env, FixedPolicy(action=action_idx), eval_seeds, budget=None)
+        return _eval_arm(
+            env, FixedPolicy(action=action_idx), eval_seeds, budget=None, keep_per_seed=True
+        )
 
     best_idx, _ = max(sweep, key=lambda item: item[1]["J_mean"])
     noretry_sweep = [item for item in sweep if grid.values_for(item[0]).max_attempts == 1]
@@ -216,14 +226,21 @@ def _run_calibration(
         )
     )
     ordered_j = [feasible[b]["J_mean"] for b in sorted(budgets)] + [best["J_mean"]]
-    standard_error = best["J_std"] / np.sqrt(len(eval_seeds))
-    gap = best["J_mean"] - feasible[min_budget]["J_mean"]
+    # Every arm runs the same eval seeds, so the seed-to-seed blip-difficulty
+    # variance is shared and cancels in a paired comparison — test the
+    # per-seed gaps, not the pooled stds.
+    paired_gaps = [
+        b_j - f_j
+        for b_j, f_j in zip(best["J_per_seed"], feasible[min_budget]["J_per_seed"], strict=True)
+    ]
+    gap = float(np.mean(paired_gaps))
+    paired_se = float(np.std(paired_gaps)) / np.sqrt(len(paired_gaps))
     results.append(
         (
-            f"(c) budgets separate: J nondecreasing in budget and "
-            f"gap {gap:.3f} > 2*SE {2 * standard_error:.3f}",
+            f"(c) budgets separate: J nondecreasing in budget and paired "
+            f"gap {gap:.3f} > 2*SE {2 * paired_se:.3f}",
             all(a <= b + 1e-9 for a, b in zip(ordered_j, ordered_j[1:], strict=False))
-            and gap > 2 * standard_error,
+            and gap > 2 * paired_se,
             "widen the p_fail range so the cost spectrum spreads",
         )
     )

@@ -726,22 +726,29 @@ def build_multichain_env(
     duration = 30 if duration_s is None else int(duration_s)
     rng = random.Random(build_seed)
 
+    # p_fail must be high enough that upstream retry layers (A->B x2, top x2:
+    # up to 4 end-to-end C rolls) cannot recover blips on their own — at ~0.65
+    # a no-edge-retry root succeeds ~1-0.65^4 ~= 0.82 during a blip, so cheap
+    # edge retries carry genuine value. Calibrated via `constrained_retry
+    # --calibrate`; at U(0.3, 0.6) the edge-retry arm loses to no-retry.
     blips: list[PartialFailure] = []
     for _ in range(rng.randint(2, 4)):
         onset = rng.uniform(0.05, 0.75) * duration
         length = rng.uniform(0.08, 0.20) * duration
         window = TimeInterval(begin=s_to_ns(onset), end=s_to_ns(min(onset + length, duration)))
-        blips.append(PartialFailure(duration=window, p_fail=rng.uniform(0.3, 0.6)))
+        blips.append(PartialFailure(duration=window, p_fail=rng.uniform(0.5, 0.8)))
 
     # Calibration knobs: median/sigma/workers size C against the two chains'
-    # combined load (2 x 180 rps x ~22.7 ms mean ~= 8.2 erlangs -> ~0.68
-    # utilization), leaving headroom for useful retries at baseline while blip
-    # amplification pushes C into queueing that the bystander feels.
+    # combined load (2 x 180 rps x ~22.7 ms mean ~= 8.2 erlangs -> ~0.58
+    # utilization), leaving headroom for blip retries to actually complete
+    # (at 12 workers C saturates during blips and retries time out, eroding
+    # their value) while amplification still queues C enough to hurt the
+    # bystander.
     c_cfg = ServiceConfig(
         name="svc-C",
         latency_median=ms_to_ns(20),
         latency_lognorm_sigma=0.5,
-        workers=12,
+        workers=14,
         queue_capacity=800,
         partial_failures=blips,
     )
@@ -787,10 +794,16 @@ def build_multichain_env(
         service=c_node,
     )
 
+    # Relay edges (A->B, X->Y) do not retry: hop-by-hop retries at every layer
+    # are the retry-storm anti-pattern, and they double as a hidden recovery
+    # channel that erases the value of the agent's edge knob (calibration
+    # showed the no-edge-retry arm winning when relays retried). Recovery
+    # lives at the client of the flaky dependency (the tunable B->C edge) and
+    # at the top-level clients.
     def _relay_client(node: ServiceNodeRuntime) -> ClientRuntime:
         return ClientRuntime(
             cfg=ClientConfig(
-                retry=FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(20)),
+                retry=FixedBackoffRetryPolicy(max_attempts=1, delay=0),
                 timeout_controller=StaticTimeoutController(
                     global_timeout=None, attempt_timeout=ms_to_ns(150)
                 ),

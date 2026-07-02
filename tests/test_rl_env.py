@@ -333,8 +333,8 @@ class TestMicroservicesEnv(unittest.TestCase):
                 self.assertGreaterEqual(blip.duration.begin, 0)
                 self.assertLess(blip.duration.begin, blip.duration.end)
                 self.assertLessEqual(blip.duration.end, s_to_ns(30))
-                self.assertGreaterEqual(blip.p_fail, 0.3)
-                self.assertLessEqual(blip.p_fail, 0.6)
+                self.assertGreaterEqual(blip.p_fail, 0.5)
+                self.assertLessEqual(blip.p_fail, 0.8)
 
     def test_multichain_faults_deterministic_per_seed(self):
         from chain import ServiceNodeRuntime
