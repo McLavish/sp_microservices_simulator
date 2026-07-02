@@ -62,6 +62,10 @@ class EnvComponents:
     # scenario this is the tunable B->C edge client, whose amplification is
     # invisible in the top-level client's summary. None -> cost is 0.
     cost_client: ClientRuntime | None = None
+    # Top-level client of a fixed-policy bystander chain (multichain scenario).
+    # Its success rate gauges the externality of the agent's edge retries; it
+    # feeds reporting only, never reward or observation.
+    bystander_client: ClientRuntime | None = None
 
 
 @dataclass
@@ -214,6 +218,10 @@ class MicroservicesEnv(_GymEnvBase):
             drained_summary = self._summarize_roots(drained)
             drained_summary["cost"] = self._window_cost()
             info["drained_summary"] = drained_summary
+        if terminated:
+            components = self._components
+            if components is not None and components.bystander_client is not None:
+                info["bystander_summary"] = self._summarize_roots(components.bystander_client.roots)
         return obs, reward, terminated, False, info
 
     def _build(self, seed: int | None) -> EnvComponents:
@@ -431,6 +439,11 @@ class MicroservicesEnv(_GymEnvBase):
         if self._client is None:
             return None
         return self._client.metrics().summary()
+
+    def bystander_metrics_summary(self) -> Summary | None:
+        if self._components is None or self._components.bystander_client is None:
+            return None
+        return self._components.bystander_client.metrics().summary()
 
     def set_cost_weight(self, value: float) -> None:
         """Set the constraint-cost reward weight (the Lagrange multiplier).
@@ -679,6 +692,158 @@ def build_chain_env(
     )
 
 
+def build_multichain_env(
+    seed: int | None = None,
+    duration_s: int | None = None,
+    *,
+    retry_budget_ratio: float | None = None,
+) -> EnvComponents:
+    """Two chains A -> B -> C and X -> Y -> C sharing bottleneck C.
+
+    The agent tunes its own chain's B->C edge; reward comes from chain A's
+    top-level client (a *selfish* objective). The X->Y->C bystander chain runs
+    fixed, retry-free policies and is exposed as ``bystander_client`` — its
+    success rate gauges the externality of the agent's retries, since both
+    chains drain the same C worker pool and queue.
+
+    Unlike the single-chain scenario, C degrades with pure partial-failure
+    blips and *no* latency injection: p_fail is rolled fresh per attempt at
+    attempt end, so an edge retry genuinely recovers a failed call and easily
+    fits the 60 ms edge attempt timeout — but every failed attempt still burns
+    a full service time on a shared worker. That makes some retrying optimal
+    (cost > 0 at the unconstrained optimum) while amplification during blips
+    steals capacity from the bystander: the regime where a retry budget forces
+    a real trade-off. This mirrors production retry budgets (Finagle's
+    ``retryBudget`` defaults to 20% of requests, gRPC retry throttling to a
+    ~10% token ratio), which exist to bound exactly this externality.
+
+    Blip count, onset, length, and p_fail are drawn from the seed (see the
+    randomized single-service builder for why). ``retry_budget_ratio`` wraps
+    the edge policy in ``RetryBudgetPolicy`` as in ``build_chain_env``.
+    """
+    build_seed = 1 if seed is None else int(seed)
+    sim = Simulator(seed=build_seed)
+    duration = 30 if duration_s is None else int(duration_s)
+    rng = random.Random(build_seed)
+
+    blips: list[PartialFailure] = []
+    for _ in range(rng.randint(2, 4)):
+        onset = rng.uniform(0.05, 0.75) * duration
+        length = rng.uniform(0.08, 0.20) * duration
+        window = TimeInterval(begin=s_to_ns(onset), end=s_to_ns(min(onset + length, duration)))
+        blips.append(PartialFailure(duration=window, p_fail=rng.uniform(0.3, 0.6)))
+
+    # Calibration knobs: median/sigma/workers size C against the two chains'
+    # combined load (2 x 180 rps x ~22.7 ms mean ~= 8.2 erlangs -> ~0.68
+    # utilization), leaving headroom for useful retries at baseline while blip
+    # amplification pushes C into queueing that the bystander feels.
+    c_cfg = ServiceConfig(
+        name="svc-C",
+        latency_median=ms_to_ns(20),
+        latency_lognorm_sigma=0.5,
+        workers=12,
+        queue_capacity=800,
+        partial_failures=blips,
+    )
+
+    def _relay_cfg(name: str) -> ServiceConfig:
+        return ServiceConfig(
+            name=name,
+            latency_median=ms_to_ns(12),
+            latency_lognorm_sigma=0.4,
+            workers=48,
+            queue_capacity=2000,
+        )
+
+    a_node = ServiceNodeRuntime(service=ServiceRuntime(cfg=_relay_cfg("svc-A")).bind())
+    b_node = ServiceNodeRuntime(service=ServiceRuntime(cfg=_relay_cfg("svc-B")).bind())
+    x_node = ServiceNodeRuntime(service=ServiceRuntime(cfg=_relay_cfg("svc-X")).bind())
+    y_node = ServiceNodeRuntime(service=ServiceRuntime(cfg=_relay_cfg("svc-Y")).bind())
+    c_node = ServiceNodeRuntime(service=ServiceRuntime(cfg=c_cfg).bind())
+
+    # Tunable edge: B -> C on the agent's chain.
+    edge_timeout = StaticTimeoutController(global_timeout=None, attempt_timeout=ms_to_ns(60))
+    edge_retry = FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(20))
+    edge_policy: RetryPolicy = edge_retry
+    if retry_budget_ratio is not None:
+        edge_policy = RetryBudgetPolicy(
+            budget_ratio=retry_budget_ratio,
+            max_retries=5,
+            underlying_strategy=edge_retry,
+        )
+    b_to_c = ClientRuntime(
+        cfg=ClientConfig(retry=edge_policy, timeout_controller=edge_timeout), service=c_node
+    )
+
+    # Bystander edge Y -> C: retry-free, so its success rate is an
+    # uncontaminated gauge of contention at C.
+    y_to_c = ClientRuntime(
+        cfg=ClientConfig(
+            retry=FixedBackoffRetryPolicy(max_attempts=1, delay=0),
+            timeout_controller=StaticTimeoutController(
+                global_timeout=None, attempt_timeout=ms_to_ns(60)
+            ),
+        ),
+        service=c_node,
+    )
+
+    def _relay_client(node: ServiceNodeRuntime) -> ClientRuntime:
+        return ClientRuntime(
+            cfg=ClientConfig(
+                retry=FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(20)),
+                timeout_controller=StaticTimeoutController(
+                    global_timeout=None, attempt_timeout=ms_to_ns(150)
+                ),
+            ),
+            service=node,
+        )
+
+    b_node.add_downstream(DownstreamEdge(client=b_to_c, target=c_node))
+    a_node.add_downstream(DownstreamEdge(client=_relay_client(b_node), target=b_node))
+    y_node.add_downstream(DownstreamEdge(client=y_to_c, target=c_node))
+    x_node.add_downstream(DownstreamEdge(client=_relay_client(y_node), target=y_node))
+
+    def _top_client(node: ServiceNodeRuntime) -> ClientRuntime:
+        return ClientRuntime(
+            cfg=ClientConfig(
+                retry=FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(30)),
+                timeout_controller=StaticTimeoutController(
+                    global_timeout=None, attempt_timeout=ms_to_ns(300)
+                ),
+            ),
+            service=node,
+        )
+
+    top_client = _top_client(a_node)
+    bystander_top = _top_client(x_node)
+
+    workload = Workload(
+        base_rps=180.0,
+        duration_s=duration,
+        load_spikes=[],
+        rng_seed=seed,
+    )
+    # The env only drives EnvComponents.workload, so the bystander arrival
+    # process is scheduled here; drive() just pushes tick events onto the sim
+    # heap, and both workloads stop at duration_s so episode drain terminates.
+    bystander_workload = Workload(
+        base_rps=180.0,
+        duration_s=duration,
+        load_spikes=[],
+        rng_seed=build_seed + 100_003,
+    )
+    bystander_workload.drive(sim, lambda s: bystander_top.start_request(s))
+
+    return EnvComponents(
+        sim=sim,
+        workload=workload,
+        client=top_client,
+        apply_knobs=_static_knob_applier(edge_timeout, edge_retry),
+        cost_client=b_to_c,
+        bystander_client=bystander_top,
+    )
+
+
 # Scenario name -> builder, shared by the CLI entry points (--fault-scenario).
 SCENARIO_BUILDERS: dict[str, Callable[[int | None, int | None], EnvComponents]] = {
     "none": build_single_service_env,
@@ -686,4 +851,6 @@ SCENARIO_BUILDERS: dict[str, Callable[[int | None, int | None], EnvComponents]] 
     "randomized": build_randomized_faulty_single_service_env,
     "chain": build_chain_env,
     "chain_budget": functools.partial(build_chain_env, retry_budget_ratio=0.1),
+    "multichain": build_multichain_env,
+    "multichain_budget": functools.partial(build_multichain_env, retry_budget_ratio=0.1),
 }

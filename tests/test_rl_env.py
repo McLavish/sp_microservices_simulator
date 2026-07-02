@@ -13,6 +13,7 @@ from rl.env import (
     EnvConfig,
     MicroservicesEnv,
     build_chain_env,
+    build_multichain_env,
     build_randomized_faulty_single_service_env,
     build_single_service_env,
 )
@@ -267,6 +268,173 @@ class TestMicroservicesEnv(unittest.TestCase):
         # Drained roots are reported separately, not folded into the step summary.
         self.assertIn("drained_summary", info)
         self.assertIsInstance(info["drained_summary"], dict)
+
+    def test_multichain_shared_bottleneck_single_runtime(self):
+        from chain import ServiceNodeRuntime
+
+        components = build_multichain_env(3, duration_s=10)
+        assert components.bystander_client is not None
+        a_node = components.client.service
+        x_node = components.bystander_client.service
+        assert isinstance(a_node, ServiceNodeRuntime)
+        assert isinstance(x_node, ServiceNodeRuntime)
+        agent_c = a_node.downstreams[0].target.downstreams[0].target
+        bystander_c = x_node.downstreams[0].target.downstreams[0].target
+        self.assertIs(agent_c, bystander_c)
+        self.assertIs(agent_c.service, bystander_c.service)
+
+    def test_multichain_knobs_reach_agent_edge_only(self):
+        from chain import ServiceNodeRuntime
+        from retry_policies import FixedBackoffRetryPolicy
+        from timeout_controllers import StaticTimeoutController
+
+        components = build_multichain_env(3, duration_s=10)
+        components.apply_knobs(
+            ActionValues(
+                attempt_timeout_ms=80, max_attempts=3, backoff_ms=50, global_timeout_ms=None
+            )
+        )
+
+        edge_client = components.cost_client
+        assert edge_client is not None
+        edge_retry = edge_client.cfg.retry
+        edge_timeout = edge_client.cfg.timeout_controller
+        assert isinstance(edge_retry, FixedBackoffRetryPolicy)
+        assert isinstance(edge_timeout, StaticTimeoutController)
+        self.assertEqual(edge_retry.max_attempts, 3)
+        self.assertEqual(edge_retry.delay, ms_to_ns(50))
+        self.assertEqual(edge_timeout.attempt_timeout, ms_to_ns(80))
+
+        # The bystander's Y->C edge stays retry-free and both top-level
+        # clients keep their fixed knobs.
+        assert components.bystander_client is not None
+        x_node = components.bystander_client.service
+        assert isinstance(x_node, ServiceNodeRuntime)
+        y_to_c = x_node.downstreams[0].target.downstreams[0].client
+        bystander_retry = y_to_c.cfg.retry
+        assert isinstance(bystander_retry, FixedBackoffRetryPolicy)
+        self.assertEqual(bystander_retry.max_attempts, 1)
+        for top in (components.client, components.bystander_client):
+            controller = top.cfg.timeout_controller
+            assert isinstance(controller, StaticTimeoutController)
+            self.assertEqual(controller.attempt_timeout, ms_to_ns(300))
+
+    def test_multichain_pure_partial_failure_blips(self):
+        from chain import ServiceNodeRuntime
+
+        for seed in range(20):
+            components = build_multichain_env(seed, duration_s=30)
+            a_node = components.client.service
+            assert isinstance(a_node, ServiceNodeRuntime)
+            c_cfg = a_node.downstreams[0].target.downstreams[0].target.service.cfg
+            self.assertEqual(c_cfg.latency_injections, [])
+            self.assertIn(len(c_cfg.partial_failures), (2, 3, 4))
+            for blip in c_cfg.partial_failures:
+                self.assertGreaterEqual(blip.duration.begin, 0)
+                self.assertLess(blip.duration.begin, blip.duration.end)
+                self.assertLessEqual(blip.duration.end, s_to_ns(30))
+                self.assertGreaterEqual(blip.p_fail, 0.3)
+                self.assertLessEqual(blip.p_fail, 0.6)
+
+    def test_multichain_faults_deterministic_per_seed(self):
+        from chain import ServiceNodeRuntime
+
+        def blip_params(components):
+            a_node = components.client.service
+            assert isinstance(a_node, ServiceNodeRuntime)
+            c_cfg = a_node.downstreams[0].target.downstreams[0].target.service.cfg
+            return tuple(
+                (pf.duration.begin, pf.duration.end, pf.p_fail) for pf in c_cfg.partial_failures
+            )
+
+        a = blip_params(build_multichain_env(5, duration_s=30))
+        b = blip_params(build_multichain_env(5, duration_s=30))
+        c = blip_params(build_multichain_env(6, duration_s=30))
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, c)
+
+    def test_multichain_cost_measures_edge_amplification(self):
+        env = self._make_env(build_multichain_env, episode_duration_s=10.0)
+        env.reset(seed=11)
+        # 50 ms timeout leaves headroom over C's 20 ms median, so cost comes
+        # from the p_fail blips (recoverable failures), not forced timeouts.
+        costs = []
+        terminated = False
+        while not terminated:
+            _, _, terminated, _, info = env.step(np.array([1, 1, 0]))
+            costs.append(info["summary"]["cost"])
+        self.assertGreater(max(costs), 0.0)
+
+    def test_multichain_budget_knobs_route_through_wrapper(self):
+        from retry_policies import FixedBackoffRetryPolicy, RetryBudgetPolicy
+
+        components = build_multichain_env(3, duration_s=10, retry_budget_ratio=0.1)
+        components.apply_knobs(
+            ActionValues(
+                attempt_timeout_ms=80, max_attempts=3, backoff_ms=50, global_timeout_ms=None
+            )
+        )
+        edge_client = components.cost_client
+        assert edge_client is not None
+        wrapper = edge_client.cfg.retry
+        assert isinstance(wrapper, RetryBudgetPolicy)
+        inner = wrapper.underlying_strategy
+        assert isinstance(inner, FixedBackoffRetryPolicy)
+        self.assertEqual(inner.max_attempts, 3)
+        self.assertEqual(inner.delay, ms_to_ns(50))
+
+    def test_multichain_budget_wrapper_throttles_edge_retries(self):
+        def mean_cost(retry_budget_ratio):
+            env = self._make_env(
+                lambda seed: build_multichain_env(
+                    seed, duration_s=10, retry_budget_ratio=retry_budget_ratio
+                ),
+                episode_duration_s=10.0,
+            )
+            env.reset(seed=11)
+            costs = []
+            terminated = False
+            while not terminated:
+                _, _, terminated, _, info = env.step(np.array([1, 1, 0]))
+                costs.append(info["summary"]["cost"])
+            return float(np.mean(costs))
+
+        unbudgeted = mean_cost(None)
+        budgeted = mean_cost(0.05)
+        self.assertGreater(unbudgeted, 0.0)
+        self.assertLess(budgeted, unbudgeted)
+
+    def test_multichain_bystander_summary_reported(self):
+        env = self._make_env(build_multichain_env, episode_duration_s=2.0)
+        env.reset(seed=7)
+        terminated = False
+        while not terminated:
+            _, _, terminated, _, info = env.step(np.array([1, 0, 0]))
+        self.assertIn("bystander_summary", info)
+        self.assertGreater(info["bystander_summary"]["completed"], 0)
+        summary = env.bystander_metrics_summary()
+        assert summary is not None
+        self.assertGreater(summary.total, 0)
+
+    def test_bystander_summary_absent_without_bystander(self):
+        env = self._make_env(build_chain_env, episode_duration_s=1.0)
+        env.reset(seed=7)
+        _, _, terminated, _, info = env.step(np.array([0, 0, 0]))
+        self.assertTrue(terminated)
+        self.assertNotIn("bystander_summary", info)
+        self.assertIsNone(env.bystander_metrics_summary())
+
+    def test_multichain_episode_runs(self):
+        env = self._make_env(build_multichain_env, episode_duration_s=3.0)
+        obs, _ = env.reset(seed=11)
+        terminated = False
+        steps = 0
+        while not terminated and steps < 10:
+            obs, reward, terminated, _, info = env.step(np.array([1, 1, 1]))
+            steps += 1
+        self.assertTrue(terminated)
+        self.assertTrue(env.observation_space.contains(obs))
+        self.assertGreater(info["summary"]["completed"], 0)
 
 
 if __name__ == "__main__":
