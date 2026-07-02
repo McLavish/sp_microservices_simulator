@@ -138,6 +138,125 @@ def _best_fixed_policy(
     return FixedPolicy(action=best_idx, name="retry_budget")
 
 
+def _run_calibration(
+    env: MicroservicesEnv,
+    grid: ActionGrid,
+    oracle_seeds: Sequence[int],
+    eval_seeds: Sequence[int],
+    budgets: Sequence[float],
+) -> bool:
+    """Check the scenario supports a binding retry budget before any training.
+
+    Sweeps every fixed action on the same J metric arm C's oracle uses, then
+    verdicts: retries must be valuable at the unconstrained optimum, the
+    smallest budget must bind there, budgets must trade J for cost, and (when
+    a bystander chain exists) the agent's retries must measurably hurt it.
+    Returns True when every applicable criterion passes.
+    """
+    print(f"[calibrate] sweeping {len(grid.indices)} fixed actions on seeds {list(oracle_seeds)}")
+    sweep: list[tuple[tuple[int, ...], dict]] = []
+    for action_idx in grid.indices:
+        metrics = _eval_arm(env, FixedPolicy(action=action_idx), oracle_seeds, budget=None)
+        sweep.append((action_idx, metrics))
+        values = grid.values_for(action_idx)
+        bystander = metrics["bystander_success_rate"]
+        bystander_str = f"{bystander:.3f}" if isinstance(bystander, float) else "-"
+        print(
+            f"  timeout={values.attempt_timeout_ms:>3}ms attempts={values.max_attempts} "
+            f"backoff={values.backoff_ms:>2}ms  J={metrics['J_mean']:7.3f} "
+            f"cost={metrics['cost_mean']:5.3f} success={metrics['success_rate']:.3f} "
+            f"bystander={bystander_str}"
+        )
+
+    def re_eval(action_idx: tuple[int, ...]) -> dict:
+        return _eval_arm(env, FixedPolicy(action=action_idx), eval_seeds, budget=None)
+
+    best_idx, _ = max(sweep, key=lambda item: item[1]["J_mean"])
+    noretry_sweep = [item for item in sweep if grid.values_for(item[0]).max_attempts == 1]
+    best_noretry_idx, _ = max(noretry_sweep, key=lambda item: item[1]["J_mean"])
+
+    best = re_eval(best_idx)
+    best_values = grid.values_for(best_idx)
+    best_noretry = re_eval(best_noretry_idx)
+    min_budget = min(budgets)
+
+    # Feasible optimum per budget, selected on the sweep's cost (as arm C's
+    # oracle would see it), re-evaluated on the eval seeds for tighter stats.
+    feasible: dict[float, dict] = {}
+    for budget in sorted(budgets):
+        candidates = [item for item in sweep if item[1]["cost_mean"] <= budget]
+        idx, _ = max(candidates, key=lambda item: item[1]["J_mean"])
+        feasible[budget] = re_eval(idx)
+
+    print(
+        f"[calibrate] best action: timeout={best_values.attempt_timeout_ms}ms "
+        f"attempts={best_values.max_attempts} backoff={best_values.backoff_ms}ms "
+        f"J={best['J_mean']:.3f}±{best['J_std']:.3f} cost={best['cost_mean']:.3f}"
+    )
+    for budget in sorted(budgets):
+        row = feasible[budget]
+        print(
+            f"[calibrate] best under cost<={budget}: J={row['J_mean']:.3f} "
+            f"cost={row['cost_mean']:.3f}"
+        )
+
+    results: list[tuple[str, bool, str]] = []
+    results.append(
+        (
+            "(a) retries valuable: unconstrained optimum has max_attempts >= 2",
+            best_values.max_attempts >= 2,
+            "raise p_fail range or blip length in build_multichain_env",
+        )
+    )
+    results.append(
+        (
+            f"(b) smallest budget binds: best cost {best['cost_mean']:.3f} > {min_budget}",
+            best["cost_mean"] > min_budget,
+            "raise p_fail range or blip length in build_multichain_env",
+        )
+    )
+    ordered_j = [feasible[b]["J_mean"] for b in sorted(budgets)] + [best["J_mean"]]
+    standard_error = best["J_std"] / np.sqrt(len(eval_seeds))
+    gap = best["J_mean"] - feasible[min_budget]["J_mean"]
+    results.append(
+        (
+            f"(c) budgets separate: J nondecreasing in budget and "
+            f"gap {gap:.3f} > 2*SE {2 * standard_error:.3f}",
+            all(a <= b + 1e-9 for a, b in zip(ordered_j, ordered_j[1:], strict=False))
+            and gap > 2 * standard_error,
+            "widen the p_fail range so the cost spectrum spreads",
+        )
+    )
+    if isinstance(best["bystander_success_rate"], float) and isinstance(
+        best_noretry["bystander_success_rate"], float
+    ):
+        externality = best_noretry["bystander_success_rate"] - best["bystander_success_rate"]
+        results.append(
+            (
+                f"(d) externality real: bystander damage {externality:.3f} >= 0.02",
+                externality >= 0.02,
+                "drop svc-C workers or raise per-chain base_rps",
+            )
+        )
+    else:
+        print("[calibrate] (d) externality: SKIP — scenario has no bystander chain")
+    results.append(
+        (
+            f"(e) baseline healthy: no-retry success {best_noretry['success_rate']:.3f} >= 0.85",
+            best_noretry["success_rate"] >= 0.85,
+            "raise svc-C workers (undersized even without amplification)",
+        )
+    )
+
+    all_passed = True
+    for label, passed, remedy in results:
+        verdict = "PASS" if passed else f"FAIL — remedy: {remedy}"
+        print(f"[calibrate] {label}: {verdict}")
+        all_passed = all_passed and passed
+    print(f"[calibrate] overall: {'PASS' if all_passed else 'FAIL'}")
+    return all_passed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", choices=sorted(SCENARIO_TO_BUILDER), default="chain")
@@ -168,12 +287,13 @@ def main() -> None:
     parser.add_argument(
         "--curve-prefix", type=str, default=None, help="default: rl_constrained_curve_<scenario>"
     )
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="grid-sweep fixed policies and verify the scenario supports a "
+        "binding retry budget, then exit without training",
+    )
     args = parser.parse_args()
-
-    if PPO is None:
-        raise ImportError(
-            "stable-baselines3 is required for this experiment"
-        ) from _SB3_IMPORT_ERROR
 
     builder = SCENARIO_TO_BUILDER[args.scenario]
     output_csv = args.output_csv or f"rl_constrained_comparison_{args.scenario}.csv"
@@ -191,6 +311,16 @@ def main() -> None:
         return builder(seed, duration)
 
     plain_env = _make_env(plain_build, action_spec, args.episode_duration_s)
+
+    if args.calibrate:
+        _run_calibration(plain_env, grid, args.oracle_seeds, args.eval_seeds, args.budgets)
+        return
+
+    if PPO is None:
+        raise ImportError(
+            "stable-baselines3 is required for this experiment"
+        ) from _SB3_IMPORT_ERROR
+
     rows: list[dict] = []
 
     def common_train_kwargs() -> dict:
