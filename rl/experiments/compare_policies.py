@@ -1,5 +1,6 @@
 import argparse
 import csv
+import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -23,7 +24,7 @@ from rl.policies.model_based import ModelBasedPolicy
 from rl.policies.sb3 import SB3Policy
 from rl.sb3_support import import_sb3
 
-PPO, make_vec_env, sb3_evaluate, _SubprocVecEnv, _ = import_sb3()
+PPO, make_vec_env, _sb3_evaluate, _SubprocVecEnv, _ = import_sb3()
 
 
 @dataclass
@@ -41,7 +42,6 @@ class ExperimentConfig:
     ppo_eval_interval: int
     ppo_eval_episodes: int
     ppo_patience: int
-    ppo_min_delta: float
     ppo_n_steps: int
     ppo_batch_size: int
     ppo_gamma: float
@@ -173,8 +173,13 @@ def _evaluate(
 
 
 def _train_ppo(cfg: ExperimentConfig, learning_curve_csv: str | None = None) -> SB3Policy:
-    if PPO is None or make_vec_env is None or sb3_evaluate is None:
+    if PPO is None or make_vec_env is None:
         raise ImportError("stable-baselines3 is required for PPO baseline")
+    from stable_baselines3.common.callbacks import (
+        EvalCallback,
+        StopTrainingOnNoModelImprovement,
+    )
+    from stable_baselines3.common.monitor import Monitor
 
     def env_factory():
         return _build_env(cfg)
@@ -192,34 +197,36 @@ def _train_ppo(cfg: ExperimentConfig, learning_curve_csv: str | None = None) -> 
 
     # Seed the early-stopping eval env once: its unseeded resets then draw a
     # reproducible scenario sequence from the gym RNG instead of fresh entropy.
-    eval_env = _build_env(cfg)
+    eval_env = Monitor(_build_env(cfg))
     eval_env.reset(seed=cfg.train_seeds[0] + 10_000)
 
-    best_mean = -float("inf")
-    no_improve = 0
-    trained = 0
-    curve: list[tuple[int, float]] = []
-    while trained < cfg.ppo_timesteps:
-        step = min(cfg.ppo_eval_interval, cfg.ppo_timesteps - trained)
-        model.learn(total_timesteps=step)
-        trained += step
-        mean_reward = float(
-            np.mean(sb3_evaluate(model, eval_env, n_eval_episodes=cfg.ppo_eval_episodes)[0])
+    # EvalCallback only keeps its evaluation history when log_path is set; the
+    # npz it writes there is discarded in favor of the CSV below.
+    with tempfile.TemporaryDirectory() as npz_dir:
+        eval_callback = EvalCallback(
+            eval_env,
+            n_eval_episodes=cfg.ppo_eval_episodes,
+            eval_freq=cfg.ppo_eval_interval,
+            log_path=npz_dir,
+            callback_after_eval=StopTrainingOnNoModelImprovement(
+                max_no_improvement_evals=cfg.ppo_patience
+            ),
+            verbose=0,
         )
-        curve.append((trained, mean_reward))
-        if mean_reward > best_mean + cfg.ppo_min_delta:
-            best_mean = mean_reward
-            no_improve = 0
-        else:
-            no_improve += 1
-        if no_improve >= cfg.ppo_patience:
-            break
+        model.learn(total_timesteps=cfg.ppo_timesteps, callback=eval_callback)
 
-    if learning_curve_csv and curve:
+    if learning_curve_csv and len(eval_callback.evaluations_timesteps):
         with open(learning_curve_csv, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["timesteps", "eval_reward"])
-            writer.writerows(curve)
+            writer.writerows(
+                (steps, float(np.mean(rewards)))
+                for steps, rewards in zip(
+                    eval_callback.evaluations_timesteps,
+                    eval_callback.evaluations_results,
+                    strict=True,
+                )
+            )
         print(f"Wrote PPO learning curve to {learning_curve_csv}")
 
     return SB3Policy(model=model, deterministic=True, name="ppo")
@@ -262,7 +269,6 @@ def main() -> None:
     parser.add_argument("--ppo-eval-interval", type=int, default=1000)
     parser.add_argument("--ppo-eval-episodes", type=int, default=3)
     parser.add_argument("--ppo-patience", type=int, default=3)
-    parser.add_argument("--ppo-min-delta", type=float, default=0.1)
     parser.add_argument("--ppo-n-steps", type=int, default=64)
     parser.add_argument("--ppo-batch-size", type=int, default=64)
     parser.add_argument("--ppo-gamma", type=float, default=0.95)
@@ -359,7 +365,6 @@ def main() -> None:
         ppo_eval_interval=args.ppo_eval_interval,
         ppo_eval_episodes=args.ppo_eval_episodes,
         ppo_patience=args.ppo_patience,
-        ppo_min_delta=args.ppo_min_delta,
         ppo_n_steps=args.ppo_n_steps,
         ppo_batch_size=args.ppo_batch_size,
         ppo_gamma=args.ppo_gamma,
