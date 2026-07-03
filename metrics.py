@@ -1,16 +1,15 @@
-import csv
 from dataclasses import dataclass
 
 import numpy as np
 
 from core import (
     MS_TO_NS,
+    S_TO_NS,
     DropReason,
     RootRequest,
     Summary,
     TimeInterval,
     ns_to_ms,
-    ns_to_s,
     s_to_ns,
 )
 
@@ -119,192 +118,145 @@ class Metrics:
         - failure_retry_count counts failed RETRY attempts (after the first), bucketed by attempt end.
         - latencies are for successful roots completed in the bucket.
         """
+        # Lazy import: pandas is a dev dependency; the simulation core stays
+        # numpy+stdlib-only until export time.
+        import pandas as pd
+
         if granularity_s <= 0:
             raise ValueError("granularity_s must be > 0")
         bucket_ns = s_to_ns(granularity_s)
 
-        all_attempts = [a for r in self.roots for a in r.attempts]
+        columns = [
+            "timepoint",
+            "root_requests",  # bucketed at the start
+            "retries",  # bucketed at the start
+            "success_root",  # # bucketed at the end. Actually should be the same as success_retry
+            "completed",  # all attempts completed, bucketed at the end
+            "failure_root",
+            "failure_retry",
+            "failure_queue_full",
+            "failure_deadline",
+            "failure_server",
+            "failure_circuit_open",
+            "total_request",  # bucketed at the start. rename total_started_roots?
+            "total_failure",  # bucketed at the end. rename total_failed_roots_completed?
+            "p50",  # percentiles are all bucketed at the end
+            "p90",
+            "p95",
+            "p99",
+            "p99.9",
+            "p99.99",
+            "min",
+            "max",
+            "queue_avg_at_attempt_end",
+        ]
 
-        with open(path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                [
-                    "timepoint",
-                    "root_requests",  # bucketed at the start
-                    "retries",  # bucketed at the start
-                    "success_root",  # # bucketed at the end. Actually should be the same as success_retry
-                    "completed",  # all attempts completed, bucketed at the end
-                    "failure_root",
-                    "failure_retry",
-                    "failure_queue_full",
-                    "failure_deadline",
-                    "failure_server",
-                    "failure_circuit_open",
-                    "total_request",  # bucketed at the start. rename total_started_roots?
-                    "total_failure",  # bucketed at the end. rename total_failed_roots_completed?
-                    "p50",  # percentiles are all bucketed at the end
-                    "p90",
-                    "p95",
-                    "p99",
-                    "p99.9",
-                    "p99.99",
-                    "min",
-                    "max",
-                    "queue_avg_at_attempt_end",
-                ]
+        # One row per attempt (retry order per root) and one per root; failed
+        # roots are attributed to the final attempt's drop_reason.
+        attempt_rows: list[dict] = []
+        root_rows: list[dict] = []
+        for root in self.roots:
+            if not root.attempts:
+                continue
+            attempts_by_begin = sorted(root.attempts, key=lambda a: a.interval.begin)
+            last_attempt = sorted(root.attempts, key=lambda a: a.interval.end)[-1]
+            root_rows.append(
+                {
+                    "begin": attempts_by_begin[0].interval.begin,
+                    "end": last_attempt.interval.end,
+                    "succeeded": any(a.success for a in root.attempts),
+                    "drop_reason": last_attempt.drop_reason,
+                }
             )
-
-            if not all_attempts:
-                return
-
-            min_begin = min(a.interval.begin for a in all_attempts)
-            max_end = max(a.interval.end for a in all_attempts)
-
-            # check if no attempt begins and ends at the exact same time
-            # for a in all_attempts:
-            #     assert a.interval.begin != a.interval.end
-
-            # Align to bucket boundaries
-            start_ns = (min_begin // bucket_ns) * bucket_ns
-            # end_ns = ((max_end + bucket_ns - 1) // bucket_ns) * bucket_ns
-            end_ns = ((max_end // bucket_ns) + 1) * bucket_ns
-            nbuckets = int((end_ns - start_ns) // bucket_ns)
-
-            # Per-bucket trackers (counts only)
-            root_counts = [0] * nbuckets  # roots that START in bucket
-            retry_counts = [0] * nbuckets  # retry attempts that START in bucket
-            failure_counts = [0] * nbuckets  # failed ROOTS that COMPLETE in bucket
-            failure_q_counts = [0] * nbuckets  # failed ROOTS by reason
-            failure_dead_counts = [0] * nbuckets
-            failure_srv_counts = [0] * nbuckets
-            failure_co_counts = [0] * nbuckets
-            retry_fail_counts = [0] * nbuckets  # failed RETRY attempts that END in bucket
-            completed_counts = [0] * nbuckets  # all attempts that END in bucket
-            latencies_by_bucket: list[list[int]] = [
-                [] for _ in range(nbuckets)
-            ]  # successful ROOT latencies (ns), by completion bucket
-            queue_sizes_by_bucket: list[list[int]] = [
-                [] for _ in range(nbuckets)
-            ]  # queue size at attempt END, by completion bucket
-
-            def bin_of(tns: int) -> int:
-                return int((tns - start_ns) // bucket_ns)
-
-            # Populate attempt-end buckets (completed_counts, queue sizes)
-            for a in all_attempts:
-                b_end = bin_of(a.interval.end)
-                if 0 <= b_end < nbuckets:
-                    completed_counts[b_end] += 1
-                    if a.queue_size_at_end is not None:
-                        queue_sizes_by_bucket[b_end].append(int(a.queue_size_at_end))
-
-            # Populate buckets
-            for root in self.roots:
-                if not root.attempts:
-                    continue
-
-                attempts_by_begin = sorted(root.attempts, key=lambda a: a.interval.begin)
-                attempts_by_end = sorted(root.attempts, key=lambda a: a.interval.end)
-
-                root_begin = attempts_by_begin[0].interval.begin
-                root_end = attempts_by_end[-1].interval.end
-                last_attempt = attempts_by_end[-1]
-
-                # Root start -> root_requests_count
-                b_start = bin_of(root_begin)
-                if 0 <= b_start < nbuckets:
-                    root_counts[b_start] += 1
-
-                # Retries: attempts beyond first, bucketed by BEGIN
-                for a in attempts_by_begin[1:]:
-                    b_retry = bin_of(a.interval.begin)
-                    if 0 <= b_retry < nbuckets:
-                        retry_counts[b_retry] += 1
-
-                # Failed retry attempts: bucket by END
-                for a in attempts_by_begin[1:]:
-                    if (not a.success) and (a.drop_reason != DropReason.NONE):
-                        b_rfail = bin_of(a.interval.end)
-                        if 0 <= b_rfail < nbuckets:
-                            retry_fail_counts[b_rfail] += 1
-
-                # Root completion: success/failure and latency allocation
-                succeeded = any(a.success for a in root.attempts)
-                b_done = bin_of(root_end)
-                if 0 <= b_done < nbuckets:
-                    if succeeded:
-                        latencies_by_bucket[b_done].append(root_end - root_begin)
-                    else:
-                        failure_counts[b_done] += 1
-                        # Attribute failed root to the final attempt's drop_reason
-                        if last_attempt.drop_reason == DropReason.QUEUE_FULL:
-                            failure_q_counts[b_done] += 1
-                        elif last_attempt.drop_reason == DropReason.DEADLINE:
-                            failure_dead_counts[b_done] += 1
-                        elif last_attempt.drop_reason == DropReason.CIRCUIT_OPEN:
-                            failure_co_counts[b_done] += 1
-                        elif last_attempt.drop_reason == DropReason.SERVER_FAILURE:
-                            failure_srv_counts[b_done] += 1
-
-            total_requests_so_far = 0
-            total_failures_so_far = 0
-
-            for i in range(nbuckets):
-                tp_sec = ns_to_s(start_ns + i * bucket_ns)
-
-                n_roots = root_counts[i]
-                n_retries = retry_counts[i]
-                n_fail_roots = failure_counts[i]
-                n_retry_fails = retry_fail_counts[i]
-                lats = latencies_by_bucket[i]
-                n_success_roots = len(lats)
-
-                # Update cumulatives
-                total_requests_so_far += n_roots
-                total_failures_so_far += n_fail_roots
-
-                # Latency stats (ms) for successful roots in this bucket
-                if lats:
-                    p50 = self._percentile_ms(0.5, lats)
-                    p90 = self._percentile_ms(0.9, lats)
-                    p95 = self._percentile_ms(0.95, lats)
-                    p99 = self._percentile_ms(0.99, lats)
-                    p999 = self._percentile_ms(0.999, lats)
-                    p9999 = self._percentile_ms(0.9999, lats)
-                    min_ms = ns_to_ms(min(lats))
-                    max_ms = ns_to_ms(max(lats))
-                else:
-                    p50 = p90 = p95 = p99 = p999 = p9999 = min_ms = max_ms = float("nan")
-
-                # Queue size stats for attempts ending in this bucket
-                if queue_sizes_by_bucket[i]:
-                    q_avg = float(np.mean(queue_sizes_by_bucket[i]))
-                else:
-                    q_avg = float("nan")
-
-                writer.writerow(
-                    [
-                        f"{tp_sec:.3f}",
-                        str(n_roots),
-                        str(n_retries),
-                        str(n_success_roots),
-                        str(completed_counts[i]),
-                        str(n_fail_roots),
-                        str(n_retry_fails),
-                        str(failure_q_counts[i]),
-                        str(failure_dead_counts[i]),
-                        str(failure_srv_counts[i]),
-                        str(failure_co_counts[i]),
-                        str(total_requests_so_far),
-                        str(total_failures_so_far),
-                        f"{p50:.3f}",
-                        f"{p90:.3f}",
-                        f"{p95:.3f}",
-                        f"{p99:.3f}",
-                        f"{p999:.3f}",
-                        f"{p9999:.3f}",
-                        f"{min_ms:.3f}",
-                        f"{max_ms:.3f}",
-                        f"{q_avg:.3f}",
-                    ]
+            for i, a in enumerate(attempts_by_begin):
+                attempt_rows.append(
+                    {
+                        "begin": a.interval.begin,
+                        "end": a.interval.end,
+                        "is_retry": i > 0,
+                        "retry_failed": i > 0
+                        and not a.success
+                        and a.drop_reason != DropReason.NONE,
+                        "queue": float("nan")
+                        if a.queue_size_at_end is None
+                        else int(a.queue_size_at_end),
+                    }
                 )
+
+        if not attempt_rows:
+            pd.DataFrame(columns=columns).to_csv(path, index=False, lineterminator="\r\n")
+            return
+
+        attempts = pd.DataFrame(attempt_rows)
+        roots = pd.DataFrame(root_rows)
+
+        # Align to bucket boundaries
+        start_ns = int(attempts["begin"].min()) // bucket_ns * bucket_ns
+        end_ns = (int(attempts["end"].max()) // bucket_ns + 1) * bucket_ns
+        buckets = pd.RangeIndex((end_ns - start_ns) // bucket_ns)
+
+        def bucket_of(at: "pd.Series") -> "pd.Series":
+            return (at - start_ns) // bucket_ns
+
+        def per_bucket_count(at: "pd.Series") -> "pd.Series":
+            return bucket_of(at).value_counts().reindex(buckets, fill_value=0)
+
+        succeeded = roots[roots["succeeded"]]
+        failed = roots[~roots["succeeded"]]
+
+        # Latency stats (ms) over successful ROOT latencies, by completion bucket
+        def percentile(p: float):
+            return lambda lat_ns: self._percentile_ms(p, lat_ns.tolist())
+
+        lat_stats = (
+            (succeeded["end"] - succeeded["begin"])
+            .groupby(bucket_of(succeeded["end"]))
+            .agg(
+                **{
+                    "p50": percentile(0.5),
+                    "p90": percentile(0.9),
+                    "p95": percentile(0.95),
+                    "p99": percentile(0.99),
+                    "p99.9": percentile(0.999),
+                    "p99.99": percentile(0.9999),
+                    "min": lambda lat_ns: ns_to_ms(lat_ns.min()),
+                    "max": lambda lat_ns: ns_to_ms(lat_ns.max()),
+                }
+            )
+            .reindex(buckets)
+        )
+
+        with_queue = attempts.dropna(subset=["queue"])
+        out = pd.DataFrame(
+            {
+                "timepoint": (start_ns + np.arange(len(buckets)) * bucket_ns) / S_TO_NS,
+                "root_requests": per_bucket_count(roots["begin"]),
+                "retries": per_bucket_count(attempts.loc[attempts["is_retry"], "begin"]),
+                "success_root": per_bucket_count(succeeded["end"]),
+                "completed": per_bucket_count(attempts["end"]),
+                "failure_root": per_bucket_count(failed["end"]),
+                "failure_retry": per_bucket_count(attempts.loc[attempts["retry_failed"], "end"]),
+                "failure_queue_full": per_bucket_count(
+                    failed.loc[failed["drop_reason"] == DropReason.QUEUE_FULL, "end"]
+                ),
+                "failure_deadline": per_bucket_count(
+                    failed.loc[failed["drop_reason"] == DropReason.DEADLINE, "end"]
+                ),
+                "failure_server": per_bucket_count(
+                    failed.loc[failed["drop_reason"] == DropReason.SERVER_FAILURE, "end"]
+                ),
+                "failure_circuit_open": per_bucket_count(
+                    failed.loc[failed["drop_reason"] == DropReason.CIRCUIT_OPEN, "end"]
+                ),
+                # queue size at attempt END, by completion bucket
+                "queue_avg_at_attempt_end": (
+                    with_queue.groupby(bucket_of(with_queue["end"]))["queue"]
+                    .mean()
+                    .reindex(buckets)
+                ),
+            }
+        )
+        out["total_request"] = out["root_requests"].cumsum()
+        out["total_failure"] = out["failure_root"].cumsum()
+        out = pd.concat([out, lat_stats], axis=1)[columns]
+        out.to_csv(path, index=False, float_format="%.3f", na_rep="nan", lineterminator="\r\n")
