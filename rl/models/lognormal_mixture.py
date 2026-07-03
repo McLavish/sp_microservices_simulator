@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass, field
 
 import numpy as np
+from scipy.optimize import brentq
 from scipy.stats import norm
 from sklearn.mixture import GaussianMixture
 
@@ -86,16 +87,19 @@ class LogNormalMixtureModel:
         if q >= 1.0:
             return math.inf
 
+        def cdf_gap(x: float) -> float:
+            return float(self.cdf(np.array([x]))[0]) - q
+
+        # Bracket the root, then let brentq solve cdf(x) = q. The lo loop
+        # terminates because cdf(0) == 0; the hi loop because every mixture
+        # quantile is finite.
         lo = max(self._min_sample * 0.5, 1e-12)
         hi = max(self._max_sample * 2.0, lo * 10.0)
-
-        for _ in range(80):
-            mid = 0.5 * (lo + hi)
-            if self.cdf(np.array([mid]))[0] < q:
-                lo = mid
-            else:
-                hi = mid
-        return float(0.5 * (lo + hi))
+        while cdf_gap(lo) > 0:
+            lo /= 2.0
+        while cdf_gap(hi) < 0:
+            hi *= 2.0
+        return float(brentq(cdf_gap, lo, hi))
 
     def sample(self, rng: np.random.Generator, size: int) -> np.ndarray:
         weights, mus, sigmas = self._fitted_params()
