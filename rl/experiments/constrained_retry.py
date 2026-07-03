@@ -22,6 +22,7 @@ import csv
 from collections.abc import Callable, Sequence
 
 import numpy as np
+from scipy.stats import ttest_rel
 
 from rl.cli import parse_float_list, parse_int_list
 from rl.constrained import (
@@ -227,20 +228,18 @@ def _run_calibration(
     )
     ordered_j = [feasible[b]["J_mean"] for b in sorted(budgets)] + [best["J_mean"]]
     # Every arm runs the same eval seeds, so the seed-to-seed blip-difficulty
-    # variance is shared and cancels in a paired comparison — test the
-    # per-seed gaps, not the pooled stds.
-    paired_gaps = [
-        b_j - f_j
-        for b_j, f_j in zip(best["J_per_seed"], feasible[min_budget]["J_per_seed"], strict=True)
-    ]
-    gap = float(np.mean(paired_gaps))
-    paired_se = float(np.std(paired_gaps)) / np.sqrt(len(paired_gaps))
+    # variance is shared and cancels in a paired comparison — hence a paired
+    # t-test on per-seed J, not the pooled stds.
+    gap = float(np.mean(best["J_per_seed"])) - float(np.mean(feasible[min_budget]["J_per_seed"]))
+    paired = ttest_rel(
+        best["J_per_seed"], feasible[min_budget]["J_per_seed"], alternative="greater"
+    )
     results.append(
         (
             f"(c) budgets separate: J nondecreasing in budget and paired "
-            f"gap {gap:.3f} > 2*SE {2 * paired_se:.3f}",
+            f"gap {gap:.3f} > 0 (t-test p={paired.pvalue:.3f})",
             all(a <= b + 1e-9 for a, b in zip(ordered_j, ordered_j[1:], strict=False))
-            and gap > 2 * paired_se,
+            and paired.pvalue < 0.05,
             "widen the p_fail range so the cost spectrum spreads",
         )
     )
