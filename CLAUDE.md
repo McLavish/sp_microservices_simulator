@@ -8,6 +8,8 @@ Discrete-event simulator of microservice request flows: queues, retries, timeout
 
 The project is uv-managed but **not an installable package** (`pyproject.toml` sets `package = false`). Everything runs as `python -m <module>` from the repo root against the in-tree `.venv`. Imports are flat (`from core import ...`, `from service import ...`), so the cwd must be the repo root. The simulator core depends only on `numpy` + stdlib; `scipy`, `scikit-learn`, `matplotlib`, `pandas`, `gymnasium`, `stable-baselines3` are dev/optional deps pulled in only by plotting and RL entry points.
 
+Deeper reference docs live in `docs/` — start with `docs/architecture.md`, then the subsystem you're touching (`services-and-workload`, `request-handling`, `observability`, `experiments`, `rl`). Keep them in sync when changing the behavior they describe. `AGENTS.md` is a symlink to this file — edit `CLAUDE.md`, never create a separate agents file.
+
 ## Architecture
 
 The simulator is built around a single-threaded discrete-event loop. Events are pushed onto a heap with `(at, seq)` ordering, popped in time order, and `Simulator.timestep` advances to the event's `at` before its action runs (`simulator.py`). Every random draw goes through `Simulator.rng()` so a single seed makes service times, failures, and jitter reproducible — `Workload` deliberately keeps a *separate* RNG (`workload.py`) so arrival processes stay identical across experiments even when the simulator seed changes.
@@ -74,7 +76,9 @@ Single-service / chain experiments (write CSVs + JSON to repo root):
 python -m experiments.default
 python -m experiments.chain_fanout
 python -m experiments.multichain_retry_storm
+python -m experiments.hotel_matched   # DeathStarBench hotelReservation approximation -> hotel_matched_results/
 ```
+`experiments/hotel_matched.py` maps the hotel read workload onto two chains sharing `profile`; `--calibration-json` takes the calibration JSON emitted by the external `valharness` project (`orchestrator.record_real`) and falls back to built-in defaults without it.
 The tandem vs hold-worker fan-out behaviour is covered by
 `tests/test_chain_worker_model.py`; broader chain scenarios (fan-out
 monotonicity, deadline propagation, queue pressure) live in
@@ -95,11 +99,17 @@ RL:
 python -m rl.experiments.compare_models --dist {lognormal,mixture,pareto}
 python -m rl.experiments.compare_policies \
     --policies fixed,aimd,model_based,model_based_queue,bayesian,ppo,oracle_fixed \
-    --fault-scenario randomized   # choices: none, basic, randomized, chain
+    --fault-scenario randomized   # any SCENARIO_BUILDERS name: none, basic, randomized, chain, chain_budget, multichain, multichain_budget
 python -m rl.train_sb3 --timesteps 100000 --fault-scenario randomized --save-path rl_models/ppo.zip
 python -m rl.experiments.constrained_retry --budgets 0.05,0.1,0.2 --device cpu  # Lagrangian PPO vs RetryBudgetPolicy
 python -m rl.experiments.constrained_retry --scenario multichain --calibrate --device cpu  # gate: budget must bind
 python -m rl.experiments.constrained_retry --scenario multichain --budgets 0.05,0.1,0.2 --device cpu
+```
+
+RL result plots (consume the CSVs the experiments above write):
+```bash
+python -m plotting.rl_pareto rl_constrained_comparison_multichain.csv   # goodput-vs-amplification Pareto + bystander panel
+python -m plotting.rl_traces_over_time rl_traces_basic.csv              # per-step knob/success traces; fault overlay only lines up for `basic`
 ```
 
 ## Conventions when extending
