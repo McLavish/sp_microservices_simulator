@@ -95,15 +95,15 @@ def plot_pareto(comparison_csv: str, output: str) -> None:
             markeredgewidth=0.4,
         )
 
-    for _, row in df[df["arm"] == "constrained_ppo"].iterrows():
-        if pd.notna(row["budget"]):
-            ax_j.annotate(
-                f"$b$={row['budget']:g}",
-                (row["cost_mean"], row["J_mean"]),
-                textcoords="offset points",
-                xytext=(4, -9),
-                fontsize=6.5,
-            )
+    # one label per distinct constrained-PPO point; coincident points share it
+    con = df[(df["arm"] == "constrained_ppo") & pd.notna(df["budget"])]
+    grouped: dict[tuple[float, float], list[float]] = {}
+    for _, row in con.iterrows():
+        key = (round(row["cost_mean"], 4), round(row["J_mean"], 4))
+        grouped.setdefault(key, []).append(row["budget"])
+    for (cost, j), buds in grouped.items():
+        label = "$b$=" + ", ".join(f"{b:g}" for b in sorted(buds))
+        ax_j.annotate(label, (cost, j), textcoords="offset points", xytext=(4, -9), fontsize=6.5)
 
     ax_j.set_ylabel("objective $J$")
     ax_by.set_ylabel("bystander success rate")
@@ -120,16 +120,19 @@ def plot_dual_ascent(curve_prefix: str, output: str) -> None:
         raise SystemExit(f"no curve CSVs match {curve_prefix}_b*.csv")
 
     budget_colors = [C_BLUE, C_AQUA, C_YELLOW]
+    # distinct dashes so coincident trajectories stay distinguishable
+    budget_dashes = ["-", "--", "-."]
     fig, (ax_cost, ax_lambda) = plt.subplots(2, 1, figsize=(COLUMN_WIDTH_IN, 2.9), sharex=True)
 
     for i, path in enumerate(files):
         budget = float(path.rsplit("_b", 1)[1].removesuffix(".csv"))
         df = pd.read_csv(path)
         color = budget_colors[i % len(budget_colors)]
+        dash = budget_dashes[i % len(budget_dashes)]
         steps = df["timesteps"] / 1000.0
-        ax_cost.plot(steps, df["eval_cost"], color=color, label=f"$b$={budget:g}")
+        ax_cost.plot(steps, df["eval_cost"], color=color, linestyle=dash, label=f"$b$={budget:g}")
         ax_cost.axhline(budget, color=color, linestyle=":", linewidth=0.7, alpha=0.8)
-        ax_lambda.plot(steps, df["lambda"], color=color)
+        ax_lambda.plot(steps, df["lambda"], color=color, linestyle=dash)
         ax_lambda.annotate(
             f"$b$={budget:g}",
             (steps.iloc[-1], df["lambda"].iloc[-1]),
