@@ -131,6 +131,7 @@ def _eval_arm(
     }
     if keep_per_seed:
         result["J_per_seed"] = objectives
+        result["cost_per_seed"] = costs
     return result
 
 
@@ -304,6 +305,19 @@ def main() -> None:
         "--curve-prefix", type=str, default=None, help="default: rl_constrained_curve_<scenario>"
     )
     parser.add_argument(
+        "--per-seed-csv",
+        type=str,
+        default=None,
+        help="also write one row per (arm, budget, eval seed) with J and cost; "
+        "default: <output-csv stem>_per_seed.csv",
+    )
+    parser.add_argument(
+        "--save-model-prefix",
+        type=str,
+        default=None,
+        help="save each trained PPO model to <prefix>_<arm>[_b<budget>].zip",
+    )
+    parser.add_argument(
         "--calibrate",
         action="store_true",
         help="grid-sweep fixed policies and verify the scenario supports a "
@@ -338,6 +352,21 @@ def main() -> None:
         ) from _SB3_IMPORT_ERROR
 
     rows: list[dict] = []
+    per_seed_rows: list[dict] = []
+    per_seed_csv = args.per_seed_csv or f"{output_csv.removesuffix('.csv')}_per_seed.csv"
+
+    def record(arm: str, budget: float | str, metrics: dict) -> dict:
+        """Split per-seed samples out of an eval result and log both."""
+        j_per_seed = metrics.pop("J_per_seed", [])
+        cost_per_seed = metrics.pop("cost_per_seed", [])
+        for seed, j, cost in zip(args.eval_seeds, j_per_seed, cost_per_seed, strict=False):
+            per_seed_rows.append({"arm": arm, "budget": budget, "seed": seed, "J": j, "cost": cost})
+        rows.append({"arm": arm, "budget": budget, **metrics})
+        return metrics
+
+    def save_model(policy, name: str) -> None:
+        if args.save_model_prefix is not None:
+            policy.model.save(f"{args.save_model_prefix}_{name}.zip")
 
     def common_train_kwargs() -> dict:
         return {
@@ -365,8 +394,9 @@ def main() -> None:
             **common_train_kwargs(),
         )
     )
-    metrics = _eval_arm(plain_env, unconstrained, args.eval_seeds, budget=None)
-    rows.append({"arm": "unconstrained_ppo", "budget": "", **metrics})
+    metrics = _eval_arm(plain_env, unconstrained, args.eval_seeds, budget=None, keep_per_seed=True)
+    metrics = record("unconstrained_ppo", "", metrics)
+    save_model(unconstrained, "unconstrained")
     print(
         f"[arm A] J={metrics['J_mean']:.3f} cost={metrics['cost_mean']:.3f} "
         f"bystander={metrics['bystander_success_rate']}"
@@ -385,8 +415,11 @@ def main() -> None:
                 **common_train_kwargs(),
             )
         )
-        metrics = _eval_arm(plain_env, constrained, args.eval_seeds, budget=budget)
-        rows.append({"arm": "constrained_ppo", "budget": budget, **metrics})
+        metrics = _eval_arm(
+            plain_env, constrained, args.eval_seeds, budget=budget, keep_per_seed=True
+        )
+        metrics = record("constrained_ppo", budget, metrics)
+        save_model(constrained, f"constrained_b{budget}")
         print(
             f"[arm B] b={budget} J={metrics['J_mean']:.3f} cost={metrics['cost_mean']:.3f} "
             f"violations={metrics['violation_rate']} "
@@ -399,13 +432,20 @@ def main() -> None:
 
         budget_env = _make_env(budget_build, action_spec, args.episode_duration_s)
         oracle = _best_fixed_policy(budget_env, grid, args.oracle_seeds)
-        metrics = _eval_arm(budget_env, oracle, args.eval_seeds, budget=budget)
-        rows.append({"arm": "retry_budget", "budget": budget, **metrics})
+        metrics = _eval_arm(budget_env, oracle, args.eval_seeds, budget=budget, keep_per_seed=True)
+        metrics = record("retry_budget", budget, metrics)
         print(
             f"[arm C] b={budget} J={metrics['J_mean']:.3f} cost={metrics['cost_mean']:.3f} "
             f"violations={metrics['violation_rate']} "
             f"bystander={metrics['bystander_success_rate']}"
         )
+
+    if per_seed_rows:
+        with open(per_seed_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(per_seed_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(per_seed_rows)
+        print(f"Wrote per-seed evaluations to {per_seed_csv}")
 
     with open(output_csv, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
