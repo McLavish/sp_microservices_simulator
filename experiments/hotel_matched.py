@@ -62,6 +62,7 @@ class HotelMatchedConfig:
     seed: int = 1234
     profile_faults: list[tuple[float, float, float, float]] | None = None
     load_spikes: list[tuple[float, float, float]] | None = None
+    leaf_max_attempts: int = 3
 
 
 @dataclass
@@ -85,7 +86,11 @@ def run_hotel_matched(config: HotelMatchedConfig) -> dict[str, str]:
 
     sim = Simulator(seed=config.seed)
     run = _build_runtime(
-        sim, calibration=calibration, profile_faults=profile_faults, seed=config.seed
+        sim,
+        calibration=calibration,
+        profile_faults=profile_faults,
+        seed=config.seed,
+        leaf_max_attempts=config.leaf_max_attempts,
     )
 
     duration_s = int(math.ceil(config.duration_s))
@@ -142,6 +147,7 @@ def _build_runtime(
     calibration: dict[str, Any],
     profile_faults: list[tuple[float, float, float, float]],
     seed: int,
+    leaf_max_attempts: int = 3,
 ) -> HotelMatchedRun:
     fault_tracker = FaultEventsTracker()
 
@@ -177,7 +183,7 @@ def _build_runtime(
 
     nodes = {name: ServiceNodeRuntime(ServiceRuntime(cfg=cfg).bind()) for name, cfg in cfgs.items()}
 
-    policies = _client_policies(seed)
+    policies = _client_policies(seed, leaf_max_attempts=leaf_max_attempts)
 
     hotels_to_search = ClientRuntime(policies["aggregator_no_retry"], nodes["search"])
     search_to_geo = ClientRuntime(policies["search_downstream_geo"], nodes["geo"])
@@ -232,7 +238,7 @@ def _build_runtime(
     )
 
 
-def _client_policies(seed: int) -> dict[str, ClientConfig]:
+def _client_policies(seed: int, *, leaf_max_attempts: int = 3) -> dict[str, ClientConfig]:
     return {
         "top": _no_retry_cfg(attempt_timeout_ms=1000),
         "aggregator_no_retry": _no_retry_cfg(attempt_timeout_ms=900),
@@ -250,18 +256,18 @@ def _client_policies(seed: int) -> dict[str, ClientConfig]:
             initial_delay_ms=20,
             max_delay_ms=150,
         ),
-        "leaf_reservation": _leaf_read_cfg(seed=seed + 201),
-        "leaf_hotels_profile": _leaf_read_cfg(seed=seed + 202),
-        "leaf_recommendation": _leaf_read_cfg(seed=seed + 203),
-        "leaf_recommendations_profile": _leaf_read_cfg(seed=seed + 204),
+        "leaf_reservation": _leaf_read_cfg(seed=seed + 201, max_attempts=leaf_max_attempts),
+        "leaf_hotels_profile": _leaf_read_cfg(seed=seed + 202, max_attempts=leaf_max_attempts),
+        "leaf_recommendation": _leaf_read_cfg(seed=seed + 203, max_attempts=leaf_max_attempts),
+        "leaf_recommendations_profile": _leaf_read_cfg(seed=seed + 204, max_attempts=leaf_max_attempts),
     }
 
 
-def _leaf_read_cfg(seed: int) -> ClientConfig:
+def _leaf_read_cfg(seed: int, max_attempts: int = 3) -> ClientConfig:
     return _exp_jitter_cfg(
         seed=seed,
         attempt_timeout_ms=750,
-        max_attempts=3,
+        max_attempts=max_attempts,
         initial_delay_ms=25,
         max_delay_ms=200,
     )
@@ -416,7 +422,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Load spike as start,end,multiplier; overrides calibration.",
     )
+    parser.add_argument(
+        "--leaf-max-attempts",
+        type=_parse_leaf_max_attempts,
+        default=3,
+        help="Total attempts (initial + retries) for leaf-read clients; mirrors leaf-read max_retries + 1.",
+    )
     return parser
+
+
+def _parse_leaf_max_attempts(value: str) -> int:
+    attempts = int(value)
+    if attempts < 1:
+        raise argparse.ArgumentTypeError("leaf max attempts must be >= 1")
+    return attempts
 
 
 def config_from_args(argv: Sequence[str] | None = None) -> HotelMatchedConfig:
@@ -430,6 +449,7 @@ def config_from_args(argv: Sequence[str] | None = None) -> HotelMatchedConfig:
         seed=args.seed,
         profile_faults=list(args.profile_fault) if args.profile_fault is not None else None,
         load_spikes=list(args.load_spike) if args.load_spike is not None else None,
+        leaf_max_attempts=args.leaf_max_attempts,
     )
 
 
