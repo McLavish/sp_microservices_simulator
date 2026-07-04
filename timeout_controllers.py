@@ -38,7 +38,6 @@ class StaticTimeoutController(TimeoutController):
         pass
 
 
-# TODO: This is untested
 @dataclass
 class AdaptiveTimeoutController(TimeoutController):
     """Adaptive timeout controller that adjusts based on latency percentiles and success rates"""
@@ -106,6 +105,9 @@ class AdaptiveTimeoutController(TimeoutController):
             if success_rate < self.min_success_rate:
                 success_adjustment = 1.0 / max(success_rate, 0.1)
                 adjusted_timeout = int(percentile_timeout * success_adjustment)
+                # max_timeout is a hard cap; inflation must not escape it
+                if self.max_timeout is not None:
+                    adjusted_timeout = min(adjusted_timeout, self.max_timeout)
             else:
                 adjusted_timeout = percentile_timeout
 
