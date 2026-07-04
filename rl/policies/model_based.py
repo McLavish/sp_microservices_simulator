@@ -94,13 +94,12 @@ def _simulate_action(
         for attempt in range(max_attempts):
             attempts += 1
             sample = float(model.sample(rng, 1)[0])
+            q_delay = 0.0
             if queue_delay_ms > 0:
                 if queue_delay_mode == "exponential":
                     q_delay = float(rng.exponential(queue_delay_ms))
                 else:
                     q_delay = queue_delay_ms
-            else:
-                q_delay = 0.0
             total_sample = sample + q_delay
             attempt_latency = min(total_sample, timeout)
             elapsed += attempt_latency

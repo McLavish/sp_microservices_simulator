@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import os
-from collections.abc import Sequence
 from dataclasses import dataclass
 
 from rl.cli import parse_int_list, parse_optional_int_list
@@ -153,10 +152,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _coerce_list_arg(value: Sequence[int | None] | None, default):
-    return default if value is None else list(value)
-
-
 def main() -> None:
     parser = _build_arg_parser()
     args = parser.parse_args()
@@ -167,9 +162,9 @@ def main() -> None:
         n_envs=args.n_envs,
         step_duration_s=args.step_duration_s,
         episode_duration_s=args.episode_duration_s,
-        attempt_timeouts_ms=_coerce_list_arg(args.attempt_timeouts_ms, [10, 30, 50]),
-        max_attempts=_coerce_list_arg(args.max_attempts, [1, 2, 3]),
-        backoff_ms=_coerce_list_arg(args.backoff_ms, [0, 20, 50]),
+        attempt_timeouts_ms=list(args.attempt_timeouts_ms),
+        max_attempts=list(args.max_attempts),
+        backoff_ms=list(args.backoff_ms),
         global_timeouts_ms=args.global_timeouts_ms,
         n_steps=args.n_steps,
         batch_size=args.batch_size,

@@ -7,6 +7,13 @@ from rl.models.lognormal import LogNormalModel
 from rl.models.utils import ensure_positive
 
 
+def _log_or_neg_inf(values: np.ndarray) -> np.ndarray:
+    """Elementwise log, with -inf where the value is non-positive."""
+    out = np.full_like(values, -math.inf, dtype=np.float64)
+    np.log(values, where=values > 0, out=out)
+    return out
+
+
 @dataclass
 class EVTTailModel:
     """Lognormal body with a Pareto tail above a quantile threshold.
@@ -65,18 +72,13 @@ class EVTTailModel:
         if np.any(body_mask):
             body_pdf = np.exp(self.body.logpdf(x_pos[body_mask]))
             scale = self.p_u / self._body_cdf_u if self.p_u > 0 else 0.0
-            out_vals = body_pdf * scale
-            log_body = np.full_like(out_vals, -math.inf, dtype=np.float64)
-            np.log(out_vals, where=out_vals > 0, out=log_body)
-            out[idx[body_mask]] = log_body
+            out[idx[body_mask]] = _log_or_neg_inf(body_pdf * scale)
 
         if np.any(tail_mask):
             x_tail = x_pos[tail_mask]
             scale = 1.0 - self.p_u
             pdf = scale * self.alpha * (self.u**self.alpha) * (x_tail ** (-self.alpha - 1))
-            log_tail = np.full_like(pdf, -math.inf, dtype=np.float64)
-            np.log(pdf, where=pdf > 0, out=log_tail)
-            out[idx[tail_mask]] = log_tail
+            out[idx[tail_mask]] = _log_or_neg_inf(pdf)
 
         return out
 

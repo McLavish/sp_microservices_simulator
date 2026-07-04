@@ -247,16 +247,12 @@ class MicroservicesEnv(_GymEnvBase):
                 f"Action has {len(action)} entries but the action space expects "
                 f"{len(self._action_sizes)} (did a policy emit the wrong dimensionality?)"
             )
-        idx = 0
-        attempt_timeout_ms = spec.attempt_timeout_ms[action[idx]]
-        idx += 1
-        max_attempts = spec.max_attempts[action[idx]]
-        idx += 1
-        backoff_ms = spec.backoff_ms[action[idx]]
-        idx += 1
+        attempt_timeout_ms = spec.attempt_timeout_ms[action[0]]
+        max_attempts = spec.max_attempts[action[1]]
+        backoff_ms = spec.backoff_ms[action[2]]
         global_timeout_ms = None
         if spec.global_timeout_ms is not None:
-            global_timeout_ms = spec.global_timeout_ms[action[idx]]
+            global_timeout_ms = spec.global_timeout_ms[action[3]]
 
         self._require_components().apply_knobs(
             ActionValues(
@@ -317,13 +313,13 @@ class MicroservicesEnv(_GymEnvBase):
 
         for root in roots:
             attempts_total += len(root.attempts)
-            last_attempt = max(root.attempts, key=lambda a: a.interval.end)
             if any(a.success for a in root.attempts):
                 successes += 1
                 begin = min(a.interval.begin for a in root.attempts)
                 end = max(a.interval.end for a in root.attempts)
                 latencies.append(end - begin)
             else:
+                last_attempt = max(root.attempts, key=lambda a: a.interval.end)
                 if last_attempt.drop_reason == DropReason.DEADLINE:
                     deadline_drops += 1
                 elif last_attempt.drop_reason == DropReason.QUEUE_FULL:
@@ -337,28 +333,22 @@ class MicroservicesEnv(_GymEnvBase):
                 if attempt.queue_size_at_end is not None:
                     queue_sizes.append(int(attempt.queue_size_at_end))
 
-        success_rate = successes / completed if completed else 0.0
-        deadline_rate = deadline_drops / completed if completed else 0.0
-        queue_rate = queue_drops / completed if completed else 0.0
-        server_rate = server_drops / completed if completed else 0.0
-        circuit_open_rate = circuit_open_drops / completed if completed else 0.0
         avg_latency_ms = ns_to_ms(int(np.mean(latencies))) if latencies else 0.0
         p95_latency_ms = (
             ns_to_ms(int(np.quantile(np.asarray(latencies), 0.95))) if latencies else 0.0
         )
-        retries_per_root = (attempts_total - completed) / completed if completed else 0.0
         queue_avg = float(np.mean(queue_sizes)) if queue_sizes else 0.0
 
         return {
             "completed": completed,
-            "success_rate": success_rate,
-            "deadline_drop_rate": deadline_rate,
-            "queue_drop_rate": queue_rate,
-            "server_drop_rate": server_rate,
-            "circuit_open_drop_rate": circuit_open_rate,
+            "success_rate": successes / completed,
+            "deadline_drop_rate": deadline_drops / completed,
+            "queue_drop_rate": queue_drops / completed,
+            "server_drop_rate": server_drops / completed,
+            "circuit_open_drop_rate": circuit_open_drops / completed,
             "avg_latency_ms": avg_latency_ms,
             "p95_latency_ms": p95_latency_ms,
-            "retries_per_root": retries_per_root,
+            "retries_per_root": (attempts_total - completed) / completed,
             "queue_avg": queue_avg,
             # Overridden by step() with the cost-client window when one exists.
             "cost": 0.0,
