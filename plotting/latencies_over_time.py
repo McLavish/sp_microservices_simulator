@@ -10,11 +10,8 @@ def main(csv_file, output_file, fault_events_file=None):
     t = df["timepoint"].astype(float)
 
     plt.figure(figsize=(9, 5))
-    plt.plot(t, df["p50"], label="p50")
-    plt.plot(t, df["p90"], label="p90")
-    plt.plot(t, df["p95"], label="p95")
-    plt.plot(t, df["p99"], label="p99")
-    plt.plot(t, df["max"], label="max")
+    for col in ("p50", "p90", "p95", "p99", "max"):
+        plt.plot(t, df[col], label=col)
 
     if fault_events_file:
         fault_events = load_fault_events(fault_events_file)
@@ -25,7 +22,6 @@ def main(csv_file, output_file, fault_events_file=None):
     plt.xlim(left=0)
     plt.ylim(bottom=0)
 
-    # plt.legend(title="Latency stats")
     plt.legend()
 
     plt.title("Latency over Time")

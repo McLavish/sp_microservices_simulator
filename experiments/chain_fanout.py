@@ -112,7 +112,7 @@ if __name__ == "__main__":
         load_spikes=[],
     )
 
-    wl.drive(sim, lambda s: top_client.start_request(s))
+    wl.drive(sim, top_client.start_request)
 
     sim.run(until=s_to_ns(wl.duration_s))
     sim.run()
@@ -141,7 +141,7 @@ if __name__ == "__main__":
         cli.metrics().print_stats()
 
     # Simple AND-fanout sanity: successes must be monotonic
-    sA = top_client.metrics().summary().succeeded
+    sA = m.summary().succeeded
     sB = a_to_b_client.metrics().summary().succeeded
     sC = b_to_c_client.metrics().summary().succeeded
     sE = b_to_e_client.metrics().summary().succeeded

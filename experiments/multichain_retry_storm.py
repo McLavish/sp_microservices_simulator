@@ -147,8 +147,8 @@ if __name__ == "__main__":
     wl_a.register_fault_events(fault_tracker)
     wl_x.register_fault_events(fault_tracker)
 
-    wl_a.drive(sim, lambda s: top_client_a.start_request(s))
-    wl_x.drive(sim, lambda s: top_client_x.start_request(s))
+    wl_a.drive(sim, top_client_a.start_request)
+    wl_x.drive(sim, top_client_x.start_request)
 
     sim.run(until=s_to_ns(duration_s))
     sim.run()

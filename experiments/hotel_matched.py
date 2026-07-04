@@ -112,11 +112,8 @@ def run_hotel_matched(config: HotelMatchedConfig) -> dict[str, str]:
         rng_seed=config.seed + 1,
     )
     hotels_workload.register_fault_events(run.fault_tracker)
-    hotels_workload.drive(sim, lambda s: run.hotels_client.start_request(s))
-    recommendation_workload.drive(
-        sim,
-        lambda s: run.recommendations_client.start_request(s),
-    )
+    hotels_workload.drive(sim, run.hotels_client.start_request)
+    recommendation_workload.drive(sim, run.recommendations_client.start_request)
 
     sim.run(until=s_to_ns(duration_s))
     sim.run()
@@ -128,12 +125,8 @@ def run_hotel_matched(config: HotelMatchedConfig) -> dict[str, str]:
         "fault_events_json": output_dir / "hotel_matched_fault_events.json",
     }
 
-    _combined_metrics(
-        [
-            run.hotels_client,
-            run.recommendations_client,
-        ]
-    ).export_csv(str(outputs["root_csv"]), granularity_s=1.0)
+    root_metrics = _combined_metrics([run.hotels_client, run.recommendations_client])
+    root_metrics.export_csv(str(outputs["root_csv"]), granularity_s=1.0)
     for service_name, clients in run.per_service_clients.items():
         path = output_dir / f"svc-{service_name}_output.csv"
         _combined_metrics(clients).export_csv(str(path), granularity_s=1.0)
@@ -170,24 +163,14 @@ def _build_runtime(
     ]
 
     cfgs = {
-        "hotels-root": _service_cfg("svc-hotels-root", "hotels-root", calibration),
-        "recommendations-root": _service_cfg(
-            "svc-recommendations-root",
-            "recommendations-root",
+        name: _service_cfg(
+            f"svc-{name}",
+            name,
             calibration,
-        ),
-        "search": _service_cfg("svc-search", "search", calibration),
-        "geo": _service_cfg("svc-geo", "geo", calibration),
-        "rate": _service_cfg("svc-rate", "rate", calibration),
-        "reservation": _service_cfg("svc-reservation", "reservation", calibration),
-        "profile": _service_cfg(
-            "svc-profile",
-            "profile",
-            calibration,
-            latency_injections=profile_injections,
-            partial_failures=profile_failures,
-        ),
-        "recommendation": _service_cfg("svc-recommendation", "recommendation", calibration),
+            latency_injections=profile_injections if name == "profile" else None,
+            partial_failures=profile_failures if name == "profile" else None,
+        )
+        for name in DEFAULT_SERVICE_PARAMS
     }
     for cfg in cfgs.values():
         cfg.register_fault_events(fault_tracker)

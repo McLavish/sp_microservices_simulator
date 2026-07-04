@@ -8,30 +8,9 @@ def main(csv_file, output_file, fault_events_file=None):
     df = load_metrics(csv_file)
 
     plt.figure(figsize=(10, 6))
-    plt.plot(
-        df["timepoint"],
-        df["root_requests"],
-        label="Root Requests",
-        # marker="o",
-        # markersize=5,
-        linewidth=2,
-    )
-
-    plt.plot(
-        df["timepoint"],
-        df["retries"],
-        label="Retries",
-        # marker="^",
-        # markersize=5,
-        linewidth=2,
-    )
-
-    plt.plot(
-        df["timepoint"],
-        df["failure_root"],
-        label="Failures",
-        linewidth=2,
-    )
+    plt.plot(df["timepoint"], df["root_requests"], label="Root Requests", linewidth=2)
+    plt.plot(df["timepoint"], df["retries"], label="Retries", linewidth=2)
+    plt.plot(df["timepoint"], df["failure_root"], label="Failures", linewidth=2)
 
     if fault_events_file:
         fault_events = load_fault_events(fault_events_file)

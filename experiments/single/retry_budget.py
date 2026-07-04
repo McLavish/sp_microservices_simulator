@@ -68,7 +68,7 @@ if __name__ == "__main__":
     )
     wl.register_fault_events(fault_tracker)
 
-    wl.drive(sim, lambda s: client.start_request(s))
+    wl.drive(sim, client.start_request)
 
     sim.run(until=s_to_ns(wl.duration_s))
     sim.run()

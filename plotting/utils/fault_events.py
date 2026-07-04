@@ -21,8 +21,6 @@ def plot_fault_events(events):
         event_type = event["event_type"]
         params = event["parameters"]
 
-        # add vertical lines for injected failures
-        # TODO: change colours to make it more readable
         if event_type == "latency_injection":
             add_latency_ms = params.get("add_latency_ms", 0)
             multiplier = params.get("multiplier", 1)

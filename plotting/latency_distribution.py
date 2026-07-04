@@ -15,15 +15,20 @@ def plot_lognormal_latency(median_ms, sigma, output_file="latency_distribution.p
         sigma:    Lognormal sigma parameter (std dev of ln(latency))
         output_file: Output file name for the plot
     """
-    # For a lognormal: median = exp(mu)  =>  mu = ln(median)
-    mu = np.log(median_ms)
+    # For a lognormal: median = exp(mu)  =>  mu = ln(median), scale = exp(mu)
+    scale = np.exp(np.log(median_ms))
 
     # x values (latency range in milliseconds)
     x_ms = np.logspace(np.log10(median_ms * 0.1), np.log10(median_ms * 10), 1000)
 
     # PDF and CDF in ms units
-    pdf = stats.lognorm.pdf(x_ms, s=sigma, scale=np.exp(mu))  # units: 1/ms
-    cdf = stats.lognorm.cdf(x_ms, s=sigma, scale=np.exp(mu))  # unitless
+    pdf = stats.lognorm.pdf(x_ms, s=sigma, scale=scale)  # units: 1/ms
+    cdf = stats.lognorm.cdf(x_ms, s=sigma, scale=scale)  # unitless
+
+    # Percentiles (ms), reused for CDF markers and the summary printout
+    percentile_values = {
+        p: stats.lognorm.ppf(p / 100, s=sigma, scale=scale) for p in (50, 90, 95, 99)
+    }
 
     # subplots
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
@@ -62,10 +67,8 @@ def plot_lognormal_latency(median_ms, sigma, output_file="latency_distribution.p
     ax2.axhline(0.5, color="r", linestyle="--", alpha=0.7)
 
     # Add percentile lines
-    percentiles = [50, 90, 95, 99]
     colors = ["red", "orange", "purple", "brown"]
-    for p, color in zip(percentiles, colors, strict=False):
-        p_value_ms = stats.lognorm.ppf(p / 100, s=sigma, scale=np.exp(mu))
+    for (p, p_value_ms), color in zip(percentile_values.items(), colors, strict=True):
         if p_value_ms <= median_ms * 5:
             ax2.axvline(
                 p_value_ms,
@@ -87,17 +90,11 @@ def plot_lognormal_latency(median_ms, sigma, output_file="latency_distribution.p
     plt.savefig(output_file, dpi=150, bbox_inches="tight")
     print(f"Saved latency distribution plot to {output_file}")
 
-    # Percentiles (ms)
-    p50 = stats.lognorm.ppf(0.5, s=sigma, scale=np.exp(mu))
-    p90 = stats.lognorm.ppf(0.9, s=sigma, scale=np.exp(mu))
-    p95 = stats.lognorm.ppf(0.95, s=sigma, scale=np.exp(mu))
-    p99 = stats.lognorm.ppf(0.99, s=sigma, scale=np.exp(mu))
-
     print("\nLatency Percentiles:")
-    print(f"p50 (median): {p50:.2f} ms")
-    print(f"p90: {p90:.2f} ms")
-    print(f"p95: {p95:.2f} ms")
-    print(f"p99: {p99:.2f} ms")
+    print(f"p50 (median): {percentile_values[50]:.2f} ms")
+    print(f"p90: {percentile_values[90]:.2f} ms")
+    print(f"p95: {percentile_values[95]:.2f} ms")
+    print(f"p99: {percentile_values[99]:.2f} ms")
 
 
 if __name__ == "__main__":
