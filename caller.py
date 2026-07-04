@@ -106,15 +106,10 @@ class ClientRuntime:
 
         # Compute global deadline: min(override, controller)
         global_timeout = self.cfg.timeout_controller.get_global_timeout()
-        computed_deadline: TimePoint | None = None
-        if global_timeout is not None:
-            computed_deadline = sim.timestep + global_timeout
-        if override_global_deadline is not None:
-            computed_deadline = (
-                override_global_deadline
-                if computed_deadline is None
-                else min(computed_deadline, override_global_deadline)
-            )
+        computed_deadline = self._min_deadline(
+            (sim.timestep + global_timeout) if global_timeout is not None else None,
+            override_global_deadline,
+        )
         root_req.global_deadline = computed_deadline
         root_req.on_done = on_done
 
@@ -199,10 +194,6 @@ class ClientRuntime:
         # Record timeout controller results
         request_latency = ctx.req.interval.end - ctx.req.interval.begin
         self.cfg.timeout_controller.record_result(success_effective, request_latency)
-
-        # always fail on first attempt
-        # if ctx.root.attempt_count() == 1:
-        #     ctx.req.success = False
 
         if ctx.req.success:
             self._complete_root(ctx.root)

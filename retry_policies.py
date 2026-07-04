@@ -382,8 +382,6 @@ class FixedWindowBurstyLimiterPolicy(RetryPolicy):
         return current_window_start + self.period
 
     def next_delay(self, context: RetryContext) -> DelayDecision:
-        self._refill_tokens(context.now)
-
         if self.can_retry(context.now):
             can_retry, delay = self.underlying_strategy.next_delay(context)
             if can_retry:

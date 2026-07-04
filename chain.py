@@ -129,37 +129,31 @@ class ServiceNodeRuntime:
                     # ensure we schedule at int(deadline)
                     deadline_event = sim2.schedule(int(deadline), on_deadline)
 
+                def on_downstream_done(_root):
+                    nonlocal remaining, done
+                    if done:
+                        return
+                    # Determine success from root attempts
+                    succeeded = any(a.success for a in _root.attempts)
+                    if not succeeded:
+                        # We can finish immediately on first failure (AND semantics)
+                        done = True
+                        cancel_deadline()
+                        drop = downstream_drop_reason(_root)
+                        if drop == DropReason.NONE:
+                            drop = DropReason.SERVER_FAILURE
+                        finalize(False, sim2.timestep - begin_at, drop)
+                        return
+                    remaining -= 1
+                    maybe_finish()
+
                 # Launch downstreams concurrently
                 for edge in downstream_edges:
                     if done:
                         break
-
-                    def _mk_cb():
-                        # Create a distinct callback capturing this invocation
-                        def _cb(_root):
-                            nonlocal remaining, done
-                            if done:
-                                return
-                            # Determine success from root attempts
-                            succeeded = any(a.success for a in _root.attempts)
-                            if not succeeded:
-                                # We can finish immediately on first failure (AND semantics)
-                                done = True
-                                cancel_deadline()
-                                drop = downstream_drop_reason(_root)
-                                if drop == DropReason.NONE:
-                                    drop = DropReason.SERVER_FAILURE
-                                finalize(False, sim2.timestep - begin_at, drop)
-                                return
-                            remaining -= 1
-                            maybe_finish()
-
-                        return _cb
-
-                    cb = _mk_cb()
                     edge.client.start_request(
                         sim2,
-                        on_done=cb,
+                        on_done=on_downstream_done,
                         override_global_deadline=deadline,
                     )
 

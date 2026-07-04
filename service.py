@@ -34,6 +34,20 @@ class ServiceConfig:
             tracker.add_partial_failure(partial_failure.duration, partial_failure.p_fail)
 
 
+# Custom attempt behavior: (service, sim, deadline, finalize, begin_at, release_worker)
+Behavior = Callable[
+    [
+        "ServiceRuntime",
+        Simulator,
+        TimePoint | None,
+        Callable[[bool, TimeDuration, DropReason], None],
+        TimePoint,
+        Callable[[], None],
+    ],
+    None,
+]
+
+
 @dataclass(order=True)
 class QItem:
     # heap order keys (in order): enqueued_at, seq
@@ -93,18 +107,7 @@ class ServiceRuntime:
             [bool, TimeDuration, DropReason, int], None
         ],  # success, service_time, whydropped, queue_size
         attempt_deadline: TimePoint | None = None,
-        behavior: Callable[
-            [
-                "ServiceRuntime",
-                Simulator,
-                TimePoint | None,
-                Callable[[bool, TimeDuration, DropReason], None],
-                TimePoint,
-                Callable[[], None],
-            ],
-            None,
-        ]
-        | None = None,
+        behavior: Behavior | None = None,
     ):
         """
         Enqueue an attempt for this service.
@@ -146,18 +149,7 @@ class ServiceRuntime:
         sim: Simulator,
         on_done: Callable[[bool, TimeDuration, DropReason, int], None],
         attempt_deadline: TimePoint | None,
-        behavior: Callable[
-            [
-                "ServiceRuntime",
-                Simulator,
-                TimePoint | None,
-                Callable[[bool, TimeDuration, DropReason], None],
-                TimePoint,
-                Callable[[], None],
-            ],
-            None,
-        ]
-        | None = None,
+        behavior: Behavior | None = None,
     ):
         # If the attempt expired while waiting in the queue, drop immediately without
         # consuming a worker. We make sure we are not scheduling an event in the past.
