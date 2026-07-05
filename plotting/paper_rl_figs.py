@@ -119,12 +119,14 @@ def plot_pareto(comparison_csvs: list[str], output: str) -> None:
             markeredgewidth=0.4,
         )
         if arm == "constrained_ppo":
-            for _, row in merged.iterrows():
+            # dodge labels of near-coincident points
+            offsets = [(5, -9), (5, 5), (-14, -9)]
+            for i, (_, row) in enumerate(merged.sort_values("J").iterrows()):
                 ax_j.annotate(
                     f"$\\times${int(row['n'])}",
                     (row["cost"], row["J"]),
                     textcoords="offset points",
-                    xytext=(5, -9),
+                    xytext=offsets[i % len(offsets)],
                     fontsize=6.5,
                 )
 
@@ -150,8 +152,8 @@ def plot_dual_ascent(curve_prefixes: list[str], output: str) -> None:
             steps = df["timesteps"] / 1000.0
             label = f"$b$={budget:g}" if budget not in seen_budgets else None
             seen_budgets.add(budget)
-            ax_cost.plot(steps, df["eval_cost"], color=color, alpha=0.8, label=label)
-            ax_lambda.plot(steps, df["lambda"], color=color, alpha=0.8)
+            ax_cost.plot(steps, df["eval_cost"], color=color, label=label)
+            ax_lambda.plot(steps, df["lambda"], color=color)
 
     for budget in sorted(seen_budgets):
         ax_cost.axhline(
