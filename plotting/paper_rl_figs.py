@@ -1,10 +1,11 @@
 """Print-styled PDF figures for the constrained-retry paper section.
 
-Consumes the CSVs written by rl.experiments.constrained_retry:
-  - comparison CSV (one row per arm/budget) -> Pareto figure
-    (J vs cost, bystander success vs cost);
-  - dual-ascent curve CSVs (timesteps, eval_J, eval_cost, lambda)
-    -> training-dynamics figure.
+Consumes the outputs of rl.experiments.constrained_retry across one or more
+training runs (comparison CSVs and dual-ascent curve CSVs):
+  - Pareto figure: unique behavioural outcomes (J vs cost, bystander vs
+    cost), with coincident run outcomes merged and counted;
+  - training-dynamics figure: evaluation-cost and multiplier trajectories
+    for every (run, budget), showing the attractor bifurcation.
 
 Figures are sized for a two-column conference page (column width 3.29 in)
 and saved as vector PDFs.
@@ -51,15 +52,26 @@ C_YELLOW = "#eda100"
 
 ARM_STYLES = {
     "constrained_ppo": {"marker": "o", "color": C_BLUE, "label": "constrained PPO"},
-    "retry_budget": {"marker": "^", "color": C_AQUA, "label": "retry-budget policy"},
+    "retry_budget": {"marker": "^", "color": C_AQUA, "label": "token retry budget"},
     "unconstrained_ppo": {"marker": "s", "color": C_YELLOW, "label": "unconstrained PPO"},
 }
 
+BUDGET_COLORS = {0.05: C_BLUE, 0.1: C_AQUA, 0.2: C_YELLOW}
 
-def plot_pareto(comparison_csv: str, output: str) -> None:
-    df = pd.read_csv(comparison_csv)
+
+def _load_runs(comparison_csvs: list[str]) -> pd.DataFrame:
+    frames = []
+    for path in comparison_csvs:
+        df = pd.read_csv(path)
+        df["run"] = path
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True)
+
+
+def plot_pareto(comparison_csvs: list[str], output: str) -> None:
+    df = _load_runs(comparison_csvs)
     fig, (ax_j, ax_by) = plt.subplots(
-        2, 1, figsize=(COLUMN_WIDTH_IN, 3.1), sharex=True, height_ratios=[1.2, 1]
+        2, 1, figsize=(COLUMN_WIDTH_IN, 3.2), sharex=True, height_ratios=[1.2, 1]
     )
 
     budgets = sorted({float(b) for b in df["budget"].dropna()})
@@ -68,11 +80,24 @@ def plot_pareto(comparison_csv: str, output: str) -> None:
             ax.axvline(budget, color="gray", linestyle=":", linewidth=0.7, alpha=0.6)
 
     for arm, style in ARM_STYLES.items():
-        sub = df[df["arm"] == arm]
+        sub = df[df["arm"] == arm].copy()
+        # merge coincident outcomes across runs/budgets; count multiplicity
+        sub["key"] = list(zip(sub["cost_mean"].round(4), sub["J_mean"].round(4), strict=True))
+        merged = (
+            sub.groupby("key")
+            .agg(
+                cost=("cost_mean", "first"),
+                J=("J_mean", "first"),
+                J_std=("J_std", "first"),
+                byst=("bystander_success_rate", "first"),
+                n=("key", "size"),
+            )
+            .reset_index(drop=True)
+        )
         ax_j.errorbar(
-            sub["cost_mean"],
-            sub["J_mean"],
-            yerr=sub["J_std"],
+            merged["cost"],
+            merged["J"],
+            yerr=merged["J_std"],
             linestyle="none",
             capsize=2,
             elinewidth=0.7,
@@ -83,10 +108,9 @@ def plot_pareto(comparison_csv: str, output: str) -> None:
             markeredgewidth=0.4,
             label=style["label"],
         )
-        by = sub[pd.notna(sub["bystander_success_rate"])]
         ax_by.plot(
-            by["cost_mean"],
-            by["bystander_success_rate"],
+            merged["cost"],
+            merged["byst"],
             linestyle="none",
             markersize=4.5,
             marker=style["marker"],
@@ -94,59 +118,50 @@ def plot_pareto(comparison_csv: str, output: str) -> None:
             markeredgecolor="black",
             markeredgewidth=0.4,
         )
-
-    # one label per distinct constrained-PPO point; coincident points share it
-    con = df[(df["arm"] == "constrained_ppo") & pd.notna(df["budget"])]
-    grouped: dict[tuple[float, float], list[float]] = {}
-    for _, row in con.iterrows():
-        key = (round(row["cost_mean"], 4), round(row["J_mean"], 4))
-        grouped.setdefault(key, []).append(row["budget"])
-    for (cost, j), buds in grouped.items():
-        label = "$b$=" + ", ".join(f"{b:g}" for b in sorted(buds))
-        ax_j.annotate(label, (cost, j), textcoords="offset points", xytext=(4, -9), fontsize=6.5)
+        if arm == "constrained_ppo":
+            for _, row in merged.iterrows():
+                ax_j.annotate(
+                    f"$\\times${int(row['n'])}",
+                    (row["cost"], row["J"]),
+                    textcoords="offset points",
+                    xytext=(5, -9),
+                    fontsize=6.5,
+                )
 
     ax_j.set_ylabel("objective $J$")
     ax_by.set_ylabel("bystander success rate")
-    ax_by.set_xlabel("edge retry amplification (retries per edge request)")
+    ax_by.set_xlabel("constraint cost (edge retries per request)")
     ax_j.legend(loc="lower right", handletextpad=0.3)
     fig.align_ylabels()
     fig.savefig(output)
     plt.close(fig)
 
 
-def plot_dual_ascent(curve_prefix: str, output: str) -> None:
-    files = sorted(glob.glob(f"{curve_prefix}_b*.csv"))
-    if not files:
-        raise SystemExit(f"no curve CSVs match {curve_prefix}_b*.csv")
+def plot_dual_ascent(curve_prefixes: list[str], output: str) -> None:
+    """Cost and multiplier trajectories for every (run, budget) pair."""
+    fig, (ax_cost, ax_lambda) = plt.subplots(2, 1, figsize=(COLUMN_WIDTH_IN, 3.0), sharex=True)
 
-    budget_colors = [C_BLUE, C_AQUA, C_YELLOW]
-    # distinct dashes so coincident trajectories stay distinguishable
-    budget_dashes = ["-", "--", "-."]
-    fig, (ax_cost, ax_lambda) = plt.subplots(2, 1, figsize=(COLUMN_WIDTH_IN, 2.9), sharex=True)
+    seen_budgets: set[float] = set()
+    for prefix in curve_prefixes:
+        for path in sorted(glob.glob(f"{prefix}_b*.csv")):
+            budget = float(path.rsplit("_b", 1)[1].removesuffix(".csv"))
+            color = BUDGET_COLORS.get(budget, "gray")
+            df = pd.read_csv(path)
+            steps = df["timesteps"] / 1000.0
+            label = f"$b$={budget:g}" if budget not in seen_budgets else None
+            seen_budgets.add(budget)
+            ax_cost.plot(steps, df["eval_cost"], color=color, alpha=0.8, label=label)
+            ax_lambda.plot(steps, df["lambda"], color=color, alpha=0.8)
 
-    for i, path in enumerate(files):
-        budget = float(path.rsplit("_b", 1)[1].removesuffix(".csv"))
-        df = pd.read_csv(path)
-        color = budget_colors[i % len(budget_colors)]
-        dash = budget_dashes[i % len(budget_dashes)]
-        steps = df["timesteps"] / 1000.0
-        ax_cost.plot(steps, df["eval_cost"], color=color, linestyle=dash, label=f"$b$={budget:g}")
-        ax_cost.axhline(budget, color=color, linestyle=":", linewidth=0.7, alpha=0.8)
-        ax_lambda.plot(steps, df["lambda"], color=color, linestyle=dash)
-        ax_lambda.annotate(
-            f"$b$={budget:g}",
-            (steps.iloc[-1], df["lambda"].iloc[-1]),
-            textcoords="offset points",
-            xytext=(-2, 4),
-            ha="right",
-            fontsize=6.5,
-            color=color,
+    for budget in sorted(seen_budgets):
+        ax_cost.axhline(
+            budget, color=BUDGET_COLORS.get(budget, "gray"), linestyle=":", linewidth=0.7
         )
 
     ax_cost.set_ylabel("evaluation cost")
     ax_lambda.set_ylabel(r"multiplier $\lambda$")
     ax_lambda.set_xlabel("training timesteps ($\\times 10^3$)")
-    ax_cost.legend(loc="upper left", handletextpad=0.4, ncols=3, columnspacing=0.9)
+    ax_cost.legend(loc="upper right", handletextpad=0.4, ncols=3, columnspacing=0.9)
     fig.align_ylabels()
     fig.savefig(output)
     plt.close(fig)
@@ -154,15 +169,25 @@ def plot_dual_ascent(curve_prefix: str, output: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--comparison-csv", default="rl_constrained_comparison_multichain.csv")
-    parser.add_argument("--curve-prefix", default="rl_constrained_curve_multichain")
+    parser.add_argument(
+        "--comparison-csvs",
+        nargs="+",
+        default=["rl_constrained_comparison_multichain.csv"],
+        help="one or more comparison CSVs (multiple training runs)",
+    )
+    parser.add_argument(
+        "--curve-prefixes",
+        nargs="+",
+        default=["rl_constrained_curve_multichain"],
+        help="one or more curve-file prefixes (multiple training runs)",
+    )
     parser.add_argument("--pareto-output", default="paper_rl_pareto.pdf")
     parser.add_argument("--curves-output", default="paper_rl_dual_ascent.pdf")
     args = parser.parse_args()
 
     plt.rcParams.update(PAPER_RC)
-    plot_pareto(args.comparison_csv, args.pareto_output)
-    plot_dual_ascent(args.curve_prefix, args.curves_output)
+    plot_pareto(args.comparison_csvs, args.pareto_output)
+    plot_dual_ascent(args.curve_prefixes, args.curves_output)
     print(f"wrote {args.pareto_output} and {args.curves_output}")
 
 
