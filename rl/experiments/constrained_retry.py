@@ -38,6 +38,7 @@ from rl.env import (
     build_chain_env,
     build_multichain_env,
 )
+from rl.model_io import save_action_spec
 from rl.policies.action_space import ActionGrid
 from rl.policies.fixed import FixedPolicy
 from rl.sb3_support import import_sb3
@@ -375,7 +376,9 @@ def main() -> None:
 
     def save_model(policy, name: str) -> None:
         if args.save_model_prefix is not None:
-            policy.model.save(f"{args.save_model_prefix}_{name}.zip")
+            path = f"{args.save_model_prefix}_{name}.zip"
+            policy.model.save(path)
+            save_action_spec(path, action_spec, step_duration_s=1.0, fault_scenario=args.scenario)
 
     def common_train_kwargs() -> dict:
         return {
