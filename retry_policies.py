@@ -2,6 +2,7 @@ import random
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
+from fractions import Fraction
 from typing import NamedTuple
 
 from core import TimeDuration, TimePoint
@@ -299,21 +300,25 @@ class RetryBudgetPolicy(RetryPolicy):
     max_retries: int  # maximum consecutive retries before throttling
     underlying_strategy: RetryPolicy
 
-    # Derived token values, calculated from budget_ratio and max_retries
-    _max_tokens: int = field(init=False)
-    _success_award: float = field(init=False)
+    # Integer token bucket in units of 1/denominator of the (rationalized)
+    # ratio: one retry costs `denominator` tokens, each success awards
+    # `numerator`. Exact arithmetic — no float drift (cf. Finagle's integer
+    # RetryBudget deposit/withdraw); limit_denominator(10_000) recovers
+    # intended ratios like 1/3 from their float representations.
     _retry_cost: int = field(init=False)
-
-    _tokens: float = field(init=False)
+    _success_award: int = field(init=False)
+    _max_tokens: int = field(init=False)
+    _tokens: int = field(init=False)
 
     def __post_init__(self):
-        # Derive token values from budget_ratio and max_retries
-        # If budget_ratio = 0.1 (10%), then 10 successes should allow 1 retry
-        # So success_award = 10, retry_cost = 100
-        self._retry_cost = 100  # Base cost for a retry
-        self._success_award = self._retry_cost * self.budget_ratio
+        if not 0 < self.budget_ratio <= 1:
+            raise ValueError("budget_ratio must be in (0, 1]")
+        if self.max_retries < 1:
+            raise ValueError("max_retries must be >= 1")
+        ratio = Fraction(self.budget_ratio).limit_denominator(10_000)
+        self._retry_cost = ratio.denominator
+        self._success_award = ratio.numerator
         self._max_tokens = self._retry_cost * self.max_retries
-
         self._tokens = self._max_tokens  # start with full budget
 
     def add_result(self, success: bool, now: TimePoint | None = None) -> None:
@@ -325,7 +330,8 @@ class RetryBudgetPolicy(RetryPolicy):
         return self._tokens >= self._retry_cost
 
     def get_token_balance(self) -> float:
-        return self._tokens
+        # Backward-compatible scale: 100 tokens == one retry, as before.
+        return self._tokens / self._retry_cost * 100.0
 
     def next_delay(self, context: RetryContext) -> DelayDecision:
         if self.can_retry():

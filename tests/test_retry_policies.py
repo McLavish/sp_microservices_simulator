@@ -449,6 +449,41 @@ class TestTimeBasedBreakerCounters(unittest.TestCase):
             )
 
 
+class TestRetryBudgetExactArithmetic(unittest.TestCase):
+    def _drained(self, ratio):
+        policy = RetryBudgetPolicy(
+            budget_ratio=ratio,
+            max_retries=1,
+            underlying_strategy=FixedBackoffRetryPolicy(max_attempts=10, delay=0),
+        )
+        while policy.can_retry():  # drain the initial burst
+            policy.next_delay(RetryContext(attempt=1, now=0))
+        return policy
+
+    def test_one_third_ratio_earns_a_retry_after_three_successes(self):
+        policy = self._drained(1 / 3)
+        for _ in range(3):
+            policy.add_result(True, now=0)
+        self.assertTrue(policy.can_retry())  # float accumulation gave 99.99999999999999
+
+    def test_one_seventh_ratio_earns_a_retry_after_seven_successes(self):
+        policy = self._drained(1 / 7)
+        for _ in range(6):
+            policy.add_result(True, now=0)
+        self.assertFalse(policy.can_retry())
+        policy.add_result(True, now=0)
+        self.assertTrue(policy.can_retry())
+
+    def test_shipped_ratios_unchanged(self):
+        for ratio, needed in ((0.05, 20), (0.1, 10), (0.2, 5)):
+            policy = self._drained(ratio)
+            for _ in range(needed - 1):
+                policy.add_result(True, now=0)
+            self.assertFalse(policy.can_retry())
+            policy.add_result(True, now=0)
+            self.assertTrue(policy.can_retry())
+
+
 class TestBackoffValidation(unittest.TestCase):
     def test_negative_fixed_backoff_rejected(self):
         with self.assertRaises(ValueError):
