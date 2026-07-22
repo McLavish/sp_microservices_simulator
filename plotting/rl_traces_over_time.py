@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 from plotting.utils.fault_events import load_fault_events, plot_fault_events
-from plotting.utils.io import build_plot_parser
+from plotting.utils.io import build_plot_parser, require_rows
 
 
 def _step_seconds(df: pd.DataFrame) -> float:
@@ -22,6 +22,7 @@ def _step_seconds(df: pd.DataFrame) -> float:
 
 def main(csv_file, output_file, policies=None, seed=None, fault_events_file=None):
     df = pd.read_csv(csv_file)
+    require_rows(df, csv_file)
     if seed is None:
         seed = int(df["seed"].iloc[0])
     df = df[df["seed"] == seed]

@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 
 from plotting.utils.fault_events import load_fault_events, plot_fault_events
-from plotting.utils.io import build_plot_parser, load_metrics
+from plotting.utils.io import build_plot_parser, load_metrics, require_rows
 
 
 def _bucket_width_s(df) -> float:
@@ -15,6 +15,7 @@ def _bucket_width_s(df) -> float:
 
 def main(csv_file, output_file, fault_events_file=None):
     df = load_metrics(csv_file)
+    require_rows(df, csv_file)
 
     # Counts per bucket divided by the bucket width: the y axis is a true
     # rate (QPS) at any export granularity, not just the default 1 s.
