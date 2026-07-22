@@ -86,6 +86,8 @@ def _eval_arm(
     costs: list[float] = []
     successes: list[float] = []
     p95s: list[float] = []
+    successes_horizon: list[float] = []
+    p95s_horizon: list[float] = []
     violations: list[float] = []
     bystander_successes: list[float] = []
 
@@ -110,6 +112,10 @@ def _eval_arm(
         if metrics:
             successes.append(metrics.succeeded / metrics.total if metrics.total else 0.0)
             p95s.append(metrics.p95)
+        horizon = env.in_horizon_summary()
+        if horizon:
+            successes_horizon.append(horizon.succeeded / horizon.total if horizon.total else 0.0)
+            p95s_horizon.append(horizon.p95)
         bystander = env.bystander_metrics_summary()
         if bystander is not None:
             bystander_successes.append(
@@ -121,6 +127,9 @@ def _eval_arm(
         "J_std": float(np.std(objectives)),
         "success_rate": float(np.mean(successes)) if successes else 0.0,
         "p95_ms": float(np.mean(p95s)) if p95s else 0.0,
+        # Full-population above (incl. drained roots); reward-visible below.
+        "success_rate_in_horizon": float(np.mean(successes_horizon)) if successes_horizon else 0.0,
+        "p95_ms_in_horizon": float(np.mean(p95s_horizon)) if p95s_horizon else 0.0,
         "cost_mean": float(np.mean(costs)),
         "violation_rate": float(np.mean(violations)) if violations else "",
         # Empty when the scenario has no bystander chain (CSV-shape convention

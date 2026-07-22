@@ -135,7 +135,7 @@ def _episode(
         policy.update(obs, reward, terminated or truncated, info)
 
     cost_mean = float(np.mean(window_costs)) if window_costs else 0.0
-    return total_reward, env.metrics_summary(), cost_mean
+    return total_reward, env.metrics_summary(), env.in_horizon_summary(), cost_mean
 
 
 def _evaluate(
@@ -147,26 +147,38 @@ def _evaluate(
     rewards = []
     successes = []
     p95s = []
+    successes_horizon = []
+    p95s_horizon = []
     retries = []
     costs = []
 
     for seed in seeds:
-        total_reward, summary, cost_mean = _episode(env, policy, seed, trace_rows=trace_rows)
+        total_reward, summary, horizon, cost_mean = _episode(
+            env, policy, seed, trace_rows=trace_rows
+        )
         rewards.append(total_reward)
         costs.append(cost_mean)
         if summary:
             successes.append(summary.succeeded / summary.total if summary.total else 0.0)
             p95s.append(summary.p95)
             retries.append(summary.retries_per_root)
+        if horizon:
+            successes_horizon.append(horizon.succeeded / horizon.total if horizon.total else 0.0)
+            p95s_horizon.append(horizon.p95)
 
     def avg(values: list[float]) -> float:
         return float(np.mean(values)) if values else 0.0
 
+    # success_rate / p95_ms keep their historical full-population meaning
+    # (incl. drained roots); the *_in_horizon columns cover exactly the roots
+    # the reward saw.
     return {
         "reward_mean": avg(rewards),
         "reward_std": float(np.std(rewards)) if rewards else 0.0,
         "success_rate": avg(successes),
         "p95_ms": avg(p95s),
+        "success_rate_in_horizon": avg(successes_horizon),
+        "p95_ms_in_horizon": avg(p95s_horizon),
         "retries_per_root": avg(retries),
         "cost_mean": avg(costs),
     }
