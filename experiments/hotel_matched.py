@@ -259,7 +259,9 @@ def _client_policies(seed: int, *, leaf_max_attempts: int = 3) -> dict[str, Clie
         "leaf_reservation": _leaf_read_cfg(seed=seed + 201, max_attempts=leaf_max_attempts),
         "leaf_hotels_profile": _leaf_read_cfg(seed=seed + 202, max_attempts=leaf_max_attempts),
         "leaf_recommendation": _leaf_read_cfg(seed=seed + 203, max_attempts=leaf_max_attempts),
-        "leaf_recommendations_profile": _leaf_read_cfg(seed=seed + 204, max_attempts=leaf_max_attempts),
+        "leaf_recommendations_profile": _leaf_read_cfg(
+            seed=seed + 204, max_attempts=leaf_max_attempts
+        ),
     }
 
 
