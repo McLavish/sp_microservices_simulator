@@ -157,11 +157,13 @@ def train_constrained_ppo(cfg: ConstrainedTrainConfig) -> SB3Policy:
     curve: list[tuple[int, float, float, float]] = []
     trained = 0
     while trained < cfg.timesteps:
-        trained = min(trained + cfg.chunk_timesteps, cfg.timesteps)
-        # reset_num_timesteps=False continues one training run across chunks
-        # (counter, schedules, and in-flight episodes keep advancing) instead
-        # of restarting the counter — and the envs — at every dual-ascent step.
-        model.learn(total_timesteps=trained, reset_num_timesteps=False)
+        chunk = min(cfg.chunk_timesteps, cfg.timesteps - trained)
+        # SB3 semantics: with reset_num_timesteps=False, learn() trains
+        # `total_timesteps` ADDITIONAL steps (_setup_learn adds the current
+        # num_timesteps). Pass the per-chunk increment; the counter, schedules,
+        # and in-flight episodes still continue across chunks.
+        model.learn(total_timesteps=chunk, reset_num_timesteps=False)
+        trained = int(model.num_timesteps)  # true cumulative; curve rows stay honest
         eval_objective, eval_cost = evaluate_objective_and_cost(
             model, eval_env, cfg.eval_episodes, cfg.base_weights
         )
