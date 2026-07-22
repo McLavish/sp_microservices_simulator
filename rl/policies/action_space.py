@@ -76,8 +76,19 @@ class ActionGrid:
             return (i, j, k)
 
         if global_timeout_ms is None:
-            g = 0
+            if None not in self._spec.global_timeout_ms:
+                raise ValueError(
+                    "requested global_timeout_ms=None but the ActionSpec has no None entry"
+                )
+            g = self._spec.global_timeout_ms.index(None)
         else:
-            gt_candidates = [v if v is not None else 0 for v in self._spec.global_timeout_ms]
-            g = nearest(global_timeout_ms, gt_candidates)
+            numeric = [
+                (idx, v) for idx, v in enumerate(self._spec.global_timeout_ms) if v is not None
+            ]
+            if not numeric:
+                raise ValueError(
+                    f"requested global_timeout_ms={global_timeout_ms} but the "
+                    "ActionSpec contains only None"
+                )
+            g = min(numeric, key=lambda iv: abs(iv[1] - global_timeout_ms))[0]
         return (i, j, k, g)

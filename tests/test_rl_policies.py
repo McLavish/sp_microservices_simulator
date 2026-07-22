@@ -199,6 +199,31 @@ class TestServiceMoments(unittest.TestCase):
         self.assertAlmostEqual(mean_s2, 400.0)
 
 
+class TestNearestIndicesGlobalTimeout(unittest.TestCase):
+    def _grid(self, global_list):
+        return ActionGrid(
+            ActionSpec(
+                attempt_timeout_ms=[10, 30],
+                max_attempts=[1],
+                backoff_ms=[0],
+                global_timeout_ms=global_list,
+            )
+        )
+
+    def test_none_request_maps_to_the_none_entry(self):
+        grid = self._grid([500, 1000, None])
+        self.assertEqual(grid.nearest_indices(10, 1, 0, global_timeout_ms=None), (0, 0, 0, 2))
+
+    def test_numeric_request_ignores_none_entries(self):
+        grid = self._grid([None, 500, 1000])
+        self.assertEqual(grid.nearest_indices(10, 1, 0, global_timeout_ms=600), (0, 0, 0, 1))
+
+    def test_none_request_without_none_entry_raises(self):
+        grid = self._grid([500, 1000])
+        with self.assertRaises(ValueError):
+            grid.nearest_indices(10, 1, 0, global_timeout_ms=None)
+
+
 class TestActionSpecSidecar(unittest.TestCase):
     def setUp(self):
         self.spec = ActionSpec(
