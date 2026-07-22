@@ -448,6 +448,14 @@ class MicroservicesEnv(_GymEnvBase):
                 root_latencies.append(ns_to_ms(end - begin))
 
             for attempt in root.attempts:
+                if (
+                    attempt.drop_reason in (DropReason.QUEUE_FULL, DropReason.CIRCUIT_OPEN)
+                    and attempt.interval.end == attempt.interval.begin
+                ):
+                    # Instant rejections carry no latency information; policies
+                    # see them through the drop-rate features instead. A zero
+                    # would poison lognormal fits (log 0) as an uncensored value.
+                    continue
                 attempt_latencies.append(ns_to_ms(attempt.interval.end - attempt.interval.begin))
                 attempt_censored.append(attempt.drop_reason == DropReason.DEADLINE)
                 if attempt.service_time_ns is not None:

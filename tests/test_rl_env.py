@@ -8,7 +8,7 @@ except Exception:
     gymnasium = None  # ty: ignore[invalid-assignment]
 
 from caller import ClientConfig, ClientRuntime
-from core import DropReason, TimeInterval, ms_to_ns, ns_to_ms, s_to_ns
+from core import DropReason, Request, RootRequest, TimeInterval, ms_to_ns, ns_to_ms, s_to_ns
 from faults import PartialFailure
 from retry_policies import FixedBackoffRetryPolicy
 from rl.env import (
@@ -544,6 +544,28 @@ class TestSampleSource(unittest.TestCase):
         )
         self.assertGreater(len(edge_latencies), 0)
         self.assertEqual(sorted(info["attempt_latencies_ms"]), edge_latencies)
+
+
+@unittest.skipIf(gymnasium is None, "gymnasium not installed")
+class TestInstantRejectionSamples(unittest.TestCase):
+    def test_zero_latency_rejections_are_not_emitted(self):
+        env = MicroservicesEnv(EnvConfig(build=_build_slow_failing_env, action_spec=SLOW_SPEC))
+        env.reset(seed=1)
+        rejected = RootRequest()
+        rejected.add_attempt(
+            Request(
+                service="svc",
+                interval=TimeInterval(begin=1000, end=1000),
+                drop_reason=DropReason.QUEUE_FULL,
+            )
+        )
+        served = RootRequest()
+        served.add_attempt(
+            Request(service="svc", interval=TimeInterval(begin=0, end=ms_to_ns(20)), success=True)
+        )
+        samples = env._collect_latency_samples([rejected, served])
+        self.assertEqual(len(samples["attempt_latencies_ms"]), 1)
+        self.assertAlmostEqual(samples["attempt_latencies_ms"][0], 20.0)
 
 
 if __name__ == "__main__":

@@ -195,6 +195,34 @@ class TestServiceMoments(unittest.TestCase):
         self.assertAlmostEqual(mean_s2, 400.0)
 
 
+class TestZeroSampleRobustness(unittest.TestCase):
+    def _info(self, values):
+        return {
+            "attempt_latencies_ms": values,
+            "attempt_censored": [False] * len(values),
+            "summary": {"completed": float(len(values)), "retries_per_root": 0.0},
+        }
+
+    def test_bayesian_ignores_nonpositive_samples(self):
+        # Zeros must contribute nothing: same decision as the clean stream.
+        # Pre-fix, log(0) collapses the posterior to NaN and the argmax
+        # degenerates to the first grid entry (timeout 10 ms, which the clean
+        # fit rejects because every sample exceeds it).
+        grid = ActionGrid(ActionSpec(attempt_timeout_ms=[10, 50], max_attempts=[1], backoff_ms=[0]))
+        with_zeros = BayesianPolicy(grid=grid).act(
+            np.zeros(1), self._info([0.0, 0.0, 20.0, 25.0, 22.0, 24.0])
+        )
+        clean = BayesianPolicy(grid=grid).act(np.zeros(1), self._info([20.0, 25.0, 22.0, 24.0]))
+        self.assertEqual(with_zeros, clean)
+        self.assertEqual(clean, (1, 0, 0))
+
+    def test_model_based_survives_all_zero_buffer(self):
+        grid = ActionGrid(ActionSpec(attempt_timeout_ms=[50], max_attempts=[1], backoff_ms=[0]))
+        policy = ModelBasedPolicy(grid=grid)
+        action = policy.act(np.zeros(1), self._info([0.0, 0.0, 0.0]))
+        self.assertEqual(action, grid.indices[0])
+
+
 class _ConstantModel:
     def __init__(self, value_ms: float):
         self._value = value_ms

@@ -171,6 +171,7 @@ class ModelBasedPolicy:
             self._service_samples = self._service_samples[-self.buffer_size :]
         values, censored = self._buffer.censored_data()
         uncensored = values[~censored]
+        uncensored = uncensored[uncensored > 0]
         if uncensored.size == 0:
             return self.grid.indices[0]
 
