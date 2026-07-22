@@ -2,7 +2,7 @@ import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from core import TimeDuration, TimePoint, s_to_ns
+from core import TimePoint, ns_to_s, s_to_ns
 from fault_events import FaultEventsTracker
 from faults import LoadSpike
 from simulator import Simulator
@@ -32,25 +32,54 @@ class Workload:
                 rps *= spike.rps_multiplier
         return max(0.0, rps)
 
-    def _sample_interarrival(self, time: TimePoint, rps: float | None = None) -> TimeDuration:
-        rps = self.rps_at(time) if rps is None else rps
-        if rps <= 0.0:
-            # No load right now - push a bit forward.
-            # RNG is intentionally NOT consumed here; arrivals stay identical across experiments only when RPS-positive intervals match.
-            return s_to_ns(0.5)
-        return s_to_ns(self._rng.expovariate(rps))
+    def _next_boundary(self, t: TimePoint, end_at: TimePoint) -> TimePoint:
+        """Next spike start/end after t (the rate is constant in between)."""
+        nxt = end_at
+        for spike in self.load_spikes:
+            for edge in (spike.duration.begin, spike.duration.end):
+                if t < edge < nxt:
+                    nxt = edge
+        return nxt
+
+    def _next_arrival_after(self, t: TimePoint, end_at: TimePoint) -> TimePoint | None:
+        """Exact next-arrival draw for the piecewise-constant rate.
+
+        One Exp(1) budget is consumed across rate segments (spike boundaries):
+        a segment of rate r and length dt supplies r*dt of exposure, and
+        memorylessness makes segment-wise consumption exact — equivalent to
+        re-drawing at every boundary, without needing the max-rate bound that
+        thinning would. Zero-rate segments supply no exposure and are skipped
+        (consuming no RNG beyond the one draw, so arrivals stay identical
+        across experiments whose RPS-positive intervals match). Returns None
+        when no arrival lands before end_at.
+        """
+        e = self._rng.expovariate(1.0)
+        while t < end_at:
+            rate = self.rps_at(t)
+            boundary = self._next_boundary(t, end_at)
+            if rate <= 0.0:
+                t = boundary
+                continue
+            exposure = rate * ns_to_s(boundary - t)
+            if e <= exposure:
+                return t + s_to_ns(e / rate)
+            e -= exposure
+            t = boundary
+        return None
 
     def drive(self, sim: Simulator, on_arrival: Callable[[Simulator], None]):
         end_at = s_to_ns(self.duration_s)
 
-        def tick():
+        def schedule_next(from_t: TimePoint):
+            nxt = self._next_arrival_after(from_t, end_at)
+            if nxt is not None:
+                # Keep the historical 1 ns minimum interarrival clamp.
+                sim.schedule(max(nxt, from_t + 1), arrive)
+
+        def arrive():
             if sim.timestep >= end_at:
                 return
-            rps = self.rps_at(sim.timestep)
-            if rps > 0.0:
-                on_arrival(sim)
-            ia = max(1, self._sample_interarrival(sim.timestep, rps))
-            sim.schedule(sim.timestep + ia, tick)
+            on_arrival(sim)
+            schedule_next(sim.timestep)
 
-        # start at t=0
-        sim.schedule(0, tick)
+        schedule_next(0)

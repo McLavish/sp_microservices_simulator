@@ -30,7 +30,7 @@ The simulator is built around a single-threaded discrete-event loop. Events are 
 
 When adding completion paths in `behavior`, preserve AND semantics and route deadlines through `min(...)` rather than overwriting; the deadline guard schedules an `on_deadline` event that must be cancelled on success.
 
-**Workload** (`workload.py`) is a Poisson arrival process (`expovariate`) modulated by `LoadSpike.rps_multiplier`. RPS=0 means no arrivals but the tick keeps polling at 0.5s intervals.
+**Workload** (`workload.py`) is an exact nonhomogeneous Poisson process for the piecewise-constant rate (base RPS × active `LoadSpike.rps_multiplier`s): one Exp(1) budget per arrival is consumed across rate segments, so short spikes are never skipped and the first arrival is exponentially distributed (never deterministically at t=0). Zero-rate segments are skipped exactly without consuming RNG; an all-zero workload schedules no events.
 
 **Metrics** (`metrics.py`). `Metrics.summary()` is per-root aggregate. `Metrics.export_csv()` produces per-second buckets where:
 - `root_requests` and `retries` are bucketed by **start** time.
