@@ -427,6 +427,28 @@ class TestRetryPolicies(unittest.TestCase):
             sim.run()
 
 
+class TestTimeBasedBreakerCounters(unittest.TestCase):
+    def test_incremental_counters_match_full_rescan(self):
+        rng = random.Random(7)
+        policy = TimeBasedCircuitBreakerPolicy(
+            failure_threshold_rate=0.5,
+            success_threshold_rate=0.6,
+            min_requests=5,
+            window_duration=s_to_ns(2),
+            underlying_strategy=FixedBackoffRetryPolicy(max_attempts=3, delay=0),
+            half_open_delay=s_to_ns(1),
+        )
+        now = 0
+        for _ in range(3000):
+            now += rng.randint(0, s_to_ns(0.01))
+            policy.allow_request(now)
+            policy.add_result(rng.random() < 0.6, now)
+            self.assertEqual(
+                policy._failures_in_window,
+                sum(1 for _, ok in policy._window if not ok),
+            )
+
+
 class TestBackoffValidation(unittest.TestCase):
     def test_negative_fixed_backoff_rejected(self):
         with self.assertRaises(ValueError):

@@ -199,12 +199,19 @@ class TimeBasedCircuitBreakerPolicy(RetryPolicy):
     half_open_delay: TimeDuration
 
     _window: deque[tuple[TimePoint, bool]] = field(default_factory=deque)  # (timestamp, success)
+    _failures_in_window: int = field(default=0, init=False)
     _state: CBState = CBState.CLOSED
     _opened_at: TimePoint | None = None
 
     def _evict_old(self, now: TimePoint) -> None:
         while self._window and (now - self._window[0][0]) > self.window_duration:
-            self._window.popleft()
+            _, ok = self._window.popleft()
+            if not ok:
+                self._failures_in_window -= 1
+
+    def _clear_window(self) -> None:
+        self._window.clear()
+        self._failures_in_window = 0
 
     def get_state(self) -> CBState:
         return self._state
@@ -213,9 +220,14 @@ class TimeBasedCircuitBreakerPolicy(RetryPolicy):
         self._evict_old(now)
         if self._state != CBState.OPEN:
             self._window.append((now, success))
+            if not success:
+                self._failures_in_window += 1
 
+        # Incremental counters instead of a full window rescan per result
+        # (resilience4j's time-based sliding window keeps aggregates the same
+        # way); the old sum() made every result O(window) -> O(n^2) overall.
         total = len(self._window)
-        failures = sum(1 for _, ok in self._window if not ok)
+        failures = self._failures_in_window
         rate = failures / total if total > 0 else 0.0
 
         if self._state == CBState.CLOSED:
@@ -231,11 +243,11 @@ class TimeBasedCircuitBreakerPolicy(RetryPolicy):
                 # Fresh metrics after recovery (resilience4j resets the sliding
                 # window on transition to CLOSED); otherwise half-open probe
                 # results would seed the closed-state failure rate.
-                self._window.clear()
+                self._clear_window()
             elif total >= self.min_requests:
                 self._state = CBState.OPEN
                 self._opened_at = now
-                self._window.clear()
+                self._clear_window()
 
     def allow_request(self, now: TimePoint) -> bool:
         # NOTE: half-open admits *every* request (no probe cap) — see CBState.HALF_OPEN.
@@ -247,7 +259,7 @@ class TimeBasedCircuitBreakerPolicy(RetryPolicy):
             or now - self._opened_at >= self.half_open_delay
         ):
             self._state = CBState.HALF_OPEN
-            self._window.clear()
+            self._clear_window()
             return True
         return False
 
