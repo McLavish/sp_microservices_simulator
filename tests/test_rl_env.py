@@ -8,7 +8,7 @@ except Exception:
     gymnasium = None  # ty: ignore[invalid-assignment]
 
 from caller import ClientConfig, ClientRuntime
-from core import TimeInterval, ms_to_ns, s_to_ns
+from core import DropReason, TimeInterval, ms_to_ns, ns_to_ms, s_to_ns
 from faults import PartialFailure
 from retry_policies import FixedBackoffRetryPolicy
 from rl.env import (
@@ -517,6 +517,33 @@ class TestPopulationAccounting(unittest.TestCase):
         _, j_defer_on, _ = self._run_episode((1, 0, 0), terminal_drain_penalty=True)
         _, j_fail_on, _ = self._run_episode((0, 0, 0), terminal_drain_penalty=True)
         self.assertLess(abs(j_defer_on - j_fail_on), abs(j_defer_off - j_fail_off))
+
+
+@unittest.skipIf(gymnasium is None, "gymnasium not installed")
+class TestSampleSource(unittest.TestCase):
+    def test_chain_samples_come_from_the_actuated_edge(self):
+        env = MicroservicesEnv(
+            EnvConfig(
+                build=lambda seed: build_chain_env(seed, duration_s=4),
+                action_spec=ActionSpec(attempt_timeout_ms=[80], max_attempts=[2], backoff_ms=[20]),
+                step_duration_s=1.0,
+                episode_duration_s=4.0,
+            )
+        )
+        obs, info = env.reset(seed=7)
+        obs, reward, terminated, truncated, info = env.step((0, 0, 0))
+        cost_client = env._require_components().cost_client
+        edge_latencies = sorted(
+            ns_to_ms(a.interval.end - a.interval.begin)
+            for root in cost_client.roots[: env._last_sample_root_idx]
+            for a in root.attempts
+            if not (
+                a.drop_reason in (DropReason.QUEUE_FULL, DropReason.CIRCUIT_OPEN)
+                and a.interval.end == a.interval.begin
+            )
+        )
+        self.assertGreater(len(edge_latencies), 0)
+        self.assertEqual(sorted(info["attempt_latencies_ms"]), edge_latencies)
 
 
 if __name__ == "__main__":

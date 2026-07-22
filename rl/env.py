@@ -124,6 +124,7 @@ class MicroservicesEnv(_GymEnvBase):
         self._components: EnvComponents | None = None
         self._last_root_idx = 0
         self._last_cost_root_idx = 0
+        self._last_sample_root_idx = 0
         self._horizon_root_count = 0
         self._episode_steps = 0
         self._current_time_ns: TimePoint = 0
@@ -176,6 +177,7 @@ class MicroservicesEnv(_GymEnvBase):
 
         self._last_root_idx = 0
         self._last_cost_root_idx = 0
+        self._last_sample_root_idx = 0
         self._horizon_root_count = 0
         self._episode_steps = 0
         self._require_workload().drive(
@@ -218,7 +220,17 @@ class MicroservicesEnv(_GymEnvBase):
         terminated = self._current_time_ns >= self._end_time_ns
         info: dict[str, object] = {"summary": summary, "action": self._last_action_values.copy()}
         if self._cfg.emit_latency_samples:
-            info.update(self._collect_latency_samples(new_roots))
+            # Latency-based policies must see the client the knobs actuate: in
+            # chain scenarios that is the B->C edge (cost_client), not the
+            # top-level client whose end-to-end latencies the knobs only
+            # influence indirectly. Reward/observation stay top-level.
+            sample_client = self._require_components().cost_client
+            if sample_client is not None:
+                sample_roots = sample_client.roots[self._last_sample_root_idx :]
+                self._last_sample_root_idx = len(sample_client.roots)
+            else:
+                sample_roots = new_roots
+            info.update(self._collect_latency_samples(sample_roots))
 
         if terminated:
             self._horizon_root_count = self._last_root_idx
