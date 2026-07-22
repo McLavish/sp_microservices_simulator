@@ -472,7 +472,7 @@ def _build_slow_failing_env(seed=None, duration_s=None):
         retry.max_attempts = values.max_attempts
         retry.delay = ms_to_ns(values.backoff_ms)
 
-    workload = Workload(base_rps=50.0, duration_s=int(duration), load_spikes=[], rng_seed=seed)
+    workload = Workload(base_rps=50.0, duration_s=duration, load_spikes=[], rng_seed=seed)
     return EnvComponents(sim=sim, workload=workload, client=client, apply_knobs=apply_knobs)
 
 
@@ -533,6 +533,7 @@ class TestSampleSource(unittest.TestCase):
         obs, info = env.reset(seed=7)
         obs, reward, terminated, truncated, info = env.step((0, 0, 0))
         cost_client = env._require_components().cost_client
+        assert cost_client is not None
         edge_latencies = sorted(
             ns_to_ms(a.interval.end - a.interval.begin)
             for root in cost_client.roots[: env._last_sample_root_idx]
@@ -566,6 +567,23 @@ class TestInstantRejectionSamples(unittest.TestCase):
         samples = env._collect_latency_samples([rejected, served])
         self.assertEqual(len(samples["attempt_latencies_ms"]), 1)
         self.assertAlmostEqual(samples["attempt_latencies_ms"][0], 20.0)
+
+
+@unittest.skipIf(gymnasium is None, "gymnasium not installed")
+class TestDurationValidation(unittest.TestCase):
+    def test_zero_step_duration_rejected(self):
+        with self.assertRaises(ValueError):
+            MicroservicesEnv(
+                EnvConfig(build=_build_slow_failing_env, action_spec=SLOW_SPEC, step_duration_s=0.0)
+            )
+
+    def test_negative_episode_duration_rejected(self):
+        with self.assertRaises(ValueError):
+            MicroservicesEnv(
+                EnvConfig(
+                    build=_build_slow_failing_env, action_spec=SLOW_SPEC, episode_duration_s=-1.0
+                )
+            )
 
 
 if __name__ == "__main__":

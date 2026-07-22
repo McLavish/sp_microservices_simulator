@@ -67,7 +67,7 @@ class ExperimentConfig:
 
 
 def _build_env(cfg: ExperimentConfig) -> MicroservicesEnv:
-    duration_s = int(round(cfg.episode_duration_s)) if cfg.episode_duration_s else None
+    duration_s = cfg.episode_duration_s if cfg.episode_duration_s else None
     builder = SCENARIO_BUILDERS[cfg.fault_scenario]
 
     def build_fn(seed):
@@ -492,7 +492,7 @@ def main() -> None:
             policies.append(ppo_policy)
 
     if "constrained_ppo" in policy_names:
-        duration_s = int(round(cfg.episode_duration_s)) if cfg.episode_duration_s else None
+        duration_s = cfg.episode_duration_s if cfg.episode_duration_s else None
         builder = SCENARIO_BUILDERS[cfg.fault_scenario]
         constrained_cfg = ConstrainedTrainConfig(
             build=lambda seed: builder(seed, duration_s),

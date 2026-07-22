@@ -37,6 +37,24 @@ class TestWorkload(unittest.TestCase):
         self.assertGreaterEqual(len(arrivals), 1)
 
 
+class TestFractionalDuration(unittest.TestCase):
+    def _times(self, duration_s):
+        sim = Simulator(seed=1)
+        times = []
+        wl = Workload(base_rps=200.0, duration_s=duration_s, load_spikes=[], rng_seed=3)
+        wl.drive(sim, lambda s: times.append(s.timestep))
+        sim.run()
+        return times
+
+    def test_no_arrivals_start_after_fractional_horizon(self):
+        times = self._times(1.6)
+        self.assertGreater(len(times), 0)
+        self.assertLess(max(times), s_to_ns(1.6))
+
+    def test_sub_second_duration_still_generates_traffic(self):
+        self.assertGreater(len(self._times(0.4)), 0)
+
+
 class TestWorkloadSeeding(unittest.TestCase):
     def _arrivals(self, rng_seed):
         sim = Simulator(seed=1)

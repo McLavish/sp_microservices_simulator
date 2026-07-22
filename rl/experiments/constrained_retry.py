@@ -330,7 +330,7 @@ def main() -> None:
         backoff_ms=list(args.backoff_ms),
     )
     grid = ActionGrid(action_spec)
-    duration = int(round(args.episode_duration_s))
+    duration = float(args.episode_duration_s)
 
     def plain_build(seed):
         return builder(seed, duration)

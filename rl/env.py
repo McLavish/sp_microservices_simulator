@@ -96,6 +96,10 @@ class MicroservicesEnv(_GymEnvBase):
         if gym is None or spaces is None:
             raise ImportError("gymnasium is required for MicroservicesEnv") from _GYM_IMPORT_ERROR
         assert spaces is not None  # narrow for type checker after the check above
+        if config.step_duration_s <= 0:
+            raise ValueError("step_duration_s must be > 0")
+        if config.episode_duration_s is not None and config.episode_duration_s <= 0:
+            raise ValueError("episode_duration_s must be > 0")
         self._cfg = config
 
         self._action_sizes = [
@@ -519,7 +523,7 @@ def _static_knob_applier(
 
 def _single_service_components(
     seed: int | None,
-    duration: int,
+    duration: float,
     *,
     latency_injections: list[LatencyInjection] | None = None,
     partial_failures: list[PartialFailure] | None = None,
@@ -559,21 +563,21 @@ def _single_service_components(
 
 
 def build_single_service_env(
-    seed: int | None = None, duration_s: int | None = None
+    seed: int | None = None, duration_s: float | None = None
 ) -> EnvComponents:
-    duration = 30 if duration_s is None else int(duration_s)
+    duration = 30.0 if duration_s is None else float(duration_s)
     return _single_service_components(seed, duration)
 
 
 def build_faulty_single_service_env(
-    seed: int | None = None, duration_s: int | None = None
+    seed: int | None = None, duration_s: float | None = None
 ) -> EnvComponents:
     """Faulty single service with fault windows at *fixed* episode fractions.
 
     Because the observation includes the episode-time fraction, policies can
     memorize these windows; use the randomized variant for training.
     """
-    duration = 30 if duration_s is None else int(duration_s)
+    duration = 30.0 if duration_s is None else float(duration_s)
     return _single_service_components(
         seed,
         duration,
@@ -599,7 +603,7 @@ def build_faulty_single_service_env(
 
 
 def build_randomized_faulty_single_service_env(
-    seed: int | None = None, duration_s: int | None = None
+    seed: int | None = None, duration_s: float | None = None
 ) -> EnvComponents:
     """Faulty single service with fault windows drawn from the seed.
 
@@ -607,7 +611,7 @@ def build_randomized_faulty_single_service_env(
     memorize the episode clock via the time-fraction feature — it has to react
     to observed degradation. Same seed reproduces the same fault draw.
     """
-    duration = 30 if duration_s is None else int(duration_s)
+    duration = 30.0 if duration_s is None else float(duration_s)
     rng = random.Random(1 if seed is None else seed)
 
     def window() -> TimeInterval:
@@ -628,7 +632,7 @@ def build_randomized_faulty_single_service_env(
 
 def build_chain_env(
     seed: int | None = None,
-    duration_s: int | None = None,
+    duration_s: float | None = None,
     *,
     retry_budget_ratio: float | None = None,
 ) -> EnvComponents:
@@ -648,7 +652,7 @@ def build_chain_env(
     """
     build_seed = 1 if seed is None else int(seed)
     sim = Simulator(seed=build_seed)
-    duration = 30 if duration_s is None else int(duration_s)
+    duration = 30.0 if duration_s is None else float(duration_s)
     rng = random.Random(build_seed)
 
     onset = rng.uniform(0.1, 0.5) * duration
@@ -742,7 +746,7 @@ def build_chain_env(
 
 def build_multichain_env(
     seed: int | None = None,
-    duration_s: int | None = None,
+    duration_s: float | None = None,
     *,
     retry_budget_ratio: float | None = None,
 ) -> EnvComponents:
@@ -771,7 +775,7 @@ def build_multichain_env(
     """
     build_seed = 1 if seed is None else int(seed)
     sim = Simulator(seed=build_seed)
-    duration = 30 if duration_s is None else int(duration_s)
+    duration = 30.0 if duration_s is None else float(duration_s)
     rng = random.Random(build_seed)
 
     # p_fail must be high enough that upstream retry layers (A->B x2, top x2:
@@ -906,7 +910,7 @@ def build_multichain_env(
 
 
 # Scenario name -> builder, shared by the CLI entry points (--fault-scenario).
-SCENARIO_BUILDERS: dict[str, Callable[[int | None, int | None], EnvComponents]] = {
+SCENARIO_BUILDERS: dict[str, Callable[[int | None, float | None], EnvComponents]] = {
     "none": build_single_service_env,
     "basic": build_faulty_single_service_env,
     "randomized": build_randomized_faulty_single_service_env,

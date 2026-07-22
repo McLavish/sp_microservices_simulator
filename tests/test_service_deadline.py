@@ -52,6 +52,7 @@ class TestServiceTimeRecording(unittest.TestCase):
             key=lambda a: a.interval.end,
         )
         first, second = attempts
+        assert first.service_time_ns is not None and second.service_time_ns is not None
         tol = ms_to_ns(2)
         self.assertLess(abs(first.service_time_ns - ms_to_ns(20)), tol)
         self.assertLess(abs(second.service_time_ns - ms_to_ns(20)), tol)

@@ -11,7 +11,7 @@ from simulator import Simulator
 @dataclass
 class Workload:
     base_rps: float
-    duration_s: int
+    duration_s: float
     load_spikes: list[LoadSpike]
     rng_seed: int | None = None
     _rng: random.Random = field(init=False, repr=False)

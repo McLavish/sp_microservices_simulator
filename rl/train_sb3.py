@@ -34,7 +34,7 @@ class TrainConfig:
 
 def _make_env(cfg: TrainConfig) -> MicroservicesEnv:
     builder = SCENARIO_BUILDERS[cfg.fault_scenario]
-    duration_s = int(round(cfg.episode_duration_s)) if cfg.episode_duration_s else None
+    duration_s = cfg.episode_duration_s if cfg.episode_duration_s else None
 
     def build_fn(seed):
         return builder(seed, duration_s)

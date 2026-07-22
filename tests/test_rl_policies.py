@@ -224,11 +224,31 @@ class TestZeroSampleRobustness(unittest.TestCase):
 
 
 class _ConstantModel:
+    """Minimal LatencyModel-protocol stub returning a constant latency."""
+
     def __init__(self, value_ms: float):
         self._value = value_ms
 
-    def sample(self, rng, n):
-        return np.full(n, self._value)
+    def fit(self, samples):
+        return self
+
+    def logpdf(self, x):
+        return np.zeros_like(np.asarray(x, dtype=float))
+
+    def cdf(self, x):
+        return (np.asarray(x, dtype=float) >= self._value).astype(float)
+
+    def quantile(self, q: float) -> float:
+        return self._value
+
+    def sample(self, rng, size):
+        return np.full(size, self._value)
+
+    def params(self) -> dict[str, float]:
+        return {"value_ms": self._value}
+
+    def log_likelihood(self, samples) -> float:
+        return 0.0
 
 
 class TestSurrogateGlobalDeadline(unittest.TestCase):
