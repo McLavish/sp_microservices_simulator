@@ -92,6 +92,13 @@ def _simulate_action(
         success = False
         attempts = 0
         for attempt in range(max_attempts):
+            remaining = None if global_timeout is None else global_timeout - elapsed
+            if remaining is not None and remaining <= 0:
+                break
+            # Mirror the real caller: per-attempt deadline is
+            # min(attempt timeout, remaining global budget), and success needs
+            # strictly-before completion (half-open deadline, caller.py).
+            effective_timeout = timeout if remaining is None else min(timeout, remaining)
             attempts += 1
             sample = float(model.sample(rng, 1)[0])
             q_delay = 0.0
@@ -101,19 +108,16 @@ def _simulate_action(
                 else:
                     q_delay = queue_delay_ms
             total_sample = sample + q_delay
-            attempt_latency = min(total_sample, timeout)
+            attempt_latency = min(total_sample, effective_timeout)
             elapsed += attempt_latency
 
-            if total_sample <= timeout:
+            if total_sample < effective_timeout:
                 success = True
                 latencies.append(elapsed)
                 break
 
             if attempt < max_attempts - 1:
                 elapsed += backoff
-
-            if global_timeout is not None and elapsed >= global_timeout:
-                break
 
         retries += max(0, attempts - 1)
         if success:

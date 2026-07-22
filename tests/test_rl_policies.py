@@ -8,7 +8,8 @@ from rl.models.lognormal import LogNormalModel
 from rl.policies.action_space import ActionGrid
 from rl.policies.aimd import AIMDPolicy
 from rl.policies.bayesian import BayesianPolicy
-from rl.policies.model_based import ModelBasedPolicy
+from rl.policies.model_based import ModelBasedPolicy, _simulate_action
+from rl.spec import ActionValues
 
 
 class TestRLPolicies(unittest.TestCase):
@@ -173,6 +174,51 @@ class TestRLPolicies(unittest.TestCase):
         action = policy.act(np.zeros(12, dtype=np.float32), info)
         self.assertEqual(len(action), 4)
         self.assertIn(action, grid.indices)
+
+
+class _ConstantModel:
+    def __init__(self, value_ms: float):
+        self._value = value_ms
+
+    def sample(self, rng, n):
+        return np.full(n, self._value)
+
+
+class TestSurrogateGlobalDeadline(unittest.TestCase):
+    def _score(self, sample_ms, attempt_timeout_ms, global_timeout_ms):
+        weights = RewardWeights(
+            success=1.0,
+            deadline_drop=1.0,
+            queue_drop=0.0,
+            server_drop=0.0,
+            circuit_open_drop=0.0,
+            p95_latency_ms=0.0,
+            retries=0.0,
+        )
+        action = ActionValues(
+            attempt_timeout_ms=attempt_timeout_ms,
+            max_attempts=1,
+            backoff_ms=0,
+            global_timeout_ms=global_timeout_ms,
+        )
+        return _simulate_action(
+            _ConstantModel(sample_ms),
+            action,
+            weights,
+            np.random.default_rng(0),
+            n_roots=10,
+            queue_delay_ms=0.0,
+            queue_delay_mode="deterministic",
+        )
+
+    def test_sample_beyond_global_budget_is_a_deadline_drop(self):
+        # 80 ms sample, 100 ms attempt timeout, 50 ms global: the real caller
+        # caps the attempt at min(remaining global, attempt timeout) and
+        # requires strictly-before completion -> deadline drop, reward -1.
+        self.assertAlmostEqual(self._score(80.0, 100, 50), -1.0)
+
+    def test_sample_within_both_budgets_succeeds(self):
+        self.assertAlmostEqual(self._score(30.0, 100, 200), 1.0)
 
 
 if __name__ == "__main__":
