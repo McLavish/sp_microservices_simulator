@@ -129,33 +129,51 @@ class ServiceNodeRuntime:
                     # ensure we schedule at int(deadline)
                     deadline_event = sim2.schedule(int(deadline), on_deadline)
 
+                launching = False
+                sync_failure_root = None
+
+                def fail_with(_root):
+                    nonlocal done
+                    done = True
+                    cancel_deadline()
+                    drop = downstream_drop_reason(_root)
+                    if drop == DropReason.NONE:
+                        drop = DropReason.SERVER_FAILURE
+                    finalize(False, sim2.timestep - begin_at, drop)
+
                 def on_downstream_done(_root):
-                    nonlocal remaining, done
+                    nonlocal remaining, sync_failure_root
                     if done:
                         return
                     # Determine success from root attempts
                     succeeded = any(a.success for a in _root.attempts)
                     if not succeeded:
-                        # We can finish immediately on first failure (AND semantics)
-                        done = True
-                        cancel_deadline()
-                        drop = downstream_drop_reason(_root)
-                        if drop == DropReason.NONE:
-                            drop = DropReason.SERVER_FAILURE
-                        finalize(False, sim2.timestep - begin_at, drop)
+                        if launching:
+                            # A synchronous rejection (queue-full / circuit-open)
+                            # during the launch loop: remember it, but launch the
+                            # remaining edges first so downstream load does not
+                            # depend on edge order.
+                            if sync_failure_root is None:
+                                sync_failure_root = _root
+                            return
+                        # First failure short-circuits the parent (AND semantics)
+                        fail_with(_root)
                         return
                     remaining -= 1
                     maybe_finish()
 
-                # Launch downstreams concurrently
+                # Launch ALL downstreams concurrently; AND semantics still
+                # short-circuit the parent, but only after every edge is launched.
+                launching = True
                 for edge in downstream_edges:
-                    if done:
-                        break
                     edge.client.start_request(
                         sim2,
                         on_done=on_downstream_done,
                         override_global_deadline=deadline,
                     )
+                launching = False
+                if sync_failure_root is not None and not done:
+                    fail_with(sync_failure_root)
 
                 if not done and not self.hold_worker_during_fanout:
                     release_worker()

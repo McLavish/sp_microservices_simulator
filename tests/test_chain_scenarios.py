@@ -11,9 +11,9 @@ import unittest
 
 from caller import ClientConfig, ClientRuntime
 from chain import DownstreamEdge, ServiceNodeRuntime
-from core import TimeInterval, ms_to_ns, s_to_ns
+from core import DropReason, TimeInterval, ms_to_ns, s_to_ns
 from faults import LatencyInjection, LoadSpike, PartialFailure
-from retry_policies import FixedBackoffRetryPolicy
+from retry_policies import FixedBackoffRetryPolicy, NoRetryPolicy
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import StaticTimeoutController
@@ -198,6 +198,74 @@ class TestChainScenarios(unittest.TestCase):
         self.assertEqual(a.succeeded, b.succeeded)
         self.assertEqual(b.succeeded, c.succeeded)
         self.assertLessEqual(c.succeeded, d.succeeded)
+
+
+class TestFanoutLaunchesAllEdges(unittest.TestCase):
+    def _run(self, reject_first: bool):
+        sim = Simulator(seed=1)
+
+        def leaf(name, queue_capacity=None):
+            return ServiceNodeRuntime(
+                service=ServiceRuntime(
+                    cfg=ServiceConfig(
+                        name=name,
+                        latency_median=ms_to_ns(10),
+                        latency_lognorm_sigma=1e-6,
+                        workers=1,
+                        queue_capacity=queue_capacity,
+                    )
+                ).bind()
+            )
+
+        reject = leaf("svc-reject", queue_capacity=0)
+        ok = leaf("svc-ok")
+        # Occupy svc-reject's single worker so a fan-out submit hits the full
+        # (capacity-0) queue and fails synchronously.
+        reject.service.submit_attempt(sim, lambda *a: None)
+
+        parent = ServiceNodeRuntime(
+            service=ServiceRuntime(
+                cfg=ServiceConfig(
+                    name="svc-parent",
+                    latency_median=ms_to_ns(5),
+                    latency_lognorm_sigma=1e-6,
+                    workers=4,
+                )
+            ).bind()
+        )
+
+        def edge(node):
+            return DownstreamEdge(
+                client=ClientRuntime(
+                    cfg=ClientConfig(
+                        retry=NoRetryPolicy(),
+                        timeout_controller=StaticTimeoutController(
+                            global_timeout=None, attempt_timeout=ms_to_ns(200)
+                        ),
+                    ),
+                    service=node,
+                ),
+                target=node,
+            )
+
+        edges = [edge(reject), edge(ok)] if reject_first else [edge(ok), edge(reject)]
+        for e in edges:
+            parent.add_downstream(e)
+        results = []
+        parent.submit_attempt(sim, lambda success, t, drop, q: results.append((success, drop)))
+        sim.run()
+        ok_edge = edges[1] if reject_first else edges[0]
+        return results, len(ok_edge.client.roots)
+
+    def test_second_edge_still_receives_load_when_first_rejects_synchronously(self):
+        results, ok_calls = self._run(reject_first=True)
+        self.assertEqual(ok_calls, 1)  # was 0: the loop broke before launching it
+        self.assertEqual(results[0][0], False)  # AND semantics: parent still fails
+        self.assertEqual(results[0][1], DropReason.QUEUE_FULL)
+
+    def test_edge_order_does_not_change_the_load_pattern(self):
+        _, ok_calls = self._run(reject_first=False)
+        self.assertEqual(ok_calls, 1)
 
 
 if __name__ == "__main__":
