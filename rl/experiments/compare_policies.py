@@ -16,6 +16,7 @@ from rl.env import (
     MicroservicesEnv,
     RewardWeights,
 )
+from rl.model_io import check_action_spec, save_action_spec
 from rl.policies.action_space import ActionGrid
 from rl.policies.aimd import AIMDPolicy
 from rl.policies.bayesian import BayesianPolicy
@@ -482,12 +483,16 @@ def main() -> None:
         if args.ppo_load_path:
             if PPO is None:
                 raise ImportError("stable-baselines3 is required for PPO baseline")
+            check_action_spec(args.ppo_load_path, action_spec)
             model = PPO.load(args.ppo_load_path)
             policies.append(SB3Policy(model=model, deterministic=True, name="ppo"))
         else:
             ppo_policy = _train_ppo(cfg, learning_curve_csv=args.ppo_learning_curve_csv)
             if args.ppo_save_path:
                 ppo_policy.model.save(args.ppo_save_path)
+                save_action_spec(
+                    args.ppo_save_path, action_spec, cfg.step_duration_s, cfg.fault_scenario
+                )
                 print(f"Saved PPO model to {args.ppo_save_path}")
             policies.append(ppo_policy)
 

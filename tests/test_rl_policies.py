@@ -1,5 +1,8 @@
 import math
+import tempfile
 import unittest
+import warnings
+from pathlib import Path
 
 import numpy as np
 
@@ -8,6 +11,7 @@ from rl.models.lognormal import LogNormalModel
 from rl.policies.action_space import ActionGrid
 from rl.policies.aimd import AIMDPolicy
 from rl.policies.bayesian import BayesianPolicy
+from rl.model_io import check_action_spec, save_action_spec
 from rl.policies.model_based import ModelBasedPolicy, _simulate_action
 from rl.spec import ActionValues
 
@@ -193,6 +197,43 @@ class TestServiceMoments(unittest.TestCase):
         self.assertEqual(count, 50)
         self.assertAlmostEqual(mean_s, 20.0)
         self.assertAlmostEqual(mean_s2, 400.0)
+
+
+class TestActionSpecSidecar(unittest.TestCase):
+    def setUp(self):
+        self.spec = ActionSpec(
+            attempt_timeout_ms=[10, 30],
+            max_attempts=[1, 2],
+            backoff_ms=[0, 20],
+            global_timeout_ms=[500, None],
+        )
+
+    def test_roundtrip_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "model.zip")
+            save_action_spec(path, self.spec, step_duration_s=1.0, fault_scenario="chain")
+            check_action_spec(path, self.spec)  # no raise
+
+    def test_reordered_grid_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "model.zip")
+            save_action_spec(path, self.spec, step_duration_s=1.0)
+            mutated = ActionSpec(
+                attempt_timeout_ms=[30, 10],
+                max_attempts=[1, 2],
+                backoff_ms=[0, 20],
+                global_timeout_ms=[500, None],
+            )
+            with self.assertRaises(ValueError):
+                check_action_spec(path, mutated)
+
+    def test_missing_sidecar_warns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "model.zip")
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                check_action_spec(path, self.spec)
+            self.assertTrue(any("sidecar" in str(w.message) for w in caught))
 
 
 class TestZeroSampleRobustness(unittest.TestCase):
