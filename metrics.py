@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -125,6 +126,11 @@ class Metrics:
         if granularity_s <= 0:
             raise ValueError("granularity_s must be > 0")
         bucket_ns = s_to_ns(granularity_s)
+        if bucket_ns <= 0:
+            raise ValueError(
+                f"granularity_s={granularity_s!r} rounds to {bucket_ns} ns; "
+                "the minimum representable bucket is 1 ns (1e-9 s)"
+            )
 
         columns = [
             "timepoint",
@@ -259,4 +265,11 @@ class Metrics:
         out["total_request"] = out["root_requests"].cumsum()
         out["total_failure"] = out["failure_root"].cumsum()
         out = pd.concat([out, lat_stats], axis=1)[columns]
+        # %.3f is fine for millisecond latency columns but collapses sub-ms
+        # bucket timestamps; format the timepoint with granularity-aware
+        # precision (as strings, so float_format leaves it alone).
+        decimals = (
+            3 if bucket_ns >= S_TO_NS else max(3, math.ceil(-math.log10(bucket_ns / S_TO_NS)))
+        )
+        out["timepoint"] = [f"{v:.{decimals}f}" for v in out["timepoint"]]
         out.to_csv(path, index=False, float_format="%.3f", na_rep="nan", lineterminator="\r\n")

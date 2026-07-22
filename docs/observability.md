@@ -32,8 +32,14 @@ latency percentiles `p50..p99_99`, `mean`, `max`, `retries_per_root`,
 
 ### `export_csv(path, granularity_s=1.0)` (`metrics.py:113`)
 
-Writes one row per time bucket (default 1 s). The subtlety is **which event time a
-column is bucketed by** — start vs. end:
+Writes one row per time bucket (default 1 s). `granularity_s` must round to at
+least 1 ns (values below 5e-10 s raise `ValueError`); the `timepoint` column is
+serialized with granularity-aware precision so sub-millisecond buckets never
+collapse under the fixed `%.3f` used for latency columns. Count columns are raw
+per-bucket counts — `plotting.qps_over_time` divides them by the bucket width
+(inferred from consecutive timepoints) before labeling the axis "QPS".
+
+The subtlety is **which event time a column is bucketed by** — start vs. end:
 
 | Column | Bucketed by | Meaning |
 | --- | --- | --- |
