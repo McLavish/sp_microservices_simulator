@@ -492,6 +492,10 @@ class MicroservicesEnv(_GymEnvBase):
         roots = self._client.roots[: self._horizon_root_count]
         return Metrics(roots=roots, attempts_total=sum(len(r.attempts) for r in roots)).summary()
 
+    @property
+    def step_duration_s(self) -> float:
+        return self._cfg.step_duration_s
+
     def bystander_metrics_summary(self) -> Summary | None:
         if self._components is None or self._components.bystander_client is None:
             return None

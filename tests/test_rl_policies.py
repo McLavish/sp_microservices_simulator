@@ -7,11 +7,11 @@ from pathlib import Path
 import numpy as np
 
 from rl.env import ActionSpec, RewardWeights
+from rl.model_io import check_action_spec, save_action_spec
 from rl.models.lognormal import LogNormalModel
 from rl.policies.action_space import ActionGrid
 from rl.policies.aimd import AIMDPolicy
 from rl.policies.bayesian import BayesianPolicy
-from rl.model_io import check_action_spec, save_action_spec
 from rl.policies.model_based import ModelBasedPolicy, _simulate_action
 from rl.spec import ActionValues
 
@@ -197,6 +197,24 @@ class TestServiceMoments(unittest.TestCase):
         self.assertEqual(count, 50)
         self.assertAlmostEqual(mean_s, 20.0)
         self.assertAlmostEqual(mean_s2, 400.0)
+
+
+class TestTraceTimeAxis(unittest.TestCase):
+    def test_uses_step_duration_column(self):
+        import pandas as pd
+
+        from plotting.rl_traces_over_time import _step_seconds
+
+        df = pd.DataFrame({"step": [0, 1, 2], "step_duration_s": [2.0, 2.0, 2.0]})
+        self.assertEqual(_step_seconds(df), 2.0)
+
+    def test_legacy_csv_defaults_to_one_second(self):
+        import pandas as pd
+
+        from plotting.rl_traces_over_time import _step_seconds
+
+        df = pd.DataFrame({"step": [0, 1, 2]})
+        self.assertEqual(_step_seconds(df), 1.0)
 
 
 class TestNearestIndicesGlobalTimeout(unittest.TestCase):

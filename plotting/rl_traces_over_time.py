@@ -13,11 +13,19 @@ from plotting.utils.fault_events import load_fault_events, plot_fault_events
 from plotting.utils.io import build_plot_parser
 
 
+def _step_seconds(df: pd.DataFrame) -> float:
+    if "step_duration_s" in df.columns:
+        return float(df["step_duration_s"].iloc[0])
+    print("warning: trace CSV has no step_duration_s column (legacy); assuming 1.0 s/step")
+    return 1.0
+
+
 def main(csv_file, output_file, policies=None, seed=None, fault_events_file=None):
     df = pd.read_csv(csv_file)
     if seed is None:
         seed = int(df["seed"].iloc[0])
     df = df[df["seed"] == seed]
+    step_s = _step_seconds(df)
     names = policies or sorted(df["policy"].unique())
 
     fig, (ax_top, ax_bottom) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
@@ -26,8 +34,8 @@ def main(csv_file, output_file, policies=None, seed=None, fault_events_file=None
         sub = df[df["policy"] == name].sort_values("step")
         if sub.empty:
             continue
-        ax_top.step(sub["step"], sub["attempt_timeout_ms"], where="post", label=name)
-        ax_bottom.plot(sub["step"], sub["success_rate"], label=name)
+        ax_top.step(sub["step"] * step_s, sub["attempt_timeout_ms"], where="post", label=name)
+        ax_bottom.plot(sub["step"] * step_s, sub["success_rate"], label=name)
 
     ax_top.set_ylabel("Attempt timeout (ms)")
     ax_top.set_ylim(bottom=0)

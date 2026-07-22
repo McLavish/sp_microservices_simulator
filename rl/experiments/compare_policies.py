@@ -117,6 +117,7 @@ def _episode(
                     "policy": policy.name,
                     "seed": seed,
                     "step": step_idx,
+                    "step_duration_s": env.step_duration_s,
                     "attempt_timeout_ms": applied["attempt_timeout_ms"],
                     "max_attempts": applied["max_attempts"],
                     "backoff_ms": applied["backoff_ms"],
