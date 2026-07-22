@@ -27,7 +27,23 @@ SB3 recommends CPU for small MLP policies; `--device` defaults to `auto`.
 Each `step()` advances the sim by `step_duration_s` and summarizes the roots that
 completed in that window. On episode end, in-flight work is drained *after* the
 final reward and reported under `info["drained_summary"]` so the last action is not
-credited with the tail.
+credited with the tail. Two accounting notes:
+
+- **Populations.** `metrics_summary()` covers *all* roots including drained ones;
+  `in_horizon_summary()` covers only roots completed before the horizon — the
+  population the reward actually saw. The experiment CSVs report both
+  (`success_rate`/`p95_ms` = full population, `*_in_horizon` = reward-visible).
+- **`terminal_drain_penalty`** (default off) folds drained-root outcomes into the
+  final step's reward, weighted by how many average-sized step windows the
+  drained population represents. It removes the incentive to defer failures past
+  the horizon; leave it off to reproduce results trained without it.
+- **Latency samples** (`info["attempt_latencies_ms"]`, `attempt_censored`,
+  `attempt_service_ms`) come from the knob-actuated client — the B->C edge
+  (`cost_client`) in chain scenarios, the top-level client otherwise — so
+  latency-based policies fit the distribution their knobs actually control.
+  `attempt_service_ms` is queue-exclusive service time (used by
+  `model_based_queue` for Erlang-C moments); instant rejections
+  (queue-full/circuit-open) emit no latency samples.
 
 Unseeded `reset()` draws a fresh build seed from the gym RNG. This matters: SB3
 vector envs only seed the *first* reset, so builders must never fall back to fixed
@@ -37,7 +53,8 @@ seeds on the env path or training collapses to one repeated episode.
 
 - **`EnvConfig`** — `build`, `action_spec`, `step_duration_s` (default 1.0),
   `episode_duration_s`, `reward_weights`, `drain_on_done`, `initial_action`,
-  `emit_latency_samples`, `max_latency_samples`.
+  `emit_latency_samples`, `max_latency_samples`, `terminal_drain_penalty`.
+  Durations may be fractional seconds; non-positive values raise at construction.
 - **`ActionSpec`** (`rl/spec.py`) — the discrete choices: `attempt_timeout_ms`,
   `max_attempts`, `backoff_ms`, and optional `global_timeout_ms` (each a list). The
   action space is a `MultiDiscrete` over the *indices* into these lists.
@@ -243,6 +260,11 @@ gitignored): per-policy results (`--output-csv`), per-step action/reward traces
 (`--traces-csv`), and the PPO early-stopping learning curve
 (`--ppo-learning-curve-csv`). `--ppo-save-path` / `--ppo-load-path` let you train
 PPO once (e.g. on `randomized`) and evaluate the same model on another scenario.
+Saves write an ActionSpec sidecar (`<model>.zip.spec.json`) recording the ordered
+knob-value lists; loads verify it against the eval-time grids and **fail on any
+mismatch** (SB3 zips alone store only space shapes, so reordered grids like
+`[10,30]` vs `[30,10]` would otherwise silently reinterpret every action). A
+missing sidecar (legacy model) only warns.
 
 ```bash
 python -m rl.experiments.compare_policies \

@@ -48,7 +48,7 @@ policy, or workload. The building blocks are documented in
 | `experiments.default` | Single `svc-A` (20 ms, 16 workers, queue 20) under a latency injection `[10,30)s +10ms`, partial failure `[50,70)s p=0.5`, and a `[20,40)s` 2x load spike; 300 rps for 100 s; 1 retry @ 100 ms, 50 ms attempt timeout | `output.csv`, `fault_events.json` |
 | `experiments.nofaults` | Same single service, **no faults** — a clean baseline; 300 rps for 100 s | `nofaults_output.csv` |
 | `experiments.chain_fanout` | Fan-out `A -> B -> {C, E}` (all 60 ms; A/B wide, C/E 16 workers); `C` has a partial failure `[10,20)s p=0.5` | `chain_output.csv`, `chain_fault_events.json`, and `svc-{A,B,C,E}_output.csv` |
-| `experiments.multichain_retry_storm` | Two chains `A->B->C` and `X->Y->C` sharing a bottleneck `C`; `C` outage `[40,60)s` (+30 ms latency **and** `p=0.4`) drives a metastable retry storm; 120 s | `multichain_{A,X}_output.csv`, `multichain_{B_to_C,Y_to_C}.csv`, `multichain_fault_events.json` |
+| `experiments.multichain_retry_storm` | Two chains `A->B->C` and `X->Y->C` sharing a bottleneck `C`; `C` outage `[40,60)s` (+30 ms latency **and** `p=0.4`) drives a metastable retry storm; 120 s. The two workloads use explicit distinct seeds (0 and 1) — `Workload` defaults to seed 0, so unseeded concurrent workloads would emit identical arrival streams | `multichain_{A,X}_output.csv`, `multichain_{B_to_C,Y_to_C}.csv`, `multichain_fault_events.json` |
 
 The **tandem vs hold-worker** fan-out occupancy model (see
 [request-handling](request-handling.md#worker-occupancy-tandem-vs-hold-worker)) is

@@ -107,9 +107,8 @@ class TestExportGranularity(unittest.TestCase):
         return Metrics(roots=[root, root2], attempts_total=2)
 
     def test_sub_nanosecond_granularity_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaises(ValueError):
-                self._metrics().export_csv(str(Path(tmp) / "out.csv"), granularity_s=1e-10)
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
+            self._metrics().export_csv(str(Path(tmp) / "out.csv"), granularity_s=1e-10)
 
     def test_sub_millisecond_buckets_keep_distinct_timepoints(self):
         with tempfile.TemporaryDirectory() as tmp:

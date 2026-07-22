@@ -91,13 +91,17 @@ non-profile-only scenario → no profile faults.
 matches Gymnasium truncation semantics):
 - `MicroservicesEnv` exposes both populations explicitly: `metrics_summary()` stays the
   full population; add `in_horizon_summary()` (roots completed before the horizon).
-- `compare_policies` and `constrained_retry` results CSVs report both, with unambiguous
-  column names (`success_rate_full` / `success_rate_in_horizon`, same for p95); existing
-  ambiguous columns are renamed, not silently redefined.
-- Optional `terminal_drain_penalty: bool = False` on `RewardWeights`/env config: when on,
+- `compare_policies` and `constrained_retry` results CSVs report both. *(As landed:
+  existing `success_rate`/`p95_ms` columns keep their historical full-population
+  meaning — figure scripts must stay compatible with the pinned paper CSVs — and
+  explicit `success_rate_in_horizon`/`p95_ms_in_horizon` columns are added
+  alongside.)*
+- Optional `terminal_drain_penalty: bool = False` on the env config: when on,
   drained-root outcomes are folded into the final step's reward, removing the
   defer-failures-past-horizon incentive for future studies. Default off (keeps trained
-  behavior comparable with pinned data).
+  behavior comparable with pinned data). *(As landed: the drained-window rate-reward is
+  weighted by drained completions relative to average per-step completions — a flat
+  rate would penalize 2 drained roots as hard as 100 and fail to remove the incentive.)*
 **Tests**: long-vs-short-timeout repro asserts (a) both summaries present and populations
 sum correctly, (b) with the flag on, the deferred-failure episode no longer scores higher
 than the in-horizon-failure episode.
