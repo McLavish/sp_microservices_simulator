@@ -95,7 +95,7 @@ def _episode(
     policy,
     seed: int,
     trace_rows: list[dict] | None = None,
-) -> tuple[float, Summary | None, float]:
+) -> tuple[float, Summary | None, Summary | None, float]:
     obs, info = env.reset(seed=seed)
     policy.reset(seed=seed)
     total_reward = 0.0
