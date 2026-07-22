@@ -112,6 +112,14 @@ class ServiceRuntime:
         """
         Enqueue an attempt for this service.
         Execution is FCFS with 'workers' concurrency.
+
+        Callback contract: `on_done` runs after the worker is freed but BEFORE
+        queued work resumes — a callback that synchronously submits new work can
+        therefore start ahead of already-queued items (stock retry/chain paths
+        never do this; they always go through the event heap). Callbacks must
+        not raise: an exception aborts the run and strands queued items. Custom
+        behaviors must call `finalize` exactly once (a second call raises) and
+        `release_worker` at most once.
         """
 
         self._seq += 1
@@ -183,7 +191,13 @@ class ServiceRuntime:
                 self.in_flight -= 1
                 self._start_next(sim)
 
+            finalized = False
+
             def finalize(success: bool, service_time: TimeDuration, drop: DropReason):
+                nonlocal finalized
+                if finalized:
+                    raise RuntimeError("finalize called more than once for the same attempt")
+                finalized = True
                 if released:
                     on_done(success, service_time, drop, len(self.queue))
                 else:

@@ -7,9 +7,13 @@ try:
 except Exception:
     gymnasium = None  # ty: ignore[invalid-assignment]
 
-from core import ms_to_ns, s_to_ns
+from caller import ClientConfig, ClientRuntime
+from core import DropReason, Request, RootRequest, TimeInterval, ms_to_ns, ns_to_ms, s_to_ns
+from faults import PartialFailure
+from retry_policies import FixedBackoffRetryPolicy
 from rl.env import (
     ActionSpec,
+    EnvComponents,
     EnvConfig,
     MicroservicesEnv,
     build_chain_env,
@@ -18,6 +22,10 @@ from rl.env import (
     build_single_service_env,
 )
 from rl.spec import ActionValues
+from service import ServiceConfig, ServiceRuntime
+from simulator import Simulator
+from timeout_controllers import StaticTimeoutController
+from workload import Workload
 
 
 @unittest.skipIf(gymnasium is None, "gymnasium not installed")
@@ -435,6 +443,147 @@ class TestMicroservicesEnv(unittest.TestCase):
         self.assertTrue(terminated)
         self.assertTrue(env.observation_space.contains(obs))
         self.assertGreater(info["summary"]["completed"], 0)
+
+
+def _build_slow_failing_env(seed=None, duration_s=None):
+    """Every request fails after ~2.5 s of service: with a long attempt timeout
+    all failures land in the drain; with a short one they land in-episode."""
+    build_seed = 1 if seed is None else int(seed)
+    sim = Simulator(seed=build_seed)
+    duration = 2.0 if duration_s is None else float(duration_s)
+    cfg = ServiceConfig(
+        name="svc-slow",
+        latency_median=ms_to_ns(2500),
+        latency_lognorm_sigma=1e-6,
+        workers=256,
+        partial_failures=[
+            PartialFailure(duration=TimeInterval(begin=0, end=s_to_ns(10_000)), p_fail=1.0)
+        ],
+    )
+    timeout_ctrl = StaticTimeoutController(global_timeout=None, attempt_timeout=ms_to_ns(50))
+    retry = FixedBackoffRetryPolicy(max_attempts=1, delay=0)
+    client = ClientRuntime(
+        cfg=ClientConfig(retry=retry, timeout_controller=timeout_ctrl),
+        service=ServiceRuntime(cfg=cfg).bind(),
+    )
+
+    def apply_knobs(values):
+        timeout_ctrl.attempt_timeout = ms_to_ns(values.attempt_timeout_ms)
+        retry.max_attempts = values.max_attempts
+        retry.delay = ms_to_ns(values.backoff_ms)
+
+    workload = Workload(base_rps=50.0, duration_s=duration, load_spikes=[], rng_seed=seed)
+    return EnvComponents(sim=sim, workload=workload, client=client, apply_knobs=apply_knobs)
+
+
+SLOW_SPEC = ActionSpec(attempt_timeout_ms=[50, 100_000], max_attempts=[1], backoff_ms=[0])
+
+
+@unittest.skipIf(gymnasium is None, "gymnasium not installed")
+class TestPopulationAccounting(unittest.TestCase):
+    def _run_episode(self, action, terminal_drain_penalty=False):
+        env = MicroservicesEnv(
+            EnvConfig(
+                build=_build_slow_failing_env,
+                action_spec=SLOW_SPEC,
+                step_duration_s=1.0,
+                episode_duration_s=2.0,
+                terminal_drain_penalty=terminal_drain_penalty,
+                initial_action=action,
+            )
+        )
+        obs, info = env.reset(seed=42)
+        total = 0.0
+        terminated = truncated = False
+        while not (terminated or truncated):
+            obs, reward, terminated, truncated, info = env.step(action)
+            total += float(reward)
+        return env, total, info
+
+    def test_summaries_partition_the_population(self):
+        env, _, info = self._run_episode((1, 0, 0))  # 100 s timeout: all failures drain
+        full = env.metrics_summary()
+        horizon = env.in_horizon_summary()
+        drained = info["drained_summary"]
+        self.assertEqual(full.total, horizon.total + drained["completed"])
+        self.assertGreater(drained["completed"], 0)
+
+    def test_terminal_drain_penalty_removes_deferral_advantage(self):
+        _, j_defer_off, _ = self._run_episode((1, 0, 0))
+        _, j_fail_off, _ = self._run_episode((0, 0, 0))
+        # The exploitable asymmetry: deferring failures past the horizon
+        # scores better than failing in-episode, for identical offered work.
+        self.assertGreater(j_defer_off, j_fail_off)
+        _, j_defer_on, _ = self._run_episode((1, 0, 0), terminal_drain_penalty=True)
+        _, j_fail_on, _ = self._run_episode((0, 0, 0), terminal_drain_penalty=True)
+        self.assertLess(abs(j_defer_on - j_fail_on), abs(j_defer_off - j_fail_off))
+
+
+@unittest.skipIf(gymnasium is None, "gymnasium not installed")
+class TestSampleSource(unittest.TestCase):
+    def test_chain_samples_come_from_the_actuated_edge(self):
+        env = MicroservicesEnv(
+            EnvConfig(
+                build=lambda seed: build_chain_env(seed, duration_s=4),
+                action_spec=ActionSpec(attempt_timeout_ms=[80], max_attempts=[2], backoff_ms=[20]),
+                step_duration_s=1.0,
+                episode_duration_s=4.0,
+            )
+        )
+        obs, info = env.reset(seed=7)
+        obs, reward, terminated, truncated, info = env.step((0, 0, 0))
+        cost_client = env._require_components().cost_client
+        assert cost_client is not None
+        edge_latencies = sorted(
+            ns_to_ms(a.interval.end - a.interval.begin)
+            for root in cost_client.roots[: env._last_sample_root_idx]
+            for a in root.attempts
+            if not (
+                a.drop_reason in (DropReason.QUEUE_FULL, DropReason.CIRCUIT_OPEN)
+                and a.interval.end == a.interval.begin
+            )
+        )
+        self.assertGreater(len(edge_latencies), 0)
+        self.assertEqual(sorted(info["attempt_latencies_ms"]), edge_latencies)
+
+
+@unittest.skipIf(gymnasium is None, "gymnasium not installed")
+class TestInstantRejectionSamples(unittest.TestCase):
+    def test_zero_latency_rejections_are_not_emitted(self):
+        env = MicroservicesEnv(EnvConfig(build=_build_slow_failing_env, action_spec=SLOW_SPEC))
+        env.reset(seed=1)
+        rejected = RootRequest()
+        rejected.add_attempt(
+            Request(
+                service="svc",
+                interval=TimeInterval(begin=1000, end=1000),
+                drop_reason=DropReason.QUEUE_FULL,
+            )
+        )
+        served = RootRequest()
+        served.add_attempt(
+            Request(service="svc", interval=TimeInterval(begin=0, end=ms_to_ns(20)), success=True)
+        )
+        samples = env._collect_latency_samples([rejected, served])
+        self.assertEqual(len(samples["attempt_latencies_ms"]), 1)
+        self.assertAlmostEqual(samples["attempt_latencies_ms"][0], 20.0)
+
+
+@unittest.skipIf(gymnasium is None, "gymnasium not installed")
+class TestDurationValidation(unittest.TestCase):
+    def test_zero_step_duration_rejected(self):
+        with self.assertRaises(ValueError):
+            MicroservicesEnv(
+                EnvConfig(build=_build_slow_failing_env, action_spec=SLOW_SPEC, step_duration_s=0.0)
+            )
+
+    def test_negative_episode_duration_rejected(self):
+        with self.assertRaises(ValueError):
+            MicroservicesEnv(
+                EnvConfig(
+                    build=_build_slow_failing_env, action_spec=SLOW_SPEC, episode_duration_s=-1.0
+                )
+            )
 
 
 if __name__ == "__main__":

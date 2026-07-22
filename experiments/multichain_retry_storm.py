@@ -142,10 +142,12 @@ if __name__ == "__main__":
         duration=TimeInterval(begin=s_to_ns(45), end=s_to_ns(65)),
         rps_multiplier=1.5,
     )
-    wl_a = Workload(base_rps=180.0, duration_s=duration_s, load_spikes=[spike])
-    wl_x = Workload(base_rps=180.0, duration_s=duration_s, load_spikes=[spike])
+    # Distinct explicit seeds: Workload defaults rng_seed=None -> seed 0, so
+    # two unseeded workloads would emit nanosecond-identical arrival streams
+    # into the shared bottleneck. The shared spike is registered once.
+    wl_a = Workload(base_rps=180.0, duration_s=duration_s, load_spikes=[spike], rng_seed=0)
+    wl_x = Workload(base_rps=180.0, duration_s=duration_s, load_spikes=[spike], rng_seed=1)
     wl_a.register_fault_events(fault_tracker)
-    wl_x.register_fault_events(fault_tracker)
 
     wl_a.drive(sim, top_client_a.start_request)
     wl_x.drive(sim, top_client_x.start_request)

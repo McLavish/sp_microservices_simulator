@@ -2,6 +2,7 @@ import random
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
+from fractions import Fraction
 from typing import NamedTuple
 
 from core import TimeDuration, TimePoint
@@ -34,6 +35,12 @@ class FixedBackoffRetryPolicy(RetryPolicy):
     max_attempts: int  # total attempts including the initial try
     delay: TimeDuration
 
+    def __post_init__(self):
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        if self.delay < 0:
+            raise ValueError("delay must be >= 0 ns")
+
     def next_delay(self, context: RetryContext) -> DelayDecision:
         if context.attempt < self.max_attempts:
             return DelayDecision(True, self.delay)
@@ -51,6 +58,12 @@ class ExponentialBackoffRetryPolicy(RetryPolicy):
     max_attempts: int  # total attempts including the initial try
     initial_delay: TimeDuration
     max_delay: TimeDuration
+
+    def __post_init__(self):
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        if self.initial_delay < 0 or self.max_delay < 0:
+            raise ValueError("delays must be >= 0 ns")
 
     def next_delay(self, context: RetryContext) -> DelayDecision:
         if context.attempt < self.max_attempts:
@@ -73,6 +86,12 @@ class ExponentialBackoffWithJitterRetryPolicy(RetryPolicy):
     rng: random.Random  # pass in the simulator's rng
     jitter_mode: JitterMode = JitterMode.FULL
     # _prev: TimeDuration = 0
+
+    def __post_init__(self):
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        if self.initial_delay < 0 or self.max_delay < 0:
+            raise ValueError("delays must be >= 0 ns")
 
     def next_delay(self, context: RetryContext) -> DelayDecision:
         if context.attempt < self.max_attempts:
@@ -181,12 +200,19 @@ class TimeBasedCircuitBreakerPolicy(RetryPolicy):
     half_open_delay: TimeDuration
 
     _window: deque[tuple[TimePoint, bool]] = field(default_factory=deque)  # (timestamp, success)
+    _failures_in_window: int = field(default=0, init=False)
     _state: CBState = CBState.CLOSED
     _opened_at: TimePoint | None = None
 
     def _evict_old(self, now: TimePoint) -> None:
         while self._window and (now - self._window[0][0]) > self.window_duration:
-            self._window.popleft()
+            _, ok = self._window.popleft()
+            if not ok:
+                self._failures_in_window -= 1
+
+    def _clear_window(self) -> None:
+        self._window.clear()
+        self._failures_in_window = 0
 
     def get_state(self) -> CBState:
         return self._state
@@ -195,9 +221,14 @@ class TimeBasedCircuitBreakerPolicy(RetryPolicy):
         self._evict_old(now)
         if self._state != CBState.OPEN:
             self._window.append((now, success))
+            if not success:
+                self._failures_in_window += 1
 
+        # Incremental counters instead of a full window rescan per result
+        # (resilience4j's time-based sliding window keeps aggregates the same
+        # way); the old sum() made every result O(window) -> O(n^2) overall.
         total = len(self._window)
-        failures = sum(1 for _, ok in self._window if not ok)
+        failures = self._failures_in_window
         rate = failures / total if total > 0 else 0.0
 
         if self._state == CBState.CLOSED:
@@ -213,11 +244,11 @@ class TimeBasedCircuitBreakerPolicy(RetryPolicy):
                 # Fresh metrics after recovery (resilience4j resets the sliding
                 # window on transition to CLOSED); otherwise half-open probe
                 # results would seed the closed-state failure rate.
-                self._window.clear()
+                self._clear_window()
             elif total >= self.min_requests:
                 self._state = CBState.OPEN
                 self._opened_at = now
-                self._window.clear()
+                self._clear_window()
 
     def allow_request(self, now: TimePoint) -> bool:
         # NOTE: half-open admits *every* request (no probe cap) — see CBState.HALF_OPEN.
@@ -229,7 +260,7 @@ class TimeBasedCircuitBreakerPolicy(RetryPolicy):
             or now - self._opened_at >= self.half_open_delay
         ):
             self._state = CBState.HALF_OPEN
-            self._window.clear()
+            self._clear_window()
             return True
         return False
 
@@ -269,21 +300,25 @@ class RetryBudgetPolicy(RetryPolicy):
     max_retries: int  # maximum consecutive retries before throttling
     underlying_strategy: RetryPolicy
 
-    # Derived token values, calculated from budget_ratio and max_retries
-    _max_tokens: int = field(init=False)
-    _success_award: float = field(init=False)
+    # Integer token bucket in units of 1/denominator of the (rationalized)
+    # ratio: one retry costs `denominator` tokens, each success awards
+    # `numerator`. Exact arithmetic — no float drift (cf. Finagle's integer
+    # RetryBudget deposit/withdraw); limit_denominator(10_000) recovers
+    # intended ratios like 1/3 from their float representations.
     _retry_cost: int = field(init=False)
-
-    _tokens: float = field(init=False)
+    _success_award: int = field(init=False)
+    _max_tokens: int = field(init=False)
+    _tokens: int = field(init=False)
 
     def __post_init__(self):
-        # Derive token values from budget_ratio and max_retries
-        # If budget_ratio = 0.1 (10%), then 10 successes should allow 1 retry
-        # So success_award = 10, retry_cost = 100
-        self._retry_cost = 100  # Base cost for a retry
-        self._success_award = self._retry_cost * self.budget_ratio
+        if not 0 < self.budget_ratio <= 1:
+            raise ValueError("budget_ratio must be in (0, 1]")
+        if self.max_retries < 1:
+            raise ValueError("max_retries must be >= 1")
+        ratio = Fraction(self.budget_ratio).limit_denominator(10_000)
+        self._retry_cost = ratio.denominator
+        self._success_award = ratio.numerator
         self._max_tokens = self._retry_cost * self.max_retries
-
         self._tokens = self._max_tokens  # start with full budget
 
     def add_result(self, success: bool, now: TimePoint | None = None) -> None:
@@ -295,7 +330,8 @@ class RetryBudgetPolicy(RetryPolicy):
         return self._tokens >= self._retry_cost
 
     def get_token_balance(self) -> float:
-        return self._tokens
+        # Backward-compatible scale: 100 tokens == one retry, as before.
+        return self._tokens / self._retry_cost * 100.0
 
     def next_delay(self, context: RetryContext) -> DelayDecision:
         if self.can_retry():

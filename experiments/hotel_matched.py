@@ -75,11 +75,7 @@ class HotelMatchedRun:
 
 def run_hotel_matched(config: HotelMatchedConfig) -> dict[str, str]:
     calibration = _load_calibration(config.calibration_json)
-    profile_faults = (
-        config.profile_faults
-        if config.profile_faults is not None
-        else _profile_faults_from_calibration(calibration) or DEFAULT_PROFILE_FAULT
-    )
+    profile_faults = _effective_profile_faults(config, calibration)
     load_spikes = (
         config.load_spikes if config.load_spikes is not None else _load_spikes(calibration)
     )
@@ -259,7 +255,9 @@ def _client_policies(seed: int, *, leaf_max_attempts: int = 3) -> dict[str, Clie
         "leaf_reservation": _leaf_read_cfg(seed=seed + 201, max_attempts=leaf_max_attempts),
         "leaf_hotels_profile": _leaf_read_cfg(seed=seed + 202, max_attempts=leaf_max_attempts),
         "leaf_recommendation": _leaf_read_cfg(seed=seed + 203, max_attempts=leaf_max_attempts),
-        "leaf_recommendations_profile": _leaf_read_cfg(seed=seed + 204, max_attempts=leaf_max_attempts),
+        "leaf_recommendations_profile": _leaf_read_cfg(
+            seed=seed + 204, max_attempts=leaf_max_attempts
+        ),
     }
 
 
@@ -332,7 +330,16 @@ def _service_params(real_name: str, calibration: dict[str, Any]) -> dict[str, An
     defaults = DEFAULT_SERVICE_PARAMS[real_name]
     observed = (calibration.get("services") or {}).get(real_name) or {}
     median_ms = observed.get("median_ms")
-    if not isinstance(median_ms, int | float) or not math.isfinite(float(median_ms)):
+    sigma = observed.get("sigma", defaults["sigma"])
+    # A malformed observed block (non-finite median, non-positive/non-finite
+    # sigma) is dropped wholesale in favor of the defaults.
+    if (
+        not isinstance(median_ms, int | float)
+        or not math.isfinite(float(median_ms))
+        or not isinstance(sigma, int | float)
+        or not math.isfinite(float(sigma))
+        or float(sigma) <= 0
+    ):
         observed = {}
     return {**defaults, **observed}
 
@@ -349,14 +356,25 @@ def _combined_metrics(clients: Sequence[ClientRuntime]) -> Metrics:
 def _load_calibration(path: Path | None) -> dict[str, Any]:
     if path is None:
         return {}
-    return json.loads(Path(path).read_text())
+
+    def _reject_constant(name: str):
+        raise ValueError(f"calibration JSON contains non-finite value {name}")
+
+    return json.loads(Path(path).read_text(), parse_constant=_reject_constant)
 
 
 def _profile_faults_from_calibration(
     calibration: dict[str, Any],
-) -> list[tuple[float, float, float, float]]:
+) -> list[tuple[float, float, float, float]] | None:
+    """None when the calibration has no fault_scenario key (fall back to the
+    built-in default); a list — possibly empty — when it does. An explicit
+    empty scenario, or one naming only non-profile methods, means "no profile
+    faults" and must not be replaced by the default."""
+    scenario = calibration.get("fault_scenario")
+    if scenario is None:
+        return None
     windows = []
-    for window in calibration.get("fault_scenario") or []:
+    for window in scenario:
         if window.get("method") != "/profile.Profile/GetProfiles":
             continue
         windows.append(
@@ -370,6 +388,15 @@ def _profile_faults_from_calibration(
     return windows
 
 
+def _effective_profile_faults(
+    config: HotelMatchedConfig, calibration: dict[str, Any]
+) -> list[tuple[float, float, float, float]]:
+    if config.profile_faults is not None:
+        return config.profile_faults
+    calibrated = _profile_faults_from_calibration(calibration)
+    return calibrated if calibrated is not None else DEFAULT_PROFILE_FAULT
+
+
 def _load_spikes(calibration: dict[str, Any]) -> list[tuple[float, float, float]]:
     workload = calibration.get("workload") or {}
     return [
@@ -378,13 +405,47 @@ def _load_spikes(calibration: dict[str, Any]) -> list[tuple[float, float, float]
     ]
 
 
+def _finite_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("value must be finite")
+    return parsed
+
+
+def _nonneg_float(value: str) -> float:
+    parsed = _finite_float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = _finite_float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be > 0")
+    return parsed
+
+
+def _fraction(value: str) -> float:
+    parsed = _finite_float(value)
+    if not 0 <= parsed <= 1:
+        raise argparse.ArgumentTypeError("value must be in [0, 1]")
+    return parsed
+
+
 def _parse_profile_fault(value: str) -> tuple[float, float, float, float]:
     parts = value.split(",")
     if len(parts) != 4:
         raise argparse.ArgumentTypeError("profile fault must be start,end,add_latency_ms,p_fail")
     start_s, end_s, add_latency_ms, p_fail = (float(part) for part in parts)
+    if not all(math.isfinite(part) for part in (start_s, end_s, add_latency_ms, p_fail)):
+        raise argparse.ArgumentTypeError("profile fault values must be finite")
+    if start_s < 0:
+        raise argparse.ArgumentTypeError("profile fault start must be >= 0")
     if end_s < start_s:
         raise argparse.ArgumentTypeError("profile fault end must be >= start")
+    if add_latency_ms < 0:
+        raise argparse.ArgumentTypeError("profile fault add_latency_ms must be >= 0")
     if not 0 <= p_fail <= 1:
         raise argparse.ArgumentTypeError("profile fault p_fail must be in [0,1]")
     return start_s, end_s, add_latency_ms, p_fail
@@ -395,8 +456,14 @@ def _parse_load_spike(value: str) -> tuple[float, float, float]:
     if len(parts) != 3:
         raise argparse.ArgumentTypeError("load spike must be start,end,multiplier")
     start_s, end_s, multiplier = (float(part) for part in parts)
+    if not all(math.isfinite(part) for part in (start_s, end_s, multiplier)):
+        raise argparse.ArgumentTypeError("load spike values must be finite")
+    if start_s < 0:
+        raise argparse.ArgumentTypeError("load spike start must be >= 0")
     if end_s < start_s:
         raise argparse.ArgumentTypeError("load spike end must be >= start")
+    if multiplier < 0:
+        raise argparse.ArgumentTypeError("load spike multiplier must be >= 0")
     return start_s, end_s, multiplier
 
 
@@ -404,9 +471,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run matched hotelReservation simulator scenario")
     parser.add_argument("--output-dir", type=Path, default=Path("hotel_matched_results"))
     parser.add_argument("--calibration-json", type=Path, default=None)
-    parser.add_argument("--base-rps", type=float, default=100.0)
-    parser.add_argument("--duration-s", type=float, default=60.0)
-    parser.add_argument("--recommendation-fraction", type=float, default=0.25)
+    parser.add_argument("--base-rps", type=_nonneg_float, default=100.0)
+    parser.add_argument("--duration-s", type=_positive_float, default=60.0)
+    parser.add_argument("--recommendation-fraction", type=_fraction, default=0.25)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
         "--profile-fault",

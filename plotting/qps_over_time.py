@@ -1,16 +1,29 @@
 import matplotlib.pyplot as plt
 
 from plotting.utils.fault_events import load_fault_events, plot_fault_events
-from plotting.utils.io import build_plot_parser, load_metrics
+from plotting.utils.io import build_plot_parser, load_metrics, require_rows
+
+
+def _bucket_width_s(df) -> float:
+    """Bucket width inferred from consecutive timepoints (default 1.0 s)."""
+    if len(df) > 1:
+        width = float(df["timepoint"].diff().median())
+        if width > 0:
+            return width
+    return 1.0
 
 
 def main(csv_file, output_file, fault_events_file=None):
     df = load_metrics(csv_file)
+    require_rows(df, csv_file)
 
+    # Counts per bucket divided by the bucket width: the y axis is a true
+    # rate (QPS) at any export granularity, not just the default 1 s.
+    width = _bucket_width_s(df)
     plt.figure(figsize=(10, 6))
-    plt.plot(df["timepoint"], df["root_requests"], label="Root Requests", linewidth=2)
-    plt.plot(df["timepoint"], df["retries"], label="Retries", linewidth=2)
-    plt.plot(df["timepoint"], df["failure_root"], label="Failures", linewidth=2)
+    plt.plot(df["timepoint"], df["root_requests"] / width, label="Root Requests", linewidth=2)
+    plt.plot(df["timepoint"], df["retries"] / width, label="Retries", linewidth=2)
+    plt.plot(df["timepoint"], df["failure_root"] / width, label="Failures", linewidth=2)
 
     if fault_events_file:
         fault_events = load_fault_events(fault_events_file)

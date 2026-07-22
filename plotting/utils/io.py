@@ -24,6 +24,13 @@ def load_metrics(csv_file: str) -> pd.DataFrame:
     return df
 
 
+def require_rows(df: pd.DataFrame, csv_file: str) -> None:
+    """Exit with a clear message on header-only CSVs (a legitimate
+    Metrics.export_csv product when an experiment completed zero attempts)."""
+    if df.empty:
+        raise SystemExit(f"no data rows in {csv_file} (the experiment completed zero attempts)")
+
+
 def build_plot_parser(description: str, default_output: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("csv_file", help="Input CSV file path")

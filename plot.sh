@@ -1,27 +1,14 @@
 #!/bin/bash
+set -e
 
-python -m plotting.failures_over_time chain_output.csv --fault-events fault_events.json --output chain_results/chain/failures_over_time.png
-python -m plotting.latencies_over_time chain_output.csv --fault-events fault_events.json --output chain_results/chain/latencies_over_time.png
-python -m plotting.queue_size_over_time chain_output.csv --fault-events fault_events.json --output chain_results/chain/queue_size_over_time.png
-python -m plotting.qps_over_time chain_output.csv --fault-events fault_events.json --output chain_results/chain/qps_over_time.png
-
-
-python -m plotting.failures_over_time svc-A_output.csv --fault-events fault_events.json --output chain_results/svA/failures_over_time.png
-python -m plotting.latencies_over_time svc-A_output.csv --fault-events fault_events.json --output chain_results/svA/latencies_over_time.png
-python -m plotting.queue_size_over_time svc-A_output.csv --fault-events fault_events.json --output chain_results/svA/queue_size_over_time.png
-python -m plotting.qps_over_time svc-A_output.csv --fault-events fault_events.json --output chain_results/svA/qps_over_time.png
-
-python -m plotting.failures_over_time svc-B_output.csv --fault-events fault_events.json --output chain_results/svB/failures_over_time.png
-python -m plotting.latencies_over_time svc-B_output.csv --fault-events fault_events.json --output chain_results/svB/latencies_over_time.png
-python -m plotting.queue_size_over_time svc-B_output.csv --fault-events fault_events.json --output chain_results/svB/queue_size_over_time.png
-python -m plotting.qps_over_time svc-B_output.csv --fault-events fault_events.json --output chain_results/svB/qps_over_time.png
-
-python -m plotting.failures_over_time svc-C_output.csv --fault-events fault_events.json --output chain_results/svC/failures_over_time.png
-python -m plotting.latencies_over_time svc-C_output.csv --fault-events fault_events.json --output chain_results/svC/latencies_over_time.png
-python -m plotting.queue_size_over_time svc-C_output.csv --fault-events fault_events.json --output chain_results/svC/queue_size_over_time.png
-python -m plotting.qps_over_time svc-C_output.csv --fault-events fault_events.json --output chain_results/svC/qps_over_time.png
-
-python -m plotting.failures_over_time svc-E_output.csv --fault-events fault_events.json --output chain_results/svE/failures_over_time.png
-python -m plotting.latencies_over_time svc-E_output.csv --fault-events fault_events.json --output chain_results/svE/latencies_over_time.png
-python -m plotting.queue_size_over_time svc-E_output.csv --fault-events fault_events.json --output chain_results/svE/queue_size_over_time.png
-python -m plotting.qps_over_time svc-E_output.csv --fault-events fault_events.json --output chain_results/svE/qps_over_time.png
+# CSVs below are produced by `python -m experiments.chain_fanout`, whose fault
+# overlay is chain_fault_events.json (fault_events.json is experiments.default's).
+for pair in chain:chain svc-A:svA svc-B:svB svc-C:svC svc-E:svE; do
+    csv="${pair%%:*}_output.csv"
+    out="chain_results/${pair##*:}"
+    mkdir -p "$out"
+    python -m plotting.failures_over_time "$csv" --fault-events chain_fault_events.json --output "$out/failures_over_time.png"
+    python -m plotting.latencies_over_time "$csv" --fault-events chain_fault_events.json --output "$out/latencies_over_time.png"
+    python -m plotting.queue_size_over_time "$csv" --fault-events chain_fault_events.json --output "$out/queue_size_over_time.png"
+    python -m plotting.qps_over_time "$csv" --fault-events chain_fault_events.json --output "$out/qps_over_time.png"
+done

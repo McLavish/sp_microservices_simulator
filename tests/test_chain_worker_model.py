@@ -2,7 +2,7 @@ import unittest
 
 from caller import ClientConfig, ClientRuntime
 from chain import DownstreamEdge, ServiceNodeRuntime
-from core import ms_to_ns
+from core import DropReason, ms_to_ns
 from retry_policies import NoRetryPolicy
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
@@ -155,6 +155,28 @@ class TestChainWorkerModel(unittest.TestCase):
         # request cannot start until the first fully completes (~210ms), pushing
         # its completion out to ~420ms.
         self.assertGreater(max(t for _, t in ends), ms_to_ns(350))
+
+
+class TestFinalizeExactlyOnce(unittest.TestCase):
+    def test_double_finalize_raises_and_preserves_in_flight(self):
+        sim = Simulator(seed=1)
+        svc = ServiceRuntime(
+            cfg=ServiceConfig(
+                name="svc", latency_median=ms_to_ns(10), latency_lognorm_sigma=1e-6, workers=1
+            )
+        ).bind()
+
+        def behavior(service, sim2, deadline, finalize, begin_at, release_worker):
+            def finish():
+                finalize(True, ms_to_ns(5), DropReason.NONE)
+                finalize(True, ms_to_ns(5), DropReason.NONE)  # bug: second call
+
+            sim2.schedule(begin_at + ms_to_ns(5), finish)
+
+        svc.submit_attempt(sim, lambda *a: None, behavior=behavior)
+        with self.assertRaises(RuntimeError):
+            sim.run()
+        self.assertGreaterEqual(svc.in_flight, 0)
 
 
 if __name__ == "__main__":

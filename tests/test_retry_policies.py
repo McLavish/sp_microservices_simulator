@@ -427,5 +427,82 @@ class TestRetryPolicies(unittest.TestCase):
             sim.run()
 
 
+class TestTimeBasedBreakerCounters(unittest.TestCase):
+    def test_incremental_counters_match_full_rescan(self):
+        rng = random.Random(7)
+        policy = TimeBasedCircuitBreakerPolicy(
+            failure_threshold_rate=0.5,
+            success_threshold_rate=0.6,
+            min_requests=5,
+            window_duration=s_to_ns(2),
+            underlying_strategy=FixedBackoffRetryPolicy(max_attempts=3, delay=0),
+            half_open_delay=s_to_ns(1),
+        )
+        now = 0
+        for _ in range(3000):
+            now += rng.randint(0, s_to_ns(0.01))
+            policy.allow_request(now)
+            policy.add_result(rng.random() < 0.6, now)
+            self.assertEqual(
+                policy._failures_in_window,
+                sum(1 for _, ok in policy._window if not ok),
+            )
+
+
+class TestRetryBudgetExactArithmetic(unittest.TestCase):
+    def _drained(self, ratio):
+        policy = RetryBudgetPolicy(
+            budget_ratio=ratio,
+            max_retries=1,
+            underlying_strategy=FixedBackoffRetryPolicy(max_attempts=10, delay=0),
+        )
+        while policy.can_retry():  # drain the initial burst
+            policy.next_delay(RetryContext(attempt=1, now=0))
+        return policy
+
+    def test_one_third_ratio_earns_a_retry_after_three_successes(self):
+        policy = self._drained(1 / 3)
+        for _ in range(3):
+            policy.add_result(True, now=0)
+        self.assertTrue(policy.can_retry())  # float accumulation gave 99.99999999999999
+
+    def test_one_seventh_ratio_earns_a_retry_after_seven_successes(self):
+        policy = self._drained(1 / 7)
+        for _ in range(6):
+            policy.add_result(True, now=0)
+        self.assertFalse(policy.can_retry())
+        policy.add_result(True, now=0)
+        self.assertTrue(policy.can_retry())
+
+    def test_shipped_ratios_unchanged(self):
+        for ratio, needed in ((0.05, 20), (0.1, 10), (0.2, 5)):
+            policy = self._drained(ratio)
+            for _ in range(needed - 1):
+                policy.add_result(True, now=0)
+            self.assertFalse(policy.can_retry())
+            policy.add_result(True, now=0)
+            self.assertTrue(policy.can_retry())
+
+
+class TestBackoffValidation(unittest.TestCase):
+    def test_negative_fixed_backoff_rejected(self):
+        with self.assertRaises(ValueError):
+            FixedBackoffRetryPolicy(max_attempts=2, delay=-1)
+
+    def test_nonpositive_attempts_rejected(self):
+        with self.assertRaises(ValueError):
+            FixedBackoffRetryPolicy(max_attempts=0, delay=0)
+
+    def test_negative_exponential_delays_rejected(self):
+        with self.assertRaises(ValueError):
+            ExponentialBackoffRetryPolicy(max_attempts=2, initial_delay=-5, max_delay=10)
+
+    def test_negative_jitter_delays_rejected(self):
+        with self.assertRaises(ValueError):
+            ExponentialBackoffWithJitterRetryPolicy(
+                max_attempts=2, initial_delay=-5, max_delay=10, rng=random.Random(1)
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

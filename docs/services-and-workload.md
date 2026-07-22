@@ -94,8 +94,14 @@ svc = ServiceRuntime(cfg=cfg).bind()
 
 ## Workload: Poisson arrivals (`workload.py`)
 
-`Workload` (`workload.py:11`) generates arrivals via an exponential interarrival
-process whose rate is modulated by load spikes.
+`Workload` (`workload.py:11`) generates arrivals as an **exact nonhomogeneous
+Poisson process** for the piecewise-constant rate (base RPS x active spike
+multipliers): each arrival draws one Exp(1) budget and consumes it across rate
+segments, whose boundaries are the spike starts/ends. A segment of rate `r` and
+length `dt` supplies `r*dt` of exposure; the arrival lands in the segment that
+exhausts the budget. Memorylessness makes this exact, so short spikes are never
+skipped and the first arrival is exponentially distributed (never
+deterministically at t=0).
 
 | Field | Meaning |
 | --- | --- |
@@ -106,12 +112,14 @@ process whose rate is modulated by load spikes.
 
 - `rps_at(t)` (`workload.py:28`) — effective rate = `base_rps` times every active
   spike's `rps_multiplier`.
-- `drive(sim, on_arrival)` (`workload.py:44`) — schedules the arrival loop; calls
+- `drive(sim, on_arrival)` (`workload.py`) — schedules the arrival chain; calls
   `on_arrival(sim)` at each arrival (typically `client.start_request`).
-- When the rate is `0`, the loop idles forward in 0.5 s ticks **without consuming
-  the RNG**, so arrival timing stays identical across runs whenever the
-  RPS-positive intervals match (`workload.py:35`). This is the determinism property
-  described in [architecture](architecture.md#determinism-two-rngs-on-purpose).
+- Zero-rate segments are skipped exactly and consume no extra RNG (one Exp(1)
+  draw per arrival regardless of how many segments it crosses), so arrival
+  timing stays identical across runs whenever the RPS-positive intervals match.
+  An all-zero workload schedules no events at all. This is the determinism
+  property described in
+  [architecture](architecture.md#determinism-two-rngs-on-purpose).
 
 ### Example: workload with a spike
 

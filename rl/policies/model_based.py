@@ -92,6 +92,13 @@ def _simulate_action(
         success = False
         attempts = 0
         for attempt in range(max_attempts):
+            remaining = None if global_timeout is None else global_timeout - elapsed
+            if remaining is not None and remaining <= 0:
+                break
+            # Mirror the real caller: per-attempt deadline is
+            # min(attempt timeout, remaining global budget), and success needs
+            # strictly-before completion (half-open deadline, caller.py).
+            effective_timeout = timeout if remaining is None else min(timeout, remaining)
             attempts += 1
             sample = float(model.sample(rng, 1)[0])
             q_delay = 0.0
@@ -101,19 +108,16 @@ def _simulate_action(
                 else:
                     q_delay = queue_delay_ms
             total_sample = sample + q_delay
-            attempt_latency = min(total_sample, timeout)
+            attempt_latency = min(total_sample, effective_timeout)
             elapsed += attempt_latency
 
-            if total_sample <= timeout:
+            if total_sample < effective_timeout:
                 success = True
                 latencies.append(elapsed)
                 break
 
             if attempt < max_attempts - 1:
                 elapsed += backoff
-
-            if global_timeout is not None and elapsed >= global_timeout:
-                break
 
         retries += max(0, attempts - 1)
         if success:
@@ -150,17 +154,24 @@ class ModelBasedPolicy:
 
     def __post_init__(self):
         self._buffer = LatencyBuffer(self.buffer_size)
+        self._service_samples: list[float] = []
         self._rng = np.random.default_rng(123)
 
     def reset(self, seed: int | None = None) -> None:
         self._buffer = LatencyBuffer(self.buffer_size)
+        self._service_samples = []
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
     def act(self, obs: np.ndarray, info: dict) -> tuple[int, ...]:
         self._buffer.ingest_info(info)
+        service = [float(v) for v in info.get("attempt_service_ms", [])]
+        if service:
+            self._service_samples.extend(service)
+            self._service_samples = self._service_samples[-self.buffer_size :]
         values, censored = self._buffer.censored_data()
         uncensored = values[~censored]
+        uncensored = uncensored[uncensored > 0]
         if uncensored.size == 0:
             return self.grid.indices[0]
 
@@ -195,6 +206,17 @@ class ModelBasedPolicy:
     def update(self, obs: np.ndarray, reward: float, done: bool, info: dict) -> None:
         return
 
+    def _service_moments(self) -> tuple[float, float, int]:
+        """Mean / mean-square / count of buffered queue-exclusive service times."""
+        service = np.asarray(self._service_samples, dtype=np.float64)
+        if service.size == 0:
+            return 0.0, 0.0, 0
+        return (
+            float(service.mean()),
+            float(np.dot(service, service) / service.size),
+            int(service.size),
+        )
+
     def _estimate_queue_delay(self, info: dict, model: LatencyModel) -> float:
         """Expected queueing delay in ms via the Allen-Cunneen M/G/c approximation:
 
@@ -216,14 +238,20 @@ class ModelBasedPolicy:
         if self.use_retries_in_lambda:
             lambda_per_ms *= 1.0 + float(summary.get("retries_per_root", 0.0))
 
-        moments_fn = getattr(model, "moments", None)
-        if callable(moments_fn):
-            mean_s, mean_s2 = (float(m) for m in moments_fn())
-        else:
-            sample_count = max(10, int(self.queue_moment_samples))
-            samples = model.sample(self._rng, sample_count)
-            mean_s = float(np.mean(samples))
-            mean_s2 = float(np.dot(samples, samples) / samples.size)
+        # Erlang-C needs SERVICE-time moments; attempt intervals include queue
+        # wait, so deriving moments from the fitted total-latency model would
+        # double-count queueing. Fall back to the model only while the service
+        # stream is still empty (legacy info dicts / cold start).
+        mean_s, mean_s2, count = self._service_moments()
+        if count < 10:
+            moments_fn = getattr(model, "moments", None)
+            if callable(moments_fn):
+                mean_s, mean_s2 = (float(m) for m in moments_fn())
+            else:
+                sample_count = max(10, int(self.queue_moment_samples))
+                samples = model.sample(self._rng, sample_count)
+                mean_s = float(np.mean(samples))
+                mean_s2 = float(np.dot(samples, samples) / samples.size)
         if mean_s <= 0:
             return 0.0
 

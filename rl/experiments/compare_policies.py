@@ -16,6 +16,7 @@ from rl.env import (
     MicroservicesEnv,
     RewardWeights,
 )
+from rl.model_io import check_action_spec, save_action_spec
 from rl.policies.action_space import ActionGrid
 from rl.policies.aimd import AIMDPolicy
 from rl.policies.bayesian import BayesianPolicy
@@ -67,7 +68,7 @@ class ExperimentConfig:
 
 
 def _build_env(cfg: ExperimentConfig) -> MicroservicesEnv:
-    duration_s = int(round(cfg.episode_duration_s)) if cfg.episode_duration_s else None
+    duration_s = cfg.episode_duration_s if cfg.episode_duration_s else None
     builder = SCENARIO_BUILDERS[cfg.fault_scenario]
 
     def build_fn(seed):
@@ -95,7 +96,7 @@ def _episode(
     policy,
     seed: int,
     trace_rows: list[dict] | None = None,
-) -> tuple[float, Summary | None, float]:
+) -> tuple[float, Summary | None, Summary | None, float]:
     obs, info = env.reset(seed=seed)
     policy.reset(seed=seed)
     total_reward = 0.0
@@ -116,6 +117,7 @@ def _episode(
                     "policy": policy.name,
                     "seed": seed,
                     "step": step_idx,
+                    "step_duration_s": env.step_duration_s,
                     "attempt_timeout_ms": applied["attempt_timeout_ms"],
                     "max_attempts": applied["max_attempts"],
                     "backoff_ms": applied["backoff_ms"],
@@ -135,7 +137,7 @@ def _episode(
         policy.update(obs, reward, terminated or truncated, info)
 
     cost_mean = float(np.mean(window_costs)) if window_costs else 0.0
-    return total_reward, env.metrics_summary(), cost_mean
+    return total_reward, env.metrics_summary(), env.in_horizon_summary(), cost_mean
 
 
 def _evaluate(
@@ -147,26 +149,38 @@ def _evaluate(
     rewards = []
     successes = []
     p95s = []
+    successes_horizon = []
+    p95s_horizon = []
     retries = []
     costs = []
 
     for seed in seeds:
-        total_reward, summary, cost_mean = _episode(env, policy, seed, trace_rows=trace_rows)
+        total_reward, summary, horizon, cost_mean = _episode(
+            env, policy, seed, trace_rows=trace_rows
+        )
         rewards.append(total_reward)
         costs.append(cost_mean)
         if summary:
             successes.append(summary.succeeded / summary.total if summary.total else 0.0)
             p95s.append(summary.p95)
             retries.append(summary.retries_per_root)
+        if horizon:
+            successes_horizon.append(horizon.succeeded / horizon.total if horizon.total else 0.0)
+            p95s_horizon.append(horizon.p95)
 
     def avg(values: list[float]) -> float:
         return float(np.mean(values)) if values else 0.0
 
+    # success_rate / p95_ms keep their historical full-population meaning
+    # (incl. drained roots); the *_in_horizon columns cover exactly the roots
+    # the reward saw.
     return {
         "reward_mean": avg(rewards),
         "reward_std": float(np.std(rewards)) if rewards else 0.0,
         "success_rate": avg(successes),
         "p95_ms": avg(p95s),
+        "success_rate_in_horizon": avg(successes_horizon),
+        "p95_ms_in_horizon": avg(p95s_horizon),
         "retries_per_root": avg(retries),
         "cost_mean": avg(costs),
     }
@@ -470,17 +484,21 @@ def main() -> None:
         if args.ppo_load_path:
             if PPO is None:
                 raise ImportError("stable-baselines3 is required for PPO baseline")
+            check_action_spec(args.ppo_load_path, action_spec)
             model = PPO.load(args.ppo_load_path)
             policies.append(SB3Policy(model=model, deterministic=True, name="ppo"))
         else:
             ppo_policy = _train_ppo(cfg, learning_curve_csv=args.ppo_learning_curve_csv)
             if args.ppo_save_path:
                 ppo_policy.model.save(args.ppo_save_path)
+                save_action_spec(
+                    args.ppo_save_path, action_spec, cfg.step_duration_s, cfg.fault_scenario
+                )
                 print(f"Saved PPO model to {args.ppo_save_path}")
             policies.append(ppo_policy)
 
     if "constrained_ppo" in policy_names:
-        duration_s = int(round(cfg.episode_duration_s)) if cfg.episode_duration_s else None
+        duration_s = cfg.episode_duration_s if cfg.episode_duration_s else None
         builder = SCENARIO_BUILDERS[cfg.fault_scenario]
         constrained_cfg = ConstrainedTrainConfig(
             build=lambda seed: builder(seed, duration_s),

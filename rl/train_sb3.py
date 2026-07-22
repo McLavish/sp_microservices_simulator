@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from rl.cli import parse_int_list, parse_optional_int_list
 from rl.env import SCENARIO_BUILDERS, ActionSpec, EnvConfig, MicroservicesEnv
+from rl.model_io import check_action_spec, save_action_spec
 from rl.sb3_support import import_sb3
 
 PPO, make_vec_env, _, SubprocVecEnv, _SB3_IMPORT_ERROR = import_sb3()
@@ -32,19 +33,23 @@ class TrainConfig:
     device: str = "auto"
 
 
-def _make_env(cfg: TrainConfig) -> MicroservicesEnv:
-    builder = SCENARIO_BUILDERS[cfg.fault_scenario]
-    duration_s = int(round(cfg.episode_duration_s)) if cfg.episode_duration_s else None
-
-    def build_fn(seed):
-        return builder(seed, duration_s)
-
-    action_spec = ActionSpec(
+def _action_spec(cfg: TrainConfig) -> ActionSpec:
+    return ActionSpec(
         attempt_timeout_ms=cfg.attempt_timeouts_ms,
         max_attempts=cfg.max_attempts,
         backoff_ms=cfg.backoff_ms,
         global_timeout_ms=cfg.global_timeouts_ms,
     )
+
+
+def _make_env(cfg: TrainConfig) -> MicroservicesEnv:
+    builder = SCENARIO_BUILDERS[cfg.fault_scenario]
+    duration_s = cfg.episode_duration_s if cfg.episode_duration_s else None
+
+    def build_fn(seed):
+        return builder(seed, duration_s)
+
+    action_spec = _action_spec(cfg)
     env_cfg = EnvConfig(
         build=build_fn,
         action_spec=action_spec,
@@ -96,6 +101,7 @@ def train(cfg: TrainConfig) -> None:
     )
 
     if cfg.load_path:
+        check_action_spec(cfg.load_path, _action_spec(cfg))
         model = PPO.load(cfg.load_path, env=vec_env, device=cfg.device)
     else:
         model = PPO(
@@ -117,6 +123,7 @@ def train(cfg: TrainConfig) -> None:
         if save_dir:
             os.makedirs(save_dir, exist_ok=True)
         model.save(cfg.save_path)
+        save_action_spec(cfg.save_path, _action_spec(cfg), cfg.step_duration_s, cfg.fault_scenario)
         print(f"[train] saved model to {cfg.save_path}")
 
     if cfg.eval_episodes > 0:

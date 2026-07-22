@@ -95,6 +95,28 @@ class TestConstrainedTraining(unittest.TestCase):
         policy = train_constrained_ppo(cfg)
         self.assertEqual(policy.name, "constrained_ppo")
 
+    def test_chunked_training_respects_total_timesteps(self):
+        # SB3 trains `total_timesteps` ADDITIONAL steps when
+        # reset_num_timesteps=False; the loop must pass per-chunk increments.
+        # chunk=4 with n_steps=2, n_envs=1, batch=2 divides evenly, so there is
+        # no rollout-rounding overshoot and the count is exact.
+        cfg = ConstrainedTrainConfig(
+            build=lambda seed: build_chain_env(seed, duration_s=3),
+            action_spec=ActionSpec(
+                attempt_timeout_ms=[50, 80], max_attempts=[1, 2], backoff_ms=[20]
+            ),
+            episode_duration_s=3.0,
+            timesteps=8,
+            chunk_timesteps=4,
+            n_envs=1,
+            n_steps=2,
+            batch_size=2,
+            eval_episodes=1,
+        )
+        policy = train_constrained_ppo(cfg)
+        # Buggy cumulative loop: learn(4) + learn(8) -> 4 + 8 = 12 steps.
+        self.assertEqual(policy.model.num_timesteps, 8)
+
 
 if __name__ == "__main__":
     unittest.main()

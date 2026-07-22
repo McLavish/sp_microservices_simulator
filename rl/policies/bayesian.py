@@ -70,6 +70,7 @@ class BayesianPolicy:
     def act(self, obs: np.ndarray, info: dict) -> tuple[int, ...]:
         self._buffer.ingest_info(info)
         data = self._buffer.data()
+        data = data[data > 0]  # defense in depth: log(0) would collapse the posterior
         if data.size == 0:
             return self.grid.indices[0]
 

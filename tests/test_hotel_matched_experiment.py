@@ -1,11 +1,21 @@
+import argparse
 import csv
 import json
+
+import pytest
 
 from core import ms_to_ns
 from experiments.hotel_matched import (
     DEFAULT_PROFILE_FAULT,
     HotelMatchedConfig,
     _build_runtime,
+    _effective_profile_faults,
+    _fraction,
+    _load_calibration,
+    _nonneg_float,
+    _parse_load_spike,
+    _parse_profile_fault,
+    _positive_float,
     config_from_args,
     run_hotel_matched,
 )
@@ -212,3 +222,63 @@ def _assert_exp_jitter(client, *, attempt_timeout_ms, initial_delay_ms, max_dela
     assert retry.max_delay == ms_to_ns(max_delay_ms)
     assert retry.jitter_mode == JitterMode.EQUAL
     assert client.cfg.timeout_controller.get_attempt_timeout() == ms_to_ns(attempt_timeout_ms)
+
+
+def test_absent_fault_scenario_falls_back_to_default():
+    assert _effective_profile_faults(HotelMatchedConfig(), {}) == DEFAULT_PROFILE_FAULT
+
+
+def test_explicit_empty_fault_scenario_means_no_faults():
+    assert _effective_profile_faults(HotelMatchedConfig(), {"fault_scenario": []}) == []
+
+
+def test_non_profile_only_scenario_means_no_profile_faults():
+    calibration = {
+        "fault_scenario": [
+            {
+                "method": "/search.Search/Nearby",
+                "start_s": 5,
+                "end_s": 10,
+                "add_latency_ms": 20,
+                "p_fail": 0.1,
+            }
+        ]
+    }
+    assert _effective_profile_faults(HotelMatchedConfig(), calibration) == []
+
+
+def test_config_profile_faults_override_wins():
+    cfg = HotelMatchedConfig(profile_faults=[(1.0, 2.0, 3.0, 0.4)])
+    assert _effective_profile_faults(cfg, {"fault_scenario": []}) == [(1.0, 2.0, 3.0, 0.4)]
+
+
+def test_fraction_bounds():
+    assert _fraction("0.25") == 0.25
+    for bad in ("1.5", "-0.5", "nan"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            _fraction(bad)
+
+
+def test_rates_and_durations_validated():
+    with pytest.raises(argparse.ArgumentTypeError):
+        _nonneg_float("-100")
+    with pytest.raises(argparse.ArgumentTypeError):
+        _positive_float("0")
+    with pytest.raises(argparse.ArgumentTypeError):
+        _positive_float("inf")
+
+
+def test_fault_and_spike_windows_validated():
+    with pytest.raises(argparse.ArgumentTypeError):
+        _parse_profile_fault("10,20,-500,0.5")  # negative added latency
+    with pytest.raises(argparse.ArgumentTypeError):
+        _parse_load_spike("10,20,-3")  # negative multiplier
+    with pytest.raises(argparse.ArgumentTypeError):
+        _parse_load_spike("-5,20,2")  # negative start
+
+
+def test_calibration_json_rejects_non_finite(tmp_path):
+    path = tmp_path / "cal.json"
+    path.write_text('{"services": {"profile": {"median_ms": NaN}}}')
+    with pytest.raises(ValueError):
+        _load_calibration(path)

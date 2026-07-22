@@ -22,6 +22,7 @@ from core import (
     s_to_ns,
 )
 from faults import LatencyInjection, LoadSpike, PartialFailure
+from metrics import Metrics
 from retry_policies import FixedBackoffRetryPolicy, RetryBudgetPolicy, RetryPolicy
 from rl.spec import ActionSpec, ActionValues, RewardWeights, coerce_action
 from service import ServiceConfig, ServiceRuntime
@@ -79,6 +80,11 @@ class EnvConfig:
     initial_action: tuple[int, ...] | None = None
     emit_latency_samples: bool = True
     max_latency_samples: int | None = None
+    # Fold drained-root outcomes into the final step's reward. Default off:
+    # the windowed objective is the documented design and keeps trained
+    # behavior comparable with the pinned paper data; turning it on removes
+    # the defer-failures-past-the-horizon incentive for future studies.
+    terminal_drain_penalty: bool = False
 
 
 class MicroservicesEnv(_GymEnvBase):
@@ -90,6 +96,10 @@ class MicroservicesEnv(_GymEnvBase):
         if gym is None or spaces is None:
             raise ImportError("gymnasium is required for MicroservicesEnv") from _GYM_IMPORT_ERROR
         assert spaces is not None  # narrow for type checker after the check above
+        if config.step_duration_s <= 0:
+            raise ValueError("step_duration_s must be > 0")
+        if config.episode_duration_s is not None and config.episode_duration_s <= 0:
+            raise ValueError("episode_duration_s must be > 0")
         self._cfg = config
 
         self._action_sizes = [
@@ -118,6 +128,9 @@ class MicroservicesEnv(_GymEnvBase):
         self._components: EnvComponents | None = None
         self._last_root_idx = 0
         self._last_cost_root_idx = 0
+        self._last_sample_root_idx = 0
+        self._horizon_root_count = 0
+        self._episode_steps = 0
         self._current_time_ns: TimePoint = 0
         self._end_time_ns: TimePoint = 0
         self._step_ns: TimeDuration = 0
@@ -168,6 +181,9 @@ class MicroservicesEnv(_GymEnvBase):
 
         self._last_root_idx = 0
         self._last_cost_root_idx = 0
+        self._last_sample_root_idx = 0
+        self._horizon_root_count = 0
+        self._episode_steps = 0
         self._require_workload().drive(
             self._require_sim(), lambda s: self._require_client().start_request(s)
         )
@@ -184,6 +200,7 @@ class MicroservicesEnv(_GymEnvBase):
                 {
                     "attempt_latencies_ms": [],
                     "attempt_censored": [],
+                    "attempt_service_ms": [],
                     "root_latencies_ms": [],
                 }
             )
@@ -197,6 +214,7 @@ class MicroservicesEnv(_GymEnvBase):
         self._require_sim().run(until=next_time)
         self._current_time_ns = next_time
 
+        self._episode_steps += 1
         new_roots = self._require_client().roots[self._last_root_idx :]
         self._last_root_idx = len(self._require_client().roots)
 
@@ -207,10 +225,23 @@ class MicroservicesEnv(_GymEnvBase):
         terminated = self._current_time_ns >= self._end_time_ns
         info: dict[str, object] = {"summary": summary, "action": self._last_action_values.copy()}
         if self._cfg.emit_latency_samples:
-            info.update(self._collect_latency_samples(new_roots))
+            # Latency-based policies must see the client the knobs actuate: in
+            # chain scenarios that is the B->C edge (cost_client), not the
+            # top-level client whose end-to-end latencies the knobs only
+            # influence indirectly. Reward/observation stay top-level.
+            sample_client = self._require_components().cost_client
+            if sample_client is not None:
+                sample_roots = sample_client.roots[self._last_sample_root_idx :]
+                self._last_sample_root_idx = len(sample_client.roots)
+            else:
+                sample_roots = new_roots
+            info.update(self._collect_latency_samples(sample_roots))
 
+        if terminated:
+            self._horizon_root_count = self._last_root_idx
         # Drain in-flight work after the reward is computed: drained roots complete
-        # past the episode horizon and must not be credited to the final action.
+        # past the episode horizon and must not be credited to the final action
+        # (unless terminal_drain_penalty explicitly folds them in).
         if terminated and self._cfg.drain_on_done:
             self._require_sim().run()
             drained = self._require_client().roots[self._last_root_idx :]
@@ -218,6 +249,15 @@ class MicroservicesEnv(_GymEnvBase):
             drained_summary = self._summarize_roots(drained)
             drained_summary["cost"] = self._window_cost()
             info["drained_summary"] = drained_summary
+            if self._cfg.terminal_drain_penalty:
+                # Count-consistent weighting: per-step rewards are rates over a
+                # window's completions, so a flat drained-window rate would
+                # penalize 2 drained roots as hard as 100. Scale by how many
+                # average-sized step windows the drained population represents.
+                total_completed = self._last_root_idx
+                per_step = total_completed / max(1, self._episode_steps)
+                weight = drained_summary["completed"] / max(1.0, per_step)
+                reward += weight * self._reward_from_summary(drained_summary)
         if terminated:
             components = self._components
             if components is not None and components.bystander_client is not None:
@@ -400,6 +440,7 @@ class MicroservicesEnv(_GymEnvBase):
     def _collect_latency_samples(self, roots) -> dict[str, list]:
         attempt_latencies = []
         attempt_censored = []
+        attempt_service = []
         root_latencies = []
 
         for root in roots:
@@ -411,17 +452,29 @@ class MicroservicesEnv(_GymEnvBase):
                 root_latencies.append(ns_to_ms(end - begin))
 
             for attempt in root.attempts:
+                if (
+                    attempt.drop_reason in (DropReason.QUEUE_FULL, DropReason.CIRCUIT_OPEN)
+                    and attempt.interval.end == attempt.interval.begin
+                ):
+                    # Instant rejections carry no latency information; policies
+                    # see them through the drop-rate features instead. A zero
+                    # would poison lognormal fits (log 0) as an uncensored value.
+                    continue
                 attempt_latencies.append(ns_to_ms(attempt.interval.end - attempt.interval.begin))
                 attempt_censored.append(attempt.drop_reason == DropReason.DEADLINE)
+                if attempt.service_time_ns is not None:
+                    attempt_service.append(ns_to_ms(attempt.service_time_ns))
 
         if self._cfg.max_latency_samples is not None:
             attempt_latencies = attempt_latencies[: self._cfg.max_latency_samples]
             attempt_censored = attempt_censored[: self._cfg.max_latency_samples]
+            attempt_service = attempt_service[: self._cfg.max_latency_samples]
             root_latencies = root_latencies[: self._cfg.max_latency_samples]
 
         return {
             "attempt_latencies_ms": attempt_latencies,
             "attempt_censored": attempt_censored,
+            "attempt_service_ms": attempt_service,
             "root_latencies_ms": root_latencies,
         }
 
@@ -429,6 +482,19 @@ class MicroservicesEnv(_GymEnvBase):
         if self._client is None:
             return None
         return self._client.metrics().summary()
+
+    def in_horizon_summary(self) -> Summary | None:
+        """Summary over roots completed before the episode horizon — the
+        population the reward actually saw. ``metrics_summary()`` is the full
+        population including drained roots."""
+        if self._client is None:
+            return None
+        roots = self._client.roots[: self._horizon_root_count]
+        return Metrics(roots=roots, attempts_total=sum(len(r.attempts) for r in roots)).summary()
+
+    @property
+    def step_duration_s(self) -> float:
+        return self._cfg.step_duration_s
 
     def bystander_metrics_summary(self) -> Summary | None:
         if self._components is None or self._components.bystander_client is None:
@@ -461,7 +527,7 @@ def _static_knob_applier(
 
 def _single_service_components(
     seed: int | None,
-    duration: int,
+    duration: float,
     *,
     latency_injections: list[LatencyInjection] | None = None,
     partial_failures: list[PartialFailure] | None = None,
@@ -501,21 +567,21 @@ def _single_service_components(
 
 
 def build_single_service_env(
-    seed: int | None = None, duration_s: int | None = None
+    seed: int | None = None, duration_s: float | None = None
 ) -> EnvComponents:
-    duration = 30 if duration_s is None else int(duration_s)
+    duration = 30.0 if duration_s is None else float(duration_s)
     return _single_service_components(seed, duration)
 
 
 def build_faulty_single_service_env(
-    seed: int | None = None, duration_s: int | None = None
+    seed: int | None = None, duration_s: float | None = None
 ) -> EnvComponents:
     """Faulty single service with fault windows at *fixed* episode fractions.
 
     Because the observation includes the episode-time fraction, policies can
     memorize these windows; use the randomized variant for training.
     """
-    duration = 30 if duration_s is None else int(duration_s)
+    duration = 30.0 if duration_s is None else float(duration_s)
     return _single_service_components(
         seed,
         duration,
@@ -541,7 +607,7 @@ def build_faulty_single_service_env(
 
 
 def build_randomized_faulty_single_service_env(
-    seed: int | None = None, duration_s: int | None = None
+    seed: int | None = None, duration_s: float | None = None
 ) -> EnvComponents:
     """Faulty single service with fault windows drawn from the seed.
 
@@ -549,7 +615,7 @@ def build_randomized_faulty_single_service_env(
     memorize the episode clock via the time-fraction feature — it has to react
     to observed degradation. Same seed reproduces the same fault draw.
     """
-    duration = 30 if duration_s is None else int(duration_s)
+    duration = 30.0 if duration_s is None else float(duration_s)
     rng = random.Random(1 if seed is None else seed)
 
     def window() -> TimeInterval:
@@ -570,7 +636,7 @@ def build_randomized_faulty_single_service_env(
 
 def build_chain_env(
     seed: int | None = None,
-    duration_s: int | None = None,
+    duration_s: float | None = None,
     *,
     retry_budget_ratio: float | None = None,
 ) -> EnvComponents:
@@ -590,7 +656,7 @@ def build_chain_env(
     """
     build_seed = 1 if seed is None else int(seed)
     sim = Simulator(seed=build_seed)
-    duration = 30 if duration_s is None else int(duration_s)
+    duration = 30.0 if duration_s is None else float(duration_s)
     rng = random.Random(build_seed)
 
     onset = rng.uniform(0.1, 0.5) * duration
@@ -684,7 +750,7 @@ def build_chain_env(
 
 def build_multichain_env(
     seed: int | None = None,
-    duration_s: int | None = None,
+    duration_s: float | None = None,
     *,
     retry_budget_ratio: float | None = None,
 ) -> EnvComponents:
@@ -713,7 +779,7 @@ def build_multichain_env(
     """
     build_seed = 1 if seed is None else int(seed)
     sim = Simulator(seed=build_seed)
-    duration = 30 if duration_s is None else int(duration_s)
+    duration = 30.0 if duration_s is None else float(duration_s)
     rng = random.Random(build_seed)
 
     # p_fail must be high enough that upstream retry layers (A->B x2, top x2:
@@ -848,7 +914,7 @@ def build_multichain_env(
 
 
 # Scenario name -> builder, shared by the CLI entry points (--fault-scenario).
-SCENARIO_BUILDERS: dict[str, Callable[[int | None, int | None], EnvComponents]] = {
+SCENARIO_BUILDERS: dict[str, Callable[[int | None, float | None], EnvComponents]] = {
     "none": build_single_service_env,
     "basic": build_faulty_single_service_env,
     "randomized": build_randomized_faulty_single_service_env,

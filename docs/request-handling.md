@@ -170,11 +170,15 @@ that:
 1. runs the node's **local** service time, then
 2. checks local deadline/failure (drops as `DEADLINE` / `SERVER_FAILURE`), then
 3. launches **all** downstream `client.start_request(...)` calls concurrently,
-   propagating the parent deadline via `override_global_deadline`, and
+   propagating the parent deadline via `override_global_deadline` — a
+   *synchronous* rejection (queue-full / circuit-open) on an early edge is
+   remembered but does not skip later edges' launches, so downstream load never
+   depends on edge order, and
 4. finalizes with success only when *all* downstreams succeed; the **first**
-   downstream failure short-circuits the parent (AND semantics). A deadline guard
-   event finalizes as `DEADLINE` if time runs out first, and is cancelled on
-   success (`chain.py:106`).
+   downstream failure short-circuits the parent (AND semantics), applied after
+   the launch loop for synchronous rejections. A deadline guard event finalizes
+   as `DEADLINE` if time runs out first, and is cancelled on success
+   (`chain.py:106`).
 
 ### Worker occupancy: tandem vs hold-worker
 

@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from core import DropReason, Request, RootRequest, TimeInterval, s_to_ns
+from core import DropReason, Request, RootRequest, TimeInterval, ms_to_ns, s_to_ns
 from metrics import Metrics
 
 
@@ -84,6 +84,40 @@ class TestMetricsSummary(unittest.TestCase):
                 rows = list(csv.DictReader(f))
 
         self.assertEqual(rows[0]["timepoint"], "5.000")
+
+
+class TestExportGranularity(unittest.TestCase):
+    def _metrics(self):
+        root = RootRequest()
+        root.add_attempt(
+            Request(
+                service="svc",
+                interval=TimeInterval(begin=int(ms_to_ns(0.2)), end=int(ms_to_ns(0.9))),
+                success=True,
+            )
+        )
+        root2 = RootRequest()
+        root2.add_attempt(
+            Request(
+                service="svc",
+                interval=TimeInterval(begin=int(ms_to_ns(1.4)), end=int(ms_to_ns(2.1))),
+                success=True,
+            )
+        )
+        return Metrics(roots=[root, root2], attempts_total=2)
+
+    def test_sub_nanosecond_granularity_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
+            self._metrics().export_csv(str(Path(tmp) / "out.csv"), granularity_s=1e-10)
+
+    def test_sub_millisecond_buckets_keep_distinct_timepoints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "out.csv")
+            self._metrics().export_csv(path, granularity_s=0.0005)
+            import pandas as pd
+
+            df = pd.read_csv(path)
+            self.assertEqual(df["timepoint"].nunique(), len(df))
 
 
 if __name__ == "__main__":
