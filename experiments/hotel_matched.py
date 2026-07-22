@@ -75,11 +75,7 @@ class HotelMatchedRun:
 
 def run_hotel_matched(config: HotelMatchedConfig) -> dict[str, str]:
     calibration = _load_calibration(config.calibration_json)
-    profile_faults = (
-        config.profile_faults
-        if config.profile_faults is not None
-        else _profile_faults_from_calibration(calibration) or DEFAULT_PROFILE_FAULT
-    )
+    profile_faults = _effective_profile_faults(config, calibration)
     load_spikes = (
         config.load_spikes if config.load_spikes is not None else _load_spikes(calibration)
     )
@@ -356,9 +352,16 @@ def _load_calibration(path: Path | None) -> dict[str, Any]:
 
 def _profile_faults_from_calibration(
     calibration: dict[str, Any],
-) -> list[tuple[float, float, float, float]]:
+) -> list[tuple[float, float, float, float]] | None:
+    """None when the calibration has no fault_scenario key (fall back to the
+    built-in default); a list — possibly empty — when it does. An explicit
+    empty scenario, or one naming only non-profile methods, means "no profile
+    faults" and must not be replaced by the default."""
+    scenario = calibration.get("fault_scenario")
+    if scenario is None:
+        return None
     windows = []
-    for window in calibration.get("fault_scenario") or []:
+    for window in scenario:
         if window.get("method") != "/profile.Profile/GetProfiles":
             continue
         windows.append(
@@ -370,6 +373,15 @@ def _profile_faults_from_calibration(
             )
         )
     return windows
+
+
+def _effective_profile_faults(
+    config: HotelMatchedConfig, calibration: dict[str, Any]
+) -> list[tuple[float, float, float, float]]:
+    if config.profile_faults is not None:
+        return config.profile_faults
+    calibrated = _profile_faults_from_calibration(calibration)
+    return calibrated if calibrated is not None else DEFAULT_PROFILE_FAULT
 
 
 def _load_spikes(calibration: dict[str, Any]) -> list[tuple[float, float, float]]:

@@ -6,6 +6,7 @@ from experiments.hotel_matched import (
     DEFAULT_PROFILE_FAULT,
     HotelMatchedConfig,
     _build_runtime,
+    _effective_profile_faults,
     config_from_args,
     run_hotel_matched,
 )
@@ -212,3 +213,31 @@ def _assert_exp_jitter(client, *, attempt_timeout_ms, initial_delay_ms, max_dela
     assert retry.max_delay == ms_to_ns(max_delay_ms)
     assert retry.jitter_mode == JitterMode.EQUAL
     assert client.cfg.timeout_controller.get_attempt_timeout() == ms_to_ns(attempt_timeout_ms)
+
+
+def test_absent_fault_scenario_falls_back_to_default():
+    assert _effective_profile_faults(HotelMatchedConfig(), {}) == DEFAULT_PROFILE_FAULT
+
+
+def test_explicit_empty_fault_scenario_means_no_faults():
+    assert _effective_profile_faults(HotelMatchedConfig(), {"fault_scenario": []}) == []
+
+
+def test_non_profile_only_scenario_means_no_profile_faults():
+    calibration = {
+        "fault_scenario": [
+            {
+                "method": "/search.Search/Nearby",
+                "start_s": 5,
+                "end_s": 10,
+                "add_latency_ms": 20,
+                "p_fail": 0.1,
+            }
+        ]
+    }
+    assert _effective_profile_faults(HotelMatchedConfig(), calibration) == []
+
+
+def test_config_profile_faults_override_wins():
+    cfg = HotelMatchedConfig(profile_faults=[(1.0, 2.0, 3.0, 0.4)])
+    assert _effective_profile_faults(cfg, {"fault_scenario": []}) == [(1.0, 2.0, 3.0, 0.4)]
