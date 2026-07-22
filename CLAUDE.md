@@ -115,6 +115,7 @@ python -m plotting.rl_traces_over_time rl_traces_basic.csv              # per-st
 ## Conventions when extending
 
 - New retry policies that wrap another should expose `underlying_strategy` so `_update_policy_results` reaches them. New stateful policies should implement `add_result(success, now)`.
+- Custom service behaviors must call `finalize` exactly once and `release_worker` at most once (both raise on repeats). Completion callbacks must not submit work synchronously if FCFS matters to your experiment — schedule through the event heap instead.
 - New downstream-graph features must preserve AND semantics in `chain.py`'s `behavior` and route deadlines through `min(...)` rather than overwriting.
 - After running an experiment, call `Metrics.export_csv()` *and* `FaultEventsTracker.export_json()` so plotting overlays line up.
 - Keep internal time in nanoseconds; convert only at I/O / plotting boundaries.
