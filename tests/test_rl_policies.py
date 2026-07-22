@@ -176,6 +176,25 @@ class TestRLPolicies(unittest.TestCase):
         self.assertIn(action, grid.indices)
 
 
+class TestServiceMoments(unittest.TestCase):
+    def test_queue_variant_derives_moments_from_service_stream(self):
+        grid = ActionGrid(ActionSpec(attempt_timeout_ms=[50], max_attempts=[1], backoff_ms=[0]))
+        policy = ModelBasedPolicy(grid=grid, include_queue_delay=True)
+        policy.act(
+            obs=np.zeros(1),
+            info={
+                "attempt_latencies_ms": [40.0] * 50,  # totals: include queue wait
+                "attempt_censored": [False] * 50,
+                "attempt_service_ms": [20.0] * 50,  # queue-exclusive
+                "summary": {"completed": 50.0, "retries_per_root": 0.0},
+            },
+        )
+        mean_s, mean_s2, count = policy._service_moments()
+        self.assertEqual(count, 50)
+        self.assertAlmostEqual(mean_s, 20.0)
+        self.assertAlmostEqual(mean_s2, 400.0)
+
+
 class _ConstantModel:
     def __init__(self, value_ms: float):
         self._value = value_ms

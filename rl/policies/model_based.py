@@ -154,15 +154,21 @@ class ModelBasedPolicy:
 
     def __post_init__(self):
         self._buffer = LatencyBuffer(self.buffer_size)
+        self._service_samples: list[float] = []
         self._rng = np.random.default_rng(123)
 
     def reset(self, seed: int | None = None) -> None:
         self._buffer = LatencyBuffer(self.buffer_size)
+        self._service_samples = []
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
     def act(self, obs: np.ndarray, info: dict) -> tuple[int, ...]:
         self._buffer.ingest_info(info)
+        service = [float(v) for v in info.get("attempt_service_ms", [])]
+        if service:
+            self._service_samples.extend(service)
+            self._service_samples = self._service_samples[-self.buffer_size :]
         values, censored = self._buffer.censored_data()
         uncensored = values[~censored]
         if uncensored.size == 0:
@@ -199,6 +205,17 @@ class ModelBasedPolicy:
     def update(self, obs: np.ndarray, reward: float, done: bool, info: dict) -> None:
         return
 
+    def _service_moments(self) -> tuple[float, float, int]:
+        """Mean / mean-square / count of buffered queue-exclusive service times."""
+        service = np.asarray(self._service_samples, dtype=np.float64)
+        if service.size == 0:
+            return 0.0, 0.0, 0
+        return (
+            float(service.mean()),
+            float(np.dot(service, service) / service.size),
+            int(service.size),
+        )
+
     def _estimate_queue_delay(self, info: dict, model: LatencyModel) -> float:
         """Expected queueing delay in ms via the Allen-Cunneen M/G/c approximation:
 
@@ -220,14 +237,20 @@ class ModelBasedPolicy:
         if self.use_retries_in_lambda:
             lambda_per_ms *= 1.0 + float(summary.get("retries_per_root", 0.0))
 
-        moments_fn = getattr(model, "moments", None)
-        if callable(moments_fn):
-            mean_s, mean_s2 = (float(m) for m in moments_fn())
-        else:
-            sample_count = max(10, int(self.queue_moment_samples))
-            samples = model.sample(self._rng, sample_count)
-            mean_s = float(np.mean(samples))
-            mean_s2 = float(np.dot(samples, samples) / samples.size)
+        # Erlang-C needs SERVICE-time moments; attempt intervals include queue
+        # wait, so deriving moments from the fitted total-latency model would
+        # double-count queueing. Fall back to the model only while the service
+        # stream is still empty (legacy info dicts / cold start).
+        mean_s, mean_s2, count = self._service_moments()
+        if count < 10:
+            moments_fn = getattr(model, "moments", None)
+            if callable(moments_fn):
+                mean_s, mean_s2 = (float(m) for m in moments_fn())
+            else:
+                sample_count = max(10, int(self.queue_moment_samples))
+                samples = model.sample(self._rng, sample_count)
+                mean_s = float(np.mean(samples))
+                mean_s2 = float(np.dot(samples, samples) / samples.size)
         if mean_s <= 0:
             return 0.0
 

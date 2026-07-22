@@ -196,6 +196,7 @@ class MicroservicesEnv(_GymEnvBase):
                 {
                     "attempt_latencies_ms": [],
                     "attempt_censored": [],
+                    "attempt_service_ms": [],
                     "root_latencies_ms": [],
                 }
             )
@@ -435,6 +436,7 @@ class MicroservicesEnv(_GymEnvBase):
     def _collect_latency_samples(self, roots) -> dict[str, list]:
         attempt_latencies = []
         attempt_censored = []
+        attempt_service = []
         root_latencies = []
 
         for root in roots:
@@ -448,15 +450,19 @@ class MicroservicesEnv(_GymEnvBase):
             for attempt in root.attempts:
                 attempt_latencies.append(ns_to_ms(attempt.interval.end - attempt.interval.begin))
                 attempt_censored.append(attempt.drop_reason == DropReason.DEADLINE)
+                if attempt.service_time_ns is not None:
+                    attempt_service.append(ns_to_ms(attempt.service_time_ns))
 
         if self._cfg.max_latency_samples is not None:
             attempt_latencies = attempt_latencies[: self._cfg.max_latency_samples]
             attempt_censored = attempt_censored[: self._cfg.max_latency_samples]
+            attempt_service = attempt_service[: self._cfg.max_latency_samples]
             root_latencies = root_latencies[: self._cfg.max_latency_samples]
 
         return {
             "attempt_latencies_ms": attempt_latencies,
             "attempt_censored": attempt_censored,
+            "attempt_service_ms": attempt_service,
             "root_latencies_ms": root_latencies,
         }
 

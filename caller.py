@@ -164,7 +164,7 @@ class ClientRuntime:
         ctx: AttemptCtx,
         sim: Simulator,
         success: bool,
-        svc_time: TimeDuration,  # unused for now
+        svc_time: TimeDuration,
         drop_reason: DropReason,
         queue_size: int,
     ):
@@ -184,6 +184,9 @@ class ClientRuntime:
         ctx.req.success = success_effective
         ctx.req.drop_reason = drop_reason
         ctx.req.queue_size_at_end = queue_size
+        # svc_time == 0 marks paths where service never began (queue-full,
+        # deadline-at-dequeue); real service times are floored at 100 us.
+        ctx.req.service_time_ns = svc_time if svc_time > 0 else None
 
         # Log the request
         ctx.root.add_attempt(ctx.req)

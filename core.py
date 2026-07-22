@@ -56,6 +56,10 @@ class Request:
     drop_reason: DropReason = DropReason.NONE
     # Captured at attempt end by the service: current queue length
     queue_size_at_end: int | None = None
+    # Queue-exclusive processing duration reported by the service (for chain
+    # nodes: local stage + downstream wait, still excluding the local queue).
+    # None when service never began (queue-full / deadline-at-dequeue drops).
+    service_time_ns: TimeDuration | None = None
 
 
 @dataclass
