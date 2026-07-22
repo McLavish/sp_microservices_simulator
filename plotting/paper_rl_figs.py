@@ -59,6 +59,20 @@ ARM_STYLES = {
 BUDGET_COLORS = {0.05: C_BLUE, 0.1: C_AQUA, 0.2: C_YELLOW}
 
 
+def actual_timesteps(df: pd.DataFrame, legacy: bool) -> "pd.Series":
+    """x positions in ACTUAL cumulative env steps.
+
+    Curve CSVs produced before the trainer chunking fix ("Fix constrained
+    trainer overtraining", 2026-07-22) carry per-call learn() targets in their
+    `timesteps` column, and each call trained that many ADDITIONAL steps (SB3
+    reset_num_timesteps=False semantics): the actual cumulative position of
+    row i is therefore the cumulative sum of the column — a "30k" study spans
+    105k env steps, the "100k" arm-A curve 1.05M. Post-fix CSVs already record
+    true cumulative steps and must NOT be remapped.
+    """
+    return df["timesteps"].cumsum() if legacy else df["timesteps"]
+
+
 def _load_runs(comparison_csvs: list[str]) -> pd.DataFrame:
     frames = []
     for path in comparison_csvs:
@@ -139,7 +153,7 @@ def plot_pareto(comparison_csvs: list[str], output: str) -> None:
     plt.close(fig)
 
 
-def plot_dual_ascent(curve_prefixes: list[str], output: str) -> None:
+def plot_dual_ascent(curve_prefixes: list[str], output: str, legacy: bool = True) -> None:
     """Cost and multiplier trajectories for every (run, budget) pair."""
     fig, (ax_cost, ax_lambda) = plt.subplots(2, 1, figsize=(COLUMN_WIDTH_IN, 3.0), sharex=True)
 
@@ -149,7 +163,7 @@ def plot_dual_ascent(curve_prefixes: list[str], output: str) -> None:
             budget = float(path.rsplit("_b", 1)[1].removesuffix(".csv"))
             color = BUDGET_COLORS.get(budget, "gray")
             df = pd.read_csv(path)
-            steps = df["timesteps"] / 1000.0
+            steps = actual_timesteps(df, legacy) / 1000.0
             label = f"$b$={budget:g}" if budget not in seen_budgets else None
             seen_budgets.add(budget)
             ax_cost.plot(steps, df["eval_cost"], color=color, label=label)
@@ -162,7 +176,7 @@ def plot_dual_ascent(curve_prefixes: list[str], output: str) -> None:
 
     ax_cost.set_ylabel("evaluation cost")
     ax_lambda.set_ylabel(r"multiplier $\lambda$")
-    ax_lambda.set_xlabel("training timesteps ($\\times 10^3$)")
+    ax_lambda.set_xlabel("env steps, actual ($\\times 10^3$)")
     ax_cost.legend(loc="upper right", handletextpad=0.4, ncols=3, columnspacing=0.9)
     fig.align_ylabels()
     fig.savefig(output)
@@ -185,11 +199,19 @@ def main() -> None:
     )
     parser.add_argument("--pareto-output", default="paper_rl_pareto.pdf")
     parser.add_argument("--curves-output", default="paper_rl_dual_ascent.pdf")
+    parser.add_argument(
+        "--legacy-curves",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="curve CSVs predate the trainer chunking fix: remap x to actual "
+        "cumulative env steps (cumulative sum of the timesteps column). Pass "
+        "--no-legacy-curves for curves produced by the fixed trainer.",
+    )
     args = parser.parse_args()
 
     plt.rcParams.update(PAPER_RC)
     plot_pareto(args.comparison_csvs, args.pareto_output)
-    plot_dual_ascent(args.curve_prefixes, args.curves_output)
+    plot_dual_ascent(args.curve_prefixes, args.curves_output, legacy=args.legacy_curves)
     print(f"wrote {args.pareto_output} and {args.curves_output}")
 
 
