@@ -427,5 +427,25 @@ class TestRetryPolicies(unittest.TestCase):
             sim.run()
 
 
+class TestBackoffValidation(unittest.TestCase):
+    def test_negative_fixed_backoff_rejected(self):
+        with self.assertRaises(ValueError):
+            FixedBackoffRetryPolicy(max_attempts=2, delay=-1)
+
+    def test_nonpositive_attempts_rejected(self):
+        with self.assertRaises(ValueError):
+            FixedBackoffRetryPolicy(max_attempts=0, delay=0)
+
+    def test_negative_exponential_delays_rejected(self):
+        with self.assertRaises(ValueError):
+            ExponentialBackoffRetryPolicy(max_attempts=2, initial_delay=-5, max_delay=10)
+
+    def test_negative_jitter_delays_rejected(self):
+        with self.assertRaises(ValueError):
+            ExponentialBackoffWithJitterRetryPolicy(
+                max_attempts=2, initial_delay=-5, max_delay=10, rng=random.Random(1)
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -28,12 +28,22 @@ class Simulator:
         return self._rng
 
     def schedule(self, at: TimePoint, fn: Callable[[], None]):
+        at = int(at)
+        if at < self.timestep:
+            raise ValueError(
+                f"cannot schedule an event at {at} ns: simulator time is already "
+                f"{self.timestep} ns (negative delay or misconfigured deadline?)"
+            )
         self._seq += 1
-        ev = Event(at=int(at), seq=self._seq, action=fn)
+        ev = Event(at=at, seq=self._seq, action=fn)
         heapq.heappush(self._eventheap, ev)
         return ev
 
     def run(self, until: TimePoint | None = None):
+        if until is not None and int(until) < self.timestep:
+            raise ValueError(
+                f"cannot run until {int(until)} ns: simulator time is already {self.timestep} ns"
+            )
         heap = self._eventheap
         while heap and (until is None or heap[0].at <= until):
             ev = heapq.heappop(heap)

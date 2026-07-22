@@ -34,6 +34,12 @@ class FixedBackoffRetryPolicy(RetryPolicy):
     max_attempts: int  # total attempts including the initial try
     delay: TimeDuration
 
+    def __post_init__(self):
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        if self.delay < 0:
+            raise ValueError("delay must be >= 0 ns")
+
     def next_delay(self, context: RetryContext) -> DelayDecision:
         if context.attempt < self.max_attempts:
             return DelayDecision(True, self.delay)
@@ -51,6 +57,12 @@ class ExponentialBackoffRetryPolicy(RetryPolicy):
     max_attempts: int  # total attempts including the initial try
     initial_delay: TimeDuration
     max_delay: TimeDuration
+
+    def __post_init__(self):
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        if self.initial_delay < 0 or self.max_delay < 0:
+            raise ValueError("delays must be >= 0 ns")
 
     def next_delay(self, context: RetryContext) -> DelayDecision:
         if context.attempt < self.max_attempts:
@@ -73,6 +85,12 @@ class ExponentialBackoffWithJitterRetryPolicy(RetryPolicy):
     rng: random.Random  # pass in the simulator's rng
     jitter_mode: JitterMode = JitterMode.FULL
     # _prev: TimeDuration = 0
+
+    def __post_init__(self):
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        if self.initial_delay < 0 or self.max_delay < 0:
+            raise ValueError("delays must be >= 0 ns")
 
     def next_delay(self, context: RetryContext) -> DelayDecision:
         if context.attempt < self.max_attempts:
