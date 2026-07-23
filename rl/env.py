@@ -201,6 +201,7 @@ class MicroservicesEnv(_GymEnvBase):
                     "attempt_latencies_ms": [],
                     "attempt_censored": [],
                     "attempt_service_ms": [],
+                    "attempt_service_censored": [],
                     "root_latencies_ms": [],
                 }
             )
@@ -441,6 +442,7 @@ class MicroservicesEnv(_GymEnvBase):
         attempt_latencies = []
         attempt_censored = []
         attempt_service = []
+        attempt_service_censored = []
         root_latencies = []
 
         for root in roots:
@@ -464,17 +466,22 @@ class MicroservicesEnv(_GymEnvBase):
                 attempt_censored.append(attempt.drop_reason == DropReason.DEADLINE)
                 if attempt.service_time_ns is not None:
                     attempt_service.append(ns_to_ms(attempt.service_time_ns))
+                    # Deadline cuts truncate service occupancy at the deadline:
+                    # a right-censored observation of the latent service demand.
+                    attempt_service_censored.append(attempt.drop_reason == DropReason.DEADLINE)
 
         if self._cfg.max_latency_samples is not None:
             attempt_latencies = attempt_latencies[: self._cfg.max_latency_samples]
             attempt_censored = attempt_censored[: self._cfg.max_latency_samples]
             attempt_service = attempt_service[: self._cfg.max_latency_samples]
+            attempt_service_censored = attempt_service_censored[: self._cfg.max_latency_samples]
             root_latencies = root_latencies[: self._cfg.max_latency_samples]
 
         return {
             "attempt_latencies_ms": attempt_latencies,
             "attempt_censored": attempt_censored,
             "attempt_service_ms": attempt_service,
+            "attempt_service_censored": attempt_service_censored,
             "root_latencies_ms": root_latencies,
         }
 

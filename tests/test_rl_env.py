@@ -568,6 +568,31 @@ class TestInstantRejectionSamples(unittest.TestCase):
         self.assertEqual(len(samples["attempt_latencies_ms"]), 1)
         self.assertAlmostEqual(samples["attempt_latencies_ms"][0], 20.0)
 
+    def test_service_stream_censors_deadline_cuts(self):
+        env = MicroservicesEnv(EnvConfig(build=_build_slow_failing_env, action_spec=SLOW_SPEC))
+        env.reset(seed=1)
+        cut = RootRequest()
+        cut.add_attempt(
+            Request(
+                service="svc",
+                interval=TimeInterval(begin=0, end=ms_to_ns(10)),
+                drop_reason=DropReason.DEADLINE,
+                service_time_ns=ms_to_ns(10),
+            )
+        )
+        ok = RootRequest()
+        ok.add_attempt(
+            Request(
+                service="svc",
+                interval=TimeInterval(begin=0, end=ms_to_ns(20)),
+                success=True,
+                service_time_ns=ms_to_ns(20),
+            )
+        )
+        samples = env._collect_latency_samples([cut, ok])
+        self.assertEqual(samples["attempt_service_ms"], [10.0, 20.0])
+        self.assertEqual(samples["attempt_service_censored"], [True, False])
+
 
 @unittest.skipIf(gymnasium is None, "gymnasium not installed")
 class TestDurationValidation(unittest.TestCase):

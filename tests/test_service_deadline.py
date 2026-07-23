@@ -59,6 +59,34 @@ class TestServiceTimeRecording(unittest.TestCase):
         # The second attempt's measured interval contains ~20 ms of queue wait.
         self.assertGreater(second.interval.end - second.interval.begin, ms_to_ns(35))
 
+    def test_timeout_records_occupancy_not_latent_service_time(self):
+        # A 100 ms latent draw cut by a 10 ms attempt deadline frees the worker
+        # at 10 ms; the recorded service time must be the ~10 ms of actual
+        # occupancy, not the latent 100 ms (which would corrupt utilization /
+        # Erlang-C moments downstream).
+        sim = Simulator(seed=1)
+        svc = ServiceRuntime(
+            cfg=ServiceConfig(
+                name="svc", latency_median=ms_to_ns(100), latency_lognorm_sigma=1e-6, workers=1
+            )
+        ).bind()
+        client = ClientRuntime(
+            cfg=ClientConfig(
+                retry=FixedBackoffRetryPolicy(max_attempts=1, delay=0),
+                timeout_controller=StaticTimeoutController(
+                    global_timeout=None, attempt_timeout=ms_to_ns(10)
+                ),
+            ),
+            service=svc,
+        )
+        client.start_request(sim)
+        sim.run()
+        (attempt,) = [a for root in client.roots for a in root.attempts]
+        assert attempt.service_time_ns is not None
+        self.assertEqual(attempt.drop_reason, DropReason.DEADLINE)
+        self.assertLess(attempt.service_time_ns, ms_to_ns(11))
+        self.assertEqual(svc.in_flight, 0)  # worker freed at the deadline
+
 
 if __name__ == "__main__":
     unittest.main()

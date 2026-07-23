@@ -177,7 +177,7 @@ class ServiceRuntime:
                 else begin_at + service_time
             )
 
-            finish_cb = partial(self._finish_service, sim, on_done, service_time, attempt_deadline)
+            finish_cb = partial(self._finish_service, sim, on_done, begin_at, attempt_deadline)
             sim.schedule(expiry, finish_cb)
         else:
             # Custom behavior can optionally release the worker early (for tandem queues)
@@ -209,7 +209,7 @@ class ServiceRuntime:
         self,
         sim: Simulator,
         on_done: Callable[[bool, TimeDuration, DropReason, int], None],
-        service_time: TimeDuration,  # Time spent handling the request, excluding any queuing
+        begin_at: TimePoint,
         attempt_deadline: TimePoint | None,
     ):
         success = True
@@ -221,7 +221,11 @@ class ServiceRuntime:
             if self._fails_now(sim.timestep, sim):
                 success = False
                 drop_reason = DropReason.SERVER_FAILURE
-        self._complete_attempt(sim, on_done, success, service_time, drop_reason)
+        # Report actual worker occupancy (queue-excluded): a deadline cut frees
+        # the worker at the deadline, so the latent sampled duration would
+        # overstate time spent serving and corrupt utilization-style consumers.
+        occupancy = sim.timestep - begin_at
+        self._complete_attempt(sim, on_done, success, occupancy, drop_reason)
 
     def _complete_attempt(
         self,
