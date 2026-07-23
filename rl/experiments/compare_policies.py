@@ -51,8 +51,6 @@ class ExperimentConfig:
     model_queue_delay_mode: str
     model_queue_workers: int
     model_queue_max_utilization: float
-    model_queue_moment_samples: int
-    model_queue_use_retries: bool
     bayes_buffer: int
     aimd_success_target: float
     aimd_deadline_target: float
@@ -295,8 +293,6 @@ def main() -> None:
     )
     parser.add_argument("--model-queue-workers", type=int, default=16)
     parser.add_argument("--model-queue-max-utilization", type=float, default=0.95)
-    parser.add_argument("--model-queue-moment-samples", type=int, default=500)
-    parser.add_argument("--model-queue-use-retries", action="store_true")
     parser.add_argument("--bayes-buffer", type=int, default=2000)
     parser.add_argument("--aimd-success-target", type=float, default=0.98)
     parser.add_argument("--aimd-deadline-target", type=float, default=0.01)
@@ -387,8 +383,6 @@ def main() -> None:
         model_queue_delay_mode=args.model_queue_delay_mode,
         model_queue_workers=args.model_queue_workers,
         model_queue_max_utilization=args.model_queue_max_utilization,
-        model_queue_moment_samples=args.model_queue_moment_samples,
-        model_queue_use_retries=args.model_queue_use_retries,
         bayes_buffer=args.bayes_buffer,
         aimd_success_target=args.aimd_success_target,
         aimd_deadline_target=args.aimd_deadline_target,
@@ -463,8 +457,6 @@ def main() -> None:
             queue_delay_mode=cfg.model_queue_delay_mode,
             queue_workers=cfg.model_queue_workers,
             queue_max_utilization=cfg.model_queue_max_utilization,
-            queue_moment_samples=cfg.model_queue_moment_samples,
-            use_retries_in_lambda=cfg.model_queue_use_retries,
             step_duration_s=cfg.step_duration_s,
             name="model_based_queue",
         )
