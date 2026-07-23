@@ -78,6 +78,17 @@ class TestExactNHPP(unittest.TestCase):
         times = self._arrival_times(seed=5, base_rps=0.0, spikes=[])
         self.assertEqual(times, [])
 
+    def test_stop_halts_future_arrivals(self):
+        sim = Simulator(seed=1)
+        times = []
+        wl = Workload(base_rps=100.0, duration_s=10, load_spikes=[], rng_seed=1)
+        wl.drive(sim, lambda s: times.append(s.timestep))
+        sim.run(until=s_to_ns(1))
+        wl.stop()
+        count_at_stop = len(times)
+        sim.run()
+        self.assertEqual(len(times), count_at_stop)
+
 
 class TestFractionalDuration(unittest.TestCase):
     def _times(self, duration_s):

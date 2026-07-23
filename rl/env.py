@@ -240,6 +240,10 @@ class MicroservicesEnv(_GymEnvBase):
 
         if terminated:
             self._horizon_root_count = self._last_root_idx
+            # The drain below completes IN-FLIGHT work only: halt the arrival
+            # process so a workload outliving the episode horizon cannot admit
+            # new post-horizon roots into the drained population.
+            self._require_workload().stop()
         # Drain in-flight work after the reward is computed: drained roots complete
         # past the episode horizon and must not be credited to the final action
         # (unless terminal_drain_penalty explicitly folds them in).

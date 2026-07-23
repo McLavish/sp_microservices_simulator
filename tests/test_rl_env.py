@@ -617,6 +617,26 @@ class TestInstantRejectionSamples(unittest.TestCase):
 
 
 @unittest.skipIf(gymnasium is None, "gymnasium not installed")
+class TestDrainAdmitsNoNewTraffic(unittest.TestCase):
+    def test_workload_outliving_the_horizon_is_halted_at_termination(self):
+        env = MicroservicesEnv(
+            EnvConfig(
+                build=lambda seed: _build_slow_failing_env(seed, duration_s=30.0),
+                action_spec=SLOW_SPEC,
+                step_duration_s=1.0,
+                episode_duration_s=1.0,
+            )
+        )
+        env.reset(seed=3)
+        obs, reward, terminated, truncated, info = env.step((1, 0, 0))
+        self.assertTrue(terminated)
+        client = env._require_client()
+        starts = [min(a.interval.begin for a in root.attempts) for root in client.roots]
+        self.assertGreater(len(starts), 10)
+        self.assertLess(max(starts), s_to_ns(1.0))  # drained roots are in-flight only
+
+
+@unittest.skipIf(gymnasium is None, "gymnasium not installed")
 class TestEpisodeTimeFraction(unittest.TestCase):
     def test_sub_second_episode_time_fraction_reaches_one(self):
         env = MicroservicesEnv(
