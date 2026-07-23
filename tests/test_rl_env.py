@@ -617,6 +617,24 @@ class TestInstantRejectionSamples(unittest.TestCase):
 
 
 @unittest.skipIf(gymnasium is None, "gymnasium not installed")
+class TestEpisodeTimeFraction(unittest.TestCase):
+    def test_sub_second_episode_time_fraction_reaches_one(self):
+        env = MicroservicesEnv(
+            EnvConfig(
+                build=lambda seed: _build_slow_failing_env(seed, duration_s=0.4),
+                action_spec=SLOW_SPEC,
+                step_duration_s=0.2,
+                episode_duration_s=0.4,
+            )
+        )
+        obs, info = env.reset(seed=1)
+        terminated = truncated = False
+        while not (terminated or truncated):
+            obs, reward, terminated, truncated, info = env.step((0, 0, 0))
+        self.assertAlmostEqual(float(obs[-1]), 1.0, places=5)
+
+
+@unittest.skipIf(gymnasium is None, "gymnasium not installed")
 class TestDurationValidation(unittest.TestCase):
     def test_zero_step_duration_rejected(self):
         with self.assertRaises(ValueError):

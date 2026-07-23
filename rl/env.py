@@ -434,9 +434,15 @@ class MicroservicesEnv(_GymEnvBase):
         if len(self._action_sizes) > 3:
             features.append(idx_frac(3))
         time_s = ns_to_s(self._current_time_ns)
-        features.append(
-            time_s / max(1.0, self._cfg.episode_duration_s or self._require_workload().duration_s)
+        episode_s = (
+            self._cfg.episode_duration_s
+            if self._cfg.episode_duration_s is not None
+            else self._require_workload().duration_s
         )
+        # Durations are validated positive; the epsilon only guards a
+        # zero-duration workload fallback. No 1.0 floor: sub-second episodes
+        # must still normalize to [0, 1].
+        features.append(time_s / max(1e-9, episode_s))
         return np.array(features, dtype=np.float32)
 
     def _collect_latency_samples(self, roots) -> dict[str, list]:
