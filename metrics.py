@@ -1,4 +1,3 @@
-import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -269,10 +268,17 @@ class Metrics:
         out["total_failure"] = out["failure_root"].cumsum()
         out = pd.concat([out, lat_stats], axis=1)[columns]
         # %.3f is fine for millisecond latency columns but collapses sub-ms
-        # bucket timestamps; format the timepoint with granularity-aware
-        # precision (as strings, so float_format leaves it alone).
-        decimals = (
-            3 if bucket_ns >= S_TO_NS else max(3, math.ceil(-math.log10(bucket_ns / S_TO_NS)))
-        )
+        # bucket timestamps; format the timepoint with enough decimals to
+        # represent the bucket width exactly (bucket_ns is an integer, so the
+        # required precision is 9 minus its trailing decimal zeros — e.g.
+        # 1.5 ms = 1_500_000 ns needs 4 decimals, not ceil(-log10) = 3).
+        decimals = 3
+        if bucket_ns < S_TO_NS:
+            digits = 9
+            b = bucket_ns
+            while b % 10 == 0:
+                b //= 10
+                digits -= 1
+            decimals = max(3, digits)
         out["timepoint"] = [f"{v:.{decimals}f}" for v in out["timepoint"]]
         out.to_csv(path, index=False, float_format="%.3f", na_rep="nan", lineterminator="\r\n")

@@ -146,6 +146,19 @@ class TestExportGranularity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
             self._metrics().export_csv(str(Path(tmp) / "out.csv"), granularity_s=1e-10)
 
+    def test_non_decimal_granularity_keeps_exact_timepoints(self):
+        # 1.5 ms buckets need FOUR decimals; rounding to three would serialize
+        # alternating 1/2 ms gaps and corrupt downstream width inference.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "out.csv")
+            self._metrics().export_csv(path, granularity_s=0.0015)
+            import pandas as pd
+
+            df = pd.read_csv(path)
+            self.assertEqual(df["timepoint"].nunique(), len(df))
+            widths = df["timepoint"].diff().dropna().round(9).unique()
+            self.assertEqual(list(widths), [0.0015])
+
     def test_sub_millisecond_buckets_keep_distinct_timepoints(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "out.csv")

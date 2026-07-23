@@ -10,6 +10,7 @@ def _bucket_width_s(df) -> float:
         width = float(df["timepoint"].diff().median())
         if width > 0:
             return width
+    print("warning: single-bucket CSV, cannot infer bucket width; assuming 1.0 s (QPS = count)")
     return 1.0
 
 
