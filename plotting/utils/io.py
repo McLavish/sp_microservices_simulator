@@ -6,19 +6,21 @@ import pandas as pd
 
 
 def load_metrics(csv_file: str) -> pd.DataFrame:
-    """Load a metrics CSV, sorted by time and trimmed to the experiment window.
+    """Load a metrics CSV, sorted by time and trimmed of the idle tail.
 
-    Experiments drain in-flight work after the measured window (``sim.run()``
-    with no ``until``), which appends trailing buckets in which no new roots
-    started (``root_requests == 0``). Those drain-phase rows are dropped so the
-    plot ends at the experiment's end time. This replaces the old positional
-    ``df[:-1]`` slice, which only ever removed a single trailing bucket.
+    Trailing buckets with NO activity at all (no starts and no completions)
+    are dropped. Buckets that only contain completions are kept: a request
+    starting in one bucket and completing in the next carries real
+    completion/latency data even when nothing new started there — trimming by
+    ``root_requests`` alone (the previous rule) silently discarded it.
     """
     df = pd.read_csv(csv_file).sort_values(by="timepoint").reset_index(drop=True)
     if "root_requests" in df.columns and len(df):
-        started = df["root_requests"].to_numpy()
-        last = len(started) - 1
-        while last >= 0 and started[last] == 0:
+        activity = df["root_requests"].to_numpy()
+        if "completed" in df.columns:
+            activity = activity + df["completed"].to_numpy()
+        last = len(activity) - 1
+        while last >= 0 and activity[last] == 0:
             last -= 1
         df = df.iloc[: last + 1]
     return df
