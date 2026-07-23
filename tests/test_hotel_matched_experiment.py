@@ -252,6 +252,20 @@ def test_config_profile_faults_override_wins():
     assert _effective_profile_faults(cfg, {"fault_scenario": []}) == [(1.0, 2.0, 3.0, 0.4)]
 
 
+def test_fractional_duration_changes_traffic(tmp_path):
+    def total_roots(duration_s, out):
+        outputs = run_hotel_matched(
+            HotelMatchedConfig(
+                output_dir=tmp_path / out, base_rps=50.0, duration_s=duration_s, seed=7
+            )
+        )
+        rows = _read_rows(outputs["root_csv"])
+        return sum(int(row["root_requests"]) for row in rows)
+
+    # Pre-fix, 0.4 s was ceil-rounded to 1 s and produced identical traffic.
+    assert total_roots(0.4, "short") < total_roots(1.0, "full")
+
+
 def test_fraction_bounds():
     assert _fraction("0.25") == 0.25
     for bad in ("1.5", "-0.5", "nan"):
