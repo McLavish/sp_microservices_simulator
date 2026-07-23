@@ -1,4 +1,3 @@
-import math
 import tempfile
 import unittest
 import warnings
@@ -8,7 +7,6 @@ import numpy as np
 
 from rl.env import ActionSpec, RewardWeights
 from rl.model_io import check_action_spec, save_action_spec
-from rl.models.lognormal import LogNormalModel
 from rl.policies.action_space import ActionGrid
 from rl.policies.aimd import AIMDPolicy
 from rl.policies.bayesian import BayesianPolicy
@@ -70,31 +68,40 @@ class TestRLPolicies(unittest.TestCase):
         self.assertIn(action, self.grid.indices)
 
     def test_queue_delay_matches_mm1_closed_form(self):
-        # Lognormal with E[S] = 1 ms and E[S^2] = 2 ms^2 (CV^2 = 1, the
-        # exponential moments), lambda = 0.5/ms, c = 1: the Allen-Cunneen
-        # approximation must reduce to the exact M/M/1 result
+        # Service moments with E[S] = 1 ms and E[S^2] = 2 ms^2 (CV^2 = 1, the
+        # exponential moments), lambda = 0.5/ms from the attempt stream, c = 1:
+        # the Allen-Cunneen approximation must reduce to the exact M/M/1 result
         # Wq = rho / (1 - rho) * E[S] = 1.0 ms.
         policy = ModelBasedPolicy(
             grid=self.grid,
             include_queue_delay=True,
             queue_workers=1,
             step_duration_s=1.0,
-            use_retries_in_lambda=False,
         )
-        model = LogNormalModel(mu=-math.log(2) / 2, sigma=math.sqrt(math.log(2)))
-        info = {"summary": {"completed": 500, "retries_per_root": 0.0}}
-        wq = policy._estimate_queue_delay(info, model)
+        policy._service_buffer.add([0.0, 2.0] * 250)  # mean 1, mean-square 2
+        wq = policy._estimate_queue_delay({"attempt_latencies_ms": [1.0] * 500})
         self.assertAlmostEqual(wq, 1.0, places=9)
 
-    def test_queue_delay_zero_without_traffic(self):
+    def test_queue_delay_lambda_comes_from_the_sampled_attempt_stream(self):
+        # In chain scenarios the samples describe the B->C edge; using
+        # top-level window completions for lambda underestimates the modeled
+        # queue's arrival rate by the whole retry amplification.
         policy = ModelBasedPolicy(
-            grid=self.grid,
-            include_queue_delay=True,
-            queue_workers=1,
+            grid=self.grid, include_queue_delay=True, queue_workers=1, step_duration_s=1.0
         )
-        model = LogNormalModel(mu=0.0, sigma=0.5)
-        self.assertEqual(policy._estimate_queue_delay({"summary": {"completed": 0}}, model), 0.0)
-        self.assertEqual(policy._estimate_queue_delay({}, model), 0.0)
+        policy._service_buffer.add([0.0, 2.0] * 250)
+        light = policy._estimate_queue_delay(
+            {"attempt_latencies_ms": [1.0] * 100, "summary": {"completed": 100.0}}
+        )
+        heavy = policy._estimate_queue_delay(
+            {"attempt_latencies_ms": [1.0] * 800, "summary": {"completed": 100.0}}
+        )
+        self.assertGreater(heavy, light)  # summary-based lambda would tie these
+
+    def test_queue_delay_zero_without_traffic(self):
+        policy = ModelBasedPolicy(grid=self.grid, include_queue_delay=True, queue_workers=1)
+        self.assertEqual(policy._estimate_queue_delay({"attempt_latencies_ms": []}), 0.0)
+        self.assertEqual(policy._estimate_queue_delay({}), 0.0)
 
     def test_bayesian_policy_act(self):
         policy = BayesianPolicy(
@@ -198,6 +205,25 @@ class TestServiceMoments(unittest.TestCase):
         self.assertAlmostEqual(mean_s, 20.0)
         self.assertAlmostEqual(mean_s2, 400.0)
 
+    def test_queue_variant_fits_service_stream_not_totals(self):
+        # Double-count guard: with include_queue_delay the latency model must
+        # be fitted on queue-exclusive service times (queue wait is added back
+        # via Erlang-C); the plain variant keeps fitting end-to-end totals.
+        info = {
+            "attempt_latencies_ms": [40.0] * 50,
+            "attempt_censored": [False] * 50,
+            "attempt_service_ms": [20.0] * 50,
+            "attempt_service_censored": [False] * 50,
+            "summary": {"completed": 50.0, "retries_per_root": 0.0},
+        }
+        grid = ActionGrid(ActionSpec(attempt_timeout_ms=[50], max_attempts=[1], backoff_ms=[0]))
+        queue_policy = ModelBasedPolicy(grid=grid, include_queue_delay=True)
+        queue_policy.act(np.zeros(1), info)
+        self.assertAlmostEqual(float(queue_policy._fit_buffer().data().mean()), 20.0)
+        plain_policy = ModelBasedPolicy(grid=grid)
+        plain_policy.act(np.zeros(1), info)
+        self.assertAlmostEqual(float(plain_policy._fit_buffer().data().mean()), 40.0)
+
 
 class TestTraceTimeAxis(unittest.TestCase):
     def test_uses_step_duration_column(self):
@@ -269,6 +295,22 @@ class TestActionSpecSidecar(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 check_action_spec(path, mutated)
+
+    def test_sidecar_survives_sb3_implicit_zip_extension(self):
+        # SB3 save("model") writes model.zip; load("model.zip") must find the
+        # sidecar written at save time regardless of which form was used.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = str(Path(tmp) / "model")
+            save_action_spec(base, self.spec, step_duration_s=1.0)
+            check_action_spec(base + ".zip", self.spec)  # no raise, no warn-skip
+            mutated = ActionSpec(
+                attempt_timeout_ms=[30, 10],
+                max_attempts=[1, 2],
+                backoff_ms=[0, 20],
+                global_timeout_ms=[500, None],
+            )
+            with self.assertRaises(ValueError):
+                check_action_spec(base + ".zip", mutated)
 
     def test_missing_sidecar_warns(self):
         with tempfile.TemporaryDirectory() as tmp:

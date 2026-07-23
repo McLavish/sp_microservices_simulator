@@ -178,6 +178,28 @@ class TestFinalizeExactlyOnce(unittest.TestCase):
             sim.run()
         self.assertGreaterEqual(svc.in_flight, 0)
 
+    def test_release_worker_after_finalize_raises(self):
+        # finalize() on the unreleased path already returns the worker; a
+        # subsequent release_worker() would decrement in_flight a second time.
+        sim = Simulator(seed=1)
+        svc = ServiceRuntime(
+            cfg=ServiceConfig(
+                name="svc", latency_median=ms_to_ns(10), latency_lognorm_sigma=1e-6, workers=1
+            )
+        ).bind()
+
+        def behavior(service, sim2, deadline, finalize, begin_at, release_worker):
+            def finish():
+                finalize(True, ms_to_ns(5), DropReason.NONE)
+                release_worker()  # bug: worker already released via finalize
+
+            sim2.schedule(begin_at + ms_to_ns(5), finish)
+
+        svc.submit_attempt(sim, lambda *a: None, behavior=behavior)
+        with self.assertRaises(RuntimeError):
+            sim.run()
+        self.assertGreaterEqual(svc.in_flight, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

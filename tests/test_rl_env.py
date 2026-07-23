@@ -568,6 +568,91 @@ class TestInstantRejectionSamples(unittest.TestCase):
         self.assertEqual(len(samples["attempt_latencies_ms"]), 1)
         self.assertAlmostEqual(samples["attempt_latencies_ms"][0], 20.0)
 
+    def test_service_stream_censors_deadline_cuts(self):
+        env = MicroservicesEnv(EnvConfig(build=_build_slow_failing_env, action_spec=SLOW_SPEC))
+        env.reset(seed=1)
+        cut = RootRequest()
+        cut.add_attempt(
+            Request(
+                service="svc",
+                interval=TimeInterval(begin=0, end=ms_to_ns(10)),
+                drop_reason=DropReason.DEADLINE,
+                service_time_ns=ms_to_ns(10),
+            )
+        )
+        ok = RootRequest()
+        ok.add_attempt(
+            Request(
+                service="svc",
+                interval=TimeInterval(begin=0, end=ms_to_ns(20)),
+                success=True,
+                service_time_ns=ms_to_ns(20),
+            )
+        )
+        samples = env._collect_latency_samples([cut, ok])
+        self.assertEqual(samples["attempt_service_ms"], [10.0, 20.0])
+        self.assertEqual(samples["attempt_service_censored"], [True, False])
+
+    def test_summarize_tied_final_attempts_use_completion_order(self):
+        env = MicroservicesEnv(EnvConfig(build=_build_slow_failing_env, action_spec=SLOW_SPEC))
+        env.reset(seed=1)
+        root = RootRequest()
+        root.add_attempt(
+            Request(
+                service="svc",
+                interval=TimeInterval(begin=0, end=ms_to_ns(1)),
+                drop_reason=DropReason.SERVER_FAILURE,
+            )
+        )
+        root.add_attempt(
+            Request(
+                service="svc",
+                interval=TimeInterval(begin=ms_to_ns(1), end=ms_to_ns(1)),
+                drop_reason=DropReason.QUEUE_FULL,
+            )
+        )
+        summary = env._summarize_roots([root])
+        self.assertEqual(summary["queue_drop_rate"], 1.0)
+        self.assertEqual(summary["server_drop_rate"], 0.0)
+
+
+@unittest.skipIf(gymnasium is None, "gymnasium not installed")
+class TestDrainAdmitsNoNewTraffic(unittest.TestCase):
+    def test_workload_outliving_the_horizon_is_halted_at_termination(self):
+        env = MicroservicesEnv(
+            EnvConfig(
+                build=lambda seed: _build_slow_failing_env(seed, duration_s=30.0),
+                action_spec=SLOW_SPEC,
+                step_duration_s=1.0,
+                episode_duration_s=1.0,
+            )
+        )
+        env.reset(seed=3)
+        obs, reward, terminated, truncated, info = env.step((1, 0, 0))
+        self.assertTrue(terminated)
+        client = env._require_client()
+        starts = [min(a.interval.begin for a in root.attempts) for root in client.roots]
+        self.assertGreater(len(starts), 10)
+        self.assertLess(max(starts), s_to_ns(1.0))  # drained roots are in-flight only
+
+
+@unittest.skipIf(gymnasium is None, "gymnasium not installed")
+class TestEpisodeTimeFraction(unittest.TestCase):
+    def test_sub_second_episode_time_fraction_reaches_one(self):
+        env = MicroservicesEnv(
+            EnvConfig(
+                build=lambda seed: _build_slow_failing_env(seed, duration_s=0.4),
+                action_spec=SLOW_SPEC,
+                step_duration_s=0.2,
+                episode_duration_s=0.4,
+            )
+        )
+        obs, info = env.reset(seed=1)
+        terminated = truncated = False
+        while not (terminated or truncated):
+            obs, reward, terminated, truncated, info = env.step((0, 0, 0))
+        self.assertAlmostEqual(float(obs[-1]), 1.0, places=5)
+
 
 @unittest.skipIf(gymnasium is None, "gymnasium not installed")
 class TestDurationValidation(unittest.TestCase):

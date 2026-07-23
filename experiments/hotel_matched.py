@@ -89,7 +89,7 @@ def run_hotel_matched(config: HotelMatchedConfig) -> dict[str, str]:
         leaf_max_attempts=config.leaf_max_attempts,
     )
 
-    duration_s = int(math.ceil(config.duration_s))
+    duration_s = config.duration_s  # Workload accepts fractional seconds; no rounding
     recommendation_rps = config.base_rps * config.recommendation_fraction
     hotels_rps = config.base_rps - recommendation_rps
     sim_load_spikes = [

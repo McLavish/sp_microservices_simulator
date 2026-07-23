@@ -83,7 +83,10 @@ class EnvConfig:
     # Fold drained-root outcomes into the final step's reward. Default off:
     # the windowed objective is the documented design and keeps trained
     # behavior comparable with the pinned paper data; turning it on removes
-    # the defer-failures-past-the-horizon incentive for future studies.
+    # the bulk of the defer-failures-past-the-horizon incentive for future
+    # studies. A small boundary residual (~ one drained-tail window weight)
+    # remains because in-horizon windows are rate-scored while the drain is
+    # count-weighted — see docs/rl.md.
     terminal_drain_penalty: bool = False
 
 
@@ -201,6 +204,7 @@ class MicroservicesEnv(_GymEnvBase):
                     "attempt_latencies_ms": [],
                     "attempt_censored": [],
                     "attempt_service_ms": [],
+                    "attempt_service_censored": [],
                     "root_latencies_ms": [],
                 }
             )
@@ -239,6 +243,10 @@ class MicroservicesEnv(_GymEnvBase):
 
         if terminated:
             self._horizon_root_count = self._last_root_idx
+            # The drain below completes IN-FLIGHT work only: halt the arrival
+            # process so a workload outliving the episode horizon cannot admit
+            # new post-horizon roots into the drained population.
+            self._require_workload().stop()
         # Drain in-flight work after the reward is computed: drained roots complete
         # past the episode horizon and must not be credited to the final action
         # (unless terminal_drain_penalty explicitly folds them in).
@@ -359,7 +367,8 @@ class MicroservicesEnv(_GymEnvBase):
                 end = max(a.interval.end for a in root.attempts)
                 latencies.append(end - begin)
             else:
-                last_attempt = max(root.attempts, key=lambda a: a.interval.end)
+                # Append order is completion order (ties on end time are ambiguous).
+                last_attempt = root.attempts[-1]
                 if last_attempt.drop_reason == DropReason.DEADLINE:
                     deadline_drops += 1
                 elif last_attempt.drop_reason == DropReason.QUEUE_FULL:
@@ -432,15 +441,22 @@ class MicroservicesEnv(_GymEnvBase):
         if len(self._action_sizes) > 3:
             features.append(idx_frac(3))
         time_s = ns_to_s(self._current_time_ns)
-        features.append(
-            time_s / max(1.0, self._cfg.episode_duration_s or self._require_workload().duration_s)
+        episode_s = (
+            self._cfg.episode_duration_s
+            if self._cfg.episode_duration_s is not None
+            else self._require_workload().duration_s
         )
+        # Durations are validated positive; the epsilon only guards a
+        # zero-duration workload fallback. No 1.0 floor: sub-second episodes
+        # must still normalize to [0, 1].
+        features.append(time_s / max(1e-9, episode_s))
         return np.array(features, dtype=np.float32)
 
     def _collect_latency_samples(self, roots) -> dict[str, list]:
         attempt_latencies = []
         attempt_censored = []
         attempt_service = []
+        attempt_service_censored = []
         root_latencies = []
 
         for root in roots:
@@ -464,17 +480,22 @@ class MicroservicesEnv(_GymEnvBase):
                 attempt_censored.append(attempt.drop_reason == DropReason.DEADLINE)
                 if attempt.service_time_ns is not None:
                     attempt_service.append(ns_to_ms(attempt.service_time_ns))
+                    # Deadline cuts truncate service occupancy at the deadline:
+                    # a right-censored observation of the latent service demand.
+                    attempt_service_censored.append(attempt.drop_reason == DropReason.DEADLINE)
 
         if self._cfg.max_latency_samples is not None:
             attempt_latencies = attempt_latencies[: self._cfg.max_latency_samples]
             attempt_censored = attempt_censored[: self._cfg.max_latency_samples]
             attempt_service = attempt_service[: self._cfg.max_latency_samples]
+            attempt_service_censored = attempt_service_censored[: self._cfg.max_latency_samples]
             root_latencies = root_latencies[: self._cfg.max_latency_samples]
 
         return {
             "attempt_latencies_ms": attempt_latencies,
             "attempt_censored": attempt_censored,
             "attempt_service_ms": attempt_service,
+            "attempt_service_censored": attempt_service_censored,
             "root_latencies_ms": root_latencies,
         }
 

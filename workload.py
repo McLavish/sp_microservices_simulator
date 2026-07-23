@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from core import TimePoint, ns_to_s, s_to_ns
 from fault_events import FaultEventsTracker
 from faults import LoadSpike
-from simulator import Simulator
+from simulator import Event, Simulator
 
 
 @dataclass
@@ -15,6 +15,7 @@ class Workload:
     load_spikes: list[LoadSpike]
     rng_seed: int | None = None
     _rng: random.Random = field(init=False, repr=False)
+    _next_event: Event | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self):
         # rng_seed=None falls back to seed 0 for cross-experiment determinism; pass an int explicitly to vary.
@@ -74,7 +75,9 @@ class Workload:
             nxt = self._next_arrival_after(from_t, end_at)
             if nxt is not None:
                 # Keep the historical 1 ns minimum interarrival clamp.
-                sim.schedule(max(nxt, from_t + 1), arrive)
+                self._next_event = sim.schedule(max(nxt, from_t + 1), arrive)
+            else:
+                self._next_event = None
 
         def arrive():
             if sim.timestep >= end_at:
@@ -83,3 +86,14 @@ class Workload:
             schedule_next(sim.timestep)
 
         schedule_next(0)
+
+    def stop(self) -> None:
+        """Cancel the pending arrival: no further arrivals are generated.
+
+        Used by the RL env at the episode horizon so the terminal drain only
+        completes in-flight work instead of admitting post-horizon traffic
+        when the workload's own duration outlives the episode.
+        """
+        if self._next_event is not None:
+            self._next_event.cancelled = True
+            self._next_event = None

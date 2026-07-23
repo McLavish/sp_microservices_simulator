@@ -25,9 +25,11 @@ SB3 recommends CPU for small MLP policies; `--device` defaults to `auto`.
 `MicroservicesEnv` wraps a **build function** (which constructs a fresh
 `Simulator` + `Workload` + `ClientRuntime` and a knob applicator) into a Gym env.
 Each `step()` advances the sim by `step_duration_s` and summarizes the roots that
-completed in that window. On episode end, in-flight work is drained *after* the
-final reward and reported under `info["drained_summary"]` so the last action is not
-credited with the tail. Two accounting notes:
+completed in that window. On episode end, the arrival process is halted
+(`Workload.stop()`) and in-flight work is drained *after* the final reward,
+reported under `info["drained_summary"]` so the last action is not credited with
+the tail — drained roots are strictly in-flight work, even when the builder's
+workload duration outlives `episode_duration_s`. Accounting notes:
 
 - **Populations.** `metrics_summary()` covers *all* roots including drained ones;
   `in_horizon_summary()` covers only roots completed before the horizon — the
@@ -35,15 +37,22 @@ credited with the tail. Two accounting notes:
   (`success_rate`/`p95_ms` = full population, `*_in_horizon` = reward-visible).
 - **`terminal_drain_penalty`** (default off) folds drained-root outcomes into the
   final step's reward, weighted by how many average-sized step windows the
-  drained population represents. It removes the incentive to defer failures past
-  the horizon; leave it off to reproduce results trained without it.
+  drained population represents. It removes the bulk of the incentive to defer
+  failures past the horizon; a small boundary residual remains (roughly one
+  drained-tail window weight, ~2% of J in the slow-failure repro) because
+  in-horizon windows are rate-scored while the drain is count-weighted — fully
+  removing it would require count-weighting every window, i.e. a different
+  objective. Leave the flag off to reproduce results trained without it.
 - **Latency samples** (`info["attempt_latencies_ms"]`, `attempt_censored`,
-  `attempt_service_ms`) come from the knob-actuated client — the B->C edge
-  (`cost_client`) in chain scenarios, the top-level client otherwise — so
-  latency-based policies fit the distribution their knobs actually control.
-  `attempt_service_ms` is queue-exclusive service time (used by
-  `model_based_queue` for Erlang-C moments); instant rejections
-  (queue-full/circuit-open) emit no latency samples.
+  `attempt_service_ms`, `attempt_service_censored`) come from the knob-actuated
+  client — the B->C edge (`cost_client`) in chain scenarios, the top-level
+  client otherwise — so latency-based policies fit the distribution their knobs
+  actually control. `attempt_service_ms` records actual worker occupancy
+  (queue-excluded; deadline cuts are flagged censored). `model_based_queue`
+  fits its latency model on that stream, derives Erlang-C moments from it, and
+  takes its arrival rate from the sampled attempt count — fitting
+  queue-inclusive totals and adding the Erlang-C wait would double-count
+  queueing. Instant rejections (queue-full/circuit-open) emit no samples.
 
 Unseeded `reset()` draws a fresh build seed from the gym RNG. This matters: SB3
 vector envs only seed the *first* reset, so builders must never fall back to fixed

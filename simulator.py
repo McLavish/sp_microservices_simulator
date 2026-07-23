@@ -52,4 +52,6 @@ class Simulator:
             self.timestep = ev.at
             ev.action()
         if until is not None:
-            self.timestep = int(until)
+            # max: a nested run() inside an event may already have advanced
+            # the clock past `until`; never move time backwards.
+            self.timestep = max(self.timestep, int(until))

@@ -147,29 +147,40 @@ class ModelBasedPolicy:
     queue_delay_mode: str = "deterministic"
     queue_workers: int = 16
     queue_max_utilization: float = 0.95
-    queue_moment_samples: int = 500
-    use_retries_in_lambda: bool = True
     step_duration_s: float = 1.0
     name: str = "model_based"
 
     def __post_init__(self):
         self._buffer = LatencyBuffer(self.buffer_size)
-        self._service_samples: list[float] = []
+        self._service_buffer = LatencyBuffer(self.buffer_size)
         self._rng = np.random.default_rng(123)
 
     def reset(self, seed: int | None = None) -> None:
         self._buffer = LatencyBuffer(self.buffer_size)
-        self._service_samples = []
+        self._service_buffer = LatencyBuffer(self.buffer_size)
         if seed is not None:
             self._rng = np.random.default_rng(seed)
+
+    def _fit_buffer(self) -> LatencyBuffer:
+        """Which stream the latency model is fitted on.
+
+        The queue-aware variant decomposes attempt latency into service time
+        plus Erlang-C queueing delay, so it must fit the queue-exclusive
+        SERVICE stream — fitting queue-inclusive totals and then adding the
+        queueing estimate again would double-count queueing. The plain variant
+        models end-to-end totals directly.
+        """
+        return self._service_buffer if self.include_queue_delay else self._buffer
 
     def act(self, obs: np.ndarray, info: dict) -> tuple[int, ...]:
         self._buffer.ingest_info(info)
         service = [float(v) for v in info.get("attempt_service_ms", [])]
         if service:
-            self._service_samples.extend(service)
-            self._service_samples = self._service_samples[-self.buffer_size :]
-        values, censored = self._buffer.censored_data()
+            flags = [bool(f) for f in info.get("attempt_service_censored", [])]
+            if len(flags) != len(service):
+                flags = [False] * len(service)
+            self._service_buffer.add(service, flags)
+        values, censored = self._fit_buffer().censored_data()
         uncensored = values[~censored]
         uncensored = uncensored[uncensored > 0]
         if uncensored.size == 0:
@@ -183,7 +194,7 @@ class ModelBasedPolicy:
             # Model without censored-MLE support: fall back to uncensored
             # samples only (biased optimistic when timeouts are frequent).
             base_model = base_model.fit(uncensored)
-        queue_delay = self._estimate_queue_delay(info, base_model)
+        queue_delay = self._estimate_queue_delay(info)
         best_idx = self.grid.indices[0]
         best_value = -float("inf")
 
@@ -207,8 +218,13 @@ class ModelBasedPolicy:
         return
 
     def _service_moments(self) -> tuple[float, float, int]:
-        """Mean / mean-square / count of buffered queue-exclusive service times."""
-        service = np.asarray(self._service_samples, dtype=np.float64)
+        """Mean / mean-square / count of buffered service-occupancy times.
+
+        Censored (deadline-cut) samples are included at their observed value:
+        occupancy is occupancy — utilization is driven by the time workers were
+        actually held, not by the latent demand.
+        """
+        service, _ = self._service_buffer.censored_data()
         if service.size == 0:
             return 0.0, 0.0, 0
         return (
@@ -217,43 +233,27 @@ class ModelBasedPolicy:
             int(service.size),
         )
 
-    def _estimate_queue_delay(self, info: dict, model: LatencyModel) -> float:
+    def _estimate_queue_delay(self, info: dict) -> float:
         """Expected queueing delay in ms via the Allen-Cunneen M/G/c approximation:
 
         Wq(M/G/c) ~= Wq(M/M/c) * (1 + CV_s^2) / 2,  Wq(M/M/c) from Erlang C.
 
-        The latency model is fitted on millisecond samples, so the arrival rate
-        must be per millisecond as well.
+        The moments are in milliseconds, so the arrival rate is per millisecond.
         """
         if not self.include_queue_delay:
             return 0.0
-        summary = info.get("summary")
-        if not summary:
+        # Lambda = arrivals at the MODELED service: the sampled client's
+        # per-window attempt count (retries included by construction). Using
+        # top-level window completions would undercount the modeled queue's
+        # arrivals by the whole retry amplification in chain scenarios.
+        attempt_count = len(info.get("attempt_latencies_ms") or [])
+        if attempt_count <= 0 or self.step_duration_s <= 0:
             return 0.0
-        completed = float(summary.get("completed", 0.0))
-        if completed <= 0 or self.step_duration_s <= 0:
-            return 0.0
+        lambda_per_ms = attempt_count / (float(self.step_duration_s) * 1000.0)
 
-        lambda_per_ms = completed / (float(self.step_duration_s) * 1000.0)
-        if self.use_retries_in_lambda:
-            lambda_per_ms *= 1.0 + float(summary.get("retries_per_root", 0.0))
-
-        # Erlang-C needs SERVICE-time moments; attempt intervals include queue
-        # wait, so deriving moments from the fitted total-latency model would
-        # double-count queueing. Fall back to the model only while the service
-        # stream is still empty (legacy info dicts / cold start).
         mean_s, mean_s2, count = self._service_moments()
-        if count < 10:
-            moments_fn = getattr(model, "moments", None)
-            if callable(moments_fn):
-                mean_s, mean_s2 = (float(m) for m in moments_fn())
-            else:
-                sample_count = max(10, int(self.queue_moment_samples))
-                samples = model.sample(self._rng, sample_count)
-                mean_s = float(np.mean(samples))
-                mean_s2 = float(np.dot(samples, samples) / samples.size)
-        if mean_s <= 0:
-            return 0.0
+        if count < 10 or mean_s <= 0:
+            return 0.0  # cold start: no reliable occupancy stream yet
 
         workers = max(1, int(self.queue_workers))
         rho = min((lambda_per_ms * mean_s) / workers, self.queue_max_utilization)

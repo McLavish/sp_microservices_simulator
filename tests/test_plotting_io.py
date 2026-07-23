@@ -19,6 +19,26 @@ class TestQpsBucketWidth(unittest.TestCase):
         self.assertEqual(_bucket_width_s(df), 1.0)
 
 
+class TestLoadMetricsTrim(unittest.TestCase):
+    def test_completion_only_final_bucket_is_kept(self):
+        df = pd.DataFrame(
+            {
+                "timepoint": [0.0, 1.0, 2.0],
+                "root_requests": [5, 0, 0],
+                "completed": [0, 5, 0],
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.csv")
+            df.to_csv(path, index=False)
+            from plotting.utils.io import load_metrics
+
+            out = load_metrics(path)
+        # The idle bucket at t=2 is trimmed; the completion-only bucket at t=1
+        # carries real latency/failure data and must survive.
+        self.assertEqual(list(out["timepoint"]), [0.0, 1.0])
+
+
 class TestHeaderOnlyCsv(unittest.TestCase):
     def _header_only_csv(self, tmp):
         path = os.path.join(tmp, "empty.csv")

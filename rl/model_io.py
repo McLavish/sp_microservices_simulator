@@ -18,8 +18,15 @@ from rl.spec import ActionSpec
 SIDECAR_SUFFIX = ".spec.json"
 
 
+def _model_zip_path(model_path: str) -> str:
+    """SB3 save/load append '.zip' when absent; key the sidecar on the real file
+    so save("model") and load("model.zip") resolve the same sidecar."""
+    path = str(model_path)
+    return path if path.endswith(".zip") else path + ".zip"
+
+
 def sidecar_path(model_path: str) -> str:
-    return str(model_path) + SIDECAR_SUFFIX
+    return _model_zip_path(model_path) + SIDECAR_SUFFIX
 
 
 def save_action_spec(

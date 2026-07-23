@@ -98,8 +98,8 @@ class ServiceNodeRuntime:
                 def downstream_drop_reason(_root) -> DropReason:
                     if not _root.attempts:
                         return DropReason.SERVER_FAILURE
-                    last_attempt = max(_root.attempts, key=lambda a: a.interval.end)
-                    return last_attempt.drop_reason
+                    # Append order is completion order (ties on end time are ambiguous).
+                    return _root.attempts[-1].drop_reason
 
                 deadline_event = None
 
