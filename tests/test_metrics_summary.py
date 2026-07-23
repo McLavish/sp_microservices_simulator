@@ -86,6 +86,42 @@ class TestMetricsSummary(unittest.TestCase):
         self.assertEqual(rows[0]["timepoint"], "5.000")
 
 
+class TestTiedFinalAttempts(unittest.TestCase):
+    def test_tied_final_attempts_use_completion_order(self):
+        # Zero-backoff retry rejected synchronously: SERVER_FAILURE at t, then
+        # QUEUE_FULL with begin == end == t. Both attempts end at the same
+        # nanosecond; the true final outcome is the last APPENDED attempt, and
+        # summary and CSV export must agree on it.
+        root = RootRequest(
+            attempts=[
+                Request(
+                    service="svc",
+                    interval=TimeInterval(begin=0, end=s_to_ns(1)),
+                    success=False,
+                    drop_reason=DropReason.SERVER_FAILURE,
+                ),
+                Request(
+                    service="svc",
+                    interval=TimeInterval(begin=s_to_ns(1), end=s_to_ns(1)),
+                    success=False,
+                    drop_reason=DropReason.QUEUE_FULL,
+                ),
+            ]
+        )
+        metrics = Metrics(roots=[root], attempts_total=2)
+        summary = metrics.summary()
+        self.assertEqual(summary.dropped_queue, 1)
+        self.assertEqual(summary.dropped_server_failure, 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "tied.csv")
+            metrics.export_csv(path)
+            with open(path, newline="") as f:
+                rows = list(csv.DictReader(f))
+        self.assertEqual(sum(int(r["failure_queue_full"]) for r in rows), 1)
+        self.assertEqual(sum(int(r["failure_server"]) for r in rows), 0)
+
+
 class TestExportGranularity(unittest.TestCase):
     def _metrics(self):
         root = RootRequest()

@@ -360,7 +360,8 @@ class MicroservicesEnv(_GymEnvBase):
                 end = max(a.interval.end for a in root.attempts)
                 latencies.append(end - begin)
             else:
-                last_attempt = max(root.attempts, key=lambda a: a.interval.end)
+                # Append order is completion order (ties on end time are ambiguous).
+                last_attempt = root.attempts[-1]
                 if last_attempt.drop_reason == DropReason.DEADLINE:
                     deadline_drops += 1
                 elif last_attempt.drop_reason == DropReason.QUEUE_FULL:

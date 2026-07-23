@@ -593,6 +593,28 @@ class TestInstantRejectionSamples(unittest.TestCase):
         self.assertEqual(samples["attempt_service_ms"], [10.0, 20.0])
         self.assertEqual(samples["attempt_service_censored"], [True, False])
 
+    def test_summarize_tied_final_attempts_use_completion_order(self):
+        env = MicroservicesEnv(EnvConfig(build=_build_slow_failing_env, action_spec=SLOW_SPEC))
+        env.reset(seed=1)
+        root = RootRequest()
+        root.add_attempt(
+            Request(
+                service="svc",
+                interval=TimeInterval(begin=0, end=ms_to_ns(1)),
+                drop_reason=DropReason.SERVER_FAILURE,
+            )
+        )
+        root.add_attempt(
+            Request(
+                service="svc",
+                interval=TimeInterval(begin=ms_to_ns(1), end=ms_to_ns(1)),
+                drop_reason=DropReason.QUEUE_FULL,
+            )
+        )
+        summary = env._summarize_roots([root])
+        self.assertEqual(summary["queue_drop_rate"], 1.0)
+        self.assertEqual(summary["server_drop_rate"], 0.0)
+
 
 @unittest.skipIf(gymnasium is None, "gymnasium not installed")
 class TestDurationValidation(unittest.TestCase):

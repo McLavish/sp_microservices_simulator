@@ -61,7 +61,9 @@ class Metrics:
             if success:
                 continue
 
-            last_attempt = max(request.attempts, key=lambda a: a.interval.end)
+            # Append order is completion order; ties on end time (zero-backoff
+            # synchronous rejections) make max()/sort keys ambiguous.
+            last_attempt = request.attempts[-1]
             if last_attempt.drop_reason == DropReason.QUEUE_FULL:
                 dropped_q += 1
             elif last_attempt.drop_reason == DropReason.DEADLINE:
@@ -165,7 +167,8 @@ class Metrics:
             if not root.attempts:
                 continue
             attempts_by_begin = sorted(root.attempts, key=lambda a: a.interval.begin)
-            last_attempt = sorted(root.attempts, key=lambda a: a.interval.end)[-1]
+            # Append order is completion order (ties on end time are ambiguous).
+            last_attempt = root.attempts[-1]
             root_rows.append(
                 {
                     "begin": attempts_by_begin[0].interval.begin,
