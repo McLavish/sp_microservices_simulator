@@ -296,6 +296,22 @@ class TestActionSpecSidecar(unittest.TestCase):
             with self.assertRaises(ValueError):
                 check_action_spec(path, mutated)
 
+    def test_sidecar_survives_sb3_implicit_zip_extension(self):
+        # SB3 save("model") writes model.zip; load("model.zip") must find the
+        # sidecar written at save time regardless of which form was used.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = str(Path(tmp) / "model")
+            save_action_spec(base, self.spec, step_duration_s=1.0)
+            check_action_spec(base + ".zip", self.spec)  # no raise, no warn-skip
+            mutated = ActionSpec(
+                attempt_timeout_ms=[30, 10],
+                max_attempts=[1, 2],
+                backoff_ms=[0, 20],
+                global_timeout_ms=[500, None],
+            )
+            with self.assertRaises(ValueError):
+                check_action_spec(base + ".zip", mutated)
+
     def test_missing_sidecar_warns(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "model.zip")
