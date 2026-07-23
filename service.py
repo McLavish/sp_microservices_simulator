@@ -182,16 +182,19 @@ class ServiceRuntime:
         else:
             # Custom behavior can optionally release the worker early (for tandem queues)
             released = False
+            finalized = False
 
             def release_worker():
                 nonlocal released
+                if finalized:
+                    raise RuntimeError(
+                        "release_worker called after finalize (the worker was already released)"
+                    )
                 if released:
                     raise RuntimeError("release_worker called more than once")
                 released = True
                 self.in_flight -= 1
                 self._start_next(sim)
-
-            finalized = False
 
             def finalize(success: bool, service_time: TimeDuration, drop: DropReason):
                 nonlocal finalized
