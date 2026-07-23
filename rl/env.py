@@ -83,7 +83,10 @@ class EnvConfig:
     # Fold drained-root outcomes into the final step's reward. Default off:
     # the windowed objective is the documented design and keeps trained
     # behavior comparable with the pinned paper data; turning it on removes
-    # the defer-failures-past-the-horizon incentive for future studies.
+    # the bulk of the defer-failures-past-the-horizon incentive for future
+    # studies. A small boundary residual (~ one drained-tail window weight)
+    # remains because in-horizon windows are rate-scored while the drain is
+    # count-weighted — see docs/rl.md.
     terminal_drain_penalty: bool = False
 
 
