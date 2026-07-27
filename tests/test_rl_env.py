@@ -1,3 +1,4 @@
+import functools
 import unittest
 
 import numpy as np
@@ -64,12 +65,17 @@ class TestMicroservicesEnv(unittest.TestCase):
         _, _, terminated, _, _ = env.step(action)
         self.assertTrue(terminated)
 
-    def _make_env(self, build, episode_duration_s=2.0):
+    def _make_env(self, build, episode_duration_s=2.0, duration=None):
         action_spec = ActionSpec(
             attempt_timeout_ms=[10, 50],
             max_attempts=[1, 2],
             backoff_ms=[0, 50],
         )
+        # `duration` pins the BUILDER's workload duration independently of the
+        # episode horizon, so a test can exercise the case where the arrival
+        # process outlives the episode.
+        if duration is not None:
+            build = functools.partial(build, duration_s=duration)
         cfg = EnvConfig(
             build=build,
             action_spec=action_spec,
@@ -423,6 +429,54 @@ class TestMicroservicesEnv(unittest.TestCase):
         summary = env.bystander_metrics_summary()
         assert summary is not None
         self.assertGreater(summary.total, 0)
+
+    def test_bystander_workload_halted_at_horizon(self):
+        """The terminal drain must complete in-flight work only.
+
+        build_multichain_env drives a SECOND workload for the bystander chain.
+        It is registered in EnvComponents.extra_workloads so step() halts it at
+        the horizon; without that registration the unbounded drain kept
+        admitting brand-new bystander roots until the builder's own duration
+        (measured: 70% of the population started after the horizon).
+        """
+        # Builder duration deliberately outlives the episode horizon.
+        env = self._make_env(build_multichain_env, episode_duration_s=3.0, duration=10.0)
+        env.reset(seed=5)
+        terminated = False
+        while not terminated:
+            _, _, terminated, _, info = env.step(np.array([1, 0, 0]))
+
+        components = env._require_components()
+        assert components.bystander_client is not None
+        roots = components.bystander_client.roots
+        started_after_horizon = sum(
+            1
+            for root in roots
+            if root.attempts and root.attempts[0].interval.begin > env._end_time_ns
+        )
+        self.assertEqual(
+            started_after_horizon,
+            0,
+            f"{started_after_horizon} of {len(roots)} bystander roots started after the "
+            f"episode horizon; the drain must complete in-flight work only",
+        )
+
+    def test_bystander_in_horizon_population_is_a_prefix(self):
+        env = self._make_env(build_multichain_env, episode_duration_s=3.0, duration=10.0)
+        env.reset(seed=5)
+        terminated = False
+        while not terminated:
+            _, _, terminated, _, info = env.step(np.array([1, 0, 0]))
+
+        self.assertIn("bystander_summary_in_horizon", info)
+        in_horizon = env.bystander_in_horizon_summary()
+        full = env.bystander_metrics_summary()
+        assert in_horizon is not None and full is not None
+        self.assertGreater(in_horizon.total, 0)
+        # In-horizon is a strict prefix of the full population: the drain still
+        # completes in-flight bystander roots, it just admits no new ones.
+        self.assertLessEqual(in_horizon.total, full.total)
+        self.assertEqual(in_horizon.total, info["bystander_summary_in_horizon"]["completed"])
 
     def test_bystander_summary_absent_without_bystander(self):
         env = self._make_env(build_chain_env, episode_duration_s=1.0)

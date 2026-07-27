@@ -25,16 +25,27 @@ SB3 recommends CPU for small MLP policies; `--device` defaults to `auto`.
 `MicroservicesEnv` wraps a **build function** (which constructs a fresh
 `Simulator` + `Workload` + `ClientRuntime` and a knob applicator) into a Gym env.
 Each `step()` advances the sim by `step_duration_s` and summarizes the roots that
-completed in that window. On episode end, the arrival process is halted
-(`Workload.stop()`) and in-flight work is drained *after* the final reward,
-reported under `info["drained_summary"]` so the last action is not credited with
-the tail — drained roots are strictly in-flight work, even when the builder's
-workload duration outlives `episode_duration_s`. Accounting notes:
+completed in that window. On episode end, **every** arrival process is halted
+(`Workload.stop()` on `EnvComponents.workload` and on each entry of
+`EnvComponents.extra_workloads`) and in-flight work is drained *after* the final
+reward, reported under `info["drained_summary"]` so the last action is not
+credited with the tail — drained roots are strictly in-flight work, even when the
+builder's workload duration outlives `episode_duration_s`. Accounting notes:
 
+- **Multi-workload builders.** A builder that drives more than one `Workload`
+  *must* register the extras in `EnvComponents.extra_workloads`; the env halts
+  only what it can reach. `build_multichain_env` drives a second workload for the
+  bystander chain and registers it — before it did, the unbounded drain kept
+  admitting brand-new bystander roots until the builder's own `duration_s` (70%
+  of the population on a 3 s episode against a 10 s builder duration).
 - **Populations.** `metrics_summary()` covers *all* roots including drained ones;
   `in_horizon_summary()` covers only roots completed before the horizon — the
   population the reward actually saw. The experiment CSVs report both
   (`success_rate`/`p95_ms` = full population, `*_in_horizon` = reward-visible).
+  The bystander mirrors this split: `bystander_metrics_summary()` /
+  `info["bystander_summary"]` are the full population, while
+  `bystander_in_horizon_summary()` / `info["bystander_summary_in_horizon"]`
+  score the externality on the same population as J.
 - **`terminal_drain_penalty`** (default off) folds drained-root outcomes into the
   final step's reward, weighted by how many average-sized step windows the
   drained population represents. It removes the bulk of the incentive to defer

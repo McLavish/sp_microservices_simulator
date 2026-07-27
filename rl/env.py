@@ -67,6 +67,12 @@ class EnvComponents:
     # Its success rate gauges the externality of the agent's edge retries; it
     # feeds reporting only, never reward or observation.
     bystander_client: ClientRuntime | None = None
+    # Any additional arrival processes the builder drives beyond `workload`.
+    # The env halts EVERY registered workload at the episode horizon, so the
+    # terminal drain completes in-flight work only. A builder that drives a
+    # second Workload without registering it here would keep admitting brand-new
+    # post-horizon roots into the drained population.
+    extra_workloads: list[Workload] = field(default_factory=list)
 
 
 @dataclass
@@ -133,6 +139,7 @@ class MicroservicesEnv(_GymEnvBase):
         self._last_cost_root_idx = 0
         self._last_sample_root_idx = 0
         self._horizon_root_count = 0
+        self._bystander_horizon_count = 0
         self._episode_steps = 0
         self._current_time_ns: TimePoint = 0
         self._end_time_ns: TimePoint = 0
@@ -186,6 +193,7 @@ class MicroservicesEnv(_GymEnvBase):
         self._last_cost_root_idx = 0
         self._last_sample_root_idx = 0
         self._horizon_root_count = 0
+        self._bystander_horizon_count = 0
         self._episode_steps = 0
         self._require_workload().drive(
             self._require_sim(), lambda s: self._require_client().start_request(s)
@@ -243,10 +251,16 @@ class MicroservicesEnv(_GymEnvBase):
 
         if terminated:
             self._horizon_root_count = self._last_root_idx
-            # The drain below completes IN-FLIGHT work only: halt the arrival
+            # The drain below completes IN-FLIGHT work only: halt EVERY arrival
             # process so a workload outliving the episode horizon cannot admit
-            # new post-horizon roots into the drained population.
+            # new post-horizon roots into the drained population. Builders that
+            # drive more than one Workload must register the rest in
+            # EnvComponents.extra_workloads or their traffic escapes this halt.
             self._require_workload().stop()
+            for extra in self._require_components().extra_workloads:
+                extra.stop()
+            bystander = self._require_components().bystander_client
+            self._bystander_horizon_count = 0 if bystander is None else len(bystander.roots)
         # Drain in-flight work after the reward is computed: drained roots complete
         # past the episode horizon and must not be credited to the final action
         # (unless terminal_drain_penalty explicitly folds them in).
@@ -269,7 +283,14 @@ class MicroservicesEnv(_GymEnvBase):
         if terminated:
             components = self._components
             if components is not None and components.bystander_client is not None:
-                info["bystander_summary"] = self._summarize_roots(components.bystander_client.roots)
+                roots = components.bystander_client.roots
+                info["bystander_summary"] = self._summarize_roots(roots)
+                # Score the externality on the same population as the agent's
+                # objective J, which only sees in-horizon roots. The full-
+                # population summary stays for continuity with existing columns.
+                info["bystander_summary_in_horizon"] = self._summarize_roots(
+                    roots[: self._bystander_horizon_count]
+                )
         return obs, reward, terminated, False, info
 
     def _build(self, seed: int | None) -> EnvComponents:
@@ -521,6 +542,18 @@ class MicroservicesEnv(_GymEnvBase):
         if self._components is None or self._components.bystander_client is None:
             return None
         return self._components.bystander_client.metrics().summary()
+
+    def bystander_in_horizon_summary(self) -> Summary | None:
+        """Bystander summary over roots completed before the episode horizon.
+
+        Mirrors ``in_horizon_summary()`` so the retry externality is measured on
+        the same population as the agent's objective J. ``bystander_metrics_summary()``
+        is the full population including roots drained past the horizon.
+        """
+        if self._components is None or self._components.bystander_client is None:
+            return None
+        roots = self._components.bystander_client.roots[: self._bystander_horizon_count]
+        return Metrics(roots=roots, attempts_total=sum(len(r.attempts) for r in roots)).summary()
 
     def set_cost_weight(self, value: float) -> None:
         """Set the constraint-cost reward weight (the Lagrange multiplier).
@@ -915,7 +948,9 @@ def build_multichain_env(
     )
     # The env only drives EnvComponents.workload, so the bystander arrival
     # process is scheduled here; drive() just pushes tick events onto the sim
-    # heap, and both workloads stop at duration_s so episode drain terminates.
+    # heap. It MUST also be registered in extra_workloads: the episode horizon
+    # can be shorter than `duration`, and an unregistered workload keeps
+    # admitting brand-new roots throughout the terminal drain.
     bystander_workload = Workload(
         base_rps=180.0,
         duration_s=duration,
@@ -931,6 +966,7 @@ def build_multichain_env(
         apply_knobs=_static_knob_applier(edge_timeout, edge_retry),
         cost_client=b_to_c,
         bystander_client=bystander_top,
+        extra_workloads=[bystander_workload],
     )
 
 
