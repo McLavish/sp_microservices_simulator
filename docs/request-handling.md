@@ -219,3 +219,27 @@ a.add_downstream(DownstreamEdge(client=a_to_c, target=ServiceNodeRuntime(service
 - [experiments](experiments.md) — `single/` demos for each policy, plus the chain
   scenarios.
 - [observability](observability.md) — how attempts become metrics.
+
+## Cancellation propagation
+
+When AND semantics short-circuit a fan-out (a downstream fails, or the node's
+deadline guard fires), the sibling calls already in flight are no longer wanted.
+What happens to them is an explicit modelling choice on `ServiceNodeRuntime`,
+alongside `hold_worker_during_fanout`:
+
+| `propagate_cancellation` | Behaviour | Models |
+| --- | --- | --- |
+| `False` (default) | Siblings keep running to completion. They hold their workers for their full service time and record their own outcomes — an abandoned call that succeeds is still counted a success at that service. | A stack with no cancellation plumbing: plain HTTP/1.1 clients, older Java stacks. Preserves every pre-existing result. |
+| `True` | Siblings are torn down: pending retries dropped, in-flight attempts abandon their worker immediately, queued attempts are skipped without ever consuming one. Recursive — cancelling a downstream that is itself a fan-out unwinds its whole subtree. Those roots are recorded with `DropReason.CANCELLED`. | Go `context` cancellation, gRPC deadline propagation. |
+
+Cancelled roots land in their own bucket (`Summary.dropped_cancelled`,
+`failure_cancelled` in the CSV) and are deliberately **not** folded into the
+deadline/queue/server drop counts. Cancelled work did not fail; charging it to a
+failure category would count one root cause twice — once where it actually
+failed, and again at every sibling it cancelled.
+
+Mechanically, `ServiceRuntime.submit_attempt` returns an `AttemptControl` whose
+`cancel()` is a no-op once the attempt has settled, so a cancel racing a
+completion cannot double-complete. Custom behaviours publish their own teardown
+via the `register_cancel` callback; that teardown must still route through
+`finalize`, so the exactly-once guards cover the cancel path too.

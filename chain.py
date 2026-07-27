@@ -3,8 +3,8 @@ from dataclasses import dataclass, field
 
 from caller import ClientRuntime
 from core import DropReason, TimeDuration, TimePoint
-from service import ServiceConfig, ServiceRuntime
-from simulator import Simulator
+from service import AttemptControl, ServiceConfig, ServiceRuntime
+from simulator import Event, Simulator
 
 
 @dataclass
@@ -30,6 +30,18 @@ class ServiceNodeRuntime:
     #   True -> synchronous thread-per-request: hold the worker for the full subtree
     #     (local work + downstream fan-out wait), so capacity is consumed down the tree.
     hold_worker_during_fanout: bool = False
+    # Cancellation model for the fan-out, mirroring hold_worker_during_fanout as a
+    # switch between two real architectures:
+    #   False (default) -> no propagation. When AND semantics short-circuit, the
+    #     sibling calls already in flight are abandoned but keep running to
+    #     completion, consuming downstream capacity and recording their own
+    #     outcomes. Models a stack without cancellation plumbing (plain HTTP/1.1
+    #     clients, older Java stacks) — and preserves every pre-existing result.
+    #   True -> Go-style propagation. Short-circuiting cancels the outstanding
+    #     siblings: pending retries are dropped, in-flight attempts abandon their
+    #     worker immediately, and the cancel recurses into sub-fan-outs. Those
+    #     roots are recorded with DropReason.CANCELLED.
+    propagate_cancellation: bool = False
 
     @property
     def cfg(self) -> ServiceConfig:
@@ -43,7 +55,7 @@ class ServiceNodeRuntime:
         sim: Simulator,
         on_done: Callable[[bool, TimeDuration, DropReason, int], None],
         attempt_deadline: TimePoint | None = None,
-    ) -> None:
+    ) -> AttemptControl:
         """Submit a logical attempt to this node.
 
         Uses a custom behavior that runs local service time, fans out to downstreams
@@ -60,6 +72,7 @@ class ServiceNodeRuntime:
             finalize: Callable[[bool, TimeDuration, DropReason], None],
             begin_at: TimePoint,
             release_worker: Callable[[], None],
+            register_cancel: Callable[[Callable[[], None]], None],
         ) -> None:
             # Stage 1: local service time
             base_time = svc._sample_service_time(begin_at, sim2)
@@ -69,9 +82,36 @@ class ServiceNodeRuntime:
                 else begin_at + base_time
             )
 
+            # Node-level teardown, installed BEFORE any stage runs so this node is
+            # cancellable throughout its whole lifecycle — including during local
+            # service, and including leaf nodes that never reach the fan-out
+            # block. `settled` is the single exactly-once guard for the node:
+            # every finalize path sets it, and the cancel path checks it.
+            settled = False
+            local_event: Event | None = None
+            teardown_fanout: Callable[[], None] | None = None
+
+            def cancel_node() -> None:
+                nonlocal settled
+                if settled:
+                    return
+                settled = True
+                if local_event is not None:
+                    local_event.cancelled = True  # still doing local work
+                if teardown_fanout is not None:
+                    teardown_fanout()  # drop the deadline guard, unwind children
+                finalize(False, sim2.timestep - begin_at, DropReason.CANCELLED)
+
+            register_cancel(cancel_node)
+
             def after_local():
+                nonlocal settled, teardown_fanout
+                if settled:
+                    return  # cancelled from above while we were doing local work
+
                 # If we expired during local processing, drop by deadline
                 if deadline is not None and sim2.timestep >= deadline:
+                    settled = True
                     finalize(False, sim2.timestep - begin_at, DropReason.DEADLINE)
                     return
 
@@ -81,18 +121,21 @@ class ServiceNodeRuntime:
                     else DropReason.NONE
                 )
                 if local_drop != DropReason.NONE:
+                    settled = True
                     finalize(False, sim2.timestep - begin_at, local_drop)
                     return
 
                 # No downstreams: behave like default finish.
                 if not self.downstreams:
+                    settled = True
                     finalize(True, sim2.timestep - begin_at, DropReason.NONE)
                     return
 
                 downstream_edges = list(self.downstreams)
 
-                # AND semantics across all downstream edges: all must succeed eventually.
-                done = False
+                # AND semantics across all downstream edges: all must succeed
+                # eventually. `settled` is the node-level exactly-once guard,
+                # shared with the cancel path installed before stage 1.
                 remaining = len(downstream_edges)
 
                 def downstream_drop_reason(_root) -> DropReason:
@@ -108,12 +151,12 @@ class ServiceNodeRuntime:
                         deadline_event.cancelled = True
 
                 def maybe_finish():
-                    nonlocal done, remaining
-                    if done:
+                    nonlocal settled, remaining
+                    if settled:
                         return
                     if remaining == 0:
                         # All downstreams completed
-                        done = True
+                        settled = True
                         cancel_deadline()
                         finalize(True, sim2.timestep - begin_at, DropReason.NONE)
 
@@ -121,9 +164,10 @@ class ServiceNodeRuntime:
                 if deadline is not None:
 
                     def on_deadline():
-                        nonlocal done
-                        if not done:
-                            done = True
+                        nonlocal settled
+                        if not settled:
+                            settled = True
+                            abandon_siblings()
                             finalize(False, sim2.timestep - begin_at, DropReason.DEADLINE)
 
                     # ensure we schedule at int(deadline)
@@ -131,11 +175,36 @@ class ServiceNodeRuntime:
 
                 launching = False
                 sync_failure_root = None
+                launched_roots: list = []
+
+                def abandon_siblings(except_root=None):
+                    """Tear down downstream calls nobody is waiting for any more.
+
+                    No-op unless this node models cancellation propagation. The
+                    root's own `cancel` recurses: cancelling a downstream that is
+                    itself a fan-out node runs *its* registered teardown, so a
+                    whole subtree unwinds.
+                    """
+                    if not self.propagate_cancellation:
+                        return
+                    for _r in launched_roots:
+                        if _r is not except_root and not _r.done and _r.cancel is not None:
+                            _r.cancel()
+
+                # From here on, a cancel from above must also unwind the fan-out.
+                def _teardown_fanout() -> None:
+                    cancel_deadline()
+                    abandon_siblings()
+
+                teardown_fanout = _teardown_fanout
 
                 def fail_with(_root):
-                    nonlocal done
-                    done = True
+                    nonlocal settled
+                    settled = True
                     cancel_deadline()
+                    # `settled` is already set, so the cancellations below re-enter
+                    # on_downstream_done harmlessly.
+                    abandon_siblings(except_root=_root)
                     drop = downstream_drop_reason(_root)
                     if drop == DropReason.NONE:
                         drop = DropReason.SERVER_FAILURE
@@ -143,7 +212,7 @@ class ServiceNodeRuntime:
 
                 def on_downstream_done(_root):
                     nonlocal remaining, sync_failure_root
-                    if done:
+                    if settled:
                         return
                     # Determine success from root attempts
                     succeeded = any(a.success for a in _root.attempts)
@@ -166,22 +235,25 @@ class ServiceNodeRuntime:
                 # short-circuit the parent, but only after every edge is launched.
                 launching = True
                 for edge in downstream_edges:
-                    edge.client.start_request(
-                        sim2,
-                        on_done=on_downstream_done,
-                        override_global_deadline=deadline,
+                    launched_roots.append(
+                        edge.client.start_request(
+                            sim2,
+                            on_done=on_downstream_done,
+                            override_global_deadline=deadline,
+                        )
                     )
                 launching = False
-                if sync_failure_root is not None and not done:
+                if sync_failure_root is not None and not settled:
                     fail_with(sync_failure_root)
 
-                if not done and not self.hold_worker_during_fanout:
+                if not settled and not self.hold_worker_during_fanout:
                     release_worker()
 
-            sim2.schedule(end_local, after_local)
+            local_event = sim2.schedule(end_local, after_local)
 
-        # Enqueue with custom behavior
-        self.service.submit_attempt(
+        # Enqueue with custom behavior. Propagate the cancellation handle up:
+        # without it the caller holds no way to abandon this node mid-subtree.
+        return self.service.submit_attempt(
             sim,
             on_done,
             attempt_deadline=attempt_deadline,

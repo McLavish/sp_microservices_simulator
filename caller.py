@@ -13,8 +13,8 @@ from core import (
 )
 from metrics import Metrics
 from retry_policies import RetryContext, RetryPolicy
-from service import ServiceConfig
-from simulator import Simulator
+from service import AttemptControl, ServiceConfig
+from simulator import Event, Simulator
 from timeout_controllers import TimeoutController
 
 
@@ -42,7 +42,7 @@ class ServiceLike(Protocol):
         sim: Simulator,
         on_done: Callable[[bool, TimeDuration, DropReason, int], None],
         attempt_deadline: TimePoint | None = None,
-    ) -> None: ...
+    ) -> AttemptControl: ...
 
 
 @dataclass(frozen=True)
@@ -57,6 +57,13 @@ class AttemptCtx:
     req: Request
     last_delay: TimeDuration = 0
     total_delay: TimeDuration = 0
+    # Handle on the attempt currently at the service (None while backing off).
+    control: "AttemptControl | None" = None
+    # Scheduled retry event, so cancellation can drop a pending backoff.
+    retry_event: Event | None = None
+    # Set before tearing down, so _on_attempt_done completes the root instead
+    # of scheduling the next retry.
+    cancelling: bool = False
 
 
 @dataclass
@@ -109,9 +116,41 @@ class ClientRuntime:
 
     def _complete_root(self, root: RootRequest) -> None:
         root.done = True
+        root.cancel = None  # a completed root is no longer cancellable
         self.roots.append(root)
         if root.on_done is not None:
             root.on_done(root)
+
+    def _cancel_root(self, ctx: AttemptCtx) -> None:
+        """Abandon this root: no further attempts, and give back in-flight work.
+
+        Idempotent and safe to call from a completion callback — a root that
+        has already finished is left alone.
+        """
+        if ctx.root.done or ctx.cancelling:
+            return
+        ctx.cancelling = True
+        ctx.root.cancelled = True
+
+        if ctx.retry_event is not None:
+            # Waiting on backoff: drop the pending retry. No attempt is at the
+            # service, so there is nothing to mark; the root's `cancelled` flag
+            # carries the classification.
+            ctx.retry_event.cancelled = True
+            ctx.retry_event = None
+            self._complete_root(ctx.root)
+            return
+
+        control = ctx.control
+        if control is not None and control.cancel():
+            # cancel() drove the service's teardown, which called back into
+            # _on_attempt_done and completed the root already.
+            return
+        # An attempt is outstanding but not cancellable (a behavior that never
+        # registered a teardown), or it is completing at this very instant.
+        # Leave the root open: _on_attempt_done sees `cancelling` and closes it
+        # without retrying. Completing it here would strand that callback and
+        # trip the "Root request was already done!" guard.
 
     def start_request(
         self,
@@ -147,7 +186,7 @@ class ClientRuntime:
             )
             root_req.add_attempt(req)
             self._complete_root(root_req)
-            return
+            return root_req
 
         # Start first attempt
         # Create dummy request that will be replaced in _start_attempt
@@ -157,7 +196,9 @@ class ClientRuntime:
             deadline=None,
         )
         initial_ctx = AttemptCtx(root=root_req, req=dummy_req, last_delay=0, total_delay=0)
+        root_req.cancel = partial(self._cancel_root, initial_ctx)
         self._start_attempt(sim, initial_ctx)
+        return root_req
 
     def _start_attempt(self, sim: Simulator, ctx: AttemptCtx):
         if ctx.root.done:
@@ -178,8 +219,9 @@ class ClientRuntime:
 
         ctx.req = req
 
+        ctx.retry_event = None
         on_done = partial(self._on_attempt_done, ctx, sim)
-        self.service.submit_attempt(sim, on_done, attempt_deadline=req_deadline)
+        ctx.control = self.service.submit_attempt(sim, on_done, attempt_deadline=req_deadline)
 
     def _on_attempt_done(
         self,
@@ -220,7 +262,16 @@ class ClientRuntime:
         request_latency = ctx.req.interval.end - ctx.req.interval.begin
         self.cfg.timeout_controller.record_result(success_effective, request_latency)
 
+        ctx.control = None  # nothing outstanding at the service any more
+
         if ctx.req.success:
+            self._complete_root(ctx.root)
+            return
+
+        # Cancelled by an upstream fan-out: stop here rather than retrying, so
+        # abandoned work does not keep generating load on the way down.
+        if ctx.cancelling or drop_reason == DropReason.CANCELLED:
+            ctx.root.cancelled = True
             self._complete_root(ctx.root)
             return
 
@@ -246,7 +297,7 @@ class ClientRuntime:
             self._complete_root(ctx.root)
             return
 
-        sim.schedule(next_start, partial(self._start_attempt, sim, ctx))
+        ctx.retry_event = sim.schedule(next_start, partial(self._start_attempt, sim, ctx))
 
     def metrics(self) -> Metrics:
         return Metrics(roots=self.roots, attempts_total=self.attempts_total)

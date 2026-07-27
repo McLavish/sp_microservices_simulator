@@ -34,7 +34,13 @@ class ServiceConfig:
             tracker.add_partial_failure(partial_failure.duration, partial_failure.p_fail)
 
 
-# Custom attempt behavior: (service, sim, deadline, finalize, begin_at, release_worker)
+# Custom attempt behavior:
+# (service, sim, deadline, finalize, begin_at, release_worker, register_cancel)
+#
+# `register_cancel` lets a behavior publish its own teardown so an upstream can
+# abandon this attempt mid-flight. The callback must leave the usual invariants
+# intact: finalize exactly once, release_worker at most once. It is invoked at
+# most once, and never after finalize.
 Behavior = Callable[
     [
         "ServiceRuntime",
@@ -43,9 +49,41 @@ Behavior = Callable[
         Callable[[bool, TimeDuration, DropReason], None],
         TimePoint,
         Callable[[], None],
+        Callable[[Callable[[], None]], None],
     ],
     None,
 ]
+
+
+class AttemptControl:
+    """Cancellation handle for one submitted attempt.
+
+    `cancel()` is a no-op once the attempt has completed (or already been
+    cancelled), so callers may fire it defensively without tracking state.
+    """
+
+    __slots__ = ("_cancel_fn", "_settled")
+
+    def __init__(self) -> None:
+        self._cancel_fn: Callable[[], None] | None = None
+        self._settled = False
+
+    def _bind(self, fn: Callable[[], None]) -> None:
+        if not self._settled:
+            self._cancel_fn = fn
+
+    def _settle(self) -> None:
+        self._settled = True
+        self._cancel_fn = None
+
+    def cancel(self) -> bool:
+        """Abandon the attempt. Returns True if it was still cancellable."""
+        fn = self._cancel_fn
+        if self._settled or fn is None:
+            return False
+        self._settle()
+        fn()
+        return True
 
 
 @dataclass(order=True)
@@ -54,6 +92,10 @@ class QItem:
     enqueued_at: TimePoint
     seq: int
     start: Callable[[], None] = field(compare=False)
+    # Cancelled while still queued: skipped (and discarded) by _start_next.
+    # Flagged rather than removed, because removing from the middle of a heap
+    # would cost O(n) and break the FCFS invariant the heap order encodes.
+    cancelled: bool = field(default=False, compare=False)
 
 
 @dataclass
@@ -98,6 +140,8 @@ class ServiceRuntime:
     def _start_next(self, sim: Simulator):
         while self.in_flight < self.cfg.workers and self.queue:
             item = heapq.heappop(self.queue)
+            if item.cancelled:
+                continue  # abandoned upstream; never consumed a worker
             item.start()
 
     def submit_attempt(
@@ -120,36 +164,58 @@ class ServiceRuntime:
         not raise: an exception aborts the run and strands queued items. Custom
         behaviors must call `finalize` exactly once (a second call raises) and
         `release_worker` at most once.
+
+        Returns an `AttemptControl` whose `cancel()` abandons the attempt if it
+        is still outstanding (queued or in service) and is a no-op afterwards.
         """
 
         self._seq += 1
         seq = self._seq
 
+        control = AttemptControl()
+
+        def settled_on_done(
+            success: bool, svc_time: TimeDuration, drop: DropReason, qsize: int
+        ) -> None:
+            # However the attempt ends, the handle stops being cancellable
+            # first — so a cancel racing a completion is a no-op, not a
+            # double-completion.
+            control._settle()
+            on_done(success, svc_time, drop, qsize)
+
         # Immediately drop the request if somehow it has already expired?
         if attempt_deadline is not None and sim.timestep >= attempt_deadline:
-            on_done(False, 0, DropReason.DEADLINE, len(self.queue))
-            return
+            settled_on_done(False, 0, DropReason.DEADLINE, len(self.queue))
+            return control
 
-        start_cb = partial(self._begin_service, sim, on_done, attempt_deadline, behavior)
+        start_cb = partial(
+            self._begin_service, sim, settled_on_done, attempt_deadline, behavior, control
+        )
 
         if self.in_flight < self.cfg.workers:
             start_cb()  # Immediately start handling if we have free worker
-            return
+            return control
 
         # Drop request if queue is full (load shedding)
         if self.cfg.queue_capacity is not None and len(self.queue) >= self.cfg.queue_capacity:
-            on_done(False, 0, DropReason.QUEUE_FULL, len(self.queue))  # dropped from queue
-            return
+            settled_on_done(False, 0, DropReason.QUEUE_FULL, len(self.queue))
+            return control
 
         # Enqueue the request
-        heapq.heappush(
-            self.queue,
-            QItem(
-                enqueued_at=sim.timestep,
-                seq=seq,
-                start=start_cb,
-            ),
+        item = QItem(
+            enqueued_at=sim.timestep,
+            seq=seq,
+            start=start_cb,
         )
+        heapq.heappush(self.queue, item)
+
+        def cancel_queued() -> None:
+            # Never entered service, so no worker to release and no _start_next.
+            item.cancelled = True
+            on_done(False, 0, DropReason.CANCELLED, len(self.queue))
+
+        control._bind(cancel_queued)
+        return control
 
     # begin_service can be called either immediately or after the request was dequeued
     def _begin_service(
@@ -158,6 +224,7 @@ class ServiceRuntime:
         on_done: Callable[[bool, TimeDuration, DropReason, int], None],
         attempt_deadline: TimePoint | None,
         behavior: Behavior | None = None,
+        control: AttemptControl | None = None,
     ):
         # If the attempt expired while waiting in the queue, drop immediately without
         # consuming a worker. We make sure we are not scheduling an event in the past.
@@ -178,7 +245,19 @@ class ServiceRuntime:
             )
 
             finish_cb = partial(self._finish_service, sim, on_done, begin_at, attempt_deadline)
-            sim.schedule(expiry, finish_cb)
+            finish_ev = sim.schedule(expiry, finish_cb)
+
+            def cancel_in_service() -> None:
+                # Abandon the work: drop the pending completion and hand the
+                # worker straight back, so cancellation actually reclaims
+                # capacity rather than merely suppressing the result.
+                finish_ev.cancelled = True
+                self._complete_attempt(
+                    sim, on_done, False, sim.timestep - begin_at, DropReason.CANCELLED
+                )
+
+            if control is not None:
+                control._bind(cancel_in_service)
         else:
             # Custom behavior can optionally release the worker early (for tandem queues)
             released = False
@@ -206,7 +285,16 @@ class ServiceRuntime:
                 else:
                     self._complete_attempt(sim, on_done, success, service_time, drop)
 
-            behavior(self, sim, attempt_deadline, finalize, begin_at, release_worker)
+            def register_cancel(fn: Callable[[], None]) -> None:
+                # The behavior owns its own teardown (it knows what it launched
+                # downstream); it must still route through `finalize`, so the
+                # exactly-once guards above cover the cancel path too.
+                if control is not None:
+                    control._bind(fn)
+
+            behavior(
+                self, sim, attempt_deadline, finalize, begin_at, release_worker, register_cancel
+            )
 
     def _finish_service(
         self,

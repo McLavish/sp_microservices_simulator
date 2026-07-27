@@ -2,7 +2,8 @@ import unittest
 
 from caller import ClientConfig, ClientRuntime
 from chain import DownstreamEdge, ServiceNodeRuntime
-from core import DropReason, ms_to_ns
+from core import DropReason, TimeInterval, ms_to_ns, s_to_ns
+from faults import PartialFailure
 from retry_policies import NoRetryPolicy
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
@@ -166,7 +167,7 @@ class TestFinalizeExactlyOnce(unittest.TestCase):
             )
         ).bind()
 
-        def behavior(service, sim2, deadline, finalize, begin_at, release_worker):
+        def behavior(service, sim2, deadline, finalize, begin_at, release_worker, register_cancel):
             def finish():
                 finalize(True, ms_to_ns(5), DropReason.NONE)
                 finalize(True, ms_to_ns(5), DropReason.NONE)  # bug: second call
@@ -188,7 +189,7 @@ class TestFinalizeExactlyOnce(unittest.TestCase):
             )
         ).bind()
 
-        def behavior(service, sim2, deadline, finalize, begin_at, release_worker):
+        def behavior(service, sim2, deadline, finalize, begin_at, release_worker, register_cancel):
             def finish():
                 finalize(True, ms_to_ns(5), DropReason.NONE)
                 release_worker()  # bug: worker already released via finalize
@@ -203,3 +204,114 @@ class TestFinalizeExactlyOnce(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCancellationPropagation(unittest.TestCase):
+    """propagate_cancellation selects between two real architectures.
+
+    False (default): a short-circuited fan-out leaves siblings running to
+    completion, consuming downstream capacity — a stack with no cancellation
+    plumbing. True: Go-style context propagation tears the subtree down.
+    """
+
+    def _fanout(self, propagate, slow_ms=200, depth1_workers=1):
+        """A -> {FAST (always fails), SLOW (succeeds after slow_ms)}."""
+        sim = Simulator(seed=1)
+
+        def node(name, median_ms, p_fail=0.0):
+            failures = (
+                [PartialFailure(TimeInterval(0, s_to_ns(100)), p_fail=p_fail)] if p_fail else []
+            )
+            return ServiceNodeRuntime(
+                service=ServiceRuntime(
+                    cfg=ServiceConfig(
+                        name=name,
+                        latency_median=ms_to_ns(median_ms),
+                        latency_lognorm_sigma=1e-6,
+                        workers=depth1_workers,
+                        partial_failures=failures,
+                    )
+                ).bind()
+            )
+
+        a = node("A", 1)
+        fast = node("FAST", 5, p_fail=1.0)
+        slow = node("SLOW", slow_ms)
+        a.propagate_cancellation = propagate
+
+        def edge(target):
+            return DownstreamEdge(
+                client=ClientRuntime(
+                    cfg=ClientConfig(
+                        retry=NoRetryPolicy(),
+                        timeout_controller=StaticTimeoutController(
+                            global_timeout=None, attempt_timeout=ms_to_ns(5000)
+                        ),
+                    ),
+                    service=target,
+                ),
+                target=target,
+            )
+
+        e_fast, e_slow = edge(fast), edge(slow)
+        a.add_downstream(e_fast)
+        a.add_downstream(e_slow)
+        top = ClientRuntime(
+            cfg=ClientConfig(
+                retry=NoRetryPolicy(),
+                timeout_controller=StaticTimeoutController(
+                    global_timeout=None, attempt_timeout=ms_to_ns(5000)
+                ),
+            ),
+            service=a,
+        )
+        top.start_request(sim)
+        sim.run()
+        return sim, top, e_slow.client, slow
+
+    def test_default_leaves_orphaned_siblings_running(self):
+        sim, top, slow_client, slow_node = self._fanout(propagate=False)
+        summary = slow_client.metrics().summary()
+        # The abandoned call runs to completion and really did succeed.
+        self.assertEqual(summary.succeeded, 1)
+        self.assertEqual(summary.dropped_cancelled, 0)
+        # ...and held its worker for the full 200 ms.
+        self.assertGreaterEqual(sim.timestep, ms_to_ns(200))
+
+    def test_propagation_abandons_siblings_and_reclaims_capacity(self):
+        sim, top, slow_client, slow_node = self._fanout(propagate=True)
+        summary = slow_client.metrics().summary()
+        self.assertEqual(summary.succeeded, 0)
+        self.assertEqual(summary.dropped_cancelled, 1)
+        # The worker is handed back when FAST fails (~6 ms), not at 200 ms.
+        self.assertLess(sim.timestep, ms_to_ns(100))
+        self.assertEqual(slow_node.service.in_flight, 0)
+
+    def test_cancellation_does_not_change_the_parent_verdict(self):
+        """Cancelling siblings must not alter why the parent failed."""
+        for propagate in (False, True):
+            with self.subTest(propagate=propagate):
+                _, top, _, _ = self._fanout(propagate=propagate)
+                self.assertEqual(top.roots[0].attempts[-1].drop_reason, DropReason.SERVER_FAILURE)
+
+    def test_no_worker_is_leaked_by_cancellation(self):
+        """finalize-exactly-once and release_worker-at-most-once must hold.
+
+        Both raise on violation, so a leak or a double-release would surface as
+        an exception during run(); this also pins that every worker is returned.
+        """
+        for propagate in (False, True):
+            with self.subTest(propagate=propagate):
+                _, top, _, slow_node = self._fanout(propagate=propagate)
+                self.assertEqual(slow_node.service.in_flight, 0)
+                self.assertEqual(slow_node.service.queue, [])
+
+    def test_cancelled_roots_are_not_counted_as_failures(self):
+        """Cancelled work is abandoned, not failed: its own bucket, so one root
+        cause is not charged again at every sibling it cancelled."""
+        _, _, slow_client, _ = self._fanout(propagate=True)
+        summary = slow_client.metrics().summary()
+        self.assertEqual(summary.dropped_cancelled, 1)
+        self.assertEqual(summary.dropped_server_failure, 0)
+        self.assertEqual(summary.dropped_deadline, 0)
+        self.assertEqual(summary.dropped_queue, 0)

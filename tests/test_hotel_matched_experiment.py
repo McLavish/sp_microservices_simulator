@@ -114,6 +114,7 @@ def test_run_hotel_matched_writes_root_service_and_fault_outputs(tmp_path):
         "failure_deadline",
         "failure_server",
         "failure_circuit_open",
+        "failure_cancelled",
         "total_request",
         "total_failure",
         "p50",

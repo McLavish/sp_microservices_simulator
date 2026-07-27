@@ -44,6 +44,7 @@ class Metrics:
         dropped_deadline = 0
         dropped_server_failure = 0
         dropped_circuit_open = 0
+        dropped_cancelled = 0
         for request in self.roots:
             if not request.attempts:
                 continue
@@ -58,6 +59,13 @@ class Metrics:
                     succ_lat.append(self._compute_time_interval_from_attempts(request).duration())
 
             if success:
+                continue
+
+            # Abandoned by an upstream cancellation. Checked before the
+            # per-attempt reason because a root cancelled while backing off has
+            # no attempt of its own carrying CANCELLED.
+            if request.cancelled:
+                dropped_cancelled += 1
                 continue
 
             # Append order is completion order; ties on end time (zero-backoff
@@ -92,6 +100,7 @@ class Metrics:
             max=max_ms,
             retries_per_root=retries_per_root,
             attempts_total=self.attempts_total,
+            dropped_cancelled=dropped_cancelled,
         )
 
     def print_stats(self):
@@ -102,6 +111,7 @@ class Metrics:
         print(f"Dropped (Deadline): {summary.dropped_deadline}")
         print(f"Dropped (Server Failure): {summary.dropped_server_failure}")
         print(f"Dropped (Circuit Open): {summary.dropped_circuit_open}")
+        print(f"Cancelled (Abandoned Upstream): {summary.dropped_cancelled}")
         print(f"P50 Latency (ms): {summary.p50:.2f}")
         print(f"P95 Latency (ms): {summary.p95:.2f}")
         print(f"P99 Latency (ms): {summary.p99:.2f}")
@@ -145,6 +155,7 @@ class Metrics:
             "failure_deadline",
             "failure_server",
             "failure_circuit_open",
+            "failure_cancelled",
             "total_request",  # bucketed at the start. rename total_started_roots?
             "total_failure",  # bucketed at the end. rename total_failed_roots_completed?
             "p50",  # percentiles are all bucketed at the end
@@ -173,7 +184,11 @@ class Metrics:
                     "begin": attempts_by_begin[0].interval.begin,
                     "end": last_attempt.interval.end,
                     "succeeded": any(a.success for a in root.attempts),
-                    "drop_reason": last_attempt.drop_reason,
+                    # A root cancelled while backing off has no attempt marked
+                    # CANCELLED, so the root-level flag wins (mirrors summary()).
+                    "drop_reason": (
+                        DropReason.CANCELLED if root.cancelled else last_attempt.drop_reason
+                    ),
                 }
             )
             for i, a in enumerate(attempts_by_begin):
@@ -255,6 +270,9 @@ class Metrics:
                 ),
                 "failure_circuit_open": per_bucket_count(
                     failed.loc[failed["drop_reason"] == DropReason.CIRCUIT_OPEN, "end"]
+                ),
+                "failure_cancelled": per_bucket_count(
+                    failed.loc[failed["drop_reason"] == DropReason.CANCELLED, "end"]
                 ),
                 # queue size at attempt END, by completion bucket
                 "queue_avg_at_attempt_end": (

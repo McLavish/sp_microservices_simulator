@@ -44,6 +44,10 @@ class DropReason(Enum):
     DEADLINE = auto()
     SERVER_FAILURE = auto()
     CIRCUIT_OPEN = auto()
+    # Abandoned, not failed: an upstream fan-out short-circuited and cancelled
+    # this call while it was still outstanding. Only produced when a
+    # ServiceNodeRuntime has propagate_cancellation=True.
+    CANCELLED = auto()
 
 
 @dataclass
@@ -72,6 +76,15 @@ class RootRequest:
     # Optional: callback invoked exactly once when the root completes
     # Not used by metrics; safe to leave None in existing flows
     on_done: Callable[..., object] | None = None
+    # Set when an upstream cancelled this root (fan-out short-circuit with
+    # propagate_cancellation). Metrics classify on this flag *before* falling
+    # back to the final attempt's drop_reason, so a root cancelled while
+    # waiting on backoff — with no attempt of its own to mark — is still
+    # counted as cancelled without fabricating a synthetic attempt.
+    cancelled: bool = False
+    # Installed by ClientRuntime.start_request; cancels this root's in-flight
+    # attempt and any pending retry. None once the root completes.
+    cancel: Callable[[], None] | None = None
 
     def add_attempt(self, attempt: Request):
         self.attempts.append(attempt)
@@ -98,3 +111,9 @@ class Summary:
     max: float
     retries_per_root: float
     attempts_total: int
+    # Abandoned by an upstream cancellation. Deliberately its own bucket and
+    # NOT folded into the other dropped_* counts: cancelled work did not fail,
+    # and charging it to server/deadline failures would count one root cause
+    # twice (once where it failed, once at every sibling it cancelled).
+    # Declared last so existing positional construction keeps working.
+    dropped_cancelled: int = 0
