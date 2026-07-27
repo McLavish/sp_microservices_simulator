@@ -7,6 +7,15 @@ from fault_events import FaultEventsTracker
 from faults import LoadSpike
 from simulator import Event, Simulator
 
+# Domain separation between the arrival process and every other RNG in the
+# simulation. Callers routinely pass the SAME integer to `Simulator(seed=...)`
+# and `Workload(rng_seed=...)`; without an offset both would drive the identical
+# Mersenne-Twister stream, so arrival times would be correlated with service
+# times and failure rolls instead of independent of them. Python seeds MT via
+# init_by_array, which scrambles thoroughly, so a fixed offset is enough to
+# decorrelate (same convention as the bystander workload in rl/env.py).
+_ARRIVAL_SEED_OFFSET = 100_003
+
 
 @dataclass
 class Workload:
@@ -19,7 +28,8 @@ class Workload:
 
     def __post_init__(self):
         # rng_seed=None falls back to seed 0 for cross-experiment determinism; pass an int explicitly to vary.
-        self._rng = random.Random(self.rng_seed if self.rng_seed is not None else 0)
+        base = self.rng_seed if self.rng_seed is not None else 0
+        self._rng = random.Random(base + _ARRIVAL_SEED_OFFSET)
 
     def register_fault_events(self, tracker: FaultEventsTracker):
         """Register all load spike events with the tracker"""

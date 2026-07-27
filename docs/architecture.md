@@ -107,8 +107,11 @@ There are **two** independent random streams:
 
 - `Simulator.rng()` — service times, server-failure rolls, retry jitter. Seeded per
   run via `Simulator(seed=...)`.
-- `Workload._rng` — interarrival times only. Seeded separately (`rng_seed`, default
-  `0`; see `workload.py:19`).
+- `Workload._rng` — interarrival times only. Seeded separately from `rng_seed`
+  (default `0`), offset by `_ARRIVAL_SEED_OFFSET` so that passing the *same*
+  integer to `Simulator(seed=...)` and `Workload(rng_seed=...)` — which every
+  builder in `rl/env.py` does — still yields two genuinely independent streams
+  rather than one stream drawn twice. See `Workload.__post_init__`.
 
 Keeping arrivals on their own RNG means you can change the simulator seed (to
 resample service/failure behavior) while the **arrival pattern stays fixed** across
