@@ -29,6 +29,24 @@ class RetryPolicy:
     def next_delay(self, context: RetryContext) -> DelayDecision:
         raise NotImplementedError
 
+    def rollback(self, context: RetryContext) -> None:
+        """Undo the side effects of the immediately preceding ``next_delay``.
+
+        ``next_delay`` is side-effecting for every throttling policy (a retry
+        budget withdraws tokens, a rate limiter spends one, a leaky bucket
+        reserves the next slot). The client may still decline to issue the retry
+        it just asked for — the global deadline can veto it — and without a
+        refund those never-issued retries are charged anyway.
+
+        The client calls this only when ``next_delay`` returned ``allow=True``
+        and the retry was then vetoed, and it recurses through
+        ``underlying_strategy`` so every layer that charged also refunds.
+        Default is a no-op, so side-effect-free policies need not implement it.
+        Cf. Finagle's ``RetryBudget.tryWithdraw()``, which avoids the problem by
+        only withdrawing when the caller commits to the retry.
+        """
+        return
+
 
 @dataclass
 class FixedBackoffRetryPolicy(RetryPolicy):
@@ -279,11 +297,16 @@ class LeakyRateLimiterPolicy(RetryPolicy):
     period: TimeDuration
 
     _next_at: TimePoint | None = field(default=None, init=False)
+    # Previous _next_at, so a vetoed retry can release the slot it reserved.
+    _prev_next_at: TimePoint | None = field(default=None, init=False)
+    _slot_reserved: bool = field(default=False, init=False)
 
     def add_request(self, now: TimePoint) -> TimeDuration:
         start_at = max(now, self._next_at or now)
         delay = max(0, start_at - now)
 
+        self._prev_next_at = self._next_at
+        self._slot_reserved = True
         self._next_at = round(start_at + self.period / self.max_requests)
         return delay
 
@@ -292,6 +315,13 @@ class LeakyRateLimiterPolicy(RetryPolicy):
             return DelayDecision(False, 0)
         delay = self.add_request(context.now)
         return DelayDecision(True, delay)
+
+    def rollback(self, context: RetryContext) -> None:
+        if not self._slot_reserved:
+            return
+        self._next_at = self._prev_next_at
+        self._prev_next_at = None
+        self._slot_reserved = False
 
 
 @dataclass
@@ -342,6 +372,10 @@ class RetryBudgetPolicy(RetryPolicy):
             return DelayDecision(False, 0)
         return DelayDecision(False, 0)
 
+    def rollback(self, context: RetryContext) -> None:
+        # Refund a withdrawal for a retry the client then declined to issue.
+        self._tokens = min(self._max_tokens, self._tokens + self._retry_cost)
+
 
 @dataclass
 class BurstyRateLimiterPolicy(RetryPolicy):
@@ -385,6 +419,9 @@ class BurstyRateLimiterPolicy(RetryPolicy):
             return DelayDecision(False, 0)
         return DelayDecision(False, 0)
 
+    def rollback(self, context: RetryContext) -> None:
+        self._tokens = min(float(self.max_requests), self._tokens + 1.0)
+
 
 @dataclass
 class FixedWindowBurstyLimiterPolicy(RetryPolicy):
@@ -425,6 +462,11 @@ class FixedWindowBurstyLimiterPolicy(RetryPolicy):
                 return DelayDecision(True, delay)
             return DelayDecision(False, 0)
         return DelayDecision(False, 0)
+
+    def rollback(self, context: RetryContext) -> None:
+        # Refunds land in the window the charge was made in: the client vetoes
+        # at the same simulated instant, so no window rollover intervenes.
+        self._tokens = min(self.max_requests, self._tokens + 1)
 
 
 # class HedgePolicy:

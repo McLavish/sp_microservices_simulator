@@ -83,6 +83,17 @@ class ClientRuntime:
         if isinstance(policy, _SupportsUnderlying):
             self._update_policy_results(policy.underlying_strategy, success, now)
 
+    def _rollback_policy(self, policy: RetryPolicy, context: RetryContext) -> None:
+        """Refund a retry that ``next_delay`` authorised but we never issued.
+
+        Mirrors `_update_policy_results`' recursion: every layer that charged
+        during `next_delay` sits on the `underlying_strategy` chain, so every
+        layer has to be given the chance to refund.
+        """
+        policy.rollback(context)
+        if isinstance(policy, _SupportsUnderlying):
+            self._rollback_policy(policy.underlying_strategy, context)
+
     def _allow_policy_request(self, policy: RetryPolicy, now: TimePoint) -> bool:
         if not policy.allow_request(now):
             return False
@@ -210,9 +221,17 @@ class ClientRuntime:
 
         decision = self.cfg.retry.next_delay(retry_context)
         next_start = sim.timestep + decision.delay
-        if (not decision.allow) or (
+        deadline_veto = (
             ctx.root.global_deadline is not None and next_start >= ctx.root.global_deadline
-        ):
+        )
+        if (not decision.allow) or deadline_veto:
+            # `next_delay` is side-effecting for throttling policies. When the
+            # policy authorised the retry but the deadline vetoes it, refund the
+            # charge — otherwise a retry that never happens still consumes
+            # budget/tokens. (`allow=False` charged nothing: every throttling
+            # policy withdraws only on the path that returns allow=True.)
+            if decision.allow:
+                self._rollback_policy(self.cfg.retry, retry_context)
             self._complete_root(ctx.root)
             return
 

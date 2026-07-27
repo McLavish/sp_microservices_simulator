@@ -504,5 +504,109 @@ class TestBackoffValidation(unittest.TestCase):
             )
 
 
+class TestVetoedRetriesAreRefunded(unittest.TestCase):
+    """A retry the global deadline vetoes must not be charged.
+
+    `ClientRuntime._on_attempt_done` asks the policy for a delay — which is
+    side-effecting for every throttling policy — and then discards the decision
+    when `next_start >= global_deadline`. Without `RetryPolicy.rollback` those
+    never-issued retries still consumed budget/tokens, silently tightening the
+    effective constraint.
+    """
+
+    def _run(self, policy, attempt_timeout_ms=30, global_timeout_ms=30):
+        from core import ms_to_ns
+
+        sim = Simulator(seed=1)
+        svc = ServiceRuntime(
+            cfg=ServiceConfig(
+                name="svc",
+                latency_median=ms_to_ns(10),
+                latency_lognorm_sigma=1e-6,
+                workers=4,
+                partial_failures=[
+                    PartialFailure(TimeInterval(0, s_to_ns(100)), p_fail=1.0),
+                ],
+            )
+        ).bind()
+        client = ClientRuntime(
+            cfg=ClientConfig(
+                retry=policy,
+                timeout_controller=StaticTimeoutController(
+                    global_timeout=ms_to_ns(global_timeout_ms),
+                    attempt_timeout=ms_to_ns(attempt_timeout_ms),
+                ),
+            ),
+            service=svc,
+        )
+        client.start_request(sim)
+        sim.run()
+        root = client.roots[0]
+        return len(root.attempts) - 1  # retries actually issued
+
+    def test_retry_budget_charges_only_issued_retries(self):
+        from core import ms_to_ns
+
+        policy = RetryBudgetPolicy(
+            budget_ratio=0.1,
+            max_retries=5,
+            underlying_strategy=FixedBackoffRetryPolicy(max_attempts=10, delay=ms_to_ns(50)),
+        )
+        before = policy._tokens
+        issued = self._run(policy)
+        charged = (before - policy._tokens) // policy._retry_cost
+        # The backoff (50ms) overshoots the 30ms global deadline, so the retry
+        # is authorised then vetoed: zero issued, and so zero charged.
+        self.assertEqual(issued, 0)
+        self.assertEqual(charged, 0)
+        self.assertEqual(policy._tokens, before)
+
+    def test_token_bucket_limiters_charge_only_issued_retries(self):
+        from core import ms_to_ns
+
+        for policy in (
+            BurstyRateLimiterPolicy(
+                max_requests=5,
+                refill_rate=0.0,
+                period=s_to_ns(1),
+                underlying_strategy=FixedBackoffRetryPolicy(max_attempts=10, delay=ms_to_ns(50)),
+            ),
+            FixedWindowBurstyLimiterPolicy(
+                max_requests=5,
+                period=s_to_ns(1),
+                underlying_strategy=FixedBackoffRetryPolicy(max_attempts=10, delay=ms_to_ns(50)),
+            ),
+        ):
+            with self.subTest(policy=type(policy).__name__):
+                before = policy._tokens
+                issued = self._run(policy)
+                self.assertEqual(before - policy._tokens, issued)
+
+    def test_leaky_limiter_releases_vetoed_slot(self):
+        policy = LeakyRateLimiterPolicy(max_requests=10, max_attempts=10, period=s_to_ns(1))
+        # A retry is issued here (leaky delay is 0 on an idle bucket), so the
+        # reservation stands; the invariant is that _next_at advances once per
+        # ISSUED retry, never for a vetoed one.
+        issued = self._run(policy, attempt_timeout_ms=5, global_timeout_ms=5)
+        self.assertEqual(issued, 0)
+        self.assertIsNone(policy._next_at)
+
+    def test_rollback_reaches_wrapped_layers(self):
+        from core import ms_to_ns
+
+        inner = FixedWindowBurstyLimiterPolicy(
+            max_requests=5,
+            period=s_to_ns(1),
+            underlying_strategy=FixedBackoffRetryPolicy(max_attempts=10, delay=ms_to_ns(50)),
+        )
+        outer = RetryBudgetPolicy(budget_ratio=0.1, max_retries=5, underlying_strategy=inner)
+        outer_before, inner_before = outer._tokens, inner._tokens
+        issued = self._run(outer)
+        self.assertEqual(issued, 0)
+        # Both layers charged during next_delay; both must refund.
+        self.assertEqual(outer._tokens, outer_before)
+        self.assertEqual(inner._tokens, inner_before)
+
+
 if __name__ == "__main__":
     unittest.main()
