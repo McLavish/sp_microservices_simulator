@@ -114,7 +114,7 @@ python -m plotting.rl_traces_over_time rl_traces_basic.csv              # per-st
 
 ## Conventions when extending
 
-- New retry policies that wrap another should expose `underlying_strategy` so `_update_policy_results` *and* `_rollback_policy` reach them. New stateful policies should implement `add_result(success, now)`.
+- New retry policies that wrap another should expose `underlying_strategy` so `_update_policy_results`, `_rollback_policy` *and* `_notify_request_start` reach them. New stateful policies should implement `add_result(success, now)` (once per attempt) and/or `on_request_start(now)` (once per admitted root request — that's the hook `RetryBudgetPolicy` deposits on, since its ratio is retries per *request*).
 - If a policy's `next_delay` has **side effects** (withdrawing budget, spending a rate-limiter token, reserving a leaky-bucket slot), it must also implement `rollback(context)` to undo exactly one such charge. The client asks for a delay before it knows the global deadline will veto the retry; without a refund, retries that are never issued are still charged. `RetryPolicy.rollback` defaults to a no-op, so side-effect-free policies need nothing.
 - Custom service behaviors must call `finalize` exactly once and `release_worker` at most once (both raise on repeats). Completion callbacks must not submit work synchronously if FCFS matters to your experiment — schedule through the event heap instead.
 - New downstream-graph features must preserve AND semantics in `chain.py`'s `behavior` and route deadlines through `min(...)` rather than overwriting.

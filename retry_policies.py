@@ -29,6 +29,16 @@ class RetryPolicy:
     def next_delay(self, context: RetryContext) -> DelayDecision:
         raise NotImplementedError
 
+    def on_request_start(self, now: TimePoint) -> None:
+        """Called once per root request, when the client admits it.
+
+        Separate from ``add_result`` (once per *attempt*) so a policy can key
+        off request arrivals rather than attempt outcomes — which is what a
+        Finagle-style retry budget needs, since its ratio is retries per
+        *request*. Default is a no-op.
+        """
+        return
+
     def rollback(self, context: RetryContext) -> None:
         """Undo the side effects of the immediately preceding ``next_delay``.
 
@@ -326,17 +336,36 @@ class LeakyRateLimiterPolicy(RetryPolicy):
 
 @dataclass
 class RetryBudgetPolicy(RetryPolicy):
-    budget_ratio: float  # retries can be at most this ratio of successes (e.g., 0.1 for 10%)
+    """Finagle-style retry budget: retries capped at `budget_ratio` of REQUESTS.
+
+    One deposit per admitted root request (`on_request_start`), one withdrawal
+    per retry (`next_delay`), refunded if the client then declines to issue it
+    (`rollback`) — the same deposit/tryWithdraw shape as Finagle's `RetryBudget`.
+
+    Deliberate divergence from Finagle: deposits here never expire. Finagle
+    ages them out on a TTL (default 60 s) so a long-idle client cannot bank
+    unlimited retry credit; this implementation caps the balance at
+    `max_retries` worth of tokens instead, which bounds the burst but not the
+    staleness. Adequate for episode-length simulations; would need the TTL to
+    model a long-lived client faithfully.
+
+    Note the denominator is *requests*, not *successes*. Depositing only on
+    success would enforce `retries <= ratio x successes`, which is strictly
+    tighter during exactly the failure storms a budget exists to damp, and does
+    not match the retries-per-root constraint the RL cost measures.
+    """
+
+    budget_ratio: float  # retries can be at most this ratio of requests (e.g., 0.1 for 10%)
     max_retries: int  # maximum consecutive retries before throttling
     underlying_strategy: RetryPolicy
 
     # Integer token bucket in units of 1/denominator of the (rationalized)
-    # ratio: one retry costs `denominator` tokens, each success awards
+    # ratio: one retry costs `denominator` tokens, each request deposits
     # `numerator`. Exact arithmetic — no float drift (cf. Finagle's integer
     # RetryBudget deposit/withdraw); limit_denominator(10_000) recovers
     # intended ratios like 1/3 from their float representations.
     _retry_cost: int = field(init=False)
-    _success_award: int = field(init=False)
+    _deposit: int = field(init=False)
     _max_tokens: int = field(init=False)
     _tokens: int = field(init=False)
 
@@ -347,14 +376,13 @@ class RetryBudgetPolicy(RetryPolicy):
             raise ValueError("max_retries must be >= 1")
         ratio = Fraction(self.budget_ratio).limit_denominator(10_000)
         self._retry_cost = ratio.denominator
-        self._success_award = ratio.numerator
+        self._deposit = ratio.numerator
         self._max_tokens = self._retry_cost * self.max_retries
         self._tokens = self._max_tokens  # start with full budget
 
-    def add_result(self, success: bool, now: TimePoint | None = None) -> None:
-        # Add tokens for a successful request
-        if success:
-            self._tokens = min(self._max_tokens, self._tokens + self._success_award)
+    def on_request_start(self, now: TimePoint) -> None:
+        # One deposit per admitted request, regardless of how it turns out.
+        self._tokens = min(self._max_tokens, self._tokens + self._deposit)
 
     def can_retry(self) -> bool:
         return self._tokens >= self._retry_cost

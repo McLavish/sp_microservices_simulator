@@ -275,7 +275,7 @@ class TestRetryPolicies(unittest.TestCase):
 
     def test_retry_budget_depletes_and_refills(self):
         policy = RetryBudgetPolicy(
-            budget_ratio=0.1,  # success_award = 10
+            budget_ratio=0.1,  # deposit = 10
             max_retries=2,  # max_tokens = 200, retry_cost = 100
             underlying_strategy=FixedBackoffRetryPolicy(max_attempts=100, delay=7),
         )
@@ -284,13 +284,28 @@ class TestRetryPolicies(unittest.TestCase):
         self.assertEqual(policy.next_delay(RetryContext(attempt=2, now=0)), (True, 7))  # 100 -> 0
         self.assertEqual(policy.next_delay(RetryContext(attempt=3, now=0)), (False, 0))  # depleted
 
-        policy.add_result(False, now=0)  # failures do not refill
-        self.assertEqual(policy.get_token_balance(), 0)
-
-        for _ in range(10):  # 10 successes * 10 award = 100 = one retry
-            policy.add_result(True, now=0)
+        # Finagle semantics: the denominator is REQUESTS, so a request refills
+        # the budget regardless of how it turns out. (Depositing only on success
+        # would tighten the budget during exactly the failure storms it exists
+        # to damp.)
+        for _ in range(10):  # 10 requests * 10 deposit = 100 = one retry
+            policy.on_request_start(now=0)
         self.assertEqual(policy.get_token_balance(), 100)
         self.assertEqual(policy.next_delay(RetryContext(attempt=4, now=0)), (True, 7))
+
+    def test_retry_budget_deposits_regardless_of_outcome(self):
+        policy = RetryBudgetPolicy(
+            budget_ratio=0.1,
+            max_retries=2,
+            underlying_strategy=FixedBackoffRetryPolicy(max_attempts=100, delay=7),
+        )
+        while policy.can_retry():  # drain
+            policy.next_delay(RetryContext(attempt=1, now=0))
+        self.assertEqual(policy.get_token_balance(), 0)
+        # A request that will ultimately fail still deposits.
+        for _ in range(10):
+            policy.on_request_start(now=0)
+        self.assertTrue(policy.can_retry())
 
     def test_retry_budget_does_not_consume_when_underlying_denies(self):
         policy = RetryBudgetPolicy(
@@ -460,27 +475,27 @@ class TestRetryBudgetExactArithmetic(unittest.TestCase):
             policy.next_delay(RetryContext(attempt=1, now=0))
         return policy
 
-    def test_one_third_ratio_earns_a_retry_after_three_successes(self):
+    def test_one_third_ratio_earns_a_retry_after_three_requests(self):
         policy = self._drained(1 / 3)
         for _ in range(3):
-            policy.add_result(True, now=0)
+            policy.on_request_start(now=0)
         self.assertTrue(policy.can_retry())  # float accumulation gave 99.99999999999999
 
-    def test_one_seventh_ratio_earns_a_retry_after_seven_successes(self):
+    def test_one_seventh_ratio_earns_a_retry_after_seven_requests(self):
         policy = self._drained(1 / 7)
         for _ in range(6):
-            policy.add_result(True, now=0)
+            policy.on_request_start(now=0)
         self.assertFalse(policy.can_retry())
-        policy.add_result(True, now=0)
+        policy.on_request_start(now=0)
         self.assertTrue(policy.can_retry())
 
     def test_shipped_ratios_unchanged(self):
         for ratio, needed in ((0.05, 20), (0.1, 10), (0.2, 5)):
             policy = self._drained(ratio)
             for _ in range(needed - 1):
-                policy.add_result(True, now=0)
+                policy.on_request_start(now=0)
             self.assertFalse(policy.can_retry())
-            policy.add_result(True, now=0)
+            policy.on_request_start(now=0)
             self.assertTrue(policy.can_retry())
 
 

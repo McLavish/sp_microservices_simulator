@@ -83,6 +83,12 @@ class ClientRuntime:
         if isinstance(policy, _SupportsUnderlying):
             self._update_policy_results(policy.underlying_strategy, success, now)
 
+    def _notify_request_start(self, policy: RetryPolicy, now: TimePoint) -> None:
+        """Announce an admitted root request to every layer of the policy chain."""
+        policy.on_request_start(now)
+        if isinstance(policy, _SupportsUnderlying):
+            self._notify_request_start(policy.underlying_strategy, now)
+
     def _rollback_policy(self, policy: RetryPolicy, context: RetryContext) -> None:
         """Refund a retry that ``next_delay`` authorised but we never issued.
 
@@ -114,6 +120,11 @@ class ClientRuntime:
         override_global_deadline: TimePoint | None = None,
     ):
         root_req = RootRequest()
+
+        # One budget deposit per admitted request (Finagle's RetryFilter deposits
+        # before attempting, not per outcome), so retry budgets are a ratio of
+        # requests rather than of successes.
+        self._notify_request_start(self.cfg.retry, sim.timestep)
 
         # Compute global deadline: min(override, controller)
         global_timeout = self.cfg.timeout_controller.get_global_timeout()
