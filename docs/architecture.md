@@ -50,14 +50,14 @@ downstream nodes before finalizing. See [request-handling](request-handling.md).
 
 All internal time is **integer nanoseconds**. Two aliases in `core.py` document
 intent (both are `int`): `TimePoint` (an absolute instant) and `TimeDuration` (a
-span). Convert only at boundaries with the helpers in `core.py:12`:
+span). Convert only at boundaries with the helpers in `core.py`:
 
 | Helper | Direction |
 | --- | --- |
 | `s_to_ns(s)` / `ms_to_ns(ms)` | seconds / milliseconds -> ns |
 | `ns_to_s(ns)` / `ns_to_ms(ns)` | ns -> seconds / milliseconds |
 
-`TimeInterval(begin, end)` (`core.py:29`) is **half-open** `[begin, end)`:
+`TimeInterval(begin, end)` (`core.py`) is **half-open** `[begin, end)`:
 `contains(t)` is `begin <= t < end`, and `duration()` is `end - begin`. Fault
 windows, request lifespans, and bucket ranges all use this convention.
 
@@ -67,30 +67,31 @@ windows, request lifespans, and bucket ranges all use this convention.
 
 ## Core data types (`core.py`)
 
-- **`DropReason`** (`core.py:41`) — `NONE`, `QUEUE_FULL`, `DEADLINE`,
+- **`DropReason`** (`core.py`) — `NONE`, `QUEUE_FULL`, `DEADLINE`,
   `SERVER_FAILURE`, `CIRCUIT_OPEN`. Every non-success carries one of these.
-- **`Request`** (`core.py:49`) — a single attempt: the handling `service` name, its
+- **`Request`** (`core.py`) — a single attempt: the handling `service` name, its
   `interval` (lifespan), the `deadline` it ran under, `success`, `drop_reason`, and
   `queue_size_at_end` (queue length captured when the attempt finished).
-- **`RootRequest`** (`core.py:61`) — one client-visible request = a list of
+- **`RootRequest`** (`core.py`) — one client-visible request = a list of
   `attempts` (original + retries), a `global_deadline`, a `done` flag, and an
   optional `on_done` callback fired once on completion.
-- **`Summary`** (`core.py:79`) — the aggregate returned by `Metrics.summary()`
+- **`Summary`** (`core.py`) — the aggregate returned by `Metrics.summary()`
   (counts by outcome, latency percentiles, retries per root). See
   [observability](observability.md).
 
 ## The event loop (`simulator.py`)
 
-`Simulator` (`simulator.py:20`) is the whole engine:
+`Simulator` (`simulator.py`) is the whole engine:
 
 - `schedule(at, fn) -> Event` — push a callback for time `at`; returns the `Event`,
   whose `cancelled` flag can be set to skip it (used by the chain deadline guard).
 - `run(until=None)` — pop and execute events while `heap[0].at <= until` (or to
   exhaustion if `until is None`), advancing `timestep` to each event. With `until`
-  set, `timestep` ends exactly at `until`.
+  set, `timestep` ends at `max(timestep, until)` — never *before* `until`, and
+  never rewound if a nested `run()` inside an event already advanced past it.
 - `rng()` — the single `random.Random` seeded in the constructor.
 
-`Event` (`simulator.py:9`) is ordered by `(at, seq)`; `seq` is a monotonic counter
+`Event` (`simulator.py`) is ordered by `(at, seq)`; `seq` is a monotonic counter
 so events scheduled for the same instant fire in insertion order — this keeps runs
 deterministic even under ties.
 

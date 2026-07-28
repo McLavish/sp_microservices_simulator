@@ -85,3 +85,35 @@ python -m plotting.failures_over_time chain_output.csv --fault-events chain_faul
 ```
 
 `plot.sh` batch-renders the standard chain figures.
+
+
+## `experiments/hotel_matched.py` — DeathStarBench hotelReservation
+
+Approximates the hotelReservation read path: two chains (`search` and
+`recommendation`) sharing a `profile` leaf, so contention on the shared service
+is the thing being modelled. Writes to `hotel_matched_results/`.
+
+### Calibration JSON (`--calibration-json`)
+
+Takes the calibration emitted by the external `valharness` project
+(`orchestrator.record_real`). Without it, built-in defaults are used. The
+contract, which is easy to get subtly wrong:
+
+- **Workload.** `workload.base_rps` and `workload.duration_s` drive the
+  simulation unless the corresponding CLI flag is given explicitly. A CLI value
+  always wins; omitting both means the recording decides. (Before this was
+  wired, a recorded 8 rps run simulated at the hardcoded 100 rps against
+  per-service `workers`/`queue_capacity` taken from the same file.)
+- **Fault fallback.** An *absent* `fault_scenario` key falls back to the default
+  profile fault. An explicit empty scenario — or one naming only non-profile
+  methods — means genuinely **no** profile faults. `null` is treated as absent.
+- **Validation.** The JSON path applies the same bounds as the CLI parsers:
+  windows must satisfy `end >= start`, `p_fail` must be a fraction in `[0, 1]`
+  (a value above 1 is reported as a likely percentage), spike multipliers must
+  be `>= 0`, and every number must be finite — including literals such as
+  `1e309` that overflow to infinity without ever reaching `parse_constant`.
+
+An inverted window would otherwise be silently *inert* (`TimeInterval.contains`
+is false everywhere) while still being exported to the fault-events JSON and
+shaded by the plots — a figure showing a fault the simulation never ran. That is
+why the bound checks live in `TimeInterval.__post_init__` as well as at ingest.

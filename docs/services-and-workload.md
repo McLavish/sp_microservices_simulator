@@ -16,7 +16,7 @@ arrivals --> [ queue (FCFS, cap = queue_capacity) ] --> [ c workers ] --> done
                    full -> drop QUEUE_FULL          service time ~ lognormal
 ```
 
-### `ServiceConfig` (`service.py:13`, frozen)
+### `ServiceConfig` (`service.py`, frozen)
 
 | Field | Meaning |
 | --- | --- |
@@ -28,10 +28,10 @@ arrivals --> [ queue (FCFS, cap = queue_capacity) ] --> [ c workers ] --> done
 | `latency_injections` | list of `LatencyInjection` windows (see below) |
 | `partial_failures` | list of `PartialFailure` windows |
 
-`register_fault_events(tracker)` (`service.py:25`) pushes this service's latency
+`register_fault_events(tracker)` (`service.py`) pushes this service's latency
 injections and partial failures into a `FaultEventsTracker` for plotting.
 
-### `ServiceRuntime` (`service.py:44`)
+### `ServiceRuntime` (`service.py`)
 
 Holds the live queue state (`in_flight`, `queue`). Call `.bind()` to (re)initialize
 before use. The one method clients call is:
@@ -44,16 +44,16 @@ submit_attempt(sim, on_done, attempt_deadline=None, behavior=None)
 when the attempt resolves. The optional `behavior` hook is what chains use to run
 multi-stage work on a worker — see [request-handling](request-handling.md).
 
-**Service time** (`_sample_service_time`, `service.py:66`) draws
+**Service time** (`_sample_service_time`, `service.py`) draws
 `lognormvariate(mu=log(median), sigma)` from the simulator RNG, applies any active
 latency injections, and floors the result at **100 µs** (`max(100_000, ...)`).
 
-**Latency injection math** (`_adjust_latency`, `service.py:57`): across all *active*
+**Latency injection math** (`_adjust_latency`, `service.py`): across all *active*
 injections, multipliers multiply and additive terms sum, applied as
 `base * mult + add` (then clamped at 0). So a `multiplier=2, add_latency=ms_to_ns(10)`
 window doubles the draw and adds 10 ms.
 
-**Server failures** (`_fails_now`, `service.py:79`): the effective failure
+**Server failures** (`_fails_now`, `service.py`): the effective failure
 probability at time `t` is the **max** `p_fail` over active partial failures; the
 attempt fails if `rng.random() < p_fail`.
 
@@ -64,10 +64,10 @@ reasoning about where load is shed:
 
 | When | Reason | Code |
 | --- | --- | --- |
-| At submit, queue already full | `QUEUE_FULL` | `service.py:132` |
-| At submit / at dequeue, already past deadline | `DEADLINE` | `service.py:121`, `service.py:167` |
-| At finish, now past deadline | `DEADLINE` | `service.py:214` |
-| At finish, failure roll lost | `SERVER_FAILURE` | `service.py:218` |
+| At submit, queue already full | `QUEUE_FULL` | `service.py` |
+| At submit / at dequeue, already past deadline | `DEADLINE` | `service.py`, `service.py` |
+| At finish, now past deadline | `DEADLINE` | `service.py` |
+| At finish, failure roll lost | `SERVER_FAILURE` | `service.py` |
 
 ### Example: a faulty service
 
@@ -94,7 +94,7 @@ svc = ServiceRuntime(cfg=cfg).bind()
 
 ## Workload: Poisson arrivals (`workload.py`)
 
-`Workload` (`workload.py:11`) generates arrivals as an **exact nonhomogeneous
+`Workload` (`workload.py`) generates arrivals as an **exact nonhomogeneous
 Poisson process** for the piecewise-constant rate (base RPS x active spike
 multipliers): each arrival draws one Exp(1) budget and consumes it across rate
 segments, whose boundaries are the spike starts/ends. A segment of rate `r` and
@@ -110,7 +110,7 @@ deterministically at t=0).
 | `load_spikes` | list of `LoadSpike` windows |
 | `rng_seed` | seed for the workload's **own** RNG (`None` -> `0`) |
 
-- `rps_at(t)` (`workload.py:28`) — effective rate = `base_rps` times every active
+- `rps_at(t)` (`workload.py`) — effective rate = `base_rps` times every active
   spike's `rps_multiplier`.
 - `drive(sim, on_arrival)` (`workload.py`) — schedules the arrival chain; calls
   `on_arrival(sim)` at each arrival (typically `client.start_request`).
@@ -152,7 +152,7 @@ windows compose as described above (latency multiplies+adds; failure takes the m
 ## Fault events: overlays for plots (`fault_events.py`)
 
 Faults live in nanoseconds inside the sim, but plots want seconds.
-`FaultEventsTracker` (`fault_events.py:16`) is a separate record that mirrors the
+`FaultEventsTracker` (`fault_events.py`) is a separate record that mirrors the
 configured faults in **seconds-based JSON**, so plotting can shade the windows where
 something was wrong.
 

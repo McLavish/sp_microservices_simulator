@@ -17,9 +17,9 @@ together. Always export both from the same run.
 
 Construct via `client.metrics()` (it wraps `roots` + `attempts_total`).
 
-### `summary()` (`metrics.py:39`)
+### `summary()` (`metrics.py`)
 
-Returns a `Summary` (`core.py:79`): `total`, `succeeded`, `dropped_*` by reason,
+Returns a `Summary` (`core.py`): `total`, `succeeded`, `dropped_*` by reason,
 latency percentiles `p50..p99_99`, `mean`, `max`, `retries_per_root`,
 `attempts_total`. Notes:
 
@@ -28,9 +28,9 @@ latency percentiles `p50..p99_99`, `mean`, `max`, `retries_per_root`,
 - A failed root is attributed to its **last attempt's** `drop_reason`.
 - `retries_per_root = (attempts_total - total) / total`.
 
-`print_stats()` (`metrics.py:95`) dumps the summary to stdout.
+`print_stats()` (`metrics.py`) dumps the summary to stdout.
 
-### `export_csv(path, granularity_s=1.0)` (`metrics.py:113`)
+### `export_csv(path, granularity_s=1.0)` (`metrics.py`)
 
 Writes one row per time bucket (default 1 s). `granularity_s` must round to at
 least 1 ns (values below 5e-10 s raise `ValueError`); the `timepoint` column is
