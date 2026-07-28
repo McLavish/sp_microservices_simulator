@@ -416,3 +416,58 @@ class TestSurrogateGlobalDeadline(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestActionGridUnspecifiedGlobalTimeout(unittest.TestCase):
+    """`nearest_indices` must distinguish "no opinion" from "explicitly None".
+
+    FixedValuePolicy and AIMDPolicy both default the argument, so conflating the
+    two made them raise on any spec whose global-timeout grid is all numeric.
+    """
+
+    def test_omitted_global_timeout_on_numeric_only_grid(self):
+        grid = ActionGrid(ActionSpec([10, 50], [1, 2], [0, 50], [100, 200]))
+        self.assertEqual(len(grid.nearest_indices(30, 2, 20)), 4)
+
+    def test_omitted_prefers_the_none_entry_when_present(self):
+        spec = ActionSpec([10, 50], [1, 2], [0, 50], [None, 200])
+        grid = ActionGrid(spec)
+        idx = grid.nearest_indices(30, 2, 20)
+        global_timeouts = spec.global_timeout_ms
+        assert global_timeouts is not None  # narrow for the type checker
+        self.assertIsNone(global_timeouts[idx[3]])
+
+    def test_explicit_none_still_requires_a_none_entry(self):
+        grid = ActionGrid(ActionSpec([10, 50], [1, 2], [0, 50], [100, 200]))
+        with self.assertRaises(ValueError):
+            grid.nearest_indices(30, 2, 20, None)
+
+
+class TestEVTNumericStability(unittest.TestCase):
+    def test_tight_dispersion_does_not_overflow(self):
+        """u**alpha in probability space RAISES OverflowError once the Hill
+        estimate is large; the density must be computed in log space."""
+        import numpy as np
+
+        from rl.models.evt_tail import EVTTailModel
+
+        rng = np.random.default_rng(0)
+        x = rng.lognormal(4.1, 0.012, 5000)
+        model = EVTTailModel(threshold_quantile=0.95).fit(x)
+        lp = model.logpdf(x[:100])
+        self.assertTrue(np.all(np.isfinite(lp)))
+
+    def test_body_is_fitted_without_truncation_bias(self):
+        """The body sample is right-truncated at u, so a plain MLE biases both
+        parameters toward zero and every body quantile comes out low."""
+        import numpy as np
+
+        from rl.models.evt_tail import EVTTailModel
+
+        rng = np.random.default_rng(0)
+        x = rng.lognormal(np.log(50), 0.8, 50_000)
+        model = EVTTailModel(threshold_quantile=0.95).fit(x)
+        # Within Monte-Carlo error of the true parameters; the truncated fit
+        # gave mu=3.82 / sigma=0.72 against a true 3.912 / 0.8.
+        self.assertAlmostEqual(model.body.mu, np.log(50), delta=0.05)
+        self.assertAlmostEqual(model.body.sigma, 0.8, delta=0.06)

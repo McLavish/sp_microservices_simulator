@@ -360,7 +360,29 @@ def _load_calibration(path: Path | None) -> dict[str, Any]:
     def _reject_constant(name: str):
         raise ValueError(f"calibration JSON contains non-finite value {name}")
 
-    return json.loads(Path(path).read_text(), parse_constant=_reject_constant)
+    data = json.loads(Path(path).read_text(), parse_constant=_reject_constant)
+
+    # parse_constant only catches the literal NaN/Infinity tokens. A finite
+    # literal that OVERFLOWS the float type (e.g. 1e309) parses to inf without
+    # ever reaching it, and would then flow into rates and durations -- an
+    # infinite rps multiplier schedules an arrival every nanosecond.
+    def _check_finite(node: Any, where: str) -> None:
+        if isinstance(node, bool):
+            return
+        if isinstance(node, float) and not math.isfinite(node):
+            raise ValueError(
+                f"calibration JSON has a non-finite number at {where}: {node!r} "
+                "(a literal like 1e309 overflows to infinity)"
+            )
+        if isinstance(node, dict):
+            for k, v in node.items():
+                _check_finite(v, f"{where}.{k}")
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                _check_finite(v, f"{where}[{i}]")
+
+    _check_finite(data, "<root>")
+    return data
 
 
 def _profile_faults_from_calibration(

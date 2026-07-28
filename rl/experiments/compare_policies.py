@@ -407,6 +407,24 @@ def main() -> None:
     grid = ActionGrid(action_spec)
 
     policy_names = [p.strip() for p in args.policies.split(",") if p.strip()]
+    known = {
+        "fixed",
+        "aimd",
+        "model_based",
+        "model_based_queue",
+        "bayesian",
+        "ppo",
+        "sb3",
+        "oracle_fixed",
+        "constrained_ppo",
+    }
+    unknown = [n for n in policy_names if n not in known]
+    if unknown:
+        # Silently dropping a typo produced a comparison table quietly missing
+        # the arm the caller asked for.
+        raise SystemExit(
+            f"unknown --policies entries: {', '.join(unknown)}. Known: {', '.join(sorted(known))}"
+        )
     policies = []
 
     if "fixed" in policy_names:
@@ -476,7 +494,7 @@ def main() -> None:
         if args.ppo_load_path:
             if PPO is None:
                 raise ImportError("stable-baselines3 is required for PPO baseline")
-            check_action_spec(args.ppo_load_path, action_spec)
+            check_action_spec(args.ppo_load_path, action_spec, cfg.step_duration_s)
             model = PPO.load(args.ppo_load_path)
             policies.append(SB3Policy(model=model, deterministic=True, name="ppo"))
         else:

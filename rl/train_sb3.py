@@ -75,9 +75,15 @@ def _evaluate(model, cfg: TrainConfig) -> None:
             last_info = info
 
         total_rewards.append(ep_reward)
-        summary = last_info.get("summary", {})
+        # `summary` is the FINAL WINDOW's summary, not an episode aggregate:
+        # info["summary"] is recomputed every step over that window's
+        # completions. Label it so nobody reads it as an episode total.
+        last_window = last_info.get("summary", {})
         action = last_info.get("action", {})
-        print(f"[eval] episode={ep} reward={ep_reward:.4f} action={action} summary={summary}")
+        print(
+            f"[eval] episode={ep} reward={ep_reward:.4f} action={action} "
+            f"last_window_summary={last_window}"
+        )
 
     if total_rewards:
         avg = sum(total_rewards) / len(total_rewards)
@@ -101,7 +107,7 @@ def train(cfg: TrainConfig) -> None:
     )
 
     if cfg.load_path:
-        check_action_spec(cfg.load_path, _action_spec(cfg))
+        check_action_spec(cfg.load_path, _action_spec(cfg), cfg.step_duration_s)
         model = PPO.load(cfg.load_path, env=vec_env, device=cfg.device)
     else:
         model = PPO(

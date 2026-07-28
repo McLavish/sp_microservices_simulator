@@ -342,8 +342,10 @@ def main() -> None:
     plain_env = _make_env(plain_build, action_spec, args.episode_duration_s)
 
     if args.calibrate:
-        _run_calibration(plain_env, grid, args.oracle_seeds, args.eval_seeds, args.budgets)
-        return
+        # The gate's verdict is the point of the mode: propagate it as the exit
+        # status instead of always reporting success.
+        passed = _run_calibration(plain_env, grid, args.oracle_seeds, args.eval_seeds, args.budgets)
+        raise SystemExit(0 if passed else 1)
 
     if PPO is None:
         raise ImportError(

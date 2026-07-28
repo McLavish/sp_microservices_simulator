@@ -2,6 +2,20 @@ from collections.abc import Sequence
 
 from rl.spec import ActionSpec, ActionValues, coerce_action
 
+
+class _Unspecified:
+    """Sentinel: the caller expressed no preference for a knob.
+
+    Distinct from `None`, which for `global_timeout_ms` means "explicitly no
+    global timeout" and selects the spec's None entry.
+    """
+
+    __slots__ = ()
+
+
+UNSPECIFIED = _Unspecified()
+
+
 __all__ = ["ActionGrid", "ActionValues", "coerce_action"]
 
 
@@ -64,8 +78,18 @@ class ActionGrid:
         attempt_timeout_ms: int,
         max_attempts: int,
         backoff_ms: int,
-        global_timeout_ms: int | None = None,
+        global_timeout_ms: int | None | _Unspecified = UNSPECIFIED,
     ) -> tuple[int, ...]:
+        """Map knob values onto grid indices.
+
+        `global_timeout_ms` distinguishes three cases: omitted (the caller has no
+        opinion — pick the spec's own default), explicitly `None` (select the
+        spec's no-global-timeout entry, which must exist), or a number (nearest
+        numeric entry). Conflating the first two made every policy that defaults
+        the argument — FixedValuePolicy, AIMDPolicy — raise on any spec whose
+        global-timeout grid is entirely numeric.
+        """
+
         def nearest(value: int, candidates: list[int]) -> int:
             return int(min(range(len(candidates)), key=lambda i: abs(candidates[i] - value)))
 
@@ -75,7 +99,15 @@ class ActionGrid:
         if self._spec.global_timeout_ms is None:
             return (i, j, k)
 
-        if global_timeout_ms is None:
+        if isinstance(global_timeout_ms, _Unspecified):
+            # No opinion: prefer the spec's None entry if it has one, otherwise
+            # fall back to its first (numeric) entry rather than failing.
+            g = (
+                self._spec.global_timeout_ms.index(None)
+                if None in self._spec.global_timeout_ms
+                else 0
+            )
+        elif global_timeout_ms is None:
             if None not in self._spec.global_timeout_ms:
                 raise ValueError(
                     "requested global_timeout_ms=None but the ActionSpec has no None entry"

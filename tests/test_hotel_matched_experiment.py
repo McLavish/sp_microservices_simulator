@@ -297,3 +297,19 @@ def test_calibration_json_rejects_non_finite(tmp_path):
     path.write_text('{"services": {"profile": {"median_ms": NaN}}}')
     with pytest.raises(ValueError):
         _load_calibration(path)
+
+
+def test_calibration_rejects_numbers_that_overflow_to_infinity(tmp_path):
+    """parse_constant only catches the literal NaN/Infinity tokens. A finite
+    literal that overflows the float type reaches inf without ever hitting it,
+    and an infinite rps multiplier schedules an arrival every nanosecond."""
+    cal = tmp_path / "cal.json"
+    cal.write_text('{"workload": {"load_spikes": [[1.0, 2.0, 1e309]]}}')
+    with pytest.raises(ValueError, match="non-finite"):
+        _load_calibration(cal)
+
+
+def test_calibration_still_accepts_ordinary_numbers(tmp_path):
+    cal = tmp_path / "cal.json"
+    cal.write_text('{"workload": {"base_rps": 8.0, "duration_s": 3.0, "load_spikes": []}}')
+    assert _load_calibration(cal)["workload"]["base_rps"] == 8.0

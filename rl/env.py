@@ -50,6 +50,16 @@ else:
         _GYM_IMPORT_ERROR = exc
 
 
+# Domain separation for fault-parameter draws, same rationale as
+# workload._ARRIVAL_SEED_OFFSET: the builders seed their fault RNG with the same
+# integer they pass to `Simulator(seed=...)`, so without an offset both would
+# draw from the identical Mersenne-Twister stream and fault difficulty would
+# covary with the service times and failure rolls it is supposed to be
+# independent of. Distinct from the arrival offset so faults, arrivals and
+# service draws are three separate streams.
+_FAULT_SEED_OFFSET = 700_001
+
+
 @dataclass
 class EnvComponents:
     sim: Simulator
@@ -683,7 +693,7 @@ def build_randomized_faulty_single_service_env(
     to observed degradation. Same seed reproduces the same fault draw.
     """
     duration = 30.0 if duration_s is None else float(duration_s)
-    rng = random.Random(1 if seed is None else seed)
+    rng = random.Random((1 if seed is None else seed) + _FAULT_SEED_OFFSET)
 
     def window() -> TimeInterval:
         onset = rng.uniform(0.05, 0.6) * duration
@@ -724,7 +734,7 @@ def build_chain_env(
     build_seed = 1 if seed is None else int(seed)
     sim = Simulator(seed=build_seed)
     duration = 30.0 if duration_s is None else float(duration_s)
-    rng = random.Random(build_seed)
+    rng = random.Random(build_seed + _FAULT_SEED_OFFSET)
 
     onset = rng.uniform(0.1, 0.5) * duration
     length = rng.uniform(0.15, 0.35) * duration
@@ -847,7 +857,7 @@ def build_multichain_env(
     build_seed = 1 if seed is None else int(seed)
     sim = Simulator(seed=build_seed)
     duration = 30.0 if duration_s is None else float(duration_s)
-    rng = random.Random(build_seed)
+    rng = random.Random(build_seed + _FAULT_SEED_OFFSET)
 
     # p_fail must be high enough that upstream retry layers (A->B x2, top x2:
     # up to 4 end-to-end C rolls) cannot recover blips on their own — at ~0.65
