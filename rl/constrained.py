@@ -66,22 +66,6 @@ def dual_ascent_update(lam: float, cost: float, budget: float, lr: float) -> flo
     return max(0.0, lam + lr * (cost - budget))
 
 
-def objective_from_summary(summary: dict, weights: RewardWeights) -> float:
-    """Base objective J: the env reward with retry and cost penalties zeroed.
-
-    Used for evaluation of every arm so the comparison scale does not depend
-    on each arm's training weights.
-    """
-    return float(
-        summary["success_rate"] * weights.success
-        - summary["deadline_drop_rate"] * weights.deadline_drop
-        - summary["queue_drop_rate"] * weights.queue_drop
-        - summary["server_drop_rate"] * weights.server_drop
-        - summary["circuit_open_drop_rate"] * weights.circuit_open_drop
-        - summary["p95_latency_ms"] * weights.p95_latency_ms
-    )
-
-
 def evaluate_objective_and_cost(
     model, env: MicroservicesEnv, episodes: int, weights: RewardWeights
 ) -> tuple[float, float]:

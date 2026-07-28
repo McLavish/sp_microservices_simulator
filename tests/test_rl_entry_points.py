@@ -110,7 +110,7 @@ class TestConstrainedRetryEntryPoint(unittest.TestCase):
                     "--oracle-seeds",
                     "1",
                     "--eval-seeds",
-                    "1",
+                    "1,2",
                     "--budgets",
                     "0.1",
                     "--attempt-timeouts-ms",
@@ -121,7 +121,46 @@ class TestConstrainedRetryEntryPoint(unittest.TestCase):
                     "0",
                 ]
             )
-        self.assertIn(ctx.exception.code, (0, 1))
+        # `in (0, 1)` accepts both branches, so it cannot detect the very
+        # regression this guards against - an always-succeed exit. Pin the
+        # verdict: this configuration deterministically fails the gate.
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_calibration_exits_zero_when_the_gate_passes(self):
+        """The passing branch, which no run ever reached."""
+        import rl.experiments.constrained_retry as mod
+
+        def passing(*_args, **_kwargs) -> bool:
+            return True
+
+        original = mod._run_calibration
+        mod._run_calibration = passing  # ty: ignore[invalid-assignment]
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                mod.main(
+                    [
+                        "--scenario",
+                        "chain",
+                        "--calibrate",
+                        "--episode-duration-s",
+                        "2.0",
+                        "--oracle-seeds",
+                        "1",
+                        "--eval-seeds",
+                        "1,2",
+                        "--budgets",
+                        "0.1",
+                        "--attempt-timeouts-ms",
+                        "30",
+                        "--max-attempts",
+                        "1",
+                        "--backoff-ms",
+                        "0",
+                    ]
+                )
+            self.assertEqual(ctx.exception.code, 0)
+        finally:
+            mod._run_calibration = original
 
 
 @unittest.skipIf(_PPO is None, "stable-baselines3 not installed")
@@ -156,10 +195,6 @@ class TestTrainSb3EntryPoint(unittest.TestCase):
             self.assertTrue(os.path.exists(sidecar_path(save)))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 @unittest.skipIf(gymnasium is None, "gymnasium not installed")
 class TestRolloutIsShared(unittest.TestCase):
     """The aggregations that must agree across callers live in one place.
@@ -172,14 +207,90 @@ class TestRolloutIsShared(unittest.TestCase):
 
     def test_no_module_hand_rolls_an_episode_loop(self):
         import pathlib
+        import re
 
-        offenders = [
-            path.name
-            for path in pathlib.Path("rl").rglob("*.py")
-            if path.name != "rollout.py"
-            and "while not (terminated or truncated)" in path.read_text()
-        ]
+        # Anchor to the repo, not the cwd: pathlib.Path("rl") silently yields
+        # nothing when pytest runs from anywhere else, so the guard passed while
+        # scanning zero files.
+        root = pathlib.Path(__file__).resolve().parent.parent / "rl"
+        self.assertTrue(root.is_dir(), f"expected to scan {root}")
+        scanned = [p for p in root.rglob("*.py") if p.resolve() != (root / "rollout.py").resolve()]
+        self.assertGreater(len(scanned), 5, "scan found suspiciously few modules")
+
+        # Match on shape, not one literal spelling: `while not terminated and
+        # not truncated:` is the same loop and would have slipped through.
+        loop = re.compile(r"while\s+not\s*\(?\s*(terminated|truncated)")
+        offenders = [p.name for p in scanned if loop.search(p.read_text())]
         self.assertEqual(offenders, [], "these modules re-implement the episode loop")
+
+    def test_pooled_cost_is_pooled_not_a_window_average(self):
+        """Pin the RULE, with windows sized so the two aggregations differ.
+
+        The agreement test below cannot catch a wrong rule: both of its sides
+        read the same property, so it holds for any definition. Verified by
+        mutation - replacing pooled_cost with the macro-average it was written
+        to eliminate left the whole suite green.
+        """
+        from rl.rollout import EpisodeResult, WindowRecord
+
+        def window(step, retries, roots):
+            return WindowRecord(
+                step=step,
+                reward=0.0,
+                summary={
+                    "cost_retries": float(retries),
+                    "cost_roots": float(roots),
+                    "cost": retries / roots,
+                },
+                action_values={},
+            )
+
+        # Deliberately lopsided: 1/100 and 9/10.
+        result = EpisodeResult(
+            seed=None, total_reward=0.0, windows=[window(0, 1, 100), window(1, 9, 10)]
+        )
+        # Pooled: 10 retries over 110 roots.
+        self.assertAlmostEqual(result.pooled_cost, 10 / 110, places=12)
+        # The macro-average of the per-window ratios would be 0.455 — nearly 5x.
+        macro = (1 / 100 + 9 / 10) / 2
+        self.assertNotAlmostEqual(result.pooled_cost, macro, places=3)
+
+    def test_empty_episode_has_no_cost_and_no_objective(self):
+        from rl.rollout import EpisodeResult
+        from rl.spec import RewardWeights
+
+        empty = EpisodeResult(seed=None, total_reward=0.0, windows=[])
+        self.assertEqual(empty.pooled_cost, 0.0)
+        self.assertEqual(empty.objective(RewardWeights()), 0.0)
+
+    def test_objective_matches_a_hand_computed_value(self):
+        """The live J formula. The only exact-value test used to pin
+        objective_from_summary, which has had no production caller since the
+        rollout refactor - so a wrong J shipped green."""
+        from rl.rollout import EpisodeResult, WindowRecord
+        from rl.spec import RewardWeights
+
+        summary = {
+            "success_rate": 0.8,
+            "deadline_drop_rate": 0.1,
+            "queue_drop_rate": 0.05,
+            "server_drop_rate": 0.05,
+            "circuit_open_drop_rate": 0.0,
+            "p95_latency_ms": 100.0,
+            # Neither of these may enter J: it is the objective with the retry
+            # and cost penalties zeroed, so every arm is comparable regardless
+            # of the weights it was trained with.
+            "retries_per_root": 5.0,
+            "cost": 3.0,
+        }
+        weights = RewardWeights()
+        result = EpisodeResult(
+            seed=None,
+            total_reward=0.0,
+            windows=[WindowRecord(step=0, reward=0.0, summary=summary, action_values={})],
+        )
+        expected = 0.8 - 0.1 - 0.05 - 0.05 - 0.0 - 100.0 * weights.p95_latency_ms
+        self.assertAlmostEqual(result.objective(weights), expected, places=12)
 
     def test_eval_arm_cost_matches_the_shared_pooled_cost(self):
         import numpy as np
@@ -202,3 +313,7 @@ class TestRolloutIsShared(unittest.TestCase):
             for s in seeds
         ]
         self.assertAlmostEqual(arm["cost_mean"], float(np.mean(direct)), places=12)
+
+
+if __name__ == "__main__":
+    unittest.main()

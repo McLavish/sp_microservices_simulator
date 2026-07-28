@@ -6,10 +6,10 @@ from rl.constrained import (
     PPO,
     ConstrainedTrainConfig,
     dual_ascent_update,
-    objective_from_summary,
     train_constrained_ppo,
 )
 from rl.env import ActionSpec, build_chain_env
+from rl.rollout import EpisodeResult, WindowRecord
 from rl.spec import RewardWeights
 
 
@@ -38,7 +38,15 @@ class TestObjective(unittest.TestCase):
             "cost": 5.0,  # must NOT enter J
         }
         expected = 0.9 - 0.05 - 0.02 - 0.02 - 0.01 - 100.0 * 0.001
-        self.assertAlmostEqual(objective_from_summary(summary, weights), expected)
+        result = EpisodeResult(
+            seed=None,
+            total_reward=0.0,
+            windows=[WindowRecord(step=0, reward=0.0, summary=summary, action_values={})],
+        )
+        # EpisodeResult.objective is the LIVE formula; objective_from_summary was
+        # a second copy with no production callers, and pinning the dead one let
+        # a wrong J ship green.
+        self.assertAlmostEqual(result.objective(weights), expected)
 
 
 @unittest.skipIf(PPO is None, "stable-baselines3 not installed")

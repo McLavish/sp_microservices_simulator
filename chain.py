@@ -267,7 +267,7 @@ class ServiceNodeRuntime:
     def submit_attempt(
         self,
         sim: Simulator,
-        on_done: Callable[[bool, TimeDuration, DropReason, int], None],
+        on_done: Callable[..., None],
         attempt_deadline: TimePoint | None = None,
     ) -> AttemptControl:
         """Submit a logical attempt to this node.

@@ -4,7 +4,7 @@ import unittest
 
 from caller import ClientConfig, ClientRuntime
 from chain import DownstreamEdge, ServiceNodeRuntime
-from core import DropReason, TimeInterval, ms_to_ns, s_to_ns
+from core import DropReason, RootRequest, TimeInterval, ms_to_ns, s_to_ns
 from faults import PartialFailure
 from retry_policies import (
     CBState,
@@ -86,7 +86,7 @@ class TestChainWorkerModel(unittest.TestCase):
 
         ends: list[tuple[bool, int]] = []
 
-        def on_done(success, _svc_time, _drop_reason, _q):
+        def on_done(success, _svc_time, _drop_reason, _q, _censored=False):
             ends.append((success, sim.timestep))
 
         # Probe mid fan-out: local stage done (~10ms), downstream still running (~210ms).
@@ -113,7 +113,7 @@ class TestChainWorkerModel(unittest.TestCase):
 
         ends: list[tuple[bool, int]] = []
 
-        def on_done(success, _svc_time, _drop_reason, _q):
+        def on_done(success, _svc_time, _drop_reason, _q, _censored=False):
             ends.append((success, sim.timestep))
 
         sim.schedule(ms_to_ns(100), take_probe)
@@ -134,7 +134,7 @@ class TestChainWorkerModel(unittest.TestCase):
 
         ends: list[tuple[bool, int]] = []
 
-        def on_done(success, _svc_time, _drop_reason, _q):
+        def on_done(success, _svc_time, _drop_reason, _q, _censored=False):
             ends.append((success, sim.timestep))
 
         parent.submit_attempt(sim, on_done, attempt_deadline=None)
@@ -153,7 +153,7 @@ class TestChainWorkerModel(unittest.TestCase):
 
         ends: list[tuple[bool, int]] = []
 
-        def on_done(success, _svc_time, _drop_reason, _q):
+        def on_done(success, _svc_time, _drop_reason, _q, _censored=False):
             ends.append((success, sim.timestep))
 
         parent.submit_attempt(sim, on_done, attempt_deadline=None)
@@ -815,3 +815,104 @@ class TestCancellationRecursion(unittest.TestCase):
         self.assertEqual(deep_client.metrics().summary().dropped_cancelled, 0)
         self.assertGreaterEqual(sim.timestep, ms_to_ns(200))  # DEEP ran to completion
         self.assertEqual(deep.service.in_flight, 0)
+
+
+class TestOccupancyCensoring(unittest.TestCase):
+    """Whether an occupancy sample is right-censored is a property of the
+    SAMPLE, not of the attempt's outcome.
+
+    A tandem node hands its worker back before the downstream wait, so a later
+    deadline censors the ATTEMPT while the local stage it measured ran to
+    completion. Inferring the flag from drop_reason fed complete observations to
+    the censored MLE as lower bounds and inflated the fitted E[S] several-fold.
+    """
+
+    def _fanout_attempt(self, hold: bool):
+        sim = Simulator(seed=1)
+
+        def node(name, median_ms, workers=4):
+            return ServiceNodeRuntime(
+                service=ServiceRuntime(
+                    cfg=ServiceConfig(
+                        name=name,
+                        latency_median=ms_to_ns(median_ms),
+                        latency_lognorm_sigma=1e-6,
+                        workers=workers,
+                    )
+                ).bind()
+            )
+
+        a, leaf = node("A", 10), node("LEAF", 200)
+        a.hold_worker_during_fanout = hold
+        a.add_downstream(
+            DownstreamEdge(
+                client=ClientRuntime(
+                    cfg=ClientConfig(
+                        retry=NoRetryPolicy(),
+                        timeout_controller=StaticTimeoutController(None, ms_to_ns(5000)),
+                    ),
+                    service=leaf,
+                ),
+                target=leaf,
+            )
+        )
+        client = ClientRuntime(
+            cfg=ClientConfig(
+                retry=NoRetryPolicy(),
+                # Cuts the attempt long after A's local stage has finished.
+                timeout_controller=StaticTimeoutController(None, ms_to_ns(150)),
+            ),
+            service=a,
+        )
+        client.start_request(sim)
+        sim.run()
+        return client.roots[0].attempts[-1]
+
+    def test_released_worker_yields_a_complete_occupancy_sample(self):
+        attempt = self._fanout_attempt(hold=False)
+        self.assertEqual(attempt.drop_reason, DropReason.DEADLINE)  # attempt WAS cut
+        assert attempt.service_time_ns is not None
+        self.assertAlmostEqual(attempt.service_time_ns / ms_to_ns(1), 10.0, delta=0.5)
+        self.assertFalse(attempt.service_time_censored)
+
+    def test_held_worker_yields_a_censored_occupancy_sample(self):
+        attempt = self._fanout_attempt(hold=True)
+        self.assertEqual(attempt.drop_reason, DropReason.DEADLINE)
+        self.assertTrue(attempt.service_time_censored)
+
+    def test_plain_service_deadline_cut_is_censored(self):
+        sim = Simulator(seed=1)
+        svc = ServiceRuntime(
+            cfg=ServiceConfig(
+                name="svc", latency_median=ms_to_ns(200), latency_lognorm_sigma=1e-6, workers=1
+            )
+        ).bind()
+        client = ClientRuntime(
+            cfg=ClientConfig(
+                retry=NoRetryPolicy(),
+                timeout_controller=StaticTimeoutController(None, ms_to_ns(50)),
+            ),
+            service=svc,
+        )
+        client.start_request(sim)
+        sim.run()
+        attempt = client.roots[0].attempts[-1]
+        self.assertTrue(attempt.service_time_censored)
+
+    def test_env_uses_the_recorded_flag_not_the_drop_reason(self):
+        from rl.env import EnvConfig, MicroservicesEnv, build_single_service_env
+        from rl.spec import ActionSpec
+
+        env = MicroservicesEnv(
+            EnvConfig(
+                build=build_single_service_env,
+                action_spec=ActionSpec([10, 50], [1, 2], [0, 50]),
+            )
+        )
+        attempt = self._fanout_attempt(hold=False)
+        root = RootRequest()
+        root.add_attempt(attempt)
+        samples = env._collect_latency_samples([root])
+        # The attempt's latency IS censored; its occupancy is not.
+        self.assertEqual(samples["attempt_censored"], [True])
+        self.assertEqual(samples["attempt_service_censored"], [False])

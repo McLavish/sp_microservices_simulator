@@ -99,7 +99,11 @@ def classify_root(root: "RootRequest") -> RootOutcome:
     if root.cancelled:
         return RootOutcome.CANCELLED
     if not root.attempts:
-        return RootOutcome.SERVER_FAILURE
+        # Fail loud rather than inventing an outcome. Both Metrics paths SKIP
+        # attempt-less roots while the RL env would have counted one, so any
+        # silent answer here makes the three consumers disagree; the pre-refactor
+        # env raised IndexError on this shape, and callers already guard it.
+        raise ValueError("cannot classify a RootRequest with no attempts")
     # Append order is completion order (ties on end time are ambiguous).
     return _OUTCOME_BY_DROP_REASON.get(root.attempts[-1].drop_reason, RootOutcome.SERVER_FAILURE)
 
@@ -144,6 +148,12 @@ class Request:
     # worker really is held throughout. End-to-end node latency is `interval`.
     # None when service never began (queue-full / deadline-at-dequeue drops).
     service_time_ns: TimeDuration | None = None
+    # True when the occupancy above is a LOWER BOUND: the worker was still held
+    # when a deadline or cancellation cut the attempt short. False when the
+    # occupancy is complete — notably a tandem chain node, which hands its
+    # worker back before the downstream wait, so a later cut censors the
+    # attempt but not the local stage that already finished.
+    service_time_censored: bool = False
 
 
 @dataclass

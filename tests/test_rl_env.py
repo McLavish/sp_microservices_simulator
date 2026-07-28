@@ -632,6 +632,12 @@ class TestInstantRejectionSamples(unittest.TestCase):
                 interval=TimeInterval(begin=0, end=ms_to_ns(10)),
                 drop_reason=DropReason.DEADLINE,
                 service_time_ns=ms_to_ns(10),
+                # The worker was still held at the cut, so this occupancy is a
+                # lower bound. The service records that explicitly now — it is
+                # NOT inferred from drop_reason, because a tandem chain node
+                # hands its worker back before the downstream wait and its local
+                # stage is a complete observation despite a later deadline.
+                service_time_censored=True,
             )
         )
         ok = RootRequest()

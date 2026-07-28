@@ -252,7 +252,9 @@ class TestFanoutLaunchesAllEdges(unittest.TestCase):
         for e in edges:
             parent.add_downstream(e)
         results = []
-        parent.submit_attempt(sim, lambda success, t, drop, q: results.append((success, drop)))
+        parent.submit_attempt(
+            sim, lambda success, t, drop, q, censored=False: results.append((success, drop))
+        )
         sim.run()
         ok_edge = edges[1] if reject_first else edges[0]
         return results, len(ok_edge.client.roots)

@@ -40,7 +40,7 @@ class ServiceLike(Protocol):
     def submit_attempt(
         self,
         sim: Simulator,
-        on_done: Callable[[bool, TimeDuration, DropReason, int], None],
+        on_done: Callable[..., None],
         attempt_deadline: TimePoint | None = None,
     ) -> AttemptControl: ...
 
@@ -277,6 +277,7 @@ class ClientRuntime:
         svc_time: TimeDuration,
         drop_reason: DropReason,
         queue_size: int,
+        occupancy_censored: bool = False,
     ):
         if ctx.root.done:
             raise RuntimeError("Root request was already done!")
@@ -297,6 +298,7 @@ class ClientRuntime:
         # svc_time == 0 marks paths where service never began (queue-full,
         # deadline-at-dequeue); real service times are floored at 100 us.
         ctx.req.service_time_ns = svc_time if svc_time > 0 else None
+        ctx.req.service_time_censored = occupancy_censored
 
         # Log the request
         ctx.root.add_attempt(ctx.req)

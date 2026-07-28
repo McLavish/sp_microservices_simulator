@@ -21,7 +21,7 @@ class TestServiceDeadline(unittest.TestCase):
         svc = ServiceRuntime(cfg=cfg).bind()
         results = []
 
-        def on_done(success, _svc_time, drop_reason, _queue_size):
+        def on_done(success, _svc_time, drop_reason, _queue_size, _censored=False):
             results.append((success, drop_reason))
 
         svc.submit_attempt(sim, on_done, attempt_deadline=0)

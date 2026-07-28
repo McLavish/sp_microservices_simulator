@@ -196,8 +196,8 @@ class ServiceRuntime:
         self,
         sim: Simulator,
         on_done: Callable[
-            [bool, TimeDuration, DropReason, int], None
-        ],  # success, service_time, whydropped, queue_size
+            [bool, TimeDuration, DropReason, int, bool], None
+        ],  # success, occupancy, whydropped, queue_size, occupancy_censored
         attempt_deadline: TimePoint | None = None,
         behavior: Behavior | None = None,
     ):
@@ -223,17 +223,21 @@ class ServiceRuntime:
         control = AttemptControl()
 
         def settled_on_done(
-            success: bool, svc_time: TimeDuration, drop: DropReason, qsize: int
+            success: bool,
+            svc_time: TimeDuration,
+            drop: DropReason,
+            qsize: int,
+            occupancy_censored: bool = False,
         ) -> None:
             # However the attempt ends, the handle stops being cancellable
             # first — so a cancel racing a completion is a no-op, not a
             # double-completion.
             control._settle()
-            on_done(success, svc_time, drop, qsize)
+            on_done(success, svc_time, drop, qsize, occupancy_censored)
 
         # Immediately drop the request if somehow it has already expired?
         if attempt_deadline is not None and sim.timestep >= attempt_deadline:
-            settled_on_done(False, 0, DropReason.DEADLINE, self.queue_len())
+            settled_on_done(False, 0, DropReason.DEADLINE, self.queue_len(), False)
             return control
 
         start_cb = partial(
@@ -251,7 +255,7 @@ class ServiceRuntime:
         # tombstone is still sitting in the heap.
         if self.cfg.queue_capacity is not None and self.queue_len() >= self.cfg.queue_capacity:
             self.admitted_total -= 1  # shed before joining the queue
-            settled_on_done(False, 0, DropReason.QUEUE_FULL, self.queue_len())
+            settled_on_done(False, 0, DropReason.QUEUE_FULL, self.queue_len(), False)
             return control
 
         # Enqueue the request
@@ -268,7 +272,7 @@ class ServiceRuntime:
             # Free the slot now, not when the tombstone reaches the heap head.
             item.cancelled = True
             self._queued -= 1
-            on_done(False, 0, DropReason.CANCELLED, self.queue_len())
+            on_done(False, 0, DropReason.CANCELLED, self.queue_len(), False)
 
         control._bind(cancel_queued)
         return control
@@ -277,7 +281,7 @@ class ServiceRuntime:
     def _begin_service(
         self,
         sim: Simulator,
-        on_done: Callable[[bool, TimeDuration, DropReason, int], None],
+        on_done: Callable[..., None],
         attempt_deadline: TimePoint | None,
         behavior: Behavior | None = None,
         control: AttemptControl | None = None,
@@ -293,7 +297,7 @@ class ServiceRuntime:
         # If the attempt expired while waiting in the queue, drop immediately without
         # consuming a worker. We make sure we are not scheduling an event in the past.
         if attempt_deadline is not None and sim.timestep >= attempt_deadline:
-            on_done(False, 0, DropReason.DEADLINE, self.queue_len())
+            on_done(False, 0, DropReason.DEADLINE, self.queue_len(), False)
             return
 
         self.in_flight += 1
@@ -355,7 +359,10 @@ class ServiceRuntime:
                     # consumers (the Erlang-C E[S]) need the occupancy; the
                     # end-to-end node latency is still in Request.interval.
                     occupancy = released_at - begin_at if released_at is not None else 0
-                    on_done(success, occupancy, drop, self.queue_len())
+                    # Released early: the worker was handed back before whatever
+                    # cut the attempt short, so this occupancy is a COMPLETE
+                    # observation even when the attempt itself was censored.
+                    on_done(success, occupancy, drop, self.queue_len(), False)
                 else:
                     self._complete_attempt(sim, on_done, success, service_time, drop)
 
@@ -383,7 +390,7 @@ class ServiceRuntime:
     def _finish_service(
         self,
         sim: Simulator,
-        on_done: Callable[[bool, TimeDuration, DropReason, int], None],
+        on_done: Callable[..., None],
         begin_at: TimePoint,
         attempt_deadline: TimePoint | None,
     ):
@@ -405,11 +412,15 @@ class ServiceRuntime:
     def _complete_attempt(
         self,
         sim: Simulator,
-        on_done: Callable[[bool, TimeDuration, DropReason, int], None],
+        on_done: Callable[..., None],
         success: bool,
         service_time: TimeDuration,
         drop_reason: DropReason,
     ):
         self.in_flight -= 1
-        on_done(success, service_time, drop_reason, self.queue_len())
+        # The worker was still held when the attempt ended, so a deadline or
+        # cancellation cut the SERVICE itself: the occupancy is right-censored,
+        # a lower bound on the work the server would have done.
+        occupancy_censored = drop_reason in (DropReason.DEADLINE, DropReason.CANCELLED)
+        on_done(success, service_time, drop_reason, self.queue_len(), occupancy_censored)
         self._start_next(sim)

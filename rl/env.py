@@ -464,7 +464,13 @@ class MicroservicesEnv(_GymEnvBase):
                 "cost": 0.0,
             }
 
+        # Attempt-less roots are skipped by both Metrics paths, so exclude them
+        # from the denominator too — counting them in `completed` while no
+        # outcome bucket claims them leaves the rates not summing to 1.
+        roots = [root for root in roots if root.attempts]
         completed = len(roots)
+        if not completed:
+            return self._summarize_roots([])
         successes = 0
         deadline_drops = 0
         queue_drops = 0
@@ -601,15 +607,21 @@ class MicroservicesEnv(_GymEnvBase):
                     # see them through the drop-rate features instead. A zero
                     # would poison lognormal fits (log 0) as an uncensored value.
                     continue
-                # Deadline cuts and cancellations both TRUNCATE the attempt, so
-                # what we observed is a lower bound on the latency it would have
-                # had. Treating either as an exact sample biases the fit fast.
+                # Deadline cuts and cancellations TRUNCATE the attempt, so its
+                # latency is a lower bound on what it would have been.
                 truncated = attempt.drop_reason in (DropReason.DEADLINE, DropReason.CANCELLED)
                 attempt_latencies.append(ns_to_ms(attempt.interval.end - attempt.interval.begin))
                 attempt_censored.append(truncated)
                 if attempt.service_time_ns is not None:
                     attempt_service.append(ns_to_ms(attempt.service_time_ns))
-                    attempt_service_censored.append(truncated)
+                    # The OCCUPANCY is censored only when the worker was still
+                    # held at the cut — the service records that directly. A
+                    # tandem node's local stage finishes before the worker is
+                    # handed back, so a later deadline censors the attempt but
+                    # not this sample; inferring the flag from the attempt's
+                    # drop reason fed complete observations to the censored MLE
+                    # as lower bounds and inflated E[S] several-fold.
+                    attempt_service_censored.append(attempt.service_time_censored)
 
         if self._cfg.max_latency_samples is not None:
             attempt_latencies = attempt_latencies[: self._cfg.max_latency_samples]
