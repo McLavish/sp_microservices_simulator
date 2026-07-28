@@ -404,9 +404,18 @@ class TestCancellationIntegration(unittest.TestCase):
         sim.run()
         self.assertEqual(breaker.get_state(), CBState.CLOSED)
 
-    def test_cancelling_during_backoff_refunds_the_retry_charge(self):
-        """The retry was charged when the policy granted it; abandoning it before
-        it runs must refund, exactly as a deadline veto does."""
+    def test_cancelling_during_backoff_does_not_mint_retry_quota(self):
+        """A cancel-time refund is deliberately NOT issued for throttling
+        policies.
+
+        The charge stands. Refunding late is unsound: every policy here holds
+        either single-slot undo state or a capped, refilling balance, so a
+        refund arriving after an intervening deposit clamps at the cap and MINTS
+        quota that was never spent. Over-counting one retry is strictly safer
+        than handing out an extra one. The immediate deadline-veto refund, where
+        nothing can intervene, is still exact — see
+        TestVetoedRetriesAreRefunded.
+        """
         sim = Simulator(seed=1)
         svc = self._service(median_ms=10, workers=1, p_fail=1.0)
         budget = RetryBudgetPolicy(
@@ -427,7 +436,8 @@ class TestCancellationIntegration(unittest.TestCase):
         root.cancel()
         sim.run()
         self.assertEqual(len(root.attempts) - 1, 0)  # no retry ever ran
-        self.assertEqual(budget._tokens, before)
+        # Charged, not refunded: conservative rather than mintable.
+        self.assertEqual(budget._tokens, before - budget._retry_cost)
 
     def test_backoff_cancelled_root_records_its_own_completion_time(self):
         sim = Simulator(seed=1)

@@ -23,6 +23,9 @@ def main(csv_file, output_file, fault_events_file=None):
         "failure_circuit_open",
         "failure_cancelled",
     ]
+    # Tolerate CSVs written before a reason column existed: a missing column is
+    # zero, not a crash. Keeps older exports plottable.
+    reason_cols = [c for c in reason_cols if c in df.columns]
     reasons_pct = (df[reason_cols].div(completed, axis=0) * 100.0).fillna(0.0)
 
     # Request amplification % (extra requests due to retries relative to root)

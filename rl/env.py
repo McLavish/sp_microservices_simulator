@@ -164,6 +164,8 @@ class MicroservicesEnv(_GymEnvBase):
         self._horizon_root_count = 0
         self._bystander_horizon_count = 0
         self._last_admitted = 0
+        self._cost_roots_seen = 0.0
+        self._cost_windows = 0
         self._episode_steps = 0
         self._current_time_ns: TimePoint = 0
         self._end_time_ns: TimePoint = 0
@@ -219,6 +221,8 @@ class MicroservicesEnv(_GymEnvBase):
         self._horizon_root_count = 0
         self._bystander_horizon_count = 0
         self._last_admitted = 0
+        self._cost_roots_seen = 0.0
+        self._cost_windows = 0
         self._episode_steps = 0
         self._require_workload().drive(
             self._require_sim(), lambda s: self._require_client().start_request(s)
@@ -369,6 +373,14 @@ class MicroservicesEnv(_GymEnvBase):
                 f"Action has {len(action)} entries but the action space expects "
                 f"{len(self._action_sizes)} (did a policy emit the wrong dimensionality?)"
             )
+        for position, (index, size) in enumerate(zip(action, self._action_sizes, strict=True)):
+            if not 0 <= index < size:
+                # Python would wrap a negative index to the end of the list, so
+                # an out-of-range action silently selected a valid-looking knob
+                # and returned an observation outside the declared Box.
+                raise ValueError(
+                    f"action[{position}]={index} is outside [0, {size}) for this ActionSpec"
+                )
         attempt_timeout_ms = spec.attempt_timeout_ms[action[0]]
         max_attempts = spec.max_attempts[action[1]]
         backoff_ms = spec.backoff_ms[action[2]]
@@ -403,9 +415,32 @@ class MicroservicesEnv(_GymEnvBase):
             - summary["circuit_open_drop_rate"] * w.circuit_open_drop
             - summary["p95_latency_ms"] * w.p95_latency_ms
             - summary["retries_per_root"] * w.retries
-            - summary["cost"] * w.cost
+            # Count-weighted: the dual ascends on the POOLED retries-per-root,
+            # so the primal must penalise a quantity whose episode sum is
+            # proportional to it. Penalising the raw per-window RATIO instead
+            # makes a Lagrangian whose primal and dual optimise different
+            # constraints (measured 1.104 window-mean vs 1.253 pooled), and dual
+            # ascent then converges to neither.
+            - self._cost_penalty(summary) * w.cost
         )
         return float(reward)
+
+    def _cost_penalty(self, summary: dict[str, float]) -> float:
+        """Per-window cost term whose episode SUM tracks the pooled ratio.
+
+        `retries_t / mean_roots_per_window` sums to `total_retries / mean_roots`
+        = `T * pooled_ratio`, so minimising it minimises the pooled amplification
+        the constraint is stated in. Falls back to the raw ratio before any
+        cost-client root has completed.
+        """
+        roots = summary.get("cost_roots", 0.0)
+        retries = summary.get("cost_retries", 0.0)
+        self._cost_roots_seen += roots
+        self._cost_windows += 1 if roots else 0
+        if not self._cost_windows:
+            return float(summary.get("cost", 0.0))
+        mean_roots = self._cost_roots_seen / self._cost_windows
+        return float(retries / mean_roots) if mean_roots > 0 else 0.0
 
     def _summarize_roots(self, roots) -> dict[str, float]:
         if not roots:

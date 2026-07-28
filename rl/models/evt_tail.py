@@ -50,7 +50,12 @@ class EVTTailModel:
         # observations as right-censored at u recovers an unbiased body.
         fit_censored = getattr(self.body, "fit_censored", None)
         if callable(fit_censored) and tail_samples.size > 0:
-            self.body = fit_censored(data, data > self.u)
+            # Right-censored AT u: the observation for an exceedance is the
+            # THRESHOLD ("we know only that it exceeded u"), not its actual
+            # value. Passing the actual values leaks tail information into the
+            # body fit (measured sigma 0.8384 vs 0.8004 against a true 0.8).
+            censored_at_u = np.where(data > self.u, self.u, data)
+            self.body = fit_censored(censored_at_u, data > self.u)
         else:
             self.body.fit(body_samples)
         self._body_cdf_u = float(self.body.cdf(np.array([self.u]))[0])

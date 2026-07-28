@@ -40,10 +40,13 @@ class RetryPolicy:
         return
 
     #: Whether `rollback` is safe to apply LATER than the `next_delay` it undoes.
-    #: True for commutative state (add a token back). False for policies holding
-    #: single-slot undo state, where a deferred refund would rewind whichever
-    #: charge happened most recently rather than the one being undone — with
-    #: several roots sharing one policy, that is a different root's reservation.
+    #: Default FALSE for any policy that overrides `rollback`: every throttling
+    #: policy here holds either single-slot undo state (the leaky bucket rewinds
+    #: whichever charge was most recent, not the one being undone) or a CAPPED,
+    #: refilling balance (a refund arriving after an intervening refill or
+    #: deposit clamps at the cap and thereby MINTS quota that was never spent).
+    #: A side-effect-free policy leaves this True because its no-op rollback is
+    #: trivially order-independent.
     supports_deferred_rollback: bool = True
 
     def rollback(self, context: RetryContext) -> None:
@@ -327,6 +330,14 @@ class LeakyRateLimiterPolicy(RetryPolicy):
     # immediately after the charge it undoes — see supports_deferred_rollback.
     supports_deferred_rollback: bool = field(default=False, init=False, repr=False)
 
+    def __post_init__(self):
+        if self.max_requests < 1:
+            raise ValueError(f"max_requests must be >= 1, got {self.max_requests}")
+        if self.max_attempts < 1:
+            raise ValueError(f"max_attempts must be >= 1, got {self.max_attempts}")
+        if self.period <= 0:
+            raise ValueError(f"period must be > 0 ns, got {self.period}")
+
     _next_at: TimePoint | None = field(default=None, init=False)
     # Previous _next_at, so a vetoed retry can release the slot it reserved.
     _prev_next_at: TimePoint | None = field(default=None, init=False)
@@ -421,6 +432,10 @@ class RetryBudgetPolicy(RetryPolicy):
             return DelayDecision(False, 0)
         return DelayDecision(False, 0)
 
+    # Capped balance: a refund after an intervening deposit clamps at the cap
+    # and mints quota. Only the immediate (deadline-veto) refund is exact.
+    supports_deferred_rollback: bool = field(default=False, init=False, repr=False)
+
     def rollback(self, context: RetryContext) -> None:
         # Refund a withdrawal for a retry the client then declined to issue.
         self._tokens = min(self._max_tokens, self._tokens + self._retry_cost)
@@ -468,6 +483,9 @@ class BurstyRateLimiterPolicy(RetryPolicy):
             return DelayDecision(False, 0)
         return DelayDecision(False, 0)
 
+    # Capped, continuously refilling balance: see supports_deferred_rollback.
+    supports_deferred_rollback: bool = field(default=False, init=False, repr=False)
+
     def rollback(self, context: RetryContext) -> None:
         self._tokens = min(float(self.max_requests), self._tokens + 1.0)
 
@@ -482,6 +500,10 @@ class FixedWindowBurstyLimiterPolicy(RetryPolicy):
     _window_start: TimePoint | None = field(default=None, init=False)
 
     def __post_init__(self):
+        if self.max_requests < 1:
+            raise ValueError(f"max_requests must be >= 1, got {self.max_requests}")
+        if self.period <= 0:
+            raise ValueError(f"period must be > 0 ns, got {self.period}")
         self._tokens = self.max_requests  # start with full tokens
 
     def _get_current_window_start(self, now: TimePoint) -> TimePoint:
@@ -511,6 +533,9 @@ class FixedWindowBurstyLimiterPolicy(RetryPolicy):
                 return DelayDecision(True, delay)
             return DelayDecision(False, 0)
         return DelayDecision(False, 0)
+
+    # Window resets make a late refund unsound: see supports_deferred_rollback.
+    supports_deferred_rollback: bool = field(default=False, init=False, repr=False)
 
     def rollback(self, context: RetryContext) -> None:
         # Refunds land in the window the charge was made in: the client vetoes

@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from rl.policies.action_space import ActionGrid
+from rl.policies.action_space import UNSPECIFIED, ActionGrid
 
 
 @dataclass
@@ -151,7 +151,13 @@ class AIMDPolicy:
             backoff_ms = self.grid.spec.backoff_ms[0]
 
         return self.grid.nearest_indices(
-            timeout_ms, max_attempts, backoff_ms, self.initial_global_timeout_ms
+            timeout_ms,
+            max_attempts,
+            backoff_ms,
+            # None means "no opinion", not "the spec's None entry".
+            UNSPECIFIED
+            if self.initial_global_timeout_ms is None
+            else self.initial_global_timeout_ms,
         )
 
     def _build_action(self) -> tuple[int, ...]:

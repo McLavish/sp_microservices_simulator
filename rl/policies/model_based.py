@@ -63,6 +63,24 @@ class LatencyBuffer:
         return values[~flags]
 
 
+def _action_cost_key(values) -> tuple:
+    """Deterministic tie-break: prefer the CHEAPEST action among equals.
+
+    Monte-Carlo scores tie exactly whenever two actions predict the same
+    outcome (e.g. any timeout comfortably above the latency distribution), and a
+    strict `>` then keeps whichever the grid happened to enumerate first — so
+    reversing the same physical grid changed the selection. Ordering ties by
+    (timeout, attempts, backoff) makes the choice a property of the action, not
+    of the iteration order, and picks the least aggressive of equals.
+    """
+    return (
+        values.attempt_timeout_ms,
+        values.max_attempts,
+        values.backoff_ms,
+        -1 if values.global_timeout_ms is None else values.global_timeout_ms,
+    )
+
+
 def _simulate_action(
     model: LatencyModel,
     action: ActionValues,
@@ -229,6 +247,7 @@ class ModelBasedPolicy:
         state = self._rng.bit_generator.state
         best_idx = self.grid.indices[0]
         best_value = -float("inf")
+        best_key: tuple = ()
 
         for action_idx, action_vals in zip(self.grid.indices, self.grid.values, strict=False):
             self._rng.bit_generator.state = state
@@ -241,9 +260,12 @@ class ModelBasedPolicy:
                 queue_delay,
                 self.queue_delay_mode,
             )
-            if value > best_value:
+            if value > best_value or (
+                value == best_value and _action_cost_key(action_vals) < best_key
+            ):
                 best_value = value
                 best_idx = action_idx
+                best_key = _action_cost_key(action_vals)
 
         # Advance the stream once so consecutive steps do not reuse the draws.
         self._rng.bit_generator.state = state

@@ -23,6 +23,22 @@ class ServiceConfig:
     latency_injections: list[LatencyInjection] = field(default_factory=list)
     partial_failures: list[PartialFailure] = field(default_factory=list)
 
+    def __post_init__(self):
+        if self.workers < 1:
+            raise ValueError(
+                f"workers must be >= 1, got {self.workers}; with no workers "
+                "_start_next can never dequeue, so every request is accepted and "
+                "then never completes"
+            )
+        if self.latency_median < 1:
+            raise ValueError(f"latency_median must be >= 1 ns, got {self.latency_median}")
+        if self.latency_lognorm_sigma < 0:
+            raise ValueError(
+                f"latency_lognorm_sigma must be >= 0, got {self.latency_lognorm_sigma}"
+            )
+        if self.queue_capacity is not None and self.queue_capacity < 0:
+            raise ValueError(f"queue_capacity must be >= 0 or None, got {self.queue_capacity}")
+
     def register_fault_events(self, tracker: FaultEventsTracker):
         """Register all fault events with the tracker"""
         for latency_inj in self.latency_injections:
@@ -121,9 +137,13 @@ class ServiceRuntime:
     # occupancy: using it for the capacity check would let a cancelled entry go
     # on shedding load, and using it for telemetry would inflate queue depth.
     _queued: int = 0
-    # Attempts that actually entered service, from EVERY client feeding this
-    # queue. A queueing model needs the arrival rate at the QUEUE; deriving it
-    # from one client's samples undercounts whenever the service is shared.
+    # Attempts ARRIVING at this queue, from every client feeding it. This is
+    # lambda for a queueing model, so it must be counted at submission, not at
+    # worker acquisition: counting service starts makes lambda equal to the
+    # throughput the server can sustain, which understates and time-shifts
+    # arrivals exactly under the congestion the model exists to predict.
+    # Excludes work rejected before it ever joined the queue (queue-full,
+    # already-expired), which genuinely never arrived at the server.
     admitted_total: int = 0
 
     def bind(self):
@@ -220,6 +240,8 @@ class ServiceRuntime:
             self._begin_service, sim, settled_on_done, attempt_deadline, behavior, control
         )
 
+        self.admitted_total += 1  # arrival at the queue, not a service start
+
         if self.in_flight < self.cfg.workers:
             start_cb()  # Immediately start handling if we have free worker
             return control
@@ -228,6 +250,7 @@ class ServiceRuntime:
         # only: a cancelled entry has given its slot back even though its
         # tombstone is still sitting in the heap.
         if self.cfg.queue_capacity is not None and self.queue_len() >= self.cfg.queue_capacity:
+            self.admitted_total -= 1  # shed before joining the queue
             settled_on_done(False, 0, DropReason.QUEUE_FULL, self.queue_len())
             return control
 
@@ -274,7 +297,6 @@ class ServiceRuntime:
             return
 
         self.in_flight += 1
-        self.admitted_total += 1
         begin_at = sim.timestep
 
         if behavior is None:

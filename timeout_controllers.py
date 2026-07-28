@@ -109,9 +109,14 @@ class AdaptiveTimeoutController(TimeoutController):
             if (
                 success_rate < self.min_success_rate
                 and self._successes
-                and self._current_attempt_timeout is not None
+                and self.initial_attempt_timeout is not None
             ):
-                inflated = int(self._current_attempt_timeout / max(success_rate, 0.1))
+                # Inflate off the INITIAL timeout, never off the already-inflated
+                # current value: compounding turned 10 ms into 100 s in four
+                # windows, and max_timeout is unbounded by default. This is a
+                # bounded cold-start nudge (at most 10x, the success_rate floor),
+                # not a control loop.
+                inflated = int(self.initial_attempt_timeout / max(success_rate, 0.1))
                 if self.max_timeout is not None:
                     inflated = min(inflated, self.max_timeout)
                 self._current_attempt_timeout = max(inflated, self.min_timeout)

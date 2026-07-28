@@ -60,7 +60,8 @@ class HotelMatchedConfig:
     # else the built-in default. Explicit CLI values always win.
     base_rps: float | None = None
     duration_s: float | None = None
-    recommendation_fraction: float = 0.25
+    # None -> derive from the calibration's recorded request mix, else default.
+    recommendation_fraction: float | None = None
     seed: int = 1234
     profile_faults: list[tuple[float, float, float, float]] | None = None
     load_spikes: list[tuple[float, float, float]] | None = None
@@ -77,6 +78,33 @@ class HotelMatchedRun:
 
 _DEFAULT_BASE_RPS = 100.0
 _DEFAULT_DURATION_S = 60.0
+
+
+_RECOMMENDATION_PATHS = ("/recommendation", "recommendation")
+_DEFAULT_RECOMMENDATION_FRACTION = 0.25
+
+
+def _recommendation_fraction_from(recorded: dict) -> float:
+    """Recommendation share of the recorded request mix.
+
+    `workload.path` maps request path -> count (or share). Falls back to the
+    built-in default when the recording says nothing about the mix.
+    """
+    paths = recorded.get("path")
+    if not isinstance(paths, dict) or not paths:
+        return _DEFAULT_RECOMMENDATION_FRACTION
+    total = 0.0
+    recommendation = 0.0
+    for path, count in paths.items():
+        value = float(count)
+        if value < 0:
+            raise ValueError(f"calibration workload.path[{path!r}] must be >= 0, got {value}")
+        total += value
+        if any(str(path).startswith(prefix) for prefix in _RECOMMENDATION_PATHS):
+            recommendation += value
+    if total <= 0:
+        return _DEFAULT_RECOMMENDATION_FRACTION
+    return recommendation / total
 
 
 def _validated_base_rps(value: float | int | str | None) -> float:
@@ -127,7 +155,19 @@ def run_hotel_matched(config: HotelMatchedConfig) -> dict[str, str]:
     duration_s = config.duration_s
     if duration_s is None:
         duration_s = _validated_duration(recorded.get("duration_s"))
-    recommendation_rps = base_rps * config.recommendation_fraction
+    # The MIX matters as much as the rate: a recommendations-only recording that
+    # still generates search traffic is not a matched comparison. Prefer the
+    # recorded fraction (derived from workload.path counts when present) unless
+    # the CLI set one explicitly.
+    fraction = config.recommendation_fraction
+    if fraction is None:
+        fraction = _recommendation_fraction_from(recorded)
+    if not 0 <= fraction <= 1:
+        raise ValueError(
+            f"recommendation_fraction must be in [0, 1], got {fraction}; outside "
+            "that range the search rate goes negative and is silently clamped to 0"
+        )
+    recommendation_rps = base_rps * fraction
     hotels_rps = base_rps - recommendation_rps
     sim_load_spikes = [
         LoadSpike(
@@ -582,7 +622,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--calibration-json", type=Path, default=None)
     parser.add_argument("--base-rps", type=_nonneg_float, default=None)
     parser.add_argument("--duration-s", type=_positive_float, default=None)
-    parser.add_argument("--recommendation-fraction", type=_fraction, default=0.25)
+    parser.add_argument("--recommendation-fraction", type=_fraction, default=None)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
         "--profile-fault",

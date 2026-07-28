@@ -283,12 +283,12 @@ class TestActionSpecSidecar(unittest.TestCase):
             save_action_spec(path, self.spec, step_duration_s=1.0, fault_scenario="chain")
             check_action_spec(path, self.spec)  # no raise
 
-    def test_reordered_grid_is_rejected(self):
+    def test_different_grid_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "model.zip")
             save_action_spec(path, self.spec, step_duration_s=1.0)
             mutated = ActionSpec(
-                attempt_timeout_ms=[30, 10],
+                attempt_timeout_ms=[10, 40],  # valid grid, different from the saved one
                 max_attempts=[1, 2],
                 backoff_ms=[0, 20],
                 global_timeout_ms=[500, None],
@@ -304,7 +304,7 @@ class TestActionSpecSidecar(unittest.TestCase):
             save_action_spec(base, self.spec, step_duration_s=1.0)
             check_action_spec(base + ".zip", self.spec)  # no raise, no warn-skip
             mutated = ActionSpec(
-                attempt_timeout_ms=[30, 10],
+                attempt_timeout_ms=[10, 40],  # valid grid, different from the saved one
                 max_attempts=[1, 2],
                 backoff_ms=[0, 20],
                 global_timeout_ms=[500, None],
@@ -414,10 +414,6 @@ class TestSurrogateGlobalDeadline(unittest.TestCase):
         self.assertAlmostEqual(self._score(30.0, 100, 200), 1.0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestActionGridUnspecifiedGlobalTimeout(unittest.TestCase):
     """`nearest_indices` must distinguish "no opinion" from "explicitly None".
 
@@ -514,3 +510,7 @@ class TestAIMDBothArmsReachable(unittest.TestCase):
                         obs, _, terminated, _, info = env.step(action)
                 self.assertGreater(increases, 0, "increase arm never fired")
                 self.assertGreater(decreases, 0, "decrease arm never fired")
+
+
+if __name__ == "__main__":
+    unittest.main()

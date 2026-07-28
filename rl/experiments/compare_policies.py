@@ -102,13 +102,18 @@ def _episode(
     terminated = False
     truncated = False
     step_idx = 0
-    window_costs: list[float] = []
+    # POOL raw counts: averaging per-window ratios is length-biased, and the
+    # constrained paths already pool, so a window mean here would report a
+    # different constraint than rl.experiments.constrained_retry does.
+    episode_retries = 0.0
+    episode_roots = 0.0
     while not (terminated or truncated):
         action = policy.act(obs, info)
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += float(reward)
         summary = info["summary"]
-        window_costs.append(summary["cost"])
+        episode_retries += summary.get("cost_retries", 0.0)
+        episode_roots += summary.get("cost_roots", 0.0)
         if trace_rows is not None:
             applied = info["action"]
             trace_rows.append(
@@ -135,7 +140,7 @@ def _episode(
         step_idx += 1
         policy.update(obs, reward, terminated or truncated, info)
 
-    cost_mean = float(np.mean(window_costs)) if window_costs else 0.0
+    cost_mean = episode_retries / episode_roots if episode_roots else 0.0
     return total_reward, env.metrics_summary(), env.in_horizon_summary(), cost_mean
 
 
@@ -432,7 +437,8 @@ def main() -> None:
         "model_based_queue",
         "bayesian",
         "ppo",
-        "sb3",
+        # "sb3" is deliberately absent: it was accepted here but only "ppo" was
+        # ever instantiated, so `--policies sb3` exited 0 with no rows.
         "oracle_fixed",
         "constrained_ppo",
     }

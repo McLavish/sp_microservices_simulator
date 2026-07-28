@@ -26,7 +26,17 @@ latency percentiles `p50..p99_99`, `mean`, `max`, `retries_per_root`,
 - A root's **latency is wall-clock**: `max(attempt.end) - min(attempt.begin)`, i.e.
   including queueing and every retry, counted only for **successful** roots.
 - A failed root is attributed to its **last attempt's** `drop_reason`.
-- `retries_per_root = (attempts_total - total) / total`.
+- `retries_per_root = (attempts on the summarized roots - total) / total`.
+  Counted over the roots being summarized, not the client's lifetime attempt
+  counter — those disagree whenever work is still in flight (a mid-run export,
+  or the RL env's in-horizon population).
+- `dropped_cancelled` counts roots abandoned by an upstream cancellation. It is
+  deliberately its own bucket, NOT folded into the other `dropped_*` counts:
+  cancelled work did not fail, and charging it to a failure category would count
+  one root cause once where it failed and again at every sibling it cancelled.
+- `mean` / `max` are `nan` when no successful root completed, matching the
+  percentiles. They are not 0, which would make an empty window read as a
+  perfect one.
 
 `print_stats()` (`metrics.py`) dumps the summary to stdout.
 
@@ -51,6 +61,7 @@ The subtlety is **which event time a column is bucketed by** — start vs. end:
 | `failure_root` | end | failed roots completing in the bucket |
 | `failure_retry` | end | failed *retry* attempts ending in the bucket |
 | `failure_queue_full` / `failure_deadline` / `failure_server` / `failure_circuit_open` | end | failed roots by final drop reason |
+| `failure_cancelled` | end | roots abandoned by an upstream cancellation (see `propagate_cancellation`); abandoned, not failed |
 | `total_request` | start (cumulative) | running sum of started roots |
 | `total_failure` | end (cumulative) | running sum of failed roots |
 | `p50 p90 p95 p99 p99.9 p99.99 min max` | end | latency stats over **successful roots** completing in the bucket (ms) |

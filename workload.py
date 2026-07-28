@@ -1,3 +1,4 @@
+import math
 import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -28,6 +29,10 @@ class Workload:
     _stopped: bool = field(init=False, default=False, repr=False)
 
     def __post_init__(self):
+        if not math.isfinite(self.base_rps) or self.base_rps < 0:
+            raise ValueError(f"base_rps must be finite and >= 0, got {self.base_rps}")
+        if not math.isfinite(self.duration_s) or self.duration_s < 0:
+            raise ValueError(f"duration_s must be finite and >= 0, got {self.duration_s}")
         # rng_seed=None falls back to seed 0 for cross-experiment determinism; pass an int explicitly to vary.
         base = self.rng_seed if self.rng_seed is not None else 0
         self._rng = random.Random(base + _ARRIVAL_SEED_OFFSET)
