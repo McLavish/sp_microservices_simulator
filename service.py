@@ -121,12 +121,17 @@ class ServiceRuntime:
     # occupancy: using it for the capacity check would let a cancelled entry go
     # on shedding load, and using it for telemetry would inflate queue depth.
     _queued: int = 0
+    # Attempts that actually entered service, from EVERY client feeding this
+    # queue. A queueing model needs the arrival rate at the QUEUE; deriving it
+    # from one client's samples undercounts whenever the service is shared.
+    admitted_total: int = 0
 
     def bind(self):
         self.in_flight = 0
         self.queue.clear()
         self._seq = 0
         self._queued = 0
+        self.admitted_total = 0
         return self
 
     def queue_len(self) -> int:
@@ -269,6 +274,7 @@ class ServiceRuntime:
             return
 
         self.in_flight += 1
+        self.admitted_total += 1
         begin_at = sim.timestep
 
         if behavior is None:

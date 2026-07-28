@@ -77,6 +77,12 @@ class EnvComponents:
     # Its success rate gauges the externality of the agent's edge retries; it
     # feeds reporting only, never reward or observation.
     bystander_client: ClientRuntime | None = None
+    # The service whose queue a queueing-model policy should reason about: the
+    # one the knobs actuate against (svc-C in the chain scenarios). Carries both
+    # the worker count and the true admitted-attempt stream, so a policy never
+    # has to guess `c` from a CLI default or infer lambda from one of several
+    # clients feeding the same queue.
+    modeled_service: ServiceRuntime | None = None
     # Any additional arrival processes the builder drives beyond `workload`.
     # The env halts EVERY registered workload at the episode horizon, so the
     # terminal drain completes in-flight work only. A builder that drives a
@@ -150,6 +156,7 @@ class MicroservicesEnv(_GymEnvBase):
         self._last_sample_root_idx = 0
         self._horizon_root_count = 0
         self._bystander_horizon_count = 0
+        self._last_admitted = 0
         self._episode_steps = 0
         self._current_time_ns: TimePoint = 0
         self._end_time_ns: TimePoint = 0
@@ -204,6 +211,7 @@ class MicroservicesEnv(_GymEnvBase):
         self._last_sample_root_idx = 0
         self._horizon_root_count = 0
         self._bystander_horizon_count = 0
+        self._last_admitted = 0
         self._episode_steps = 0
         self._require_workload().drive(
             self._require_sim(), lambda s: self._require_client().start_request(s)
@@ -266,6 +274,14 @@ class MicroservicesEnv(_GymEnvBase):
             else:
                 sample_roots = new_roots
             info.update(self._collect_latency_samples(sample_roots))
+            # Ground truth for a queueing model: arrivals at the MODELLED queue
+            # (all clients, not just the sampled one) and its real worker count.
+            modeled = self._require_components().modeled_service
+            if modeled is not None:
+                admitted = modeled.admitted_total
+                info["modeled_admitted"] = admitted - self._last_admitted
+                info["modeled_workers"] = modeled.cfg.workers
+                self._last_admitted = admitted
 
         if terminated:
             self._horizon_root_count = self._last_root_idx
@@ -669,6 +685,7 @@ def _single_service_components(
         sim=sim,
         workload=workload,
         client=client,
+        modeled_service=svc,
         apply_knobs=_static_knob_applier(timeout_ctrl, retry),
     )
 
@@ -852,6 +869,7 @@ def build_chain_env(
         client=top_client,
         apply_knobs=_static_knob_applier(edge_timeout, edge_retry),
         cost_client=b_to_c,
+        modeled_service=c_node.service,
     )
 
 
@@ -1018,6 +1036,7 @@ def build_multichain_env(
         client=top_client,
         apply_knobs=_static_knob_applier(edge_timeout, edge_retry),
         cost_client=b_to_c,
+        modeled_service=c_node.service,
         bystander_client=bystander_top,
         extra_workloads=[bystander_workload],
     )
