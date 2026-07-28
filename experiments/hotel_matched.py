@@ -56,8 +56,10 @@ DEFAULT_PROFILE_FAULT = [(20.0, 40.0, 50.0, 0.2)]
 class HotelMatchedConfig:
     output_dir: Path = Path("hotel_matched_results")
     calibration_json: Path | None = None
-    base_rps: float = 100.0
-    duration_s: float = 60.0
+    # None -> take the calibration JSON's recorded workload when one is given,
+    # else the built-in default. Explicit CLI values always win.
+    base_rps: float | None = None
+    duration_s: float | None = None
     recommendation_fraction: float = 0.25
     seed: int = 1234
     profile_faults: list[tuple[float, float, float, float]] | None = None
@@ -71,6 +73,29 @@ class HotelMatchedRun:
     recommendations_client: ClientRuntime
     per_service_clients: dict[str, list[ClientRuntime]]
     fault_tracker: FaultEventsTracker
+
+
+_DEFAULT_BASE_RPS = 100.0
+_DEFAULT_DURATION_S = 60.0
+
+
+def _validated_base_rps(value: float | int | str | None) -> float:
+    """Shared bound check for a calibration-supplied arrival rate."""
+    if value is None:
+        return _DEFAULT_BASE_RPS
+    rate = float(value)
+    if not math.isfinite(rate) or rate < 0:
+        raise ValueError(f"calibration workload.base_rps must be finite and >= 0, got {value!r}")
+    return rate
+
+
+def _validated_duration(value: float | int | str | None) -> float:
+    if value is None:
+        return _DEFAULT_DURATION_S
+    duration = float(value)
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError(f"calibration workload.duration_s must be finite and > 0, got {value!r}")
+    return duration
 
 
 def run_hotel_matched(config: HotelMatchedConfig) -> dict[str, str]:
@@ -89,9 +114,21 @@ def run_hotel_matched(config: HotelMatchedConfig) -> dict[str, str]:
         leaf_max_attempts=config.leaf_max_attempts,
     )
 
-    duration_s = config.duration_s  # Workload accepts fractional seconds; no rounding
-    recommendation_rps = config.base_rps * config.recommendation_fraction
-    hotels_rps = config.base_rps - recommendation_rps
+    # Resolve the workload: an explicit CLI value wins, else the calibration's
+    # own recording, else the built-in default. Ignoring the recorded workload
+    # (the previous behaviour) ran the "matched" scenario at 100 rps against
+    # per-service workers/queue_capacity taken from that same file - an
+    # order-of-magnitude offered-load error that invalidates the comparison the
+    # module exists to make.
+    recorded = calibration.get("workload") or {}
+    base_rps = config.base_rps
+    if base_rps is None:
+        base_rps = _validated_base_rps(recorded.get("base_rps"))
+    duration_s = config.duration_s
+    if duration_s is None:
+        duration_s = _validated_duration(recorded.get("duration_s"))
+    recommendation_rps = base_rps * config.recommendation_fraction
+    hotels_rps = base_rps - recommendation_rps
     sim_load_spikes = [
         LoadSpike(
             duration=TimeInterval(begin=s_to_ns(start_s), end=s_to_ns(end_s)),
@@ -385,6 +422,50 @@ def _load_calibration(path: Path | None) -> dict[str, Any]:
     return data
 
 
+def _validated_profile_fault(
+    start_s: float, end_s: float, add_latency_ms: float, p_fail: float, origin: str
+) -> tuple[float, float, float, float]:
+    """Bound check shared by the CLI parser and the calibration-JSON path.
+
+    These used to diverge: the CLI rejected inverted windows and out-of-range
+    p_fail while the JSON path applied a bare float(). An inverted window makes
+    TimeInterval.contains() false everywhere, so the fault is INERT while
+    fault_events.json still exports it and the plot shades it — a figure showing
+    a fault the simulation never ran.
+    """
+    if start_s < 0:
+        raise ValueError(f"{origin}: start must be >= 0, got {start_s}")
+    if end_s < start_s:
+        raise ValueError(
+            f"{origin}: end ({end_s}) must be >= start ({start_s}); an inverted "
+            "window is silently inert but is still exported and plotted"
+        )
+    if add_latency_ms < 0:
+        raise ValueError(f"{origin}: add_latency_ms must be >= 0, got {add_latency_ms}")
+    if not 0 <= p_fail <= 1:
+        raise ValueError(
+            f"{origin}: p_fail must be a fraction in [0, 1], got {p_fail}"
+            + (" — did you pass a percentage?" if p_fail > 1 else "")
+        )
+    return (start_s, end_s, add_latency_ms, p_fail)
+
+
+def _validated_load_spike(
+    start_s: float, end_s: float, multiplier: float, origin: str
+) -> tuple[float, float, float]:
+    if start_s < 0:
+        raise ValueError(f"{origin}: start must be >= 0, got {start_s}")
+    if end_s < start_s:
+        raise ValueError(f"{origin}: end ({end_s}) must be >= start ({start_s})")
+    if multiplier < 0:
+        raise ValueError(
+            f"{origin}: rps_multiplier must be >= 0, got {multiplier}; a negative "
+            "multiplier clamps the rate to zero, i.e. a traffic blackout exported "
+            "and plotted as a load spike"
+        )
+    return (start_s, end_s, multiplier)
+
+
 def _profile_faults_from_calibration(
     calibration: dict[str, Any],
 ) -> list[tuple[float, float, float, float]] | None:
@@ -400,11 +481,12 @@ def _profile_faults_from_calibration(
         if window.get("method") != "/profile.Profile/GetProfiles":
             continue
         windows.append(
-            (
+            _validated_profile_fault(
                 float(window["start_s"]),
                 float(window["end_s"]),
                 float(window["add_latency_ms"]),
                 float(window["p_fail"]),
+                origin="calibration fault_scenario",
             )
         )
     return windows
@@ -422,7 +504,12 @@ def _effective_profile_faults(
 def _load_spikes(calibration: dict[str, Any]) -> list[tuple[float, float, float]]:
     workload = calibration.get("workload") or {}
     return [
-        (float(spike[0]), float(spike[1]), float(spike[2]))
+        _validated_load_spike(
+            float(spike[0]),
+            float(spike[1]),
+            float(spike[2]),
+            origin="calibration workload.load_spikes",
+        )
         for spike in workload.get("load_spikes") or []
     ]
 
@@ -493,8 +580,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run matched hotelReservation simulator scenario")
     parser.add_argument("--output-dir", type=Path, default=Path("hotel_matched_results"))
     parser.add_argument("--calibration-json", type=Path, default=None)
-    parser.add_argument("--base-rps", type=_nonneg_float, default=100.0)
-    parser.add_argument("--duration-s", type=_positive_float, default=60.0)
+    parser.add_argument("--base-rps", type=_nonneg_float, default=None)
+    parser.add_argument("--duration-s", type=_positive_float, default=None)
     parser.add_argument("--recommendation-fraction", type=_fraction, default=0.25)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(

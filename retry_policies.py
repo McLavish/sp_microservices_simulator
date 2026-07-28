@@ -233,6 +233,10 @@ class TimeBasedCircuitBreakerPolicy(RetryPolicy):
     window_duration: TimeDuration
     underlying_strategy: RetryPolicy
     half_open_delay: TimeDuration
+    # Probes needed to decide in HALF_OPEN. Deliberately smaller than
+    # min_requests: an open circuit suppresses traffic, so requiring the
+    # closed-state quorum can strand the breaker in HALF_OPEN forever.
+    half_open_min_requests: int = 1
 
     _window: deque[tuple[TimePoint, bool]] = field(default_factory=deque)  # (timestamp, success)
     _failures_in_window: int = field(default=0, init=False)
@@ -273,14 +277,20 @@ class TimeBasedCircuitBreakerPolicy(RetryPolicy):
         elif self._state == CBState.OPEN:
             return
         elif self._state == CBState.HALF_OPEN:
-            if total >= self.min_requests and rate < (1 - self.success_threshold_rate):
+            # Half-open needs its own, smaller quorum. Gating on the CLOSED
+            # window's min_requests means a service whose throughput has dropped
+            # below min_requests / window_duration -- which is exactly what an
+            # open circuit causes -- can never accumulate enough probes to
+            # decide, and stays HALF_OPEN indefinitely.
+            probes = max(1, min(self.min_requests, self.half_open_min_requests))
+            if total >= probes and rate < (1 - self.success_threshold_rate):
                 self._state = CBState.CLOSED
                 self._opened_at = None
                 # Fresh metrics after recovery (resilience4j resets the sliding
                 # window on transition to CLOSED); otherwise half-open probe
                 # results would seed the closed-state failure rate.
                 self._clear_window()
-            elif total >= self.min_requests:
+            elif total >= probes:
                 self._state = CBState.OPEN
                 self._opened_at = now
                 self._clear_window()

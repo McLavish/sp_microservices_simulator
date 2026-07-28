@@ -100,6 +100,23 @@ class AdaptiveTimeoutController(TimeoutController):
         percentile_timeout = self._calculate_percentile_timeout()
         success_rate = self._get_success_rate()
 
+        if percentile_timeout is None:
+            # Not enough SUCCESSFUL samples to estimate a percentile. That is
+            # exactly the state a too-short timeout produces, and the old code
+            # returned here — so the timeout froze at its initial value and the
+            # controller could never escape. Inflate off the current value
+            # instead, which is the one signal available.
+            if (
+                success_rate < self.min_success_rate
+                and self._successes
+                and self._current_attempt_timeout is not None
+            ):
+                inflated = int(self._current_attempt_timeout / max(success_rate, 0.1))
+                if self.max_timeout is not None:
+                    inflated = min(inflated, self.max_timeout)
+                self._current_attempt_timeout = max(inflated, self.min_timeout)
+            return
+
         if percentile_timeout is not None:
             # If success rate is low, increase timeout
             if success_rate < self.min_success_rate:

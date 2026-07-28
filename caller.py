@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Protocol, runtime_checkable
@@ -85,29 +85,38 @@ class ClientRuntime:
             return d1
         return min(d1, d2)
 
+    def _policy_chain(self, policy: RetryPolicy) -> Iterator[RetryPolicy]:
+        """Every layer of a wrapping policy, outermost first.
+
+        One walker for all four traversals. They previously each re-implemented
+        this recursion, so a wrapper that one of them reached and another missed
+        would silently see inconsistent notifications, results or refunds.
+        """
+        current: RetryPolicy | None = policy
+        while current is not None:
+            yield current
+            current = (
+                current.underlying_strategy if isinstance(current, _SupportsUnderlying) else None
+            )
+
     def _update_policy_results(self, policy: RetryPolicy, success: bool, now: TimePoint) -> None:
-        """Update result tracking for policies that support it (e.g., circuit breakers, retry budget)."""
-
-        if isinstance(policy, _SupportsAddResult):
-            policy.add_result(success, now)
-
-        if isinstance(policy, _SupportsUnderlying):
-            self._update_policy_results(policy.underlying_strategy, success, now)
+        """Record an attempt outcome on every layer that tracks results."""
+        for layer in self._policy_chain(policy):
+            if isinstance(layer, _SupportsAddResult):
+                layer.add_result(success, now)
 
     def _notify_request_start(self, policy: RetryPolicy, now: TimePoint) -> None:
         """Announce an admitted root request to every layer of the policy chain."""
-        policy.on_request_start(now)
-        if isinstance(policy, _SupportsUnderlying):
-            self._notify_request_start(policy.underlying_strategy, now)
+        for layer in self._policy_chain(policy):
+            layer.on_request_start(now)
 
     def _rollback_policy(
         self, policy: RetryPolicy, context: RetryContext, deferred: bool = False
     ) -> None:
         """Refund a retry that ``next_delay`` authorised but we never issued.
 
-        Mirrors `_update_policy_results`' recursion: every layer that charged
-        during `next_delay` sits on the `underlying_strategy` chain, so every
-        layer has to be given the chance to refund.
+        Every layer that charged during `next_delay` sits on the chain, so every
+        layer gets the chance to refund.
 
         ``deferred=True`` marks a refund issued long after the charge (a cancel
         arriving mid-backoff). `RetryPolicy.rollback` is specified as undoing the
@@ -117,17 +126,13 @@ class ClientRuntime:
         the charge standing, which is conservative — it over-counts rather than
         handing the same slot out twice.
         """
-        if not deferred or policy.supports_deferred_rollback:
-            policy.rollback(context)
-        if isinstance(policy, _SupportsUnderlying):
-            self._rollback_policy(policy.underlying_strategy, context, deferred)
+        for layer in self._policy_chain(policy):
+            if not deferred or layer.supports_deferred_rollback:
+                layer.rollback(context)
 
     def _allow_policy_request(self, policy: RetryPolicy, now: TimePoint) -> bool:
-        if not policy.allow_request(now):
-            return False
-        if isinstance(policy, _SupportsUnderlying):
-            return self._allow_policy_request(policy.underlying_strategy, now)
-        return True
+        """Admission requires EVERY layer to allow the request."""
+        return all(layer.allow_request(now) for layer in self._policy_chain(policy))
 
     def _complete_root(self, root: RootRequest, now: TimePoint) -> None:
         root.done = True

@@ -31,6 +31,14 @@ class TimeInterval:
     begin: TimePoint
     end: TimePoint
 
+    def __post_init__(self):
+        if self.end < self.begin:
+            raise ValueError(
+                f"TimeInterval end ({self.end}) must be >= begin ({self.begin}); "
+                "contains() is False everywhere on an inverted interval, so any "
+                "fault built on one is silently inert while still being exported"
+            )
+
     def duration(self) -> TimeDuration:
         return self.end - self.begin
 

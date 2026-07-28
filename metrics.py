@@ -80,9 +80,18 @@ class Metrics:
             else:
                 dropped_server_failure += 1
 
-        mean_ms = ns_to_ms(int(sum(succ_lat) / len(succ_lat))) if succ_lat else 0.0
-        max_ms = ns_to_ms(max(succ_lat)) if succ_lat else 0.0
-        retries_per_root = (self.attempts_total - total) / total if total > 0 else 0.0
+        # nan, not 0.0: "no successful request completed" is missing data, and
+        # the percentiles below already use nan. Reporting 0 ms made an empty
+        # window look like a perfect one, and a consumer averaging the column
+        # silently pulled its mean toward zero.
+        mean_ms = ns_to_ms(int(sum(succ_lat) / len(succ_lat))) if succ_lat else float("nan")
+        max_ms = ns_to_ms(max(succ_lat)) if succ_lat else float("nan")
+        # Count attempts on the roots we are summarizing, not the client's
+        # lifetime counter: those disagree whenever work is still in flight
+        # (mid-run exports, the RL env's in-horizon population), and every other
+        # field here is computed over completed roots.
+        attempts_on_roots = sum(len(request.attempts) for request in self.roots)
+        retries_per_root = (attempts_on_roots - total) / total if total > 0 else 0.0
         return Summary(
             total=total,
             succeeded=succeeded,
@@ -308,7 +317,11 @@ class Metrics:
         # required precision is 9 minus its trailing decimal zeros — e.g.
         # 1.5 ms = 1_500_000 ns needs 4 decimals, not ceil(-log10) = 3).
         decimals = 3
-        if bucket_ns < S_TO_NS:
+        # Any bucket that is not a whole number of milliseconds needs more than
+        # 3 decimals, including buckets >= 1 s (e.g. 1.5 ms and 1500.5 ms are
+        # both mis-serialized at 3 dp). The old `< S_TO_NS` gate only covered
+        # sub-second widths.
+        if bucket_ns % (S_TO_NS // 1000) != 0 or bucket_ns < S_TO_NS:
             digits = 9
             b = bucket_ns
             while b % 10 == 0:

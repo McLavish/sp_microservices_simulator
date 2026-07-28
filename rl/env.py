@@ -123,6 +123,13 @@ class MicroservicesEnv(_GymEnvBase):
         assert spaces is not None  # narrow for type checker after the check above
         if config.step_duration_s <= 0:
             raise ValueError("step_duration_s must be > 0")
+        if s_to_ns(config.step_duration_s) <= 0:
+            # A sub-nanosecond step rounds to 0 ns, so step() never advances the
+            # clock, the episode never terminates and the caller hangs forever.
+            raise ValueError(
+                f"step_duration_s={config.step_duration_s!r} rounds to 0 ns; the "
+                "minimum representable step is 1e-9 s"
+            )
         if config.episode_duration_s is not None and config.episode_duration_s <= 0:
             raise ValueError("episode_duration_s must be > 0")
         self._cfg = config
