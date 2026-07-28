@@ -68,13 +68,18 @@ windows, request lifespans, and bucket ranges all use this convention.
 ## Core data types (`core.py`)
 
 - **`DropReason`** (`core.py`) — `NONE`, `QUEUE_FULL`, `DEADLINE`,
-  `SERVER_FAILURE`, `CIRCUIT_OPEN`. Every non-success carries one of these.
+  `SERVER_FAILURE`, `CIRCUIT_OPEN`, `CANCELLED`. Every non-success carries one of
+  these. `CANCELLED` means *abandoned, not failed* (an upstream fan-out
+  short-circuited); it is counted separately and kept out of the failure buckets.
 - **`Request`** (`core.py`) — a single attempt: the handling `service` name, its
-  `interval` (lifespan), the `deadline` it ran under, `success`, `drop_reason`, and
-  `queue_size_at_end` (queue length captured when the attempt finished).
+  `interval` (lifespan), the `deadline` it ran under, `success`, `drop_reason`,
+  `queue_size_at_end` (queue length when the attempt finished, `None` if it never
+  reached the service) and `service_time_ns` (queue-exclusive occupancy).
 - **`RootRequest`** (`core.py`) — one client-visible request = a list of
-  `attempts` (original + retries), a `global_deadline`, a `done` flag, and an
-  optional `on_done` callback fired once on completion.
+  `attempts` (original + retries), a `global_deadline`, a `done` flag, an optional
+  `on_done` callback fired once on completion, a `cancelled` flag, a `cancel()`
+  handle, and `completed_at` (prefer it over the last attempt's end: a root
+  cancelled while backing off finishes later than any attempt it made).
 - **`Summary`** (`core.py`) — the aggregate returned by `Metrics.summary()`
   (counts by outcome, latency percentiles, retries per root). See
   [observability](observability.md).
