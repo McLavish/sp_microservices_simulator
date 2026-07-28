@@ -64,6 +64,13 @@ make help        # list all targets
 ```
 Pre-commit runs `ruff check --fix`, `ruff format`, and `ty check` on every commit.
 
+`tests/test_golden_and_invariants.py` holds characterization tests that pin
+exact results for seeded runs, plus the invariants a change must not break
+(FCFS order, additive latency injection, the strict `end_time < deadline` rule,
+start-vs-end CSV bucketing). They are brittle by design: a diff means the
+simulator's numbers moved and every figure produced with the old behaviour is
+invalid. `docs/observability.md` records the mutations that once passed silently.
+
 Tests (pytest; tests are `unittest`-style but run under pytest):
 ```bash
 uv run pytest                              # full suite
@@ -121,7 +128,7 @@ python -m plotting.rl_traces_over_time rl_traces_basic.csv              # per-st
 - After running an experiment, call `Metrics.export_csv()` *and* `FaultEventsTracker.export_json()` so plotting overlays line up.
 - Keep internal time in nanoseconds; convert only at I/O / plotting boundaries.
 - `ty` is lenient on missing annotations but real type errors (None narrowing, protocol mismatches, numpy misuse) are kept clean — don't reintroduce them.
-- Generated artifacts (`*.csv`, `*.json`, `*.png`, `results/`) are gitignored. The committed `*_output.csv` / `*_fault_events.json` files at the repo root are sample outputs from prior runs; treat them as disposable.
+- Generated artifacts (`*.csv`, `*.json`, `*.png`, `results/`) are gitignored. Exactly one is deliberately pinned past that ignore: `rl_constrained_comparison_multichain.csv`, the paper's reference result — do not regenerate it casually. Everything else at the repo root (`*_output.csv`, `*_fault_events.json`, …) is untracked local output from prior runs; treat it as disposable.
 
 ## Git Commits
 

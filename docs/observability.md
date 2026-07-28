@@ -94,3 +94,20 @@ python -m plotting.latencies_over_time output.csv --fault-events fault_events.js
   tracker that produces the overlay JSON.
 - [experiments](experiments.md) — what each scenario writes (filenames differ per
   experiment).
+
+## Mutation record
+
+Behaviours below were, at some point, changed in the source without any test
+failing. Each now has a guard; re-run these after a significant change to the
+event loop, the queue, or the metrics path. `tests/test_golden_and_invariants.py`
+is where they are pinned.
+
+| Mutation | Caught by |
+| --- | --- |
+| `service.py` `heapq.heappop(self.queue)` → LIFO pop | `test_service_is_fcfs`, both golden runs |
+| `service.py` `add += inj.add_latency` → `add += 0` | `test_additive_latency_applies_inside_its_window` |
+| `simulator.py` `seq=self._seq` → `seq=-self._seq` | `test_fanout_golden` (needs contention: with every request succeeding, tie order is unobservable) |
+
+The golden tests are brittle on purpose. A diff means the simulator's numbers
+moved, which invalidates figures produced with the old behaviour — establish
+why before updating the expected values.
