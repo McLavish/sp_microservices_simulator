@@ -362,6 +362,7 @@ class MicroservicesEnv(_GymEnvBase):
                 "deadline_drop_rate": 0.0,
                 "queue_drop_rate": 0.0,
                 "server_drop_rate": 0.0,
+                "cancelled_rate": 0.0,
                 "circuit_open_drop_rate": 0.0,
                 "avg_latency_ms": 0.0,
                 "p95_latency_ms": 0.0,
@@ -376,6 +377,7 @@ class MicroservicesEnv(_GymEnvBase):
         queue_drops = 0
         server_drops = 0
         circuit_open_drops = 0
+        cancelled_drops = 0
         latencies: list[int] = []
         attempts_total = 0
         queue_sizes: list[int] = []
@@ -396,6 +398,11 @@ class MicroservicesEnv(_GymEnvBase):
                     queue_drops += 1
                 elif last_attempt.drop_reason == DropReason.CIRCUIT_OPEN:
                     circuit_open_drops += 1
+                elif root.cancelled or last_attempt.drop_reason == DropReason.CANCELLED:
+                    # Abandoned by an upstream cancellation, not failed here.
+                    # Charging it to server_drops would penalise the agent a
+                    # second time for the failure that triggered the cancel.
+                    cancelled_drops += 1
                 else:
                     server_drops += 1
 
@@ -415,6 +422,10 @@ class MicroservicesEnv(_GymEnvBase):
             "deadline_drop_rate": deadline_drops / completed,
             "queue_drop_rate": queue_drops / completed,
             "server_drop_rate": server_drops / completed,
+            # Reported for visibility; deliberately carries no reward weight
+            # and no observation feature, since cancelled work is abandoned
+            # rather than a failure of this service.
+            "cancelled_rate": cancelled_drops / completed,
             "circuit_open_drop_rate": circuit_open_drops / completed,
             "avg_latency_ms": avg_latency_ms,
             "p95_latency_ms": p95_latency_ms,
@@ -497,13 +508,15 @@ class MicroservicesEnv(_GymEnvBase):
                     # see them through the drop-rate features instead. A zero
                     # would poison lognormal fits (log 0) as an uncensored value.
                     continue
+                # Deadline cuts and cancellations both TRUNCATE the attempt, so
+                # what we observed is a lower bound on the latency it would have
+                # had. Treating either as an exact sample biases the fit fast.
+                truncated = attempt.drop_reason in (DropReason.DEADLINE, DropReason.CANCELLED)
                 attempt_latencies.append(ns_to_ms(attempt.interval.end - attempt.interval.begin))
-                attempt_censored.append(attempt.drop_reason == DropReason.DEADLINE)
+                attempt_censored.append(truncated)
                 if attempt.service_time_ns is not None:
                     attempt_service.append(ns_to_ms(attempt.service_time_ns))
-                    # Deadline cuts truncate service occupancy at the deadline:
-                    # a right-censored observation of the latent service demand.
-                    attempt_service_censored.append(attempt.drop_reason == DropReason.DEADLINE)
+                    attempt_service_censored.append(truncated)
 
         if self._cfg.max_latency_samples is not None:
             attempt_latencies = attempt_latencies[: self._cfg.max_latency_samples]

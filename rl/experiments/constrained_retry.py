@@ -116,7 +116,11 @@ def _eval_arm(
         if horizon:
             successes_horizon.append(horizon.succeeded / horizon.total if horizon.total else 0.0)
             p95s_horizon.append(horizon.p95)
-        bystander = env.bystander_metrics_summary()
+        # Score the externality on the SAME population as the objective J, which
+        # only sees in-horizon roots. The full population includes the drained
+        # tail, which completes after the agent's chain has gone quiet and so
+        # reads systematically better than what J was actually measured against.
+        bystander = env.bystander_in_horizon_summary()
         if bystander is not None:
             bystander_successes.append(
                 bystander.succeeded / bystander.total if bystander.total else 0.0

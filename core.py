@@ -85,6 +85,11 @@ class RootRequest:
     # Installed by ClientRuntime.start_request; cancels this root's in-flight
     # attempt and any pending retry. None once the root completes.
     cancel: Callable[[], None] | None = None
+    # When the root finished. Usually equals the final attempt's end, but a root
+    # cancelled while backing off has no attempt carrying that instant, and
+    # bucketing it at the previous attempt's end would report it in the wrong
+    # window. Consumers should prefer this over `attempts[-1].interval.end`.
+    completed_at: TimePoint | None = None
 
     def add_attempt(self, attempt: Request):
         self.attempts.append(attempt)

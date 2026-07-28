@@ -61,6 +61,10 @@ class AttemptCtx:
     control: "AttemptControl | None" = None
     # Scheduled retry event, so cancellation can drop a pending backoff.
     retry_event: Event | None = None
+    # The context that authorised the pending retry. A retry is charged when
+    # `next_delay` grants it, so abandoning it before it runs must refund
+    # through the same rollback path a deadline veto uses.
+    pending_retry_context: RetryContext | None = None
     # Set before tearing down, so _on_attempt_done completes the root instead
     # of scheduling the next retry.
     cancelling: bool = False
@@ -114,14 +118,19 @@ class ClientRuntime:
             return self._allow_policy_request(policy.underlying_strategy, now)
         return True
 
-    def _complete_root(self, root: RootRequest) -> None:
+    def _complete_root(self, root: RootRequest, now: TimePoint) -> None:
         root.done = True
         root.cancel = None  # a completed root is no longer cancellable
+        # When the root actually finished. Usually the final attempt's end, but
+        # a root cancelled while backing off has no attempt of its own to carry
+        # the timestamp, and bucketing it at the previous attempt's end would
+        # place it in the wrong window.
+        root.completed_at = now
         self.roots.append(root)
         if root.on_done is not None:
             root.on_done(root)
 
-    def _cancel_root(self, ctx: AttemptCtx) -> None:
+    def _cancel_root(self, ctx: AttemptCtx, sim: Simulator) -> None:
         """Abandon this root: no further attempts, and give back in-flight work.
 
         Idempotent and safe to call from a completion callback — a root that
@@ -129,6 +138,7 @@ class ClientRuntime:
         """
         if ctx.root.done or ctx.cancelling:
             return
+        now = sim.timestep
         ctx.cancelling = True
         ctx.root.cancelled = True
 
@@ -138,7 +148,13 @@ class ClientRuntime:
             # carries the classification.
             ctx.retry_event.cancelled = True
             ctx.retry_event = None
-            self._complete_root(ctx.root)
+            # That retry was already charged when the policy granted it. Refund
+            # it — a retry that never runs must not consume budget, whether the
+            # deadline vetoed it or an upstream cancelled it.
+            if ctx.pending_retry_context is not None:
+                self._rollback_policy(self.cfg.retry, ctx.pending_retry_context)
+                ctx.pending_retry_context = None
+            self._complete_root(ctx.root, now)
             return
 
         control = ctx.control
@@ -185,7 +201,7 @@ class ClientRuntime:
                 queue_size_at_end=0,
             )
             root_req.add_attempt(req)
-            self._complete_root(root_req)
+            self._complete_root(root_req, sim.timestep)
             return root_req
 
         # Start first attempt
@@ -196,7 +212,7 @@ class ClientRuntime:
             deadline=None,
         )
         initial_ctx = AttemptCtx(root=root_req, req=dummy_req, last_delay=0, total_delay=0)
-        root_req.cancel = partial(self._cancel_root, initial_ctx)
+        root_req.cancel = partial(self._cancel_root, initial_ctx, sim)
         self._start_attempt(sim, initial_ctx)
         return root_req
 
@@ -220,6 +236,7 @@ class ClientRuntime:
         ctx.req = req
 
         ctx.retry_event = None
+        ctx.pending_retry_context = None
         on_done = partial(self._on_attempt_done, ctx, sim)
         ctx.control = self.service.submit_attempt(sim, on_done, attempt_deadline=req_deadline)
 
@@ -255,6 +272,18 @@ class ClientRuntime:
         # Log the request
         ctx.root.add_attempt(ctx.req)
 
+        ctx.control = None  # nothing outstanding at the service any more
+
+        # Cancelled by an upstream fan-out: abandoned, NOT failed. Return before
+        # any feedback, because this attempt is not evidence about the service.
+        # Feeding it to the breaker would trip it on work the service never got
+        # to finish, and feeding it to the adaptive timeout controller would
+        # count a truncated latency as an observation.
+        if ctx.cancelling or drop_reason == DropReason.CANCELLED:
+            ctx.root.cancelled = True
+            self._complete_root(ctx.root, sim.timestep)
+            return
+
         # Update circuit breaker state if policy supports it
         self._update_policy_results(self.cfg.retry, success_effective, sim.timestep)
 
@@ -262,17 +291,8 @@ class ClientRuntime:
         request_latency = ctx.req.interval.end - ctx.req.interval.begin
         self.cfg.timeout_controller.record_result(success_effective, request_latency)
 
-        ctx.control = None  # nothing outstanding at the service any more
-
         if ctx.req.success:
-            self._complete_root(ctx.root)
-            return
-
-        # Cancelled by an upstream fan-out: stop here rather than retrying, so
-        # abandoned work does not keep generating load on the way down.
-        if ctx.cancelling or drop_reason == DropReason.CANCELLED:
-            ctx.root.cancelled = True
-            self._complete_root(ctx.root)
+            self._complete_root(ctx.root, sim.timestep)
             return
 
         # Build retry context
@@ -294,9 +314,10 @@ class ClientRuntime:
             # policy withdraws only on the path that returns allow=True.)
             if decision.allow:
                 self._rollback_policy(self.cfg.retry, retry_context)
-            self._complete_root(ctx.root)
+            self._complete_root(ctx.root, sim.timestep)
             return
 
+        ctx.pending_retry_context = retry_context
         ctx.retry_event = sim.schedule(next_start, partial(self._start_attempt, sim, ctx))
 
     def metrics(self) -> Metrics:

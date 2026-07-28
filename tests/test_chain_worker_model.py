@@ -4,7 +4,13 @@ from caller import ClientConfig, ClientRuntime
 from chain import DownstreamEdge, ServiceNodeRuntime
 from core import DropReason, TimeInterval, ms_to_ns, s_to_ns
 from faults import PartialFailure
-from retry_policies import NoRetryPolicy
+from retry_policies import (
+    CBState,
+    CountBasedCircuitBreakerPolicy,
+    FixedBackoffRetryPolicy,
+    NoRetryPolicy,
+    RetryBudgetPolicy,
+)
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import StaticTimeoutController
@@ -315,3 +321,124 @@ class TestCancellationPropagation(unittest.TestCase):
         self.assertEqual(summary.dropped_server_failure, 0)
         self.assertEqual(summary.dropped_deadline, 0)
         self.assertEqual(summary.dropped_queue, 0)
+
+
+class TestCancellationIntegration(unittest.TestCase):
+    """Cancellation must not leak into the subsystems it crosses.
+
+    Each case reproduces a regression from the first cancellation implementation,
+    where the feature worked in isolation but corrupted queue capacity, breaker
+    state, or budget accounting.
+    """
+
+    def _service(self, median_ms=100, workers=1, capacity=None, p_fail=0.0):
+        failures = [PartialFailure(TimeInterval(0, s_to_ns(100)), p_fail=p_fail)] if p_fail else []
+        return ServiceRuntime(
+            cfg=ServiceConfig(
+                name="svc",
+                latency_median=ms_to_ns(median_ms),
+                latency_lognorm_sigma=1e-6,
+                workers=workers,
+                queue_capacity=capacity,
+                partial_failures=failures,
+            )
+        ).bind()
+
+    def test_cancelled_queue_entry_frees_its_capacity_slot(self):
+        sim = Simulator(seed=1)
+        svc = self._service(workers=1, capacity=1)
+        seen = []
+        svc.submit_attempt(sim, lambda *a: seen.append(("A", a[2])))  # takes the worker
+        handle = svc.submit_attempt(sim, lambda *a: seen.append(("B", a[2])))  # queued
+        handle.cancel()
+        self.assertEqual(svc.queue_len(), 0)
+        svc.submit_attempt(sim, lambda *a: seen.append(("C", a[2])))
+        # C must fit: B gave its slot back even though its tombstone remains.
+        self.assertNotIn(("C", DropReason.QUEUE_FULL), seen)
+
+    def test_dequeued_attempt_does_not_inherit_the_queued_cancel(self):
+        """A behavior that registers no teardown must be uncancellable, not
+        cancellable via the stale queued callback (which would report CANCELLED
+        without releasing the worker, then finalize on top of it)."""
+        sim = Simulator(seed=1)
+        svc = self._service(workers=1)
+        calls = []
+
+        def behavior(service, sim2, deadline, finalize, begin_at, release_worker, register_cancel):
+            sim2.schedule(
+                begin_at + ms_to_ns(100),
+                lambda: finalize(True, ms_to_ns(100), DropReason.NONE),
+            )
+
+        svc.submit_attempt(sim, lambda *a: calls.append(a[2]))
+        handle = svc.submit_attempt(sim, lambda *a: calls.append(a[2]), behavior=behavior)
+        sim.run(until=ms_to_ns(150))  # second attempt has been dequeued into `behavior`
+        handle.cancel()
+        sim.run()
+        self.assertEqual(calls, [DropReason.NONE, DropReason.NONE])
+
+    def test_cancellation_does_not_trip_the_circuit_breaker(self):
+        """Cancelled work is abandoned, not evidence about the service."""
+        sim = Simulator(seed=1)
+        svc = self._service(median_ms=200, workers=1)
+        breaker = CountBasedCircuitBreakerPolicy(
+            failure_threshold_ratio=(1, 1),
+            success_threshold_ratio=(1, 1),
+            underlying_strategy=NoRetryPolicy(),
+            half_open_delay=s_to_ns(10),
+        )
+        client = ClientRuntime(
+            cfg=ClientConfig(
+                retry=breaker,
+                timeout_controller=StaticTimeoutController(None, ms_to_ns(5000)),
+            ),
+            service=svc,
+        )
+        root = client.start_request(sim)
+        sim.run(until=ms_to_ns(10))
+        root.cancel()
+        sim.run()
+        self.assertEqual(breaker.get_state(), CBState.CLOSED)
+
+    def test_cancelling_during_backoff_refunds_the_retry_charge(self):
+        """The retry was charged when the policy granted it; abandoning it before
+        it runs must refund, exactly as a deadline veto does."""
+        sim = Simulator(seed=1)
+        svc = self._service(median_ms=10, workers=1, p_fail=1.0)
+        budget = RetryBudgetPolicy(
+            budget_ratio=0.1,
+            max_retries=5,
+            underlying_strategy=FixedBackoffRetryPolicy(max_attempts=5, delay=ms_to_ns(500)),
+        )
+        client = ClientRuntime(
+            cfg=ClientConfig(
+                retry=budget,
+                timeout_controller=StaticTimeoutController(None, ms_to_ns(5000)),
+            ),
+            service=svc,
+        )
+        before = budget._tokens
+        root = client.start_request(sim)
+        sim.run(until=ms_to_ns(50))  # first attempt failed; retry scheduled and charged
+        root.cancel()
+        sim.run()
+        self.assertEqual(len(root.attempts) - 1, 0)  # no retry ever ran
+        self.assertEqual(budget._tokens, before)
+
+    def test_backoff_cancelled_root_records_its_own_completion_time(self):
+        sim = Simulator(seed=1)
+        svc = self._service(median_ms=10, workers=1, p_fail=1.0)
+        client = ClientRuntime(
+            cfg=ClientConfig(
+                retry=FixedBackoffRetryPolicy(max_attempts=5, delay=ms_to_ns(500)),
+                timeout_controller=StaticTimeoutController(None, ms_to_ns(5000)),
+            ),
+            service=svc,
+        )
+        root = client.start_request(sim)
+        sim.run(until=ms_to_ns(50))
+        root.cancel()
+        sim.run()
+        # Completion is the cancel instant, not the previous attempt's end.
+        self.assertIsNotNone(root.completed_at)
+        self.assertGreater(root.completed_at, root.attempts[-1].interval.end)

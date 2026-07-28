@@ -153,6 +153,12 @@ def train_constrained_ppo(cfg: ConstrainedTrainConfig) -> SB3Policy:
     eval_env = make_env()
     eval_env.reset(seed=cfg.eval_seed)
 
+    if cfg.chunk_timesteps <= 0:
+        # chunk=0 would call learn(0) forever: `trained` never advances.
+        raise ValueError(f"chunk_timesteps must be > 0, got {cfg.chunk_timesteps}")
+    if cfg.timesteps <= 0:
+        raise ValueError(f"timesteps must be > 0, got {cfg.timesteps}")
+
     lam = cfg.lambda_init
     curve: list[tuple[int, float, float, float]] = []
     trained = 0

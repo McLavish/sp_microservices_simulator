@@ -126,7 +126,7 @@ sets it).
 | `LeakyRateLimiterPolicy` (`retry_policies.py:236`) | `max_requests`, `max_attempts`, `period` | leaky-bucket-as-queue: spaces retries `period/max_requests` apart, returns the delay. Does **not** wrap an underlying policy. |
 | `BurstyRateLimiterPolicy` (`retry_policies.py:305`) | `max_requests`, `refill_rate`, `period`, `underlying_strategy` | token bucket with continuous refill; one token per retry |
 | `FixedWindowBurstyLimiterPolicy` (`retry_policies.py:351`) | `max_requests`, `period`, `underlying_strategy` | fixed-window quota, reset on each window boundary |
-| `RetryBudgetPolicy` (`retry_policies.py:260`) | `budget_ratio`, `max_retries`, `underlying_strategy` | token economy: each success awards `100 * budget_ratio` tokens (cap `100 * max_retries`), each retry costs 100 |
+| `RetryBudgetPolicy` (`retry_policies.py:260`) | `budget_ratio`, `max_retries`, `underlying_strategy` | token economy: each **request** deposits `100 * budget_ratio` tokens (cap `100 * max_retries`), each retry costs 100 and is refunded if the retry is never issued. Finagle semantics — the ratio is retries per *request*. No deposit TTL (documented divergence) |
 
 ### Example: a circuit breaker around no-retry
 

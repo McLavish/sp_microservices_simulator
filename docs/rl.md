@@ -82,12 +82,13 @@ seeds on the env path or training collapses to one repeated episode.
   `queue_drop=1.0`, `server_drop=1.0`, `circuit_open_drop=1.0`,
   `p95_latency_ms=0.001`, `retries=0.1`.
 
-### Observation (normalized `Box`, 15 dims + 1 with a global-timeout dimension)
+### Observation (normalized `Box`, 16 dims + 1 with a global-timeout dimension)
 
 In order: a has-data flag (disambiguates "no traffic" from "all failed"),
 log-scaled completed count, the five outcome rates (success, deadline, queue,
 server, circuit-open), avg and p95 latency scaled by the largest attempt timeout in
-the spec, retries scaled by the max retry budget, log-scaled queue depth, the last
+the spec, retries scaled by the max retry budget, the constraint cost (cost-client
+retry amplification, same scaling as retries), log-scaled queue depth, the last
 action echoed as index fractions (one per action dimension), and the episode-time
 fraction.
 
@@ -185,8 +186,8 @@ penalty is zeroed during constrained training; evaluation always reports the
 base objective **J** (reward with retry/cost penalties zeroed) so arms with
 different training weights stay comparable. Honest caveats: the constraint is
 enforced **in expectation** (not per episode/window — report violation rates),
-and `RetryBudgetPolicy.budget_ratio` limits retries against *successes*, which
-approximates retries-per-root only at high success rates.
+and `RetryBudgetPolicy.budget_ratio` limits retries against *requests*
+(Finagle semantics), matching the retries-per-root the constraint cost measures.
 
 `compare_policies` accepts `constrained_ppo` as a policy name
 (`--retry-budget`, `--lambda-lr`, `--lambda-init`); the three-arm study is:

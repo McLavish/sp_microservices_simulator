@@ -21,6 +21,7 @@ def main(csv_file, output_file, fault_events_file=None):
         "failure_server",
         "failure_queue_full",
         "failure_circuit_open",
+        "failure_cancelled",
     ]
     reasons_pct = (df[reason_cols].div(completed, axis=0) * 100.0).fillna(0.0)
 

@@ -182,7 +182,13 @@ class Metrics:
             root_rows.append(
                 {
                     "begin": attempts_by_begin[0].interval.begin,
-                    "end": last_attempt.interval.end,
+                    # Prefer the recorded completion instant: a root cancelled
+                    # while backing off finished after its last attempt ended.
+                    "end": (
+                        root.completed_at
+                        if root.completed_at is not None
+                        else last_attempt.interval.end
+                    ),
                     "succeeded": any(a.success for a in root.attempts),
                     # A root cancelled while backing off has no attempt marked
                     # CANCELLED, so the root-level flag wins (mirrors summary()).
@@ -197,9 +203,11 @@ class Metrics:
                         "begin": a.interval.begin,
                         "end": a.interval.end,
                         "is_retry": i > 0,
+                        # Cancelled attempts were abandoned, not failed: they
+                        # are not evidence of a retry that went wrong.
                         "retry_failed": i > 0
                         and not a.success
-                        and a.drop_reason != DropReason.NONE,
+                        and a.drop_reason not in (DropReason.NONE, DropReason.CANCELLED),
                         "queue": float("nan")
                         if a.queue_size_at_end is None
                         else int(a.queue_size_at_end),

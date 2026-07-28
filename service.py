@@ -72,6 +72,16 @@ class AttemptControl:
         if not self._settled:
             self._cancel_fn = fn
 
+    def _clear(self) -> None:
+        """Drop the current teardown without settling the handle.
+
+        Used when an attempt changes phase (queued -> in service): the queued
+        teardown is no longer valid, and the new phase installs its own. Leaving
+        the stale one bound would cancel an attempt that is already running.
+        """
+        if not self._settled:
+            self._cancel_fn = None
+
     def _settle(self) -> None:
         self._settled = True
         self._cancel_fn = None
@@ -104,12 +114,22 @@ class ServiceRuntime:
     in_flight: int = 0
     queue: list[QItem] = field(default_factory=list)
     _seq: int = 0
+    # Live (non-tombstoned) queue occupancy. `queue` still holds cancelled
+    # entries until they surface at the heap head, so its raw length overstates
+    # occupancy: using it for the capacity check would let a cancelled entry go
+    # on shedding load, and using it for telemetry would inflate queue depth.
+    _queued: int = 0
 
     def bind(self):
         self.in_flight = 0
         self.queue.clear()
         self._seq = 0
+        self._queued = 0
         return self
+
+    def queue_len(self) -> int:
+        """Queue occupancy excluding cancelled entries still in the heap."""
+        return self._queued
 
     def _adjust_latency(self, t: TimePoint, base: TimeDuration) -> TimeDuration:
         mult: int = 1
@@ -141,7 +161,8 @@ class ServiceRuntime:
         while self.in_flight < self.cfg.workers and self.queue:
             item = heapq.heappop(self.queue)
             if item.cancelled:
-                continue  # abandoned upstream; never consumed a worker
+                continue  # already discounted at cancel time; never took a worker
+            self._queued -= 1
             item.start()
 
     def submit_attempt(
@@ -185,7 +206,7 @@ class ServiceRuntime:
 
         # Immediately drop the request if somehow it has already expired?
         if attempt_deadline is not None and sim.timestep >= attempt_deadline:
-            settled_on_done(False, 0, DropReason.DEADLINE, len(self.queue))
+            settled_on_done(False, 0, DropReason.DEADLINE, self.queue_len())
             return control
 
         start_cb = partial(
@@ -196,9 +217,11 @@ class ServiceRuntime:
             start_cb()  # Immediately start handling if we have free worker
             return control
 
-        # Drop request if queue is full (load shedding)
-        if self.cfg.queue_capacity is not None and len(self.queue) >= self.cfg.queue_capacity:
-            settled_on_done(False, 0, DropReason.QUEUE_FULL, len(self.queue))
+        # Drop request if queue is full (load shedding). Counts live entries
+        # only: a cancelled entry has given its slot back even though its
+        # tombstone is still sitting in the heap.
+        if self.cfg.queue_capacity is not None and self.queue_len() >= self.cfg.queue_capacity:
+            settled_on_done(False, 0, DropReason.QUEUE_FULL, self.queue_len())
             return control
 
         # Enqueue the request
@@ -208,11 +231,14 @@ class ServiceRuntime:
             start=start_cb,
         )
         heapq.heappush(self.queue, item)
+        self._queued += 1
 
         def cancel_queued() -> None:
             # Never entered service, so no worker to release and no _start_next.
+            # Free the slot now, not when the tombstone reaches the heap head.
             item.cancelled = True
-            on_done(False, 0, DropReason.CANCELLED, len(self.queue))
+            self._queued -= 1
+            on_done(False, 0, DropReason.CANCELLED, self.queue_len())
 
         control._bind(cancel_queued)
         return control
@@ -226,10 +252,18 @@ class ServiceRuntime:
         behavior: Behavior | None = None,
         control: AttemptControl | None = None,
     ):
+        # Entering service: the queued teardown no longer applies. Drop it before
+        # anything else, so a behavior that registers no teardown of its own is
+        # simply not cancellable rather than running the stale queued one — which
+        # would report CANCELLED without releasing the worker and then let the
+        # behavior finalize on top of it.
+        if control is not None:
+            control._clear()
+
         # If the attempt expired while waiting in the queue, drop immediately without
         # consuming a worker. We make sure we are not scheduling an event in the past.
         if attempt_deadline is not None and sim.timestep >= attempt_deadline:
-            on_done(False, 0, DropReason.DEADLINE, len(self.queue))
+            on_done(False, 0, DropReason.DEADLINE, self.queue_len())
             return
 
         self.in_flight += 1
@@ -281,7 +315,7 @@ class ServiceRuntime:
                     raise RuntimeError("finalize called more than once for the same attempt")
                 finalized = True
                 if released:
-                    on_done(success, service_time, drop, len(self.queue))
+                    on_done(success, service_time, drop, self.queue_len())
                 else:
                     self._complete_attempt(sim, on_done, success, service_time, drop)
 
@@ -327,5 +361,5 @@ class ServiceRuntime:
         drop_reason: DropReason,
     ):
         self.in_flight -= 1
-        on_done(success, service_time, drop_reason, len(self.queue))
+        on_done(success, service_time, drop_reason, self.queue_len())
         self._start_next(sim)
