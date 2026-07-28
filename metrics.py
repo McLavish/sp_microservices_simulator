@@ -6,10 +6,14 @@ from core import (
     MS_TO_NS,
     S_TO_NS,
     DropReason,
+    RootOutcome,
     RootRequest,
     Summary,
-    TimeInterval,
+    classify_root,
     ns_to_ms,
+    root_completed_at,
+    root_latency,
+    root_started_at,
     s_to_ns,
 )
 
@@ -27,58 +31,35 @@ class Metrics:
         q_ns = np.quantile(arr, p)
         return float(q_ns) / MS_TO_NS
 
-    def _compute_time_interval_from_attempts(self, root_request: RootRequest) -> TimeInterval:
-        if not root_request.attempts:
-            raise ValueError("No attempts found in RootRequest")
-
-        begin = min(attempt.interval.begin for attempt in root_request.attempts)
-        end = max(attempt.interval.end for attempt in root_request.attempts)
-
-        return TimeInterval(begin=begin, end=end)
-
     def summary(self) -> Summary:
         total = len(self.roots)
         succ_lat: list[int] = []
         succeeded = 0
-        dropped_q = 0
-        dropped_deadline = 0
-        dropped_server_failure = 0
-        dropped_circuit_open = 0
-        dropped_cancelled = 0
+        counters = {
+            RootOutcome.QUEUE_FULL: 0,
+            RootOutcome.DEADLINE: 0,
+            RootOutcome.SERVER_FAILURE: 0,
+            RootOutcome.CIRCUIT_OPEN: 0,
+            RootOutcome.CANCELLED: 0,
+        }
         for request in self.roots:
             if not request.attempts:
                 continue
+            if sum(1 for attempt in request.attempts if attempt.success) > 1:
+                raise ValueError("Multiple successful attempts in RootRequest")
 
-            success = False
-            for attempt in request.attempts:
-                if attempt.success:  # there should be only 1 success per root request
-                    if success:
-                        raise ValueError("Multiple successful attempts in RootRequest")
-                    success = True
-                    succeeded += 1
-                    succ_lat.append(self._compute_time_interval_from_attempts(request).duration())
-
-            if success:
+            outcome = classify_root(request)
+            if outcome is RootOutcome.SUCCESS:
+                succeeded += 1
+                succ_lat.append(root_latency(request))
                 continue
+            counters[outcome] += 1
 
-            # Abandoned by an upstream cancellation. Checked before the
-            # per-attempt reason because a root cancelled while backing off has
-            # no attempt of its own carrying CANCELLED.
-            if request.cancelled:
-                dropped_cancelled += 1
-                continue
-
-            # Append order is completion order; ties on end time (zero-backoff
-            # synchronous rejections) make max()/sort keys ambiguous.
-            last_attempt = request.attempts[-1]
-            if last_attempt.drop_reason == DropReason.QUEUE_FULL:
-                dropped_q += 1
-            elif last_attempt.drop_reason == DropReason.DEADLINE:
-                dropped_deadline += 1
-            elif last_attempt.drop_reason == DropReason.CIRCUIT_OPEN:
-                dropped_circuit_open += 1
-            else:
-                dropped_server_failure += 1
+        dropped_q = counters[RootOutcome.QUEUE_FULL]
+        dropped_deadline = counters[RootOutcome.DEADLINE]
+        dropped_server_failure = counters[RootOutcome.SERVER_FAILURE]
+        dropped_circuit_open = counters[RootOutcome.CIRCUIT_OPEN]
+        dropped_cancelled = counters[RootOutcome.CANCELLED]
 
         # nan, not 0.0: "no successful request completed" is missing data, and
         # the percentiles below already use nan. Reporting 0 ms made an empty
@@ -186,24 +167,13 @@ class Metrics:
             if not root.attempts:
                 continue
             attempts_by_begin = sorted(root.attempts, key=lambda a: a.interval.begin)
-            # Append order is completion order (ties on end time are ambiguous).
-            last_attempt = root.attempts[-1]
+            outcome = classify_root(root)
             root_rows.append(
                 {
-                    "begin": attempts_by_begin[0].interval.begin,
-                    # Prefer the recorded completion instant: a root cancelled
-                    # while backing off finished after its last attempt ended.
-                    "end": (
-                        root.completed_at
-                        if root.completed_at is not None
-                        else last_attempt.interval.end
-                    ),
-                    "succeeded": any(a.success for a in root.attempts),
-                    # A root cancelled while backing off has no attempt marked
-                    # CANCELLED, so the root-level flag wins (mirrors summary()).
-                    "drop_reason": (
-                        DropReason.CANCELLED if root.cancelled else last_attempt.drop_reason
-                    ),
+                    "begin": root_started_at(root),
+                    "end": root_completed_at(root),
+                    "succeeded": outcome is RootOutcome.SUCCESS,
+                    "outcome": outcome,
                 }
             )
             for i, a in enumerate(attempts_by_begin):
@@ -286,19 +256,19 @@ class Metrics:
                 "failure_root": per_bucket_count(failed["end"]),
                 "failure_retry": per_bucket_count(attempts.loc[attempts["retry_failed"], "end"]),
                 "failure_queue_full": per_bucket_count(
-                    failed.loc[failed["drop_reason"] == DropReason.QUEUE_FULL, "end"]
+                    failed.loc[failed["outcome"] == RootOutcome.QUEUE_FULL, "end"]
                 ),
                 "failure_deadline": per_bucket_count(
-                    failed.loc[failed["drop_reason"] == DropReason.DEADLINE, "end"]
+                    failed.loc[failed["outcome"] == RootOutcome.DEADLINE, "end"]
                 ),
                 "failure_server": per_bucket_count(
-                    failed.loc[failed["drop_reason"] == DropReason.SERVER_FAILURE, "end"]
+                    failed.loc[failed["outcome"] == RootOutcome.SERVER_FAILURE, "end"]
                 ),
                 "failure_circuit_open": per_bucket_count(
-                    failed.loc[failed["drop_reason"] == DropReason.CIRCUIT_OPEN, "end"]
+                    failed.loc[failed["outcome"] == RootOutcome.CIRCUIT_OPEN, "end"]
                 ),
                 "failure_cancelled": per_bucket_count(
-                    failed.loc[failed["drop_reason"] == DropReason.CANCELLED, "end"]
+                    failed.loc[failed["outcome"] == RootOutcome.CANCELLED, "end"]
                 ),
                 # queue size at attempt END, by completion bucket
                 "queue_avg_at_attempt_end": (

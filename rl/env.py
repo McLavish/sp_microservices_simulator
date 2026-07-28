@@ -12,13 +12,16 @@ from caller import ClientConfig, ClientRuntime
 from chain import DownstreamEdge, ServiceNodeRuntime
 from core import (
     DropReason,
+    RootOutcome,
     Summary,
     TimeDuration,
     TimeInterval,
     TimePoint,
+    classify_root,
     ms_to_ns,
     ns_to_ms,
     ns_to_s,
+    root_latency,
     s_to_ns,
 )
 from faults import LatencyInjection, LoadSpike, PartialFailure
@@ -474,30 +477,22 @@ class MicroservicesEnv(_GymEnvBase):
 
         for root in roots:
             attempts_total += len(root.attempts)
-            if any(a.success for a in root.attempts):
+            # Same classifier as Metrics.summary() and export_csv(): these three
+            # populations must agree, and they drifted when each owned its rules.
+            outcome = classify_root(root)
+            if outcome is RootOutcome.SUCCESS:
                 successes += 1
-                begin = min(a.interval.begin for a in root.attempts)
-                end = max(a.interval.end for a in root.attempts)
-                latencies.append(end - begin)
+                latencies.append(root_latency(root))
+            elif outcome is RootOutcome.CANCELLED:
+                cancelled_drops += 1
+            elif outcome is RootOutcome.DEADLINE:
+                deadline_drops += 1
+            elif outcome is RootOutcome.QUEUE_FULL:
+                queue_drops += 1
+            elif outcome is RootOutcome.CIRCUIT_OPEN:
+                circuit_open_drops += 1
             else:
-                # Append order is completion order (ties on end time are ambiguous).
-                last_attempt = root.attempts[-1]
-                # Cancellation is tested FIRST, mirroring Metrics.summary() and
-                # export_csv(). A root cancelled while backing off keeps its
-                # previous attempt's reason (usually DEADLINE), so testing that
-                # first booked abandoned work into a reward-weighted drop rate —
-                # the exact double-penalty the cancelled bucket exists to avoid,
-                # and a disagreement with what the CSV reports for the same root.
-                if root.cancelled or last_attempt.drop_reason == DropReason.CANCELLED:
-                    cancelled_drops += 1
-                elif last_attempt.drop_reason == DropReason.DEADLINE:
-                    deadline_drops += 1
-                elif last_attempt.drop_reason == DropReason.QUEUE_FULL:
-                    queue_drops += 1
-                elif last_attempt.drop_reason == DropReason.CIRCUIT_OPEN:
-                    circuit_open_drops += 1
-                else:
-                    server_drops += 1
+                server_drops += 1
 
             for attempt in root.attempts:
                 if attempt.queue_size_at_end is not None:

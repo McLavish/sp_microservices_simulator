@@ -58,6 +58,74 @@ class DropReason(Enum):
     CANCELLED = auto()
 
 
+class RootOutcome(Enum):
+    """How a completed root request ended.
+
+    Single source of truth: `Metrics.summary`, `Metrics.export_csv` and
+    `MicroservicesEnv._summarize_roots` all classify the same populations, and
+    they previously each re-implemented the rules. They drifted — the cancelled
+    test ended up before the drop-reason chain in two of them and after it in
+    the third, so the same root was booked as cancelled in the CSV and as a
+    deadline drop in the RL reward.
+    """
+
+    SUCCESS = auto()
+    QUEUE_FULL = auto()
+    DEADLINE = auto()
+    SERVER_FAILURE = auto()
+    CIRCUIT_OPEN = auto()
+    CANCELLED = auto()
+
+
+_OUTCOME_BY_DROP_REASON: "dict[DropReason, RootOutcome]" = {
+    DropReason.QUEUE_FULL: RootOutcome.QUEUE_FULL,
+    DropReason.DEADLINE: RootOutcome.DEADLINE,
+    DropReason.CIRCUIT_OPEN: RootOutcome.CIRCUIT_OPEN,
+    DropReason.CANCELLED: RootOutcome.CANCELLED,
+    DropReason.SERVER_FAILURE: RootOutcome.SERVER_FAILURE,
+}
+
+
+def classify_root(root: "RootRequest") -> RootOutcome:
+    """Classify a completed root. Order matters and is load-bearing.
+
+    `cancelled` is tested BEFORE the final attempt's drop reason: a root
+    cancelled while waiting on backoff has no attempt of its own carrying
+    CANCELLED, so it still holds the previous attempt's reason (usually
+    DEADLINE). Testing the reason first books abandoned work as a failure.
+    """
+    if any(attempt.success for attempt in root.attempts):
+        return RootOutcome.SUCCESS
+    if root.cancelled:
+        return RootOutcome.CANCELLED
+    if not root.attempts:
+        return RootOutcome.SERVER_FAILURE
+    # Append order is completion order (ties on end time are ambiguous).
+    return _OUTCOME_BY_DROP_REASON.get(root.attempts[-1].drop_reason, RootOutcome.SERVER_FAILURE)
+
+
+def root_completed_at(root: "RootRequest") -> "TimePoint":
+    """When the root finished — the instant every end-bucketed metric uses.
+
+    Prefer the recorded `completed_at`: a root cancelled while backing off
+    finishes strictly after its last attempt ended, and bucketing it at that
+    attempt's end put it in the wrong window (or outside the bucket range
+    entirely, where it was silently dropped from the CSV).
+    """
+    if root.completed_at is not None:
+        return root.completed_at
+    return max(attempt.interval.end for attempt in root.attempts)
+
+
+def root_started_at(root: "RootRequest") -> "TimePoint":
+    return min(attempt.interval.begin for attempt in root.attempts)
+
+
+def root_latency(root: "RootRequest") -> "TimeDuration":
+    """End-to-end latency across every attempt of the root."""
+    return root_completed_at(root) - root_started_at(root)
+
+
 @dataclass
 class Request:
     service: str  # name of the service that handled the request
