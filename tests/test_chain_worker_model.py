@@ -1,3 +1,5 @@
+import os
+import random
 import unittest
 
 from caller import ClientConfig, ClientRuntime
@@ -8,12 +10,14 @@ from retry_policies import (
     CBState,
     CountBasedCircuitBreakerPolicy,
     FixedBackoffRetryPolicy,
+    LeakyRateLimiterPolicy,
     NoRetryPolicy,
     RetryBudgetPolicy,
 )
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import StaticTimeoutController
+from workload import Workload
 
 
 def _build_fanout(hold_worker: bool):
@@ -442,3 +446,228 @@ class TestCancellationIntegration(unittest.TestCase):
         # Completion is the cancel instant, not the previous attempt's end.
         self.assertIsNotNone(root.completed_at)
         self.assertGreater(root.completed_at, root.attempts[-1].interval.end)
+
+
+class TestCancellationCrossSubsystem(unittest.TestCase):
+    """Seams the cancellation feature crosses. Every case here is a regression
+    that a feature-local test passed straight over."""
+
+    def _backoff_cancelled_client(
+        self, backoff_ms=5000, cancel_at_ms=3000, attempt_timeout_ms=5000
+    ):
+        """A root cancelled while BACKING OFF: it has no attempt of its own
+        carrying CANCELLED, and completes later than any of its attempt ends."""
+        sim = Simulator(seed=1)
+        svc = ServiceRuntime(
+            cfg=ServiceConfig(
+                name="svc",
+                latency_median=ms_to_ns(100),
+                latency_lognorm_sigma=1e-6,
+                workers=1,
+                partial_failures=[PartialFailure(TimeInterval(0, s_to_ns(1000)), p_fail=1.0)],
+            )
+        ).bind()
+        client = ClientRuntime(
+            cfg=ClientConfig(
+                retry=FixedBackoffRetryPolicy(max_attempts=5, delay=ms_to_ns(backoff_ms)),
+                timeout_controller=StaticTimeoutController(None, ms_to_ns(attempt_timeout_ms)),
+            ),
+            service=svc,
+        )
+        root = client.start_request(sim)
+        sim.run(until=ms_to_ns(cancel_at_ms))
+        root.cancel()
+        sim.run()
+        return client, root
+
+    def test_csv_bucket_range_covers_root_completion_times(self):
+        """export_csv sized its bucket grid from attempt ends while bucketing
+        roots at completed_at, so a backoff-cancelled root fell past the last
+        bucket and reindex silently dropped it from every root-level column."""
+        import tempfile
+
+        import pandas as pd
+
+        client, _ = self._backoff_cancelled_client()
+        summary = client.metrics().summary()
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "out.csv")
+            client.metrics().export_csv(path, granularity_s=1.0)
+            df = pd.read_csv(path)
+        self.assertEqual(int(df["failure_cancelled"].sum()), summary.dropped_cancelled)
+        self.assertEqual(int(df["failure_root"].sum()), summary.total - summary.succeeded)
+
+    def test_env_and_metrics_classify_a_cancelled_root_identically(self):
+        """_summarize_roots tested the drop reason before root.cancelled, the
+        opposite order from metrics.summary(), so a root cancelled after a
+        timed-out attempt was charged to the reward-weighted deadline rate."""
+        from rl.env import EnvConfig, MicroservicesEnv, build_single_service_env
+        from rl.spec import ActionSpec
+
+        env = MicroservicesEnv(
+            EnvConfig(
+                build=build_single_service_env, action_spec=ActionSpec([10, 50], [1, 2], [0, 50])
+            )
+        )
+        client, _ = self._backoff_cancelled_client(
+            backoff_ms=400, cancel_at_ms=200, attempt_timeout_ms=50
+        )
+        summary = client.metrics().summary()
+        env_summary = env._summarize_roots(client.roots)
+        self.assertEqual(summary.dropped_cancelled, 1)
+        self.assertEqual(env_summary["cancelled_rate"], 1.0)
+        self.assertEqual(env_summary["deadline_drop_rate"], 0.0)
+
+    def test_committed_outcome_is_not_rewritten_by_a_reentrant_cancel(self):
+        """A cancel arriving while a behavior is finalizing must report False,
+        not be swallowed by an already-settled guard while the caller believes
+        it succeeded — that rewrote genuine failures as CANCELLED."""
+        sim = Simulator(seed=1)
+        svc = ServiceRuntime(
+            cfg=ServiceConfig(
+                name="svc", latency_median=ms_to_ns(10), latency_lognorm_sigma=1e-6, workers=1
+            )
+        ).bind()
+        seen = {}
+
+        def behavior(service, sim2, deadline, finalize, begin_at, release_worker, register_cancel):
+            register_cancel(lambda: seen.__setitem__("teardown_ran", True))
+
+            def finish():
+                register_cancel(None)  # commit
+                seen["cancel_returned"] = handle.cancel()
+                finalize(False, ms_to_ns(10), DropReason.SERVER_FAILURE)
+
+            sim2.schedule(begin_at + ms_to_ns(10), finish)
+
+        handle = svc.submit_attempt(
+            sim, lambda *a: seen.setdefault("reason", a[2]), behavior=behavior
+        )
+        sim.run()
+        self.assertFalse(seen["cancel_returned"])
+        self.assertNotIn("teardown_ran", seen)
+        self.assertEqual(seen["reason"], DropReason.SERVER_FAILURE)
+
+    def test_deferred_refund_does_not_rewind_another_roots_reservation(self):
+        """RetryPolicy.rollback undoes the IMMEDIATELY preceding next_delay.
+        LeakyRateLimiterPolicy keeps one slot of undo state, so a cancel-time
+        refund would release whichever root reserved most recently."""
+        sim = Simulator(seed=1)
+        svc = ServiceRuntime(
+            cfg=ServiceConfig(
+                name="svc",
+                latency_median=ms_to_ns(10),
+                latency_lognorm_sigma=1e-6,
+                workers=4,
+                partial_failures=[PartialFailure(TimeInterval(0, s_to_ns(100)), p_fail=1.0)],
+            )
+        ).bind()
+        leaky = LeakyRateLimiterPolicy(max_requests=1, max_attempts=5, period=s_to_ns(1))
+        client = ClientRuntime(
+            cfg=ClientConfig(
+                retry=leaky,
+                timeout_controller=StaticTimeoutController(None, ms_to_ns(60_000)),
+            ),
+            service=svc,
+        )
+        r1 = client.start_request(sim)
+        sim.run(until=ms_to_ns(20))
+        client.start_request(sim)  # r2 reserves the next slot
+        sim.run(until=ms_to_ns(40))
+        reserved = leaky._next_at
+        r1.cancel()
+        self.assertEqual(leaky._next_at, reserved)
+
+    def test_no_invariant_breaks_under_randomized_cancellation(self):
+        """Stress: random fan-outs with propagate_cancellation, asserting the
+        worker/queue invariants and summary-vs-CSV agreement across seeds."""
+        import tempfile
+
+        import pandas as pd
+
+        for seed in range(12):
+            with self.subTest(seed=seed):
+                rng = random.Random(seed)
+                sim = Simulator(seed=seed)
+
+                def node(name, median_ms, p_fail, workers, capacity):
+                    failures = (
+                        [PartialFailure(TimeInterval(0, s_to_ns(100)), p_fail=p_fail)]
+                        if p_fail
+                        else []
+                    )
+                    return ServiceNodeRuntime(
+                        service=ServiceRuntime(
+                            cfg=ServiceConfig(
+                                name=name,
+                                latency_median=ms_to_ns(median_ms),
+                                latency_lognorm_sigma=0.3,
+                                workers=workers,
+                                queue_capacity=capacity,
+                                partial_failures=failures,
+                            )
+                        ).bind()
+                    )
+
+                root_node = node("A", rng.randint(1, 10), 0.0, rng.randint(1, 3), None)
+                root_node.propagate_cancellation = True
+                root_node.hold_worker_during_fanout = bool(rng.getrandbits(1))
+                children = []
+                for i in range(rng.randint(2, 4)):
+                    child = node(
+                        f"C{i}",
+                        rng.randint(5, 80),
+                        rng.choice([0.0, 0.5, 1.0]),
+                        rng.randint(1, 2),
+                        rng.choice([None, 2]),
+                    )
+                    child.propagate_cancellation = True
+                    children.append(child)
+                    root_node.add_downstream(
+                        DownstreamEdge(
+                            client=ClientRuntime(
+                                cfg=ClientConfig(
+                                    retry=FixedBackoffRetryPolicy(
+                                        max_attempts=rng.randint(1, 3),
+                                        delay=ms_to_ns(rng.choice([0, 20, 200])),
+                                    ),
+                                    timeout_controller=StaticTimeoutController(
+                                        None, ms_to_ns(rng.choice([20, 100, 5000]))
+                                    ),
+                                ),
+                                service=child,
+                            ),
+                            target=child,
+                        )
+                    )
+
+                top = ClientRuntime(
+                    cfg=ClientConfig(
+                        retry=FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(10)),
+                        timeout_controller=StaticTimeoutController(None, ms_to_ns(5000)),
+                    ),
+                    service=root_node,
+                )
+                wl = Workload(base_rps=60.0, duration_s=2.0, load_spikes=[], rng_seed=seed)
+                wl.drive(sim, top.start_request)
+                sim.run()
+
+                for n in [root_node, *children]:
+                    self.assertEqual(n.service.in_flight, 0, f"{n.cfg.name} leaked a worker")
+                    self.assertEqual(n.service.queue_len(), 0, f"{n.cfg.name} leaked queue slots")
+
+                # summary() and export_csv() must agree about every root.
+                for edge in root_node.downstreams:
+                    summary = edge.client.metrics().summary()
+                    if summary.total == 0:
+                        continue
+                    with tempfile.TemporaryDirectory() as d:
+                        path = os.path.join(d, "o.csv")
+                        edge.client.metrics().export_csv(path, granularity_s=0.1)
+                        df = pd.read_csv(path)
+                    self.assertEqual(
+                        int(df["failure_root"].sum()) + int(df["success_root"].sum()),
+                        summary.total,
+                        "roots lost between summary() and export_csv()",
+                    )
+                    self.assertEqual(int(df["failure_cancelled"].sum()), summary.dropped_cancelled)

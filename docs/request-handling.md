@@ -230,7 +230,15 @@ alongside `hold_worker_during_fanout`:
 | `propagate_cancellation` | Behaviour | Models |
 | --- | --- | --- |
 | `False` (default) | Siblings keep running to completion. They hold their workers for their full service time and record their own outcomes — an abandoned call that succeeds is still counted a success at that service. | A stack with no cancellation plumbing: plain HTTP/1.1 clients, older Java stacks. Preserves every pre-existing result. |
-| `True` | Siblings are torn down: pending retries dropped, in-flight attempts abandon their worker immediately, queued attempts are skipped without ever consuming one. Recursive — cancelling a downstream that is itself a fan-out unwinds its whole subtree. Those roots are recorded with `DropReason.CANCELLED`. | Go `context` cancellation, gRPC deadline propagation. |
+| `True` | Siblings are torn down: pending retries dropped, in-flight attempts abandon their worker immediately, queued attempts are skipped without ever consuming one. Those roots are recorded with `DropReason.CANCELLED`. | Go `context` cancellation, gRPC deadline propagation. |
+
+**The flag is per node, and so is the recursion.** Cancelling a downstream that
+is itself a fan-out runs *that node's* teardown, which unwinds its children only
+if it too sets `propagate_cancellation`. The first descendant with the flag off
+keeps its own subtree running — setting the flag on the fan-out root alone buys
+no propagation below level 1. That is deliberate (each node models its own
+architecture, so a Go service calling a legacy one is expressible), but it means
+whole-subtree teardown requires the flag on every node along the path.
 
 Cancelled roots land in their own bucket (`Summary.dropped_cancelled`,
 `failure_cancelled` in the CSV) and are deliberately **not** folded into the

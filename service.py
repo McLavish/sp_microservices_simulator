@@ -40,7 +40,9 @@ class ServiceConfig:
 # `register_cancel` lets a behavior publish its own teardown so an upstream can
 # abandon this attempt mid-flight. The callback must leave the usual invariants
 # intact: finalize exactly once, release_worker at most once. It is invoked at
-# most once, and never after finalize.
+# most once, and never after finalize. Call `register_cancel(None)` to REVOKE
+# the teardown at the instant the behavior commits to an outcome, so a
+# re-entrant cancel is reported as failed rather than silently swallowed.
 Behavior = Callable[
     [
         "ServiceRuntime",
@@ -49,7 +51,7 @@ Behavior = Callable[
         Callable[[bool, TimeDuration, DropReason], None],
         TimePoint,
         Callable[[], None],
-        Callable[[Callable[[], None]], None],
+        Callable[[Callable[[], None] | None], None],
     ],
     None,
 ]
@@ -319,11 +321,21 @@ class ServiceRuntime:
                 else:
                     self._complete_attempt(sim, on_done, success, service_time, drop)
 
-            def register_cancel(fn: Callable[[], None]) -> None:
+            def register_cancel(fn: Callable[[], None] | None) -> None:
                 # The behavior owns its own teardown (it knows what it launched
                 # downstream); it must still route through `finalize`, so the
                 # exactly-once guards above cover the cancel path too.
-                if control is not None:
+                #
+                # Passing None REVOKES the teardown. A behavior must do this the
+                # moment it commits to an outcome, so that a cancel arriving
+                # re-entrantly during its own finalize gets a truthful False
+                # from AttemptControl.cancel() instead of being swallowed by an
+                # already-settled guard while the caller believes it succeeded.
+                if control is None:
+                    return
+                if fn is None:
+                    control._clear()
+                else:
                     control._bind(fn)
 
             behavior(

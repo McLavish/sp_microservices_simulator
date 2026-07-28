@@ -402,17 +402,20 @@ class MicroservicesEnv(_GymEnvBase):
             else:
                 # Append order is completion order (ties on end time are ambiguous).
                 last_attempt = root.attempts[-1]
-                if last_attempt.drop_reason == DropReason.DEADLINE:
+                # Cancellation is tested FIRST, mirroring Metrics.summary() and
+                # export_csv(). A root cancelled while backing off keeps its
+                # previous attempt's reason (usually DEADLINE), so testing that
+                # first booked abandoned work into a reward-weighted drop rate —
+                # the exact double-penalty the cancelled bucket exists to avoid,
+                # and a disagreement with what the CSV reports for the same root.
+                if root.cancelled or last_attempt.drop_reason == DropReason.CANCELLED:
+                    cancelled_drops += 1
+                elif last_attempt.drop_reason == DropReason.DEADLINE:
                     deadline_drops += 1
                 elif last_attempt.drop_reason == DropReason.QUEUE_FULL:
                     queue_drops += 1
                 elif last_attempt.drop_reason == DropReason.CIRCUIT_OPEN:
                     circuit_open_drops += 1
-                elif root.cancelled or last_attempt.drop_reason == DropReason.CANCELLED:
-                    # Abandoned by an upstream cancellation, not failed here.
-                    # Charging it to server_drops would penalise the agent a
-                    # second time for the failure that triggered the cancel.
-                    cancelled_drops += 1
                 else:
                     server_drops += 1
 

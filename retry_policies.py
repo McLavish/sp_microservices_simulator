@@ -39,6 +39,13 @@ class RetryPolicy:
         """
         return
 
+    #: Whether `rollback` is safe to apply LATER than the `next_delay` it undoes.
+    #: True for commutative state (add a token back). False for policies holding
+    #: single-slot undo state, where a deferred refund would rewind whichever
+    #: charge happened most recently rather than the one being undone — with
+    #: several roots sharing one policy, that is a different root's reservation.
+    supports_deferred_rollback: bool = True
+
     def rollback(self, context: RetryContext) -> None:
         """Undo the side effects of the immediately preceding ``next_delay``.
 
@@ -305,6 +312,10 @@ class LeakyRateLimiterPolicy(RetryPolicy):
     max_requests: int  # number of max requests in the period
     max_attempts: int  # total attempts including the initial try
     period: TimeDuration
+
+    # Undo state is a single previous value, so a refund is only correct
+    # immediately after the charge it undoes — see supports_deferred_rollback.
+    supports_deferred_rollback: bool = field(default=False, init=False, repr=False)
 
     _next_at: TimePoint | None = field(default=None, init=False)
     # Previous _next_at, so a vetoed retry can release the slot it reserved.

@@ -17,8 +17,14 @@ def load_metrics(csv_file: str) -> pd.DataFrame:
     df = pd.read_csv(csv_file).sort_values(by="timepoint").reset_index(drop=True)
     if "root_requests" in df.columns and len(df):
         activity = df["root_requests"].to_numpy()
-        if "completed" in df.columns:
-            activity = activity + df["completed"].to_numpy()
+        # `completed` is attempt-end bucketed and `success_root`/`failure_root`
+        # are ROOT-completion bucketed; a root cancelled while backing off
+        # completes after its last attempt ended, so it can land in a bucket
+        # where completed == 0 but failure_root == 1. Counting only the first
+        # two would trim exactly the rows metrics.py widened the range to keep.
+        for column in ("completed", "success_root", "failure_root"):
+            if column in df.columns:
+                activity = activity + df[column].to_numpy()
         last = len(activity) - 1
         while last >= 0 and activity[last] == 0:
             last -= 1

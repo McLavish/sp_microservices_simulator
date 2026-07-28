@@ -72,7 +72,7 @@ class ServiceNodeRuntime:
             finalize: Callable[[bool, TimeDuration, DropReason], None],
             begin_at: TimePoint,
             release_worker: Callable[[], None],
-            register_cancel: Callable[[Callable[[], None]], None],
+            register_cancel: Callable[[Callable[[], None] | None], None],
         ) -> None:
             # Stage 1: local service time
             base_time = svc._sample_service_time(begin_at, sim2)
@@ -91,11 +91,24 @@ class ServiceNodeRuntime:
             local_event: Event | None = None
             teardown_fanout: Callable[[], None] | None = None
 
+            def commit() -> None:
+                """Mark the node settled and revoke its teardown.
+
+                These must happen together: an upstream cancel racing our own
+                finalize has to see an unregistered teardown (so cancel() returns
+                False and the caller keeps the real outcome), not a registered
+                one guarded by `settled` that swallows the request while
+                reporting success.
+                """
+                nonlocal settled
+                settled = True
+                register_cancel(None)
+
             def cancel_node() -> None:
                 nonlocal settled
                 if settled:
                     return
-                settled = True
+                commit()
                 if local_event is not None:
                     local_event.cancelled = True  # still doing local work
                 if teardown_fanout is not None:
@@ -111,7 +124,7 @@ class ServiceNodeRuntime:
 
                 # If we expired during local processing, drop by deadline
                 if deadline is not None and sim2.timestep >= deadline:
-                    settled = True
+                    commit()
                     finalize(False, sim2.timestep - begin_at, DropReason.DEADLINE)
                     return
 
@@ -121,13 +134,13 @@ class ServiceNodeRuntime:
                     else DropReason.NONE
                 )
                 if local_drop != DropReason.NONE:
-                    settled = True
+                    commit()
                     finalize(False, sim2.timestep - begin_at, local_drop)
                     return
 
                 # No downstreams: behave like default finish.
                 if not self.downstreams:
-                    settled = True
+                    commit()
                     finalize(True, sim2.timestep - begin_at, DropReason.NONE)
                     return
 
@@ -151,12 +164,12 @@ class ServiceNodeRuntime:
                         deadline_event.cancelled = True
 
                 def maybe_finish():
-                    nonlocal settled, remaining
+                    nonlocal remaining
                     if settled:
                         return
                     if remaining == 0:
                         # All downstreams completed
-                        settled = True
+                        commit()
                         cancel_deadline()
                         finalize(True, sim2.timestep - begin_at, DropReason.NONE)
 
@@ -164,9 +177,8 @@ class ServiceNodeRuntime:
                 if deadline is not None:
 
                     def on_deadline():
-                        nonlocal settled
                         if not settled:
-                            settled = True
+                            commit()
                             abandon_siblings()
                             finalize(False, sim2.timestep - begin_at, DropReason.DEADLINE)
 
@@ -199,8 +211,7 @@ class ServiceNodeRuntime:
                 teardown_fanout = _teardown_fanout
 
                 def fail_with(_root):
-                    nonlocal settled
-                    settled = True
+                    commit()
                     cancel_deadline()
                     # `settled` is already set, so the cancellations below re-enter
                     # on_downstream_done harmlessly.

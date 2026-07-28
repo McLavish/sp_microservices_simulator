@@ -33,12 +33,16 @@ def main(csv_file, output_file, fault_events_file=None):
         2, 1, figsize=(10, 7), sharex=True, gridspec_kw={"height_ratios": [1.2, 1]}
     )
 
+    # Labels are DERIVED from reason_cols: matplotlib pulls labels lazily, so a
+    # hand-written list that is shorter than the series list silently renders an
+    # unlabelled band instead of raising.
+    reason_labels = [c.removeprefix("failure_") for c in reason_cols]
     ax_top.stackplot(
         t,
         *[reasons_pct[c].to_numpy() for c in reason_cols],
-        labels=["deadline", "server", "queue_full", "circuit_open"],
+        labels=reason_labels,
     )
-    ax_top.legend(loc="upper left", ncol=4, frameon=True)
+    ax_top.legend(loc="upper left", ncol=len(reason_labels), frameon=True)
     ax_top.set_ylabel("Failure rate (%)")
     ax_top.set_xlim(left=0)
     ax_top.set_ylim(0, 100)

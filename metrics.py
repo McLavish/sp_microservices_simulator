@@ -221,9 +221,18 @@ class Metrics:
         attempts = pd.DataFrame(attempt_rows)
         roots = pd.DataFrame(root_rows)
 
-        # Align to bucket boundaries
+        # Align to bucket boundaries. The upper bound must cover BOTH frames:
+        # roots are bucketed at `completed_at`, which for a root cancelled while
+        # backing off is strictly later than any of its attempt ends. Sizing the
+        # range from attempts alone put such a root past the last bucket, where
+        # `reindex(buckets, fill_value=0)` silently discarded it — it stayed in
+        # root_requests (bucketed at its first attempt's begin) but vanished from
+        # success_root/failure_root/failure_cancelled, so summary() and
+        # export_csv() disagreed about the same root.
+        # start_ns needs no such union: roots["begin"] IS attempts_by_begin[0].
         start_ns = int(attempts["begin"].min()) // bucket_ns * bucket_ns
-        end_ns = (int(attempts["end"].max()) // bucket_ns + 1) * bucket_ns
+        last_end = max(int(attempts["end"].max()), int(roots["end"].max()))
+        end_ns = (last_end // bucket_ns + 1) * bucket_ns
         buckets = pd.RangeIndex((end_ns - start_ns) // bucket_ns)
 
         def bucket_of(at: "pd.Series") -> "pd.Series":

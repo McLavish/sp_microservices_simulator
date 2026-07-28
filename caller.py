@@ -100,16 +100,27 @@ class ClientRuntime:
         if isinstance(policy, _SupportsUnderlying):
             self._notify_request_start(policy.underlying_strategy, now)
 
-    def _rollback_policy(self, policy: RetryPolicy, context: RetryContext) -> None:
+    def _rollback_policy(
+        self, policy: RetryPolicy, context: RetryContext, deferred: bool = False
+    ) -> None:
         """Refund a retry that ``next_delay`` authorised but we never issued.
 
         Mirrors `_update_policy_results`' recursion: every layer that charged
         during `next_delay` sits on the `underlying_strategy` chain, so every
         layer has to be given the chance to refund.
+
+        ``deferred=True`` marks a refund issued long after the charge (a cancel
+        arriving mid-backoff). `RetryPolicy.rollback` is specified as undoing the
+        *immediately preceding* `next_delay`, so layers that keep single-slot
+        undo state are skipped: with several roots sharing one policy, a late
+        refund would rewind a different root's live reservation. Skipping leaves
+        the charge standing, which is conservative — it over-counts rather than
+        handing the same slot out twice.
         """
-        policy.rollback(context)
+        if not deferred or policy.supports_deferred_rollback:
+            policy.rollback(context)
         if isinstance(policy, _SupportsUnderlying):
-            self._rollback_policy(policy.underlying_strategy, context)
+            self._rollback_policy(policy.underlying_strategy, context, deferred)
 
     def _allow_policy_request(self, policy: RetryPolicy, now: TimePoint) -> bool:
         if not policy.allow_request(now):
@@ -139,6 +150,10 @@ class ClientRuntime:
         if ctx.root.done or ctx.cancelling:
             return
         now = sim.timestep
+        # Tentative: these only stand if something was still cancellable. A node
+        # that has already committed to a real outcome (its finalize is in
+        # flight) must keep that outcome — marking the root cancelled regardless
+        # rewrote genuine failures as CANCELLED and hid them from the breaker.
         ctx.cancelling = True
         ctx.root.cancelled = True
 
@@ -152,7 +167,7 @@ class ClientRuntime:
             # it — a retry that never runs must not consume budget, whether the
             # deadline vetoed it or an upstream cancelled it.
             if ctx.pending_retry_context is not None:
-                self._rollback_policy(self.cfg.retry, ctx.pending_retry_context)
+                self._rollback_policy(self.cfg.retry, ctx.pending_retry_context, deferred=True)
                 ctx.pending_retry_context = None
             self._complete_root(ctx.root, now)
             return
@@ -162,11 +177,15 @@ class ClientRuntime:
             # cancel() drove the service's teardown, which called back into
             # _on_attempt_done and completed the root already.
             return
-        # An attempt is outstanding but not cancellable (a behavior that never
-        # registered a teardown), or it is completing at this very instant.
-        # Leave the root open: _on_attempt_done sees `cancelling` and closes it
-        # without retrying. Completing it here would strand that callback and
-        # trip the "Root request was already done!" guard.
+        # Nothing was cancellable: either no teardown was registered, or the
+        # attempt has already committed to an outcome (its finalize is running
+        # right now, reachable re-entrantly through a sibling's teardown). Undo
+        # the tentative marks so that outcome is reported as itself rather than
+        # being rewritten as CANCELLED, and leave the root open —
+        # _on_attempt_done will close it. Completing it here would strand that
+        # callback and trip the "Root request was already done!" guard.
+        ctx.cancelling = False
+        ctx.root.cancelled = False
 
     def start_request(
         self,
