@@ -281,7 +281,9 @@ def _best_fixed_action(cfg: ExperimentConfig, grid: ActionGrid) -> tuple[int, ..
     return best_idx
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
+    """`argv` defaults to sys.argv; taking it explicitly makes the entry
+    point callable from a test without patching sys.argv."""
     parser = argparse.ArgumentParser(description="Compare policy baselines.")
     parser.add_argument("--attempt-timeouts-ms", type=parse_int_list, default=[10, 30, 50, 80])
     parser.add_argument("--max-attempts", type=parse_int_list, default=[1, 2, 3])
@@ -373,7 +375,7 @@ def main() -> None:
         default="rl_constrained_curve.csv",
         help="Constrained-PPO dual-ascent trajectory (timesteps, eval_J, eval_cost, lambda).",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     reward_weights = RewardWeights(
         success=args.reward_success,

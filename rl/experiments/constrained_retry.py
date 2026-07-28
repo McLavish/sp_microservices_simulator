@@ -292,7 +292,9 @@ def _run_calibration(
     return all_passed
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
+    """`argv` defaults to sys.argv; taking it explicitly makes the entry
+    point callable from a test without patching sys.argv."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", choices=sorted(SCENARIO_TO_BUILDER), default="chain")
     parser.add_argument("--budgets", type=parse_float_list, default=[0.05, 0.1, 0.2])
@@ -328,7 +330,7 @@ def main() -> None:
         help="grid-sweep fixed policies and verify the scenario supports a "
         "binding retry budget, then exit without training",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     builder = SCENARIO_TO_BUILDER[args.scenario]
     output_csv = args.output_csv or f"rl_constrained_comparison_{args.scenario}.csv"

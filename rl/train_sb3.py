@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from rl.cli import parse_int_list, parse_optional_int_list
@@ -165,9 +166,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
+    """`argv` defaults to sys.argv; taking it explicitly makes the entry
+    point callable from a test without patching sys.argv."""
     parser = _build_arg_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     cfg = TrainConfig(
         timesteps=args.timesteps,
