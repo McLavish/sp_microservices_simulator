@@ -745,3 +745,73 @@ class TestWorkerOccupancyReporting(unittest.TestCase):
         attempt = self._fanout(hold=True)
         assert attempt.service_time_ns is not None
         self.assertAlmostEqual(attempt.service_time_ns / ms_to_ns(1), 210.0, delta=1.0)
+
+
+class TestCancellationRecursion(unittest.TestCase):
+    """Recursion through a sub-fan-out — claimed in the docs, only ever checked
+    ad hoc until now. It is also the property most likely to break under a
+    refactor of the fan-out state machine."""
+
+    def _tree(self, mid_propagates: bool):
+        """A -> {FAST (fails ~5ms), MID}; MID -> DEEP (200ms)."""
+        sim = Simulator(seed=1)
+
+        def node(name, median_ms, p_fail=0.0):
+            failures = (
+                [PartialFailure(TimeInterval(0, s_to_ns(100)), p_fail=p_fail)] if p_fail else []
+            )
+            return ServiceNodeRuntime(
+                service=ServiceRuntime(
+                    cfg=ServiceConfig(
+                        name=name,
+                        latency_median=ms_to_ns(median_ms),
+                        latency_lognorm_sigma=1e-6,
+                        workers=1,
+                        partial_failures=failures,
+                    )
+                ).bind()
+            )
+
+        def edge(target):
+            return DownstreamEdge(
+                client=ClientRuntime(
+                    cfg=ClientConfig(
+                        retry=NoRetryPolicy(),
+                        timeout_controller=StaticTimeoutController(None, ms_to_ns(5000)),
+                    ),
+                    service=target,
+                ),
+                target=target,
+            )
+
+        a, fast, mid, deep = node("A", 1), node("FAST", 5, 1.0), node("MID", 1), node("DEEP", 200)
+        a.propagate_cancellation = True
+        mid.propagate_cancellation = mid_propagates
+        deep_edge = edge(deep)
+        mid.add_downstream(deep_edge)
+        a.add_downstream(edge(fast))
+        a.add_downstream(edge(mid))
+        top = ClientRuntime(
+            cfg=ClientConfig(
+                retry=NoRetryPolicy(),
+                timeout_controller=StaticTimeoutController(None, ms_to_ns(5000)),
+            ),
+            service=a,
+        )
+        top.start_request(sim)
+        sim.run()
+        return sim, deep_edge.client, deep
+
+    def test_cancel_unwinds_two_levels(self):
+        sim, deep_client, deep = self._tree(mid_propagates=True)
+        self.assertEqual(deep_client.metrics().summary().dropped_cancelled, 1)
+        self.assertLess(sim.timestep, ms_to_ns(100))  # not DEEP's full 200 ms
+        self.assertEqual(deep.service.in_flight, 0)
+
+    def test_recursion_stops_at_a_node_that_does_not_propagate(self):
+        """Documented semantics: each node models its own architecture, so the
+        first descendant with the flag off keeps its own subtree running."""
+        sim, deep_client, deep = self._tree(mid_propagates=False)
+        self.assertEqual(deep_client.metrics().summary().dropped_cancelled, 0)
+        self.assertGreaterEqual(sim.timestep, ms_to_ns(200))  # DEEP ran to completion
+        self.assertEqual(deep.service.in_flight, 0)
