@@ -325,10 +325,11 @@ class ServiceRuntime:
         else:
             # Custom behavior can optionally release the worker early (for tandem queues)
             released = False
+            released_at: TimePoint | None = None
             finalized = False
 
             def release_worker():
-                nonlocal released
+                nonlocal released, released_at
                 if finalized:
                     raise RuntimeError(
                         "release_worker called after finalize (the worker was already released)"
@@ -336,6 +337,7 @@ class ServiceRuntime:
                 if released:
                     raise RuntimeError("release_worker called more than once")
                 released = True
+                released_at = sim.timestep  # occupancy ends HERE, not at finalize
                 self.in_flight -= 1
                 self._start_next(sim)
 
@@ -345,7 +347,15 @@ class ServiceRuntime:
                     raise RuntimeError("finalize called more than once for the same attempt")
                 finalized = True
                 if released:
-                    on_done(success, service_time, drop, self.queue_len())
+                    # Report WORKER OCCUPANCY, which ended when the worker was
+                    # handed back. A tandem node releases after its local stage
+                    # and finalizes only once the whole subtree returns, so the
+                    # duration the behavior reports spans the downstream wait —
+                    # time no worker of THIS service was held. Utilization-style
+                    # consumers (the Erlang-C E[S]) need the occupancy; the
+                    # end-to-end node latency is still in Request.interval.
+                    occupancy = released_at - begin_at if released_at is not None else 0
+                    on_done(success, occupancy, drop, self.queue_len())
                 else:
                     self._complete_attempt(sim, on_done, success, service_time, drop)
 

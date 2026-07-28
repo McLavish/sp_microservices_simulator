@@ -251,3 +251,21 @@ Mechanically, `ServiceRuntime.submit_attempt` returns an `AttemptControl` whose
 completion cannot double-complete. Custom behaviours publish their own teardown
 via the `register_cancel` callback; that teardown must still route through
 `finalize`, so the exactly-once guards cover the cancel path too.
+
+
+## `service_time_ns` is worker occupancy, not node latency
+
+`Request.service_time_ns` records how long a worker of the handling service was
+actually **held**. It is queue-exclusive, and for a fan-out node it depends on
+the occupancy model:
+
+| `hold_worker_during_fanout` | `service_time_ns` covers |
+| --- | --- |
+| `False` (default, tandem) | the local stage only — the worker is handed back before the downstream wait |
+| `True` (thread-per-request) | the whole subtree, because the worker is genuinely held throughout |
+
+End-to-end node latency is always `Request.interval`, so nothing is lost by the
+narrower definition. The distinction matters because `ModelBasedPolicy` derives
+its Erlang-C `E[S]` and utilisation from this field: reporting a tandem node's
+downstream wait as occupancy inflates `E[S]` by the entire subtree latency and
+makes the queueing estimate meaningless.

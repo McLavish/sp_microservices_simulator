@@ -681,3 +681,67 @@ class TestCancellationCrossSubsystem(unittest.TestCase):
                         "roots lost between summary() and export_csv()",
                     )
                     self.assertEqual(int(df["failure_cancelled"].sum()), summary.dropped_cancelled)
+
+
+class TestWorkerOccupancyReporting(unittest.TestCase):
+    """`service_time_ns` means WORKER OCCUPANCY, per the documented contract.
+
+    A tandem node (hold_worker_during_fanout=False) hands its worker back after
+    the local stage and finalizes only once the whole subtree returns, so the
+    duration its behavior reports spans a downstream wait during which no worker
+    of this service was held. Reporting that as occupancy inflates the E[S] the
+    Erlang-C queueing model derives from it.
+    """
+
+    def _fanout(self, hold: bool, local_ms=10, leaf_ms=200):
+        sim = Simulator(seed=1)
+
+        def node(name, median_ms):
+            return ServiceNodeRuntime(
+                service=ServiceRuntime(
+                    cfg=ServiceConfig(
+                        name=name,
+                        latency_median=ms_to_ns(median_ms),
+                        latency_lognorm_sigma=1e-6,
+                        workers=2,
+                    )
+                ).bind()
+            )
+
+        a, leaf = node("A", local_ms), node("LEAF", leaf_ms)
+        a.hold_worker_during_fanout = hold
+        a.add_downstream(
+            DownstreamEdge(
+                client=ClientRuntime(
+                    cfg=ClientConfig(
+                        retry=NoRetryPolicy(),
+                        timeout_controller=StaticTimeoutController(None, ms_to_ns(5000)),
+                    ),
+                    service=leaf,
+                ),
+                target=leaf,
+            )
+        )
+        top = ClientRuntime(
+            cfg=ClientConfig(
+                retry=NoRetryPolicy(),
+                timeout_controller=StaticTimeoutController(None, ms_to_ns(5000)),
+            ),
+            service=a,
+        )
+        top.start_request(sim)
+        sim.run()
+        return top.roots[0].attempts[-1]
+
+    def test_tandem_node_reports_local_stage_only(self):
+        attempt = self._fanout(hold=False)
+        assert attempt.service_time_ns is not None
+        self.assertAlmostEqual(attempt.service_time_ns / ms_to_ns(1), 10.0, delta=0.5)
+        # The end-to-end node latency is still available on the interval.
+        node_latency = attempt.interval.end - attempt.interval.begin
+        self.assertAlmostEqual(node_latency / ms_to_ns(1), 210.0, delta=1.0)
+
+    def test_hold_worker_node_reports_the_whole_subtree(self):
+        attempt = self._fanout(hold=True)
+        assert attempt.service_time_ns is not None
+        self.assertAlmostEqual(attempt.service_time_ns / ms_to_ns(1), 210.0, delta=1.0)

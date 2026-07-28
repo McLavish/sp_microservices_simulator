@@ -136,8 +136,12 @@ class Request:
     drop_reason: DropReason = DropReason.NONE
     # Captured at attempt end by the service: current queue length
     queue_size_at_end: int | None = None
-    # Queue-exclusive processing duration reported by the service (for chain
-    # nodes: local stage + downstream wait, still excluding the local queue).
+    # WORKER OCCUPANCY: how long a worker of the handling service was actually
+    # held. Queue-exclusive, and for a tandem chain node (the default
+    # hold_worker_during_fanout=False) it covers the local stage only — the
+    # downstream wait happens after the worker is handed back. With
+    # hold_worker_during_fanout=True it covers the whole subtree, because the
+    # worker really is held throughout. End-to-end node latency is `interval`.
     # None when service never began (queue-full / deadline-at-dequeue drops).
     service_time_ns: TimeDuration | None = None
 
