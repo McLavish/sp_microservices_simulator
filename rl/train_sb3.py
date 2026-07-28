@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from rl.cli import parse_int_list, parse_optional_int_list
 from rl.env import SCENARIO_BUILDERS, ActionSpec, EnvConfig, MicroservicesEnv
 from rl.model_io import check_action_spec, save_action_spec
+from rl.rollout import model_actor, run_episode
 from rl.sb3_support import import_sb3
 
 PPO, make_vec_env, _, SubprocVecEnv, _SB3_IMPORT_ERROR = import_sb3()
@@ -64,26 +65,19 @@ def _evaluate(model, cfg: TrainConfig) -> None:
     total_rewards: list[float] = []
     for ep in range(cfg.eval_episodes):
         env = _make_env(cfg)
-        obs, _ = env.reset(seed=cfg.seed + 1000 + ep)
-        terminated = False
-        truncated = False
-        ep_reward = 0.0
-        last_info = {}
-        while not (terminated or truncated):
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
-            ep_reward += float(reward)
-            last_info = info
-
-        total_rewards.append(ep_reward)
-        # `summary` is the FINAL WINDOW's summary, not an episode aggregate:
-        # info["summary"] is recomputed every step over that window's
-        # completions. Label it so nobody reads it as an episode total.
-        last_window = last_info.get("summary", {})
-        action = last_info.get("action", {})
+        result = run_episode(env, model_actor(model), seed=cfg.seed + 1000 + ep)
+        total_rewards.append(result.total_reward)
+        # The per-window summary is NOT an episode aggregate — it is recomputed
+        # each step over that window's completions — so report the episode-level
+        # figures explicitly and label the window as a window.
+        last = result.windows[-1] if result.windows else None
+        episode_success = result.success_rate(in_horizon=True)
         print(
-            f"[eval] episode={ep} reward={ep_reward:.4f} action={action} "
-            f"last_window_summary={last_window}"
+            f"[eval] episode={ep} reward={result.total_reward:.4f} "
+            f"success_rate_in_horizon={episode_success:.4f} "
+            f"cost_pooled={result.pooled_cost:.4f} "
+            f"action={last.action_values if last else {}} "
+            f"last_window_summary={last.summary if last else {}}"
         )
 
     if total_rewards:

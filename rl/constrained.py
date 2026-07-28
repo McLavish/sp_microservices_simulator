@@ -27,6 +27,7 @@ import numpy as np
 
 from rl.env import EnvComponents, EnvConfig, MicroservicesEnv
 from rl.policies.sb3 import SB3Policy
+from rl.rollout import model_actor, run_episode
 from rl.sb3_support import import_sb3
 from rl.spec import ActionSpec, RewardWeights
 
@@ -95,25 +96,10 @@ def evaluate_objective_and_cost(
     objectives = []
     costs = []
     for _ in range(episodes):
-        obs, _ = env.reset()
-        terminated = truncated = False
-        episode_objective = 0.0
-        retries = 0.0
-        roots = 0.0
-        while not (terminated or truncated):
-            action, _ = model.predict(obs, deterministic=True)
-            obs, _reward, terminated, truncated, info = env.step(action)
-            summary = info["summary"]
-            episode_objective += objective_from_summary(summary, weights)
-            # POOL the raw counts. Averaging per-window ratios is length-biased:
-            # high-amplification windows complete more edge roots, so an
-            # unweighted mean systematically understates the episode's true
-            # retries-per-root (measured 13-33%, and by different amounts per
-            # arm, so it does not cancel between the arms being compared).
-            retries += summary.get("cost_retries", 0.0)
-            roots += summary.get("cost_roots", 0.0)
-        objectives.append(episode_objective)
-        costs.append(retries / roots if roots else 0.0)
+        # Unseeded: the env's pre-seeded RNG yields a reproducible sequence.
+        result = run_episode(env, model_actor(model))
+        objectives.append(result.objective(weights))
+        costs.append(result.pooled_cost)
     return float(np.mean(objectives)), float(np.mean(costs))
 
 

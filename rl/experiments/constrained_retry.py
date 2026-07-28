@@ -27,7 +27,6 @@ from scipy.stats import ttest_rel
 from rl.cli import parse_float_list, parse_int_list
 from rl.constrained import (
     ConstrainedTrainConfig,
-    objective_from_summary,
     train_constrained_ppo,
 )
 from rl.env import (
@@ -40,6 +39,7 @@ from rl.env import (
 )
 from rl.policies.action_space import ActionGrid
 from rl.policies.fixed import FixedPolicy
+from rl.rollout import policy_actor, run_episode
 from rl.sb3_support import import_sb3
 from rl.spec import RewardWeights
 
@@ -92,45 +92,22 @@ def _eval_arm(
     bystander_successes: list[float] = []
 
     for seed in seeds:
-        obs, info = env.reset(seed=seed)
         policy.reset(seed=seed)
-        terminated = truncated = False
-        episode_objective = 0.0
-        episode_retries = 0.0
-        episode_roots = 0.0
-        while not (terminated or truncated):
-            action = policy.act(obs, info)
-            obs, _reward, terminated, truncated, info = env.step(action)
-            summary = info["summary"]
-            episode_objective += objective_from_summary(summary, BASE_WEIGHTS)
-            # POOL raw counts rather than averaging per-window ratios: windows
-            # with high amplification also complete more edge roots, so an
-            # unweighted mean understates the episode's retries-per-root by a
-            # measured 13-33%, and by different amounts per arm.
-            episode_retries += summary.get("cost_retries", 0.0)
-            episode_roots += summary.get("cost_roots", 0.0)
-        cost_mean = episode_retries / episode_roots if episode_roots else 0.0
-        objectives.append(episode_objective)
+        result = run_episode(env, policy_actor(policy), seed=seed)
+        cost_mean = result.pooled_cost
+        objectives.append(result.objective(BASE_WEIGHTS))
         costs.append(cost_mean)
         if budget is not None:
             violations.append(1.0 if cost_mean > budget else 0.0)
-        metrics = env.metrics_summary()
-        if metrics:
-            successes.append(metrics.succeeded / metrics.total if metrics.total else 0.0)
-            p95s.append(metrics.p95)
-        horizon = env.in_horizon_summary()
-        if horizon:
-            successes_horizon.append(horizon.succeeded / horizon.total if horizon.total else 0.0)
-            p95s_horizon.append(horizon.p95)
-        # Score the externality on the SAME population as the objective J, which
-        # only sees in-horizon roots. The full population includes the drained
-        # tail, which completes after the agent's chain has gone quiet and so
-        # reads systematically better than what J was actually measured against.
-        bystander = env.bystander_in_horizon_summary()
+        if result.metrics:
+            successes.append(result.success_rate(in_horizon=False))
+            p95s.append(result.metrics.p95)
+        if result.in_horizon:
+            successes_horizon.append(result.success_rate(in_horizon=True))
+            p95s_horizon.append(result.in_horizon.p95)
+        bystander = result.bystander_success_rate()
         if bystander is not None:
-            bystander_successes.append(
-                bystander.succeeded / bystander.total if bystander.total else 0.0
-            )
+            bystander_successes.append(bystander)
 
     result: dict[str, object] = {
         "J_mean": float(np.mean(objectives)),

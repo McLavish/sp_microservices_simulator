@@ -158,3 +158,47 @@ class TestTrainSb3EntryPoint(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(gymnasium is None, "gymnasium not installed")
+class TestRolloutIsShared(unittest.TestCase):
+    """The aggregations that must agree across callers live in one place.
+
+    Four hand-rolled episode loops used to exist and drifted: one averaged
+    per-window cost ratios while another pooled raw counts, and one scored the
+    bystander on the full population while the objective saw only in-horizon
+    roots. Both produced numbers that looked comparable and were not.
+    """
+
+    def test_no_module_hand_rolls_an_episode_loop(self):
+        import pathlib
+
+        offenders = [
+            path.name
+            for path in pathlib.Path("rl").rglob("*.py")
+            if path.name != "rollout.py"
+            and "while not (terminated or truncated)" in path.read_text()
+        ]
+        self.assertEqual(offenders, [], "these modules re-implement the episode loop")
+
+    def test_eval_arm_cost_matches_the_shared_pooled_cost(self):
+        import numpy as np
+
+        from rl.env import SCENARIO_BUILDERS
+        from rl.experiments.constrained_retry import _eval_arm, _make_env
+        from rl.policies.fixed import FixedPolicy
+        from rl.rollout import policy_actor, run_episode
+        from rl.spec import ActionSpec
+
+        spec = ActionSpec([10, 30, 50, 80], [1, 2, 3], [0, 20, 50])
+        build = lambda seed: SCENARIO_BUILDERS["chain"](seed, 10.0)  # noqa: E731
+        seeds = [321, 654]
+
+        arm = _eval_arm(_make_env(build, spec, 4.0), FixedPolicy(action=(3, 2, 1)), seeds, 0.1)
+        direct = [
+            run_episode(
+                _make_env(build, spec, 4.0), policy_actor(FixedPolicy(action=(3, 2, 1))), seed=s
+            ).pooled_cost
+            for s in seeds
+        ]
+        self.assertAlmostEqual(arm["cost_mean"], float(np.mean(direct)), places=12)

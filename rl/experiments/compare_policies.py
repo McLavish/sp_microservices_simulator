@@ -24,6 +24,7 @@ from rl.policies.bayesian import BayesianPolicy
 from rl.policies.fixed import FixedPolicy, FixedValuePolicy
 from rl.policies.model_based import ModelBasedPolicy
 from rl.policies.sb3 import SB3Policy
+from rl.rollout import policy_actor, run_episode
 from rl.sb3_support import import_sb3
 
 PPO, make_vec_env, _sb3_evaluate, _SubprocVecEnv, _ = import_sb3()
@@ -96,52 +97,39 @@ def _episode(
     seed: int,
     trace_rows: list[dict] | None = None,
 ) -> tuple[float, Summary | None, Summary | None, float]:
-    obs, info = env.reset(seed=seed)
     policy.reset(seed=seed)
-    total_reward = 0.0
-    terminated = False
-    truncated = False
-    step_idx = 0
-    # POOL raw counts: averaging per-window ratios is length-biased, and the
-    # constrained paths already pool, so a window mean here would report a
-    # different constraint than rl.experiments.constrained_retry does.
-    episode_retries = 0.0
-    episode_roots = 0.0
-    while not (terminated or truncated):
-        action = policy.act(obs, info)
-        obs, reward, terminated, truncated, info = env.step(action)
-        total_reward += float(reward)
-        summary = info["summary"]
-        episode_retries += summary.get("cost_retries", 0.0)
-        episode_roots += summary.get("cost_roots", 0.0)
-        if trace_rows is not None:
-            applied = info["action"]
-            trace_rows.append(
-                {
-                    "policy": policy.name,
-                    "seed": seed,
-                    "step": step_idx,
-                    "step_duration_s": env.step_duration_s,
-                    "attempt_timeout_ms": applied["attempt_timeout_ms"],
-                    "max_attempts": applied["max_attempts"],
-                    "backoff_ms": applied["backoff_ms"],
-                    "global_timeout_ms": applied["global_timeout_ms"],
-                    "reward": float(reward),
-                    "completed": summary["completed"],
-                    "success_rate": summary["success_rate"],
-                    "deadline_drop_rate": summary["deadline_drop_rate"],
-                    "queue_drop_rate": summary["queue_drop_rate"],
-                    "server_drop_rate": summary["server_drop_rate"],
-                    "p95_latency_ms": summary["p95_latency_ms"],
-                    "retries_per_root": summary["retries_per_root"],
-                    "cost": summary["cost"],
-                }
-            )
-        step_idx += 1
-        policy.update(obs, reward, terminated or truncated, info)
-
-    cost_mean = episode_retries / episode_roots if episode_roots else 0.0
-    return total_reward, env.metrics_summary(), env.in_horizon_summary(), cost_mean
+    result = run_episode(
+        env,
+        policy_actor(policy),
+        seed=seed,
+        on_step=lambda obs, reward, done, info: policy.update(obs, reward, done, info),
+    )
+    if trace_rows is not None:
+        # Trace rows are this caller's business; the loop and the aggregations
+        # that must agree across callers live in rl.rollout.
+        trace_rows.extend(
+            {
+                "policy": policy.name,
+                "seed": seed,
+                "step": window.step,
+                "step_duration_s": env.step_duration_s,
+                "attempt_timeout_ms": window.action_values["attempt_timeout_ms"],
+                "max_attempts": window.action_values["max_attempts"],
+                "backoff_ms": window.action_values["backoff_ms"],
+                "global_timeout_ms": window.action_values["global_timeout_ms"],
+                "reward": window.reward,
+                "completed": window.summary["completed"],
+                "success_rate": window.summary["success_rate"],
+                "deadline_drop_rate": window.summary["deadline_drop_rate"],
+                "queue_drop_rate": window.summary["queue_drop_rate"],
+                "server_drop_rate": window.summary["server_drop_rate"],
+                "p95_latency_ms": window.summary["p95_latency_ms"],
+                "retries_per_root": window.summary["retries_per_root"],
+                "cost": window.summary["cost"],
+            }
+            for window in result.windows
+        )
+    return result.total_reward, result.metrics, result.in_horizon, result.pooled_cost
 
 
 def _evaluate(
