@@ -1,5 +1,6 @@
 import argparse
 import csv
+import os
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -215,17 +216,34 @@ def _train_ppo(cfg: ExperimentConfig, learning_curve_csv: str | None = None) -> 
     # EvalCallback only keeps its evaluation history when log_path is set; the
     # npz it writes there is discarded in favor of the CSV below.
     with tempfile.TemporaryDirectory() as npz_dir:
+        # min_evals keeps patience from firing in the opening evals of a long
+        # run. StopTrainingOnNoModelImprovement compares against a running max
+        # with min_evals=0 by default, so a budget raised without also raising
+        # the eval interval stopped after patience+1 evals - the documented
+        # 100k command trained 5000 steps, a 20x silent truncation.
+        expected_evals = max(1, cfg.ppo_timesteps // max(1, cfg.ppo_eval_interval))
+        min_evals = max(cfg.ppo_patience + 1, expected_evals // 4)
         eval_callback = EvalCallback(
             eval_env,
             n_eval_episodes=cfg.ppo_eval_episodes,
             eval_freq=cfg.ppo_eval_interval,
             log_path=npz_dir,
+            # Checkpoint the best model: without a save path SB3 only tracks
+            # best_mean_reward, so "early stopping" returned the LAST weights -
+            # by construction several non-improving evals past the best it saw.
+            best_model_save_path=npz_dir,
             callback_after_eval=StopTrainingOnNoModelImprovement(
-                max_no_improvement_evals=cfg.ppo_patience
+                max_no_improvement_evals=cfg.ppo_patience,
+                min_evals=min_evals,
             ),
             verbose=0,
         )
         model.learn(total_timesteps=cfg.ppo_timesteps, callback=eval_callback)
+
+        best_path = os.path.join(npz_dir, "best_model.zip")
+        if os.path.exists(best_path):
+            # Reload inside the tempdir, before it is cleaned up.
+            model = PPO.load(best_path, env=vec_env)
 
     if learning_curve_csv and len(eval_callback.evaluations_timesteps):
         with open(learning_curve_csv, "w", newline="") as f:
@@ -294,15 +312,15 @@ def main() -> None:
     parser.add_argument("--model-queue-workers", type=int, default=16)
     parser.add_argument("--model-queue-max-utilization", type=float, default=0.95)
     parser.add_argument("--bayes-buffer", type=int, default=2000)
-    parser.add_argument("--aimd-success-target", type=float, default=0.98)
-    parser.add_argument("--aimd-deadline-target", type=float, default=0.01)
+    parser.add_argument("--aimd-success-target", type=float, default=0.95)
+    parser.add_argument("--aimd-deadline-target", type=float, default=0.05)
     parser.add_argument("--aimd-timeout-increase-step", type=int, default=1)
     parser.add_argument("--aimd-timeout-decrease-factor", type=float, default=0.5)
     parser.add_argument("--aimd-max-attempts-step", type=int, default=1)
     parser.add_argument("--aimd-backoff-step", type=int, default=1)
     parser.add_argument("--aimd-adjust-max-attempts", action="store_true")
     parser.add_argument("--aimd-adjust-backoff", action="store_true")
-    parser.add_argument("--aimd-ema-alpha", type=float, default=0.2)
+    parser.add_argument("--aimd-ema-alpha", type=float, default=0.5)
     parser.add_argument("--aimd-min-completed", type=int, default=1)
     parser.add_argument("--fault-scenario", choices=sorted(SCENARIO_BUILDERS), default="none")
     parser.add_argument("--reward-success", type=float, default=1.0)

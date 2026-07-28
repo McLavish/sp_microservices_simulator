@@ -217,7 +217,12 @@ class ClientRuntime:
                 deadline=computed_deadline,
                 success=False,
                 drop_reason=DropReason.CIRCUIT_OPEN,
-                queue_size_at_end=0,
+                # The request never reached the service, so it observed no
+                # queue. Reporting 0 injected a fabricated "queue is empty"
+                # sample into queue_avg_at_attempt_end at exactly the moments
+                # the breaker is shedding hardest, inverting the signal.
+                # None is the same convention service_time_ns already uses here.
+                queue_size_at_end=None,
             )
             root_req.add_attempt(req)
             self._complete_root(root_req, sim.timestep)

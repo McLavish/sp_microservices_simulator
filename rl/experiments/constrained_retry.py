@@ -96,14 +96,20 @@ def _eval_arm(
         policy.reset(seed=seed)
         terminated = truncated = False
         episode_objective = 0.0
-        episode_costs: list[float] = []
+        episode_retries = 0.0
+        episode_roots = 0.0
         while not (terminated or truncated):
             action = policy.act(obs, info)
             obs, _reward, terminated, truncated, info = env.step(action)
             summary = info["summary"]
             episode_objective += objective_from_summary(summary, BASE_WEIGHTS)
-            episode_costs.append(summary["cost"])
-        cost_mean = float(np.mean(episode_costs)) if episode_costs else 0.0
+            # POOL raw counts rather than averaging per-window ratios: windows
+            # with high amplification also complete more edge roots, so an
+            # unweighted mean understates the episode's retries-per-root by a
+            # measured 13-33%, and by different amounts per arm.
+            episode_retries += summary.get("cost_retries", 0.0)
+            episode_roots += summary.get("cost_roots", 0.0)
+        cost_mean = episode_retries / episode_roots if episode_roots else 0.0
         objectives.append(episode_objective)
         costs.append(cost_mean)
         if budget is not None:

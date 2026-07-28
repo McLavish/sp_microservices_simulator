@@ -471,3 +471,46 @@ class TestEVTNumericStability(unittest.TestCase):
         # gave mu=3.82 / sigma=0.72 against a true 3.912 / 0.8.
         self.assertAlmostEqual(model.body.mu, np.log(50), delta=0.05)
         self.assertAlmostEqual(model.body.sigma, 0.8, delta=0.06)
+
+
+class TestAIMDBothArmsReachable(unittest.TestCase):
+    """AIMD must actually be additive-increase MULTIPLICATIVE-DECREASE.
+
+    With the previous defaults the decrease arm could not fire inside a
+    default-length episode, so the baseline was a one-way ramp to the widest
+    timeout -- effectively a delayed FixedValuePolicy, mislabelled as adaptive.
+    """
+
+    def test_both_arms_fire_at_shipped_defaults(self):
+        from rl.env import SCENARIO_BUILDERS, EnvConfig, MicroservicesEnv
+        from rl.policies.aimd import AIMDPolicy
+
+        spec = ActionSpec([10, 30, 50, 80], [1, 2, 3], [0, 20, 50])
+        for scenario in ("basic", "randomized", "multichain"):
+            with self.subTest(scenario=scenario):
+                increases = decreases = 0
+                for seed in (321, 654, 987, 1320):
+                    env = MicroservicesEnv(
+                        EnvConfig(
+                            build=lambda s, _sc=scenario: SCENARIO_BUILDERS[_sc](s, 30.0),
+                            action_spec=spec,
+                            step_duration_s=1.0,
+                            episode_duration_s=10.0,
+                        )
+                    )
+                    policy = AIMDPolicy(grid=ActionGrid(spec))
+                    policy.reset(seed=seed)
+                    obs, info = env.reset(seed=seed)
+                    terminated = False
+                    previous = None
+                    while not terminated:
+                        action = policy.act(obs, info)
+                        if previous is not None:
+                            if action[0] > previous[0]:
+                                increases += 1
+                            elif action[0] < previous[0]:
+                                decreases += 1
+                        previous = action
+                        obs, _, terminated, _, info = env.step(action)
+                self.assertGreater(increases, 0, "increase arm never fired")
+                self.assertGreater(decreases, 0, "decrease arm never fired")

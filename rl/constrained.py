@@ -84,7 +84,10 @@ def objective_from_summary(summary: dict, weights: RewardWeights) -> float:
 def evaluate_objective_and_cost(
     model, env: MicroservicesEnv, episodes: int, weights: RewardWeights
 ) -> tuple[float, float]:
-    """Mean episode objective J and mean per-window cost over `episodes`.
+    """Mean episode objective J and mean POOLED cost over `episodes`.
+
+    The cost is retries-per-root pooled over each episode's windows, not a mean
+    of per-window ratios — see the pooling note below.
 
     Resets unseeded so the env's (pre-seeded) RNG yields a reproducible
     scenario sequence.
@@ -95,15 +98,22 @@ def evaluate_objective_and_cost(
         obs, _ = env.reset()
         terminated = truncated = False
         episode_objective = 0.0
-        episode_costs = []
+        retries = 0.0
+        roots = 0.0
         while not (terminated or truncated):
             action, _ = model.predict(obs, deterministic=True)
             obs, _reward, terminated, truncated, info = env.step(action)
             summary = info["summary"]
             episode_objective += objective_from_summary(summary, weights)
-            episode_costs.append(summary["cost"])
+            # POOL the raw counts. Averaging per-window ratios is length-biased:
+            # high-amplification windows complete more edge roots, so an
+            # unweighted mean systematically understates the episode's true
+            # retries-per-root (measured 13-33%, and by different amounts per
+            # arm, so it does not cancel between the arms being compared).
+            retries += summary.get("cost_retries", 0.0)
+            roots += summary.get("cost_roots", 0.0)
         objectives.append(episode_objective)
-        costs.append(float(np.mean(episode_costs)) if episode_costs else 0.0)
+        costs.append(retries / roots if roots else 0.0)
     return float(np.mean(objectives)), float(np.mean(costs))
 
 

@@ -209,9 +209,12 @@ class MicroservicesEnv(_GymEnvBase):
             self._require_sim(), lambda s: self._require_client().start_request(s)
         )
 
-        initial_action = self._cfg.initial_action or tuple(
-            0 for _ in range(len(self._action_sizes))
-        )
+        # Window 0 runs before any feedback exists, so its action is pure
+        # warmup cost paid by every policy. Index 0 is the grid corner - the
+        # shortest timeout with no retries - which made that first window
+        # pathological (measured ~11% success) and poisoned any controller that
+        # seeds its state from it. Start mid-grid instead.
+        initial_action = self._cfg.initial_action or tuple(n // 2 for n in self._action_sizes)
         self._apply_action(initial_action)
 
         obs = self._build_observation(self._summarize_roots([]))
@@ -241,7 +244,12 @@ class MicroservicesEnv(_GymEnvBase):
         self._last_root_idx = len(self._require_client().roots)
 
         summary = self._summarize_roots(new_roots)
-        summary["cost"] = self._window_cost()
+        cost_ratio, cost_retries, cost_roots = self._window_cost()
+        summary["cost"] = cost_ratio
+        # Raw counts so a consumer can pool sum(retries)/sum(roots) over the
+        # episode rather than averaging per-window ratios.
+        summary["cost_retries"] = float(cost_retries)
+        summary["cost_roots"] = float(cost_roots)
         obs = self._build_observation(summary)
         reward = self._reward_from_summary(summary)
         terminated = self._current_time_ns >= self._end_time_ns
@@ -279,7 +287,10 @@ class MicroservicesEnv(_GymEnvBase):
             drained = self._require_client().roots[self._last_root_idx :]
             self._last_root_idx = len(self._require_client().roots)
             drained_summary = self._summarize_roots(drained)
-            drained_summary["cost"] = self._window_cost()
+            drained_ratio, drained_retries, drained_roots = self._window_cost()
+            drained_summary["cost"] = drained_ratio
+            drained_summary["cost_retries"] = float(drained_retries)
+            drained_summary["cost_roots"] = float(drained_roots)
             info["drained_summary"] = drained_summary
             if self._cfg.terminal_drain_penalty:
                 # Count-consistent weighting: per-step rewards are rates over a
@@ -306,18 +317,27 @@ class MicroservicesEnv(_GymEnvBase):
     def _build(self, seed: int | None) -> EnvComponents:
         return self._cfg.build(seed)
 
-    def _window_cost(self) -> float:
-        """Constraint cost: retry amplification (retries per root) at the cost
-        client over the roots it completed since the last call."""
+    def _window_cost(self) -> tuple[float, int, int]:
+        """Constraint cost at the cost client over the roots it completed since
+        the last call.
+
+        Returns ``(ratio, retries, roots)``. The raw counts are reported too so
+        consumers can pool them across windows: averaging the per-window RATIO
+        is a length-biased (Simpson) estimator, because high-amplification
+        windows also complete more edge roots. Measured 13-33% understatement of
+        the true episode amplification, and by different amounts per arm, so it
+        does not cancel in comparisons.
+        """
         components = self._components
         if components is None or components.cost_client is None:
-            return 0.0
+            return 0.0, 0, 0
         roots = components.cost_client.roots[self._last_cost_root_idx :]
         self._last_cost_root_idx = len(components.cost_client.roots)
         if not roots:
-            return 0.0
+            return 0.0, 0, 0
         attempts = sum(len(root.attempts) for root in roots)
-        return (attempts - len(roots)) / len(roots)
+        retries = attempts - len(roots)
+        return retries / len(roots), retries, len(roots)
 
     def _apply_action(self, action: tuple[int, ...]) -> None:
         spec = self._cfg.action_spec
@@ -373,6 +393,8 @@ class MicroservicesEnv(_GymEnvBase):
                 "queue_drop_rate": 0.0,
                 "server_drop_rate": 0.0,
                 "cancelled_rate": 0.0,
+                "cost_retries": 0.0,
+                "cost_roots": 0.0,
                 "circuit_open_drop_rate": 0.0,
                 "avg_latency_ms": 0.0,
                 "p95_latency_ms": 0.0,
@@ -445,7 +467,12 @@ class MicroservicesEnv(_GymEnvBase):
             "retries_per_root": (attempts_total - completed) / completed,
             "queue_avg": queue_avg,
             # Overridden by step() with the cost-client window when one exists.
+            # Kept here so the empty-window and populated dicts carry identical
+            # keys — a consumer reading info["summary"] must never KeyError
+            # depending on whether the window had traffic.
             "cost": 0.0,
+            "cost_retries": 0.0,
+            "cost_roots": 0.0,
         }
 
     def _build_observation(self, summary: dict[str, float]) -> np.ndarray:
