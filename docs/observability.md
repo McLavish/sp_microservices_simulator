@@ -21,6 +21,29 @@ a *different population* from `roots` — clients bump it at attempt **start**
 while roots are appended at **completion** — so no `Summary` field is derived
 from it.
 
+### One outcome table (`core.py`)
+
+`classify_root(root)` (`core.py`) is the single classifier: it returns a
+`RootOutcome`, and `Metrics.summary`, `Metrics.export_csv` and the RL env's
+`_summarize_roots` all book roots by its answer rather than re-deriving the
+rules.
+
+`core.FAILURE_OUTCOMES` then maps each **non-success** outcome to where it is
+reported: the `Summary` field it increments, the `export_csv` column that books
+it, and the label `print_stats` prints. Every one of those lists is generated
+from that mapping, in its declaration order — which is what fixes the CSV
+header, so appending an outcome is safe and reordering rewrites it.
+
+Adding a `RootOutcome` member is therefore two edits, and both are forced:
+`core.py` raises at import if the new member has no `FAILURE_OUTCOMES` entry (or
+if an entry names a `Summary` field that does not exist), and `rl/env.py` raises
+at import if its `_OUTCOME_RATE_KEYS` table — the env needs rate keys, not CSV
+column names — has no key for it. Consumers outside `core` get that check by
+calling `core.require_outcome_coverage(table, owner=...)` next to their own
+table. `plotting/failures_over_time.py` derives its `REASON_COLUMNS` from the
+same table (it still tolerates a column missing from an older CSV), so a new
+outcome flows into the failure-mix figure without a manual edit.
+
 ### `summary()` (`metrics.py`)
 
 Returns a `Summary` (`core.py`): `total`, `succeeded`, `dropped_*` by reason,
@@ -65,7 +88,7 @@ The subtlety is **which event time a column is bucketed by** — start vs. end:
 | `completed` | end | all attempts ending in the bucket |
 | `failure_root` | end | failed roots completing in the bucket |
 | `failure_retry` | end | failed *retry* attempts ending in the bucket |
-| `failure_queue_full` / `failure_deadline` / `failure_server` / `failure_circuit_open` | end | failed roots by final drop reason |
+| `failure_queue_full` / `failure_deadline` / `failure_server` / `failure_circuit_open` | end | failed roots by final drop reason (generated from `core.FAILURE_OUTCOMES`, in its order) |
 | `failure_cancelled` | end | roots abandoned by an upstream cancellation (see `propagate_cancellation`); abandoned, not failed |
 | `total_request` | start (cumulative) | running sum of started roots |
 | `total_failure` | end (cumulative) | running sum of failed roots |

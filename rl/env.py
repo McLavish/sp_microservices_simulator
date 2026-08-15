@@ -11,6 +11,7 @@ import numpy as np
 from caller import ClientConfig, ClientRuntime
 from chain import DownstreamEdge, ServiceNodeRuntime
 from core import (
+    FAILURE_OUTCOMES,
     DropReason,
     RootOutcome,
     Summary,
@@ -21,13 +22,14 @@ from core import (
     ms_to_ns,
     ns_to_ms,
     ns_to_s,
+    require_outcome_coverage,
     root_latency,
     s_to_ns,
 )
 from faults import LatencyInjection, LoadSpike, PartialFailure
 from metrics import Metrics
 from retry_policies import FixedBackoffRetryPolicy, RetryBudgetPolicy, RetryPolicy
-from rl.spec import ActionSpec, ActionValues, RewardWeights, coerce_action
+from rl.spec import ActionSpec, ActionValues, RewardWeights, coerce_action, linear_reward
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import StaticTimeoutController
@@ -61,6 +63,23 @@ else:
 # independent of. Distinct from the arrival offset so faults, arrivals and
 # service draws are three separate streams.
 _FAULT_SEED_OFFSET = 700_001
+
+# Observation/summary key each non-success outcome is reported under. The env
+# needs its own vocabulary (rates, not counts), so it cannot read the CSV column
+# names off core.FAILURE_OUTCOMES — but it must still cover every outcome, and
+# `require_outcome_coverage` makes a gap an import-time error here instead of a
+# new outcome quietly landing in whichever bucket a fallback `else` picked.
+_OUTCOME_RATE_KEYS: dict[RootOutcome, str] = {
+    RootOutcome.QUEUE_FULL: "queue_drop_rate",
+    RootOutcome.DEADLINE: "deadline_drop_rate",
+    RootOutcome.SERVER_FAILURE: "server_drop_rate",
+    RootOutcome.CIRCUIT_OPEN: "circuit_open_drop_rate",
+    # Reported for visibility; deliberately carries no reward weight and no
+    # observation feature, since cancelled work is abandoned rather than a
+    # failure of this service.
+    RootOutcome.CANCELLED: "cancelled_rate",
+}
+require_outcome_coverage(_OUTCOME_RATE_KEYS, owner="rl.env._OUTCOME_RATE_KEYS")
 
 
 @dataclass
@@ -424,24 +443,17 @@ class MicroservicesEnv(_GymEnvBase):
         self._last_action_indices = tuple(int(a) for a in action)
 
     def _reward_from_summary(self, summary: dict[str, float]) -> float:
-        w = self._cfg.reward_weights
-        reward = (
-            summary["success_rate"] * w.success
-            - summary["deadline_drop_rate"] * w.deadline_drop
-            - summary["queue_drop_rate"] * w.queue_drop
-            - summary["server_drop_rate"] * w.server_drop
-            - summary["circuit_open_drop_rate"] * w.circuit_open_drop
-            - summary["p95_latency_ms"] * w.p95_latency_ms
-            - summary["retries_per_root"] * w.retries
-            # Count-weighted: the dual ascends on the POOLED retries-per-root,
-            # so the primal must penalise a quantity whose episode sum is
-            # proportional to it. Penalising the raw per-window RATIO instead
-            # makes a Lagrangian whose primal and dual optimise different
-            # constraints (measured 1.104 window-mean vs 1.253 pooled), and dual
-            # ascent then converges to neither.
-            - self._cost_penalty(summary) * w.cost
+        # The linear form itself lives in rl.spec, shared with
+        # `EpisodeResult.objective` so J cannot drift away from the reward.
+        # The cost term is count-weighted: the dual ascends on the POOLED
+        # retries-per-root, so the primal must penalise a quantity whose episode
+        # sum is proportional to it. Penalising the raw per-window RATIO instead
+        # makes a Lagrangian whose primal and dual optimise different
+        # constraints (measured 1.104 window-mean vs 1.253 pooled), and dual
+        # ascent then converges to neither.
+        return linear_reward(
+            summary, self._cfg.reward_weights, cost_term=self._cost_penalty(summary)
         )
-        return float(reward)
 
     def _cost_penalty(self, summary: dict[str, float]) -> float:
         """Per-window cost term whose episode SUM is proportional to the retries.
@@ -472,11 +484,9 @@ class MicroservicesEnv(_GymEnvBase):
         roots = [root for root in roots if root.attempts]
         completed = len(roots)
         successes = 0
-        deadline_drops = 0
-        queue_drops = 0
-        server_drops = 0
-        circuit_open_drops = 0
-        cancelled_drops = 0
+        # One counter per non-success outcome, straight off the shared table, so
+        # no outcome can fall through to a catch-all bucket.
+        drops = dict.fromkeys(FAILURE_OUTCOMES, 0)
         latencies: list[int] = []
         attempts_total = 0
         queue_sizes: list[int] = []
@@ -489,16 +499,8 @@ class MicroservicesEnv(_GymEnvBase):
             if outcome is RootOutcome.SUCCESS:
                 successes += 1
                 latencies.append(root_latency(root))
-            elif outcome is RootOutcome.CANCELLED:
-                cancelled_drops += 1
-            elif outcome is RootOutcome.DEADLINE:
-                deadline_drops += 1
-            elif outcome is RootOutcome.QUEUE_FULL:
-                queue_drops += 1
-            elif outcome is RootOutcome.CIRCUIT_OPEN:
-                circuit_open_drops += 1
             else:
-                server_drops += 1
+                drops[outcome] += 1
 
             for attempt in root.attempts:
                 if attempt.queue_size_at_end is not None:
@@ -510,24 +512,18 @@ class MicroservicesEnv(_GymEnvBase):
         )
         queue_avg = float(np.mean(queue_sizes)) if queue_sizes else 0.0
 
-        # ONE literal defines the schema. An empty window must carry exactly the
+        # ONE return defines the schema. An empty window must carry exactly the
         # same keys as a populated one — a consumer reading info["summary"] must
         # never KeyError depending on whether the window had traffic — and two
         # hand-synced dicts only kept that promise until the next key was added
         # to one of them. `denom` leaves every rate at 0.0 when nothing
-        # completed, reproducing the old empty-window values exactly.
+        # completed, reproducing the old empty-window values exactly; the drop
+        # rates come from `_OUTCOME_RATE_KEYS`, so they are all present too.
         denom = completed or 1
         return {
             "completed": completed,
             "success_rate": successes / denom,
-            "deadline_drop_rate": deadline_drops / denom,
-            "queue_drop_rate": queue_drops / denom,
-            "server_drop_rate": server_drops / denom,
-            # Reported for visibility; deliberately carries no reward weight
-            # and no observation feature, since cancelled work is abandoned
-            # rather than a failure of this service.
-            "cancelled_rate": cancelled_drops / denom,
-            "circuit_open_drop_rate": circuit_open_drops / denom,
+            **{_OUTCOME_RATE_KEYS[outcome]: count / denom for outcome, count in drops.items()},
             "avg_latency_ms": avg_latency_ms,
             "p95_latency_ms": p95_latency_ms,
             "retries_per_root": (attempts_total - completed) / denom,

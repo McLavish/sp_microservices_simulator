@@ -10,6 +10,11 @@ from rl.env import SCENARIO_BUILDERS, ActionSpec, EnvConfig, MicroservicesEnv
 from rl.model_io import check_action_spec, save_action_spec
 from rl.rollout import model_actor, run_episode
 from rl.sb3_support import import_sb3
+from rl.spec import (
+    DEFAULT_ATTEMPT_TIMEOUTS_MS,
+    DEFAULT_BACKOFF_MS,
+    DEFAULT_MAX_ATTEMPTS,
+)
 
 _SB3 = import_sb3()
 PPO, make_vec_env, SubprocVecEnv = _SB3.ppo, _SB3.make_vec_env, _SB3.subproc_vec_env
@@ -142,9 +147,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-envs", type=int, default=1)
     parser.add_argument("--step-duration-s", type=float, default=1.0)
     parser.add_argument("--episode-duration-s", type=float, default=10.0)
-    parser.add_argument("--attempt-timeouts-ms", type=parse_int_list, default=[10, 30, 50, 80])
-    parser.add_argument("--max-attempts", type=parse_int_list, default=[1, 2, 3])
-    parser.add_argument("--backoff-ms", type=parse_int_list, default=[0, 20, 50])
+    parser.add_argument(
+        "--attempt-timeouts-ms", type=parse_int_list, default=list(DEFAULT_ATTEMPT_TIMEOUTS_MS)
+    )
+    parser.add_argument("--max-attempts", type=parse_int_list, default=list(DEFAULT_MAX_ATTEMPTS))
+    parser.add_argument("--backoff-ms", type=parse_int_list, default=list(DEFAULT_BACKOFF_MS))
     parser.add_argument("--global-timeouts-ms", type=parse_optional_int_list, default=None)
     parser.add_argument("--n-steps", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=64)

@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 
 from caller import ClientRuntime
 from core import DropReason, RootRequest, TimeDuration, TimePoint
-from service import AttemptControl, ServiceConfig, ServiceRuntime
+from service import AttemptControl, AttemptDoneCallback, ServiceConfig, ServiceRuntime
 from simulator import Event, Simulator
 
 
@@ -272,7 +272,7 @@ class ServiceNodeRuntime:
     def submit_attempt(
         self,
         sim: Simulator,
-        on_done: Callable[..., None],
+        on_done: AttemptDoneCallback,
         attempt_deadline: TimePoint | None = None,
     ) -> AttemptControl:
         """Submit a logical attempt to this node.

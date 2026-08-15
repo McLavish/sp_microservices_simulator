@@ -60,6 +60,16 @@ class ServiceConfig:
             tracker.add_partial_failure(partial_failure.duration, partial_failure.p_fail)
 
 
+#: The service -> client completion callback: (success, occupancy, drop reason,
+#: queue size, occupancy_censored). Spelled out rather than `Callable[..., None]`
+#: because the last argument carries statistical semantics — it marks the
+#: occupancy sample as a LOWER BOUND for the censored MLE — so a producer that
+#: omits it silently reports a truncated sample as a complete observation.
+#: Lives here, with the only producer: `caller.ServiceLike` and `chain` describe
+#: the same callback and import it.
+AttemptDoneCallback = Callable[[bool, TimeDuration, DropReason, int, bool], None]
+
+
 # Custom attempt behavior:
 # (service, sim, deadline, finalize, begin_at, release_worker, register_cancel)
 #
@@ -214,9 +224,7 @@ class ServiceRuntime:
     def submit_attempt(
         self,
         sim: Simulator,
-        on_done: Callable[
-            [bool, TimeDuration, DropReason, int, bool], None
-        ],  # success, occupancy, whydropped, queue_size, occupancy_censored
+        on_done: AttemptDoneCallback,
         attempt_deadline: TimePoint | None = None,
         behavior: Behavior | None = None,
     ):

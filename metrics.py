@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from core import (
+    FAILURE_OUTCOMES,
     MS_TO_NS,
     S_TO_NS,
     DropReason,
@@ -49,13 +50,9 @@ class Metrics:
         total = len(self.roots)
         succ_lat: list[int] = []
         succeeded = 0
-        counters = {
-            RootOutcome.QUEUE_FULL: 0,
-            RootOutcome.DEADLINE: 0,
-            RootOutcome.SERVER_FAILURE: 0,
-            RootOutcome.CIRCUIT_OPEN: 0,
-            RootOutcome.CANCELLED: 0,
-        }
+        # Derived from the one authoritative table, so a new RootOutcome is
+        # counted here the moment it exists instead of raising KeyError below.
+        counters = dict.fromkeys(FAILURE_OUTCOMES, 0)
         for request in self.roots:
             if not request.attempts:
                 continue
@@ -69,11 +66,12 @@ class Metrics:
                 continue
             counters[outcome] += 1
 
-        dropped_q = counters[RootOutcome.QUEUE_FULL]
-        dropped_deadline = counters[RootOutcome.DEADLINE]
-        dropped_server_failure = counters[RootOutcome.SERVER_FAILURE]
-        dropped_circuit_open = counters[RootOutcome.CIRCUIT_OPEN]
-        dropped_cancelled = counters[RootOutcome.CANCELLED]
+        # Each outcome goes to the Summary field the table names for it; core
+        # validates those field names against Summary at import time.
+        dropped = {
+            reporting.summary_field: counters[outcome]
+            for outcome, reporting in FAILURE_OUTCOMES.items()
+        }
 
         # nan, not 0.0: "no successful request completed" is missing data, and
         # the percentiles below already use nan. Reporting 0 ms made an empty
@@ -90,10 +88,7 @@ class Metrics:
         return Summary(
             total=total,
             succeeded=succeeded,
-            dropped_queue=dropped_q,
-            dropped_deadline=dropped_deadline,
-            dropped_server_failure=dropped_server_failure,
-            dropped_circuit_open=dropped_circuit_open,
+            **dropped,
             p50=self._percentile_ms(0.5, succ_lat),
             p90=self._percentile_ms(0.9, succ_lat),
             p95=self._percentile_ms(0.95, succ_lat),
@@ -104,18 +99,14 @@ class Metrics:
             max=max_ms,
             retries_per_root=retries_per_root,
             attempts_total=attempts_on_roots,
-            dropped_cancelled=dropped_cancelled,
         )
 
     def print_stats(self):
         summary = self.summary()
         print(f"Total Requests: {summary.total}")
         print(f"Succeeded: {summary.succeeded}")
-        print(f"Dropped (Queue Full): {summary.dropped_queue}")
-        print(f"Dropped (Deadline): {summary.dropped_deadline}")
-        print(f"Dropped (Server Failure): {summary.dropped_server_failure}")
-        print(f"Dropped (Circuit Open): {summary.dropped_circuit_open}")
-        print(f"Cancelled (Abandoned Upstream): {summary.dropped_cancelled}")
+        for reporting in FAILURE_OUTCOMES.values():
+            print(f"{reporting.label}: {getattr(summary, reporting.summary_field)}")
         print(f"P50 Latency (ms): {summary.p50:.2f}")
         print(f"P95 Latency (ms): {summary.p95:.2f}")
         print(f"P99 Latency (ms): {summary.p99:.2f}")
@@ -155,11 +146,11 @@ class Metrics:
             "completed",  # all attempts completed, bucketed at the end
             "failure_root",
             "failure_retry",
-            "failure_queue_full",
-            "failure_deadline",
-            "failure_server",
-            "failure_circuit_open",
-            "failure_cancelled",
+            # Per-reason breakdown, in the table's order — which is what fixes
+            # this header, so appending an outcome is safe and reordering the
+            # table rewrites every exported CSV. A new RootOutcome gets its
+            # column here automatically (plotting still needs its own list).
+            *(reporting.csv_column for reporting in FAILURE_OUTCOMES.values()),
             "total_request",  # cumulative root_requests, bucketed at the start
             "total_failure",  # cumulative failure_root, bucketed at the end
             "p50",  # percentiles are all bucketed at the end
@@ -269,21 +260,12 @@ class Metrics:
                 "completed": per_bucket_count(attempts["end"]),
                 "failure_root": per_bucket_count(failed["end"]),
                 "failure_retry": per_bucket_count(attempts.loc[attempts["retry_failed"], "end"]),
-                "failure_queue_full": per_bucket_count(
-                    failed.loc[failed["outcome"] == RootOutcome.QUEUE_FULL, "end"]
-                ),
-                "failure_deadline": per_bucket_count(
-                    failed.loc[failed["outcome"] == RootOutcome.DEADLINE, "end"]
-                ),
-                "failure_server": per_bucket_count(
-                    failed.loc[failed["outcome"] == RootOutcome.SERVER_FAILURE, "end"]
-                ),
-                "failure_circuit_open": per_bucket_count(
-                    failed.loc[failed["outcome"] == RootOutcome.CIRCUIT_OPEN, "end"]
-                ),
-                "failure_cancelled": per_bucket_count(
-                    failed.loc[failed["outcome"] == RootOutcome.CANCELLED, "end"]
-                ),
+                **{
+                    reporting.csv_column: per_bucket_count(
+                        failed.loc[failed["outcome"] == outcome, "end"]
+                    )
+                    for outcome, reporting in FAILURE_OUTCOMES.items()
+                },
                 # queue size at attempt END, by completion bucket
                 "queue_avg_at_attempt_end": (
                     with_queue.groupby(bucket_of(with_queue["end"]))["queue"]

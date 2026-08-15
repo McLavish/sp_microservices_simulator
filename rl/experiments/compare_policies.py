@@ -25,6 +25,13 @@ from rl.policies.model_based import ModelBasedPolicy
 from rl.policies.sb3 import SB3Policy
 from rl.rollout import EpisodeResult, mean_ignoring_nan, policy_actor, run_episode
 from rl.sb3_support import import_sb3
+from rl.spec import (
+    DEFAULT_ATTEMPT_TIMEOUTS_MS,
+    DEFAULT_BACKOFF_MS,
+    DEFAULT_EVAL_SEEDS,
+    DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_TRAIN_SEEDS,
+)
 
 _SB3 = import_sb3()
 PPO, make_vec_env = _SB3.ppo, _SB3.make_vec_env
@@ -282,18 +289,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     """`argv` defaults to sys.argv; taking it explicitly makes the entry
     point callable from a test without patching sys.argv."""
     parser = argparse.ArgumentParser(description="Compare policy baselines.")
-    parser.add_argument("--attempt-timeouts-ms", type=parse_int_list, default=[10, 30, 50, 80])
-    parser.add_argument("--max-attempts", type=parse_int_list, default=[1, 2, 3])
-    parser.add_argument("--backoff-ms", type=parse_int_list, default=[0, 20, 50])
+    parser.add_argument(
+        "--attempt-timeouts-ms", type=parse_int_list, default=list(DEFAULT_ATTEMPT_TIMEOUTS_MS)
+    )
+    parser.add_argument("--max-attempts", type=parse_int_list, default=list(DEFAULT_MAX_ATTEMPTS))
+    parser.add_argument("--backoff-ms", type=parse_int_list, default=list(DEFAULT_BACKOFF_MS))
     parser.add_argument("--global-timeouts-ms", type=parse_optional_int_list, default=None)
     parser.add_argument("--step-duration-s", type=float, default=1.0)
     parser.add_argument("--episode-duration-s", type=float, default=10.0)
-    parser.add_argument("--train-seeds", type=parse_int_list, default="123,456,789")
-    parser.add_argument(
-        "--eval-seeds",
-        type=parse_int_list,
-        default="321,654,987,1320,1653,1986,2319,2652,2985,3318",
-    )
+    parser.add_argument("--train-seeds", type=parse_int_list, default=DEFAULT_TRAIN_SEEDS)
+    parser.add_argument("--eval-seeds", type=parse_int_list, default=DEFAULT_EVAL_SEEDS)
     parser.add_argument(
         "--policies",
         type=str,

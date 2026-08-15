@@ -1,5 +1,5 @@
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, fields
 from enum import Enum, auto
 
 TimePoint = int  # nanoseconds
@@ -84,6 +84,83 @@ _OUTCOME_BY_DROP_REASON: "dict[DropReason, RootOutcome]" = {
     DropReason.CANCELLED: RootOutcome.CANCELLED,
     DropReason.SERVER_FAILURE: RootOutcome.SERVER_FAILURE,
 }
+
+
+@dataclass(frozen=True)
+class OutcomeReporting:
+    """Where one non-success `RootOutcome` surfaces in each reporting path."""
+
+    #: `Summary` counter field it increments (`Metrics.summary`).
+    summary_field: str
+    #: Per-reason column in `Metrics.export_csv` (and the plotting stack built
+    #: on it).
+    csv_column: str
+    #: Human-readable name used by `Metrics.print_stats`.
+    label: str
+
+
+#: The authoritative enumeration of non-success outcomes, in reporting order.
+#:
+#: Every consumer derives its own list from this one — the summary counters, the
+#: `Summary` fields, `print_stats`, the CSV columns and per-reason buckets, and
+#: (through `require_outcome_coverage`) the RL env's rate keys. The set used to
+#: be hand-written in each of them, so adding an outcome meant finding all of
+#: them: the ones that raised were noticed, the ones that silently booked the
+#: new outcome under an existing reason were not.
+#:
+#: ORDER IS LOAD-BEARING for `csv_column`: it fixes the column order of every
+#: exported CSV, so appending is safe and reordering rewrites the header.
+FAILURE_OUTCOMES: "dict[RootOutcome, OutcomeReporting]" = {
+    RootOutcome.QUEUE_FULL: OutcomeReporting(
+        summary_field="dropped_queue",
+        csv_column="failure_queue_full",
+        label="Dropped (Queue Full)",
+    ),
+    RootOutcome.DEADLINE: OutcomeReporting(
+        summary_field="dropped_deadline",
+        csv_column="failure_deadline",
+        label="Dropped (Deadline)",
+    ),
+    RootOutcome.SERVER_FAILURE: OutcomeReporting(
+        summary_field="dropped_server_failure",
+        csv_column="failure_server",
+        label="Dropped (Server Failure)",
+    ),
+    RootOutcome.CIRCUIT_OPEN: OutcomeReporting(
+        summary_field="dropped_circuit_open",
+        csv_column="failure_circuit_open",
+        label="Dropped (Circuit Open)",
+    ),
+    RootOutcome.CANCELLED: OutcomeReporting(
+        summary_field="dropped_cancelled",
+        csv_column="failure_cancelled",
+        label="Cancelled (Abandoned Upstream)",
+    ),
+}
+
+
+def require_outcome_coverage(mapping: "Mapping[RootOutcome, object]", *, owner: str) -> None:
+    """Fail at import time when `mapping` misses a non-success `RootOutcome`.
+
+    For consumers that must name the outcomes in their own vocabulary (the RL
+    env's per-outcome rate keys) and so cannot read `FAILURE_OUTCOMES`
+    directly. Raising where the table is DEFINED turns "a new outcome is
+    silently booked as a server drop" into one clear error naming the table
+    that needs the entry.
+    """
+    # Checked against the ENUM, not against FAILURE_OUTCOMES: the core table is
+    # itself a caller here, and comparing a mapping with itself would pass
+    # unconditionally — exactly the silent no-op this guard exists to prevent.
+    missing = [
+        outcome.name
+        for outcome in RootOutcome
+        if outcome is not RootOutcome.SUCCESS and outcome not in mapping
+    ]
+    if missing:
+        raise RuntimeError(
+            f"{owner} does not handle RootOutcome member(s) {', '.join(missing)}; "
+            "every non-success outcome needs an entry there (see core.FAILURE_OUTCOMES)"
+        )
 
 
 def classify_root(root: "RootRequest") -> RootOutcome:
@@ -214,3 +291,22 @@ class Summary:
     # twice (once where it failed, once at every sibling it cancelled).
     # Declared last so existing positional construction keeps working.
     dropped_cancelled: int = 0
+
+
+# Definition-time completeness checks for FAILURE_OUTCOMES, at module scope so a
+# table that has fallen behind `RootOutcome` (or behind `Summary`) fails at
+# import with one clear message, instead of as a KeyError several minutes into
+# an experiment. They live down here only because they need `Summary`.
+require_outcome_coverage(FAILURE_OUTCOMES, owner="core.FAILURE_OUTCOMES")
+_SUMMARY_FIELDS = {f.name for f in fields(Summary)}
+_UNKNOWN_SUMMARY_FIELDS = sorted(
+    reporting.summary_field
+    for reporting in FAILURE_OUTCOMES.values()
+    if reporting.summary_field not in _SUMMARY_FIELDS
+)
+if _UNKNOWN_SUMMARY_FIELDS:
+    raise RuntimeError(
+        "core.FAILURE_OUTCOMES names Summary field(s) that do not exist: "
+        f"{', '.join(_UNKNOWN_SUMMARY_FIELDS)}; add them to Summary (a new "
+        "outcome needs a counter of its own, not a shared one)"
+    )

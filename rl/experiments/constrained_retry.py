@@ -41,7 +41,14 @@ from rl.policies.action_space import ActionGrid
 from rl.policies.fixed import FixedPolicy
 from rl.rollout import mean_ignoring_nan, policy_actor, run_episode
 from rl.sb3_support import import_sb3
-from rl.spec import RewardWeights
+from rl.spec import (
+    DEFAULT_ATTEMPT_TIMEOUTS_MS,
+    DEFAULT_BACKOFF_MS,
+    DEFAULT_EVAL_SEEDS,
+    DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_TRAIN_SEEDS,
+    RewardWeights,
+)
 
 _SB3 = import_sb3()
 PPO = _SB3.ppo
@@ -304,15 +311,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--lambda-init", type=float, default=0.0)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--train-seed", type=int, default=123)
-    parser.add_argument("--oracle-seeds", type=parse_int_list, default="123,456,789")
+    # Same seed populations as rl.experiments.compare_policies: the two studies
+    # are only comparable when their arms are evaluated on the same seeds.
+    parser.add_argument("--oracle-seeds", type=parse_int_list, default=DEFAULT_TRAIN_SEEDS)
+    parser.add_argument("--eval-seeds", type=parse_int_list, default=DEFAULT_EVAL_SEEDS)
     parser.add_argument(
-        "--eval-seeds",
-        type=parse_int_list,
-        default="321,654,987,1320,1653,1986,2319,2652,2985,3318",
+        "--attempt-timeouts-ms", type=parse_int_list, default=list(DEFAULT_ATTEMPT_TIMEOUTS_MS)
     )
-    parser.add_argument("--attempt-timeouts-ms", type=parse_int_list, default=[10, 30, 50, 80])
-    parser.add_argument("--max-attempts", type=parse_int_list, default=[1, 2, 3])
-    parser.add_argument("--backoff-ms", type=parse_int_list, default=[0, 20, 50])
+    parser.add_argument("--max-attempts", type=parse_int_list, default=list(DEFAULT_MAX_ATTEMPTS))
+    parser.add_argument("--backoff-ms", type=parse_int_list, default=list(DEFAULT_BACKOFF_MS))
     parser.add_argument(
         "--output-csv",
         type=str,

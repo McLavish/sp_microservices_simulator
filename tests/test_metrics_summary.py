@@ -3,7 +3,17 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from core import DropReason, Request, RootRequest, TimeInterval, ms_to_ns, s_to_ns
+from core import (
+    FAILURE_OUTCOMES,
+    DropReason,
+    Request,
+    RootOutcome,
+    RootRequest,
+    TimeInterval,
+    ms_to_ns,
+    require_outcome_coverage,
+    s_to_ns,
+)
 from metrics import Metrics
 
 
@@ -208,6 +218,30 @@ class TestExportGranularity(unittest.TestCase):
 
             df = pd.read_csv(path)
             self.assertEqual(df["timepoint"].nunique(), len(df))
+
+
+class TestOutcomeCoverageGuard(unittest.TestCase):
+    """A consumer table missing a non-success outcome must fail loudly.
+
+    The guard is what turns "new RootOutcome silently booked as a server drop"
+    into an import-time error, so it must reject an incomplete mapping and not
+    compare a table against itself.
+    """
+
+    def test_complete_mapping_passes(self):
+        require_outcome_coverage(FAILURE_OUTCOMES, owner="test")
+
+    def test_missing_outcome_is_named(self):
+        incomplete = dict(FAILURE_OUTCOMES)
+        del incomplete[RootOutcome.CANCELLED]
+        with self.assertRaises(RuntimeError) as ctx:
+            require_outcome_coverage(incomplete, owner="tests.incomplete_table")
+        self.assertIn("CANCELLED", str(ctx.exception))
+        self.assertIn("tests.incomplete_table", str(ctx.exception))
+
+    def test_success_needs_no_entry(self):
+        no_success = {k: v for k, v in FAILURE_OUTCOMES.items() if k is not RootOutcome.SUCCESS}
+        require_outcome_coverage(no_success, owner="test")
 
 
 if __name__ == "__main__":

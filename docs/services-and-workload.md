@@ -45,6 +45,9 @@ submit_attempt(sim, on_done, attempt_deadline=None, behavior=None) -> AttemptCon
 `on_done(success, occupancy, drop_reason, queue_size, occupancy_censored)` is
 invoked exactly once when the attempt resolves — all five arguments are passed
 positionally, so a shorter callback raises `TypeError` at the first completion.
+Its type is spelled `service.AttemptDoneCallback`, named where the only producer
+lives and imported by the two consumers that describe the same callback
+(`caller.ServiceLike`, `chain.ServiceNodeRuntime.submit_attempt`).
 The second argument is **worker occupancy**, not end-to-end node latency: for a
 tandem chain node it covers the local stage only, because the worker is handed
 back before the downstream wait (end-to-end latency is `Request.interval`).

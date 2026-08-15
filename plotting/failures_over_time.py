@@ -2,16 +2,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.ticker import PercentFormatter
 
+from core import FAILURE_OUTCOMES
 from plotting.utils.fault_events import load_fault_events, plot_fault_events
 from plotting.utils.io import build_plot_parser, load_metrics, require_rows
 
-REASON_COLUMNS = [
-    "failure_deadline",
-    "failure_server",
-    "failure_queue_full",
-    "failure_circuit_open",
-    "failure_cancelled",
-]
+# Derived from the authoritative outcome table so a new RootOutcome shows up
+# here (stack + legend follow the CSV column order) without a manual edit.
+REASON_COLUMNS = [reporting.csv_column for reporting in FAILURE_OUTCOMES.values()]
 
 
 def completed_roots(df):

@@ -83,7 +83,14 @@ seeds on the env path or training collapses to one repeated episode.
   Durations may be fractional seconds; non-positive values raise at construction.
 - **`ActionSpec`** (`rl/spec.py`) — the discrete choices: `attempt_timeout_ms`,
   `max_attempts`, `backoff_ms`, and optional `global_timeout_ms` (each a list). The
-  action space is a `MultiDiscrete` over the *indices* into these lists.
+  action space is a `MultiDiscrete` over the *indices* into these lists. The
+  study's default grid and seed lists live next to it as
+  `DEFAULT_ATTEMPT_TIMEOUTS_MS` `(10, 30, 50, 80)`, `DEFAULT_MAX_ATTEMPTS`
+  `(1, 2, 3)`, `DEFAULT_BACKOFF_MS` `(0, 20, 50)`, `DEFAULT_TRAIN_SEEDS` and
+  `DEFAULT_EVAL_SEEDS`; all three entry points (`rl.train_sb3`,
+  `compare_policies`, `constrained_retry`) take their CLI defaults from there, so
+  a saved model still loads into another entry point's grid (`check_action_spec`
+  rejects any mismatch) and separately reported experiments stay seed-comparable.
 - **`RewardWeights`** (`rl/spec.py`) — defaults `success=1.0`, `deadline_drop=1.0`,
   `queue_drop=1.0`, `server_drop=1.0`, `circuit_open_drop=1.0`,
   `p95_latency_ms=0.001`, `retries=0.1`.
@@ -105,7 +112,21 @@ reward = success_rate
        - deadline_drop_rate - queue_drop_rate - server_drop_rate - circuit_open_drop_rate
        - p95_latency_ms * 0.001
        - retries_per_root * 0.1            (each term scaled by its RewardWeights)
+       - cost_term * RewardWeights.cost    (see "Constraint cost" below)
 ```
+
+That linear form lives once, in `rl.spec.linear_reward`, and has exactly two
+callers: `MicroservicesEnv._reward_from_summary` (the training signal) and
+`EpisodeResult.objective` (the base objective **J**), which calls it with
+`retries` and `cost` weights replaced by 0. So "J is the reward with the retry
+and cost penalties zeroed" is enforced by construction rather than by two copies
+staying in step — a new weighted term is in the reward *and* in J, or in
+neither. `cost_term` is a parameter rather than a summary key because the env
+penalises a normalised retry count, not a rate (below).
+
+`cancelled_rate` is reported in the summary but deliberately carries **no**
+weight and no observation feature: cancelled work was abandoned by an upstream,
+not failed by this service.
 
 ### Constraint cost
 

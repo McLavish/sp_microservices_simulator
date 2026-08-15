@@ -16,13 +16,13 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 import numpy as np
 
 from core import Summary
-from rl.spec import RewardWeights
+from rl.spec import RewardWeights, linear_reward
 
 ActFn = Callable[[Any, dict], Sequence[int]]
 
@@ -101,17 +101,13 @@ class EpisodeResult:
         """Base objective J: the reward with retry and cost penalties zeroed.
 
         Every arm is scored on this regardless of its training weights, so the
-        comparison scale does not depend on how an arm was trained.
+        comparison scale does not depend on how an arm was trained. Literally
+        the reward with those two weights set to zero — `linear_reward` is the
+        same function the env rewards with, so a term added there cannot leave J
+        quietly measuring something else.
         """
-        return sum(
-            w.summary["success_rate"] * weights.success
-            - w.summary["deadline_drop_rate"] * weights.deadline_drop
-            - w.summary["queue_drop_rate"] * weights.queue_drop
-            - w.summary["server_drop_rate"] * weights.server_drop
-            - w.summary["circuit_open_drop_rate"] * weights.circuit_open_drop
-            - w.summary["p95_latency_ms"] * weights.p95_latency_ms
-            for w in self.windows
-        )
+        zeroed = replace(weights, retries=0.0, cost=0.0)
+        return sum(linear_reward(w.summary, zeroed) for w in self.windows)
 
     def success_rate(self, *, in_horizon: bool) -> float:
         summary = self.in_horizon if in_horizon else self.metrics
