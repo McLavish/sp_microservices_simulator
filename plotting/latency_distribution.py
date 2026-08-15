@@ -15,8 +15,17 @@ def plot_lognormal_latency(median_ms, sigma, output_file="latency_distribution.p
         sigma:    Lognormal sigma parameter (std dev of ln(latency))
         output_file: Output file name for the plot
     """
-    # For a lognormal: median = exp(mu)  =>  mu = ln(median), scale = exp(mu)
-    scale = np.exp(np.log(median_ms))
+    # Degenerate parameters push nan through log/log10 and scipy (sigma <= 0
+    # does it without a single warning), leaving a blank figure that still
+    # reports as saved with nan percentiles. Fail instead.
+    if not (np.isfinite(median_ms) and median_ms > 0):
+        raise SystemExit(f"median must be finite and > 0 (got {median_ms})")
+    if not (np.isfinite(sigma) and sigma > 0):
+        raise SystemExit(f"sigma must be finite and > 0 (got {sigma})")
+
+    # scipy parameterizes lognorm by `scale`, which IS the median (unlike
+    # random.lognormvariate in service.py, which takes mu = ln(median)).
+    scale = median_ms
 
     # x values (latency range in milliseconds)
     x_ms = np.logspace(np.log10(median_ms * 0.1), np.log10(median_ms * 10), 1000)

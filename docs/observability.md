@@ -88,13 +88,23 @@ With `--fault-events`, the active fault windows are shaded/annotated over the se
 | `latencies_over_time` | `p50/p90/p95/p99/max` | latency percentile bands over time |
 | `qps_over_time` | `root_requests`, `retries`, `failure_root` | throughput, retries, failures over time |
 | `queue_size_over_time` | `queue_avg_at_attempt_end` | average queue depth over time |
-| `latency_distribution` | *(none — synthetic)* | lognormal PDF/CDF for `--median-ms` / `--sigma` |
+| `latency_distribution` | *(none — synthetic)* | lognormal PDF/CDF for `--median` (ms) / `--sigma` |
+| `rl_traces_over_time` | trace CSV from `compare_policies` | per-step knob + success-rate traces (`--seed`, `--policies`) |
+| `rl_pareto` | `rl_constrained_comparison*.csv` | goodput-vs-amplification Pareto (+ bystander panel) |
 
 Each script writes a PNG via `--output`/`-o` (defaults: `latencies_over_time.png`,
 `qps_over_time.png`, `queue_size_over_time.png`, `latency_distribution.png`, and
 `reasons_and_request_amplification.png` for `failures_over_time`).
-`latency_distribution` takes `--median-ms` and `--sigma` instead of a CSV.
+`latency_distribution` takes `--median` (in milliseconds) and `--sigma` instead of a
+CSV; both must be finite and positive — degenerate values used to render a blank
+figure and still report it as saved.
 `plot.sh` batch-renders the standard chain figures.
+
+Selectors and overlays fail loudly rather than rendering an empty-but-plausible
+figure: a missing `--fault-events` file, an unknown fault `event_type` in that JSON,
+and an unmatched `--seed`/`--policies` in `rl_traces_over_time` all exit with a
+message naming what *is* available. Buckets in which no root completed are drawn as
+a gap, never as a 0% failure rate.
 
 ### Example
 

@@ -5,6 +5,38 @@ from matplotlib.ticker import PercentFormatter
 from plotting.utils.fault_events import load_fault_events, plot_fault_events
 from plotting.utils.io import build_plot_parser, load_metrics, require_rows
 
+REASON_COLUMNS = [
+    "failure_deadline",
+    "failure_server",
+    "failure_queue_full",
+    "failure_circuit_open",
+    "failure_cancelled",
+]
+
+
+def completed_roots(df):
+    """Roots completing in each bucket — the denominator of the reason mix."""
+    return df["success_root"] + df["failure_root"]
+
+
+def failure_reason_percentages(df):
+    """Failure reasons as a % of the roots completing in each bucket.
+
+    Buckets where NOTHING completed stay nan rather than 0%: a stalled window
+    (every root still in flight) would otherwise render as the healthiest part
+    of the figure. That is the same convention metrics.py keeps for empty
+    buckets, and the one the amplification series below already follows.
+    `stackplot` accepts nan and draws a gap — which on a stacked area is the
+    same blank as a genuine 0%, hence the labelled no-data band in `main`.
+
+    Returns the reason columns actually present and their percentages: a CSV
+    written before a reason column existed is zero, not a crash, so older
+    exports stay plottable.
+    """
+    reason_cols = [c for c in REASON_COLUMNS if c in df.columns]
+    completed = completed_roots(df).replace(0, np.nan)
+    return reason_cols, df[reason_cols].div(completed, axis=0) * 100.0
+
 
 def main(csv_file, output_file, fault_events_file=None):
     df = load_metrics(csv_file)
@@ -12,21 +44,7 @@ def main(csv_file, output_file, fault_events_file=None):
 
     t = df["timepoint"].astype(float).to_numpy()
 
-    # Per-window completed requests
-    completed = (df["success_root"] + df["failure_root"]).replace(0, np.nan)
-
-    # Breakdown by reason as % of completed
-    reason_cols = [
-        "failure_deadline",
-        "failure_server",
-        "failure_queue_full",
-        "failure_circuit_open",
-        "failure_cancelled",
-    ]
-    # Tolerate CSVs written before a reason column existed: a missing column is
-    # zero, not a crash. Keeps older exports plottable.
-    reason_cols = [c for c in reason_cols if c in df.columns]
-    reasons_pct = (df[reason_cols].div(completed, axis=0) * 100.0).fillna(0.0)
+    reason_cols, reasons_pct = failure_reason_percentages(df)
 
     # Request amplification % (extra requests due to retries relative to root)
     root = df["root_requests"].replace(0, np.nan)
@@ -45,6 +63,29 @@ def main(csv_file, output_file, fault_events_file=None):
         *[reasons_pct[c].to_numpy() for c in reason_cols],
         labels=reason_labels,
     )
+
+    # Buckets with no completions are nan above, i.e. blank — indistinguishable
+    # from a genuine 0% on a stacked area. Shade them so a stall reads as
+    # "no data", not as a flawless window.
+    no_completions = completed_roots(df).to_numpy() == 0
+    if no_completions.any():
+        ax_top.fill_between(
+            t,
+            0,
+            100,
+            where=no_completions,
+            step="post",
+            color="grey",
+            alpha=0.25,
+            hatch="//",
+            label="no completions",
+        )
+
+    # Fault events (top) — BEFORE the legend, otherwise the shaded windows are
+    # drawn but never named in it.
+    fault_events = load_fault_events(fault_events_file)
+    plot_fault_events(fault_events, ax=ax_top)
+
     ax_top.legend(loc="upper left", ncol=len(reason_labels), frameon=True)
     ax_top.set_ylabel("Failure rate (%)")
     ax_top.set_xlim(left=0)
@@ -52,12 +93,6 @@ def main(csv_file, output_file, fault_events_file=None):
     ax_top.yaxis.set_major_formatter(PercentFormatter(100))
     ax_top.grid(True, which="both")
     ax_top.set_title("Failures (%) over Time by Reason Breakdown")
-
-    # Fault events (top)
-    if fault_events_file:
-        fault_events = load_fault_events(fault_events_file)
-        plt.sca(ax_top)
-        plot_fault_events(fault_events)
 
     # BOTTOM: request amplification %
     ax_bottom.plot(t, amplification_pct, label="Request amplification")
@@ -68,12 +103,10 @@ def main(csv_file, output_file, fault_events_file=None):
     ax_bottom.yaxis.set_major_formatter(PercentFormatter(100))
     ax_bottom.grid(True, which="both")
     ax_bottom.set_title("Request Amplification Over Time")
-    ax_bottom.legend(loc="upper left", ncol=1, frameon=True)
 
-    # Fault events (bottom)
-    if fault_events_file:
-        plt.sca(ax_bottom)
-        plot_fault_events(fault_events)
+    # Fault events (bottom), again before the legend that has to name them.
+    plot_fault_events(fault_events, ax=ax_bottom)
+    ax_bottom.legend(loc="upper left", ncol=1, frameon=True)
 
     plt.tight_layout()
     plt.savefig(output_file)
