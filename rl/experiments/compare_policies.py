@@ -7,7 +7,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from core import Summary
 from rl.cli import parse_int_list, parse_optional_int_list
 from rl.constrained import ConstrainedTrainConfig, train_constrained_ppo
 from rl.env import (
@@ -24,10 +23,12 @@ from rl.policies.bayesian import BayesianPolicy
 from rl.policies.fixed import FixedPolicy, FixedValuePolicy
 from rl.policies.model_based import ModelBasedPolicy
 from rl.policies.sb3 import SB3Policy
-from rl.rollout import policy_actor, run_episode
+from rl.rollout import EpisodeResult, mean_ignoring_nan, policy_actor, run_episode
 from rl.sb3_support import import_sb3
 
-PPO, make_vec_env, _sb3_evaluate, _SubprocVecEnv, _ = import_sb3()
+_SB3 = import_sb3()
+PPO, make_vec_env = _SB3.ppo, _SB3.make_vec_env
+_SB3_IMPORT_ERROR = _SB3.import_error
 
 
 @dataclass
@@ -96,7 +97,7 @@ def _episode(
     policy,
     seed: int,
     trace_rows: list[dict] | None = None,
-) -> tuple[float, Summary | None, Summary | None, float]:
+) -> EpisodeResult:
     policy.reset(seed=seed)
     result = run_episode(
         env,
@@ -129,7 +130,10 @@ def _episode(
             }
             for window in result.windows
         )
-    return result.total_reward, result.metrics, result.in_horizon, result.pooled_cost
+    # Return the shared result itself: flattening it into a positional tuple is
+    # what forced this module to re-implement EpisodeResult.success_rate inline
+    # and put bystander_success_rate()/drained_summary out of reach.
+    return result
 
 
 def _evaluate(
@@ -147,32 +151,34 @@ def _evaluate(
     costs = []
 
     for seed in seeds:
-        total_reward, summary, horizon, cost_mean = _episode(
-            env, policy, seed, trace_rows=trace_rows
-        )
-        rewards.append(total_reward)
-        costs.append(cost_mean)
-        if summary:
-            successes.append(summary.succeeded / summary.total if summary.total else 0.0)
-            p95s.append(summary.p95)
-            retries.append(summary.retries_per_root)
-        if horizon:
-            successes_horizon.append(horizon.succeeded / horizon.total if horizon.total else 0.0)
-            p95s_horizon.append(horizon.p95)
+        result = _episode(env, policy, seed, trace_rows=trace_rows)
+        rewards.append(result.total_reward)
+        costs.append(result.pooled_cost)
+        if result.metrics:
+            # Through the shared accessor, so this path and _eval_arm cannot
+            # drift on what "success rate over a population" means.
+            successes.append(result.success_rate(in_horizon=False))
+            p95s.append(result.metrics.p95)
+            retries.append(result.metrics.retries_per_root)
+        if result.in_horizon:
+            successes_horizon.append(result.success_rate(in_horizon=True))
+            p95s_horizon.append(result.in_horizon.p95)
 
     def avg(values: list[float]) -> float:
         return float(np.mean(values)) if values else 0.0
 
     # success_rate / p95_ms keep their historical full-population meaning
     # (incl. drained roots); the *_in_horizon columns cover exactly the roots
-    # the reward saw.
+    # the reward saw. Percentiles go through mean_ignoring_nan: a seed with no
+    # successful root reports p95 as nan by design, and plain averaging would
+    # void the cell for every other seed too.
     return {
         "reward_mean": avg(rewards),
         "reward_std": float(np.std(rewards)) if rewards else 0.0,
         "success_rate": avg(successes),
-        "p95_ms": avg(p95s),
+        "p95_ms": mean_ignoring_nan(p95s),
         "success_rate_in_horizon": avg(successes_horizon),
-        "p95_ms_in_horizon": avg(p95s_horizon),
+        "p95_ms_in_horizon": mean_ignoring_nan(p95s_horizon),
         "retries_per_root": avg(retries),
         "cost_mean": avg(costs),
     }
@@ -180,7 +186,10 @@ def _evaluate(
 
 def _train_ppo(cfg: ExperimentConfig, learning_curve_csv: str | None = None) -> SB3Policy:
     if PPO is None or make_vec_env is None:
-        raise ImportError("stable-baselines3 is required for PPO baseline")
+        # Chained: import_sb3 catches bare Exception, so a broken torch/sb3
+        # install is otherwise indistinguishable from a missing one and the
+        # user is sent to reinstall a package they already have.
+        raise ImportError("stable-baselines3 is required for PPO baseline") from _SB3_IMPORT_ERROR
     from stable_baselines3.common.callbacks import (
         EvalCallback,
         StopTrainingOnNoModelImprovement,
@@ -507,7 +516,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     if "ppo" in policy_names:
         if args.ppo_load_path:
             if PPO is None:
-                raise ImportError("stable-baselines3 is required for PPO baseline")
+                raise ImportError(
+                    "stable-baselines3 is required for PPO baseline"
+                ) from _SB3_IMPORT_ERROR
             check_action_spec(args.ppo_load_path, action_spec, cfg.step_duration_s)
             model = PPO.load(args.ppo_load_path)
             policies.append(SB3Policy(model=model, deterministic=True, name="ppo"))

@@ -11,7 +11,9 @@ from rl.model_io import check_action_spec, save_action_spec
 from rl.rollout import model_actor, run_episode
 from rl.sb3_support import import_sb3
 
-PPO, make_vec_env, _, SubprocVecEnv, _SB3_IMPORT_ERROR = import_sb3()
+_SB3 = import_sb3()
+PPO, make_vec_env, SubprocVecEnv = _SB3.ppo, _SB3.make_vec_env, _SB3.subproc_vec_env
+_SB3_IMPORT_ERROR = _SB3.import_error
 
 
 @dataclass

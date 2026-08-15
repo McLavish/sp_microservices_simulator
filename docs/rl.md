@@ -48,7 +48,13 @@ builder's workload duration outlives `episode_duration_s`. Accounting notes:
   score the externality on the same population as J.
 - **`terminal_drain_penalty`** (default off) folds drained-root outcomes into the
   final step's reward, weighted by how many average-sized step windows the
-  drained population represents. It removes the bulk of the incentive to defer
+  drained population represents. That window size is measured on the
+  **in-horizon** population: the post-drain root count already includes the very
+  tail being priced, so dividing by it understates the weight by exactly
+  `horizon / (horizon + drained)` — worst precisely when the agent defers the
+  most. When nothing completed in-horizon there is no measured window size and
+  the expected roots per window (below) stands in. The flag removes the bulk of
+  the incentive to defer
   failures past the horizon; a small boundary residual remains (roughly one
   drained-tail window weight, ~2% of J in the slow-failure repro) because
   in-horizon windows are rate-scored while the drain is count-weighted — fully
@@ -106,9 +112,25 @@ reward = success_rate
 `EnvComponents.cost_client` (set by the chain builders to the B→C edge client)
 defines where the constraint cost is measured: `summary["cost"]` is the edge's
 retry amplification (retries per edge root) over each window — distinct from
-`retries_per_root`, which measures the top-level client. The reward subtracts
-`cost * RewardWeights.cost`; the weight defaults to 0 and doubles as the
-Lagrange multiplier in constrained training.
+`retries_per_root`, which measures the top-level client. `summary["cost_retries"]`
+and `summary["cost_roots"]` carry that window's raw counts so consumers can pool
+them across the episode instead of averaging ratios.
+
+The reward does **not** subtract the per-window ratio. It subtracts the window's
+retry *count* divided by a constant fixed at `reset()` — the roots a window is
+expected to carry at the offered arrival rate, `base_rps × step_duration_s` —
+times `RewardWeights.cost`. The episode sum is then
+`total_retries / expected_roots_per_window`: independent of the order the windows
+arrive in, and a fixed multiple of the episode's total retries, so the primal
+prices the same quantity the dual ascends on (`EpisodeResult.pooled_cost`,
+Σretries / Σroots pooled over the episode). The two rejected alternatives both
+break that: the raw per-window ratio is length-biased exactly like a
+macro-average of ratios (measured 1.104 window-mean vs 1.253 pooled), and a
+*running* mean of the observed roots-per-window makes the episode sum
+order-dependent — windows of (5 retries, 5 roots) then (0, 100) summed to 1.0
+while the reverse order summed to 0.095, same pooled cost. The weight defaults to
+0 and doubles as the Lagrange multiplier in constrained training; the term falls
+back to the raw ratio only when the workload declares no arrival rate.
 
 ### Applying an action
 
@@ -150,6 +172,17 @@ provides `ActionGrid` (enumerate/snap-to-nearest) and `coerce_action`.
 The model-based surrogate only models attempt latency vs. timeout: queue-full drops
 and server failures are outside its vocabulary.
 
+Both search policies share `_argmax_over_grid` (`model_based.py`): candidates are
+scored against **common random numbers** inside a window (so the argmax is a
+decision, not resampling noise), exact ties break toward the cheapest action
+(`_action_cost_key`; `global_timeout_ms=None` counts as the *most* permissive
+setting of that knob), and the stream is then **jumped** so the next window draws
+fresh samples instead of re-scoring the previous window's. With nothing usable to
+fit — an empty buffer, or a fully censored one with no earlier fit to hold — they
+fall back to the **mid-grid** action, matching the env's warm-up action; index 0 is
+the pathological corner. A fully censored window with an earlier fit holds that fit
+(identifiability guard).
+
 ## Latency models (`rl/models/`)
 
 All implement `LatencyModel` (`rl/models/base.py`): `fit`, `logpdf`, `cdf`,
@@ -157,7 +190,7 @@ All implement `LatencyModel` (`rl/models/base.py`): `fit`, `logpdf`, `cdf`,
 
 | Model | Captures |
 | --- | --- |
-| `LogNormalModel` (`lognormal.py`) | a single lognormal backed by `scipy.stats.lognorm`; `fit_censored` does right-censored MLE via `scipy.stats.CensoredData`; `moments()` feeds the queueing math |
+| `LogNormalModel` (`lognormal.py`) | a single lognormal backed by `scipy.stats.lognorm`; `fit_censored` does right-censored MLE via `scipy.stats.CensoredData` (the queueing math takes its moments from the raw service buffer, not from a fitted model — see `ModelBasedPolicy._service_moments`) |
 | `LogNormalMixtureModel` (`lognormal_mixture.py`) | a K-component lognormal mixture fit in log-space, for multi-modal latency |
 | `EVTTailModel` (`evt_tail.py`) | a lognormal **body** plus a Pareto tail above a threshold quantile (Hill estimator, not GPD peaks-over-threshold) |
 
@@ -222,7 +255,11 @@ whether the scenario supports the study at all: the unconstrained optimum
 must retry (max_attempts ≥ 2) at a cost above the smallest budget, tighter
 budgets must trade J for cost beyond eval noise, and the retries must
 measurably hurt the bystander. Run it after touching the builder's fault or
-capacity constants; the FAIL messages name the knob to turn.
+capacity constants; the FAIL messages name the knob to turn. Three of those
+criteria are stated against a no-retry baseline, so the grid must contain
+`max_attempts = 1` (the default `--max-attempts 1,2,3` does); a grid without it
+is rejected up front rather than after the sweep, and a budget below the
+cheapest action in the grid is reported as infeasible.
 
 #### Findings (multichain sweep, 30k timesteps, 10 eval seeds)
 

@@ -214,6 +214,62 @@ class TestMicroservicesEnv(unittest.TestCase):
             costs.append(info["summary"]["cost"])
         self.assertGreater(max(costs), 0.0)
 
+    def _cost_window(self, env, retries, roots):
+        summary = env._summarize_roots([])
+        summary["cost_retries"] = float(retries)
+        summary["cost_roots"] = float(roots)
+        summary["cost"] = retries / roots if roots else 0.0
+        return summary
+
+    def test_cost_penalty_sum_is_order_independent(self):
+        """The episode's cost term must price total retries, not their order.
+
+        Dividing each window by a RUNNING mean of roots-per-window made the sum
+        depend on where the retry-heavy windows fell: windows (5 retries/5
+        roots) then (0/100) summed to 1.0 while the reverse order summed to
+        0.095 — identical pooled cost, 10.5x apart. The dual ascends on
+        EpisodeResult.pooled_cost, which carries no such weighting, so primal
+        and dual were priced on different quantities.
+        """
+        env = self._make_env(build_chain_env, episode_duration_s=2.0)
+        env.reset(seed=11)
+        heavy = self._cost_window(env, 5, 5)
+        light = self._cost_window(env, 0, 100)
+
+        forward = env._cost_penalty(heavy) + env._cost_penalty(light)
+        backward = env._cost_penalty(light) + env._cost_penalty(heavy)
+        self.assertAlmostEqual(forward, backward, places=12)
+
+        # The sum is exactly total_retries / expected_roots_per_window: a fixed
+        # multiple of the retries the constraint is stated over.
+        expected_roots = env._require_components().workload.base_rps * env.step_duration_s
+        self.assertAlmostEqual(forward, 5.0 / expected_roots, places=12)
+
+    def test_cost_penalty_is_a_pure_function_of_the_window(self):
+        """Scoring one window must not reprice the next.
+
+        `_reward_from_summary` reads as a pure summary->float mapping and is
+        called twice in one step when terminal_drain_penalty is on.
+        """
+        env = self._make_env(build_chain_env, episode_duration_s=2.0)
+        env.reset(seed=11)
+        other = self._cost_window(env, 1, 10)
+        window = self._cost_window(env, 3, 200)
+
+        alone = env._cost_penalty(window)
+        env._cost_penalty(other)
+        self.assertAlmostEqual(env._cost_penalty(window), alone, places=12)
+
+    def test_summary_keys_are_identical_with_and_without_traffic(self):
+        # A consumer reading info["summary"] must not KeyError only in the
+        # windows where nothing completed.
+        env = self._make_env(build_chain_env, episode_duration_s=2.0)
+        env.reset(seed=11)
+        _, _, _, _, info = env.step(np.array([1, 1, 0]))
+        populated = info["summary"]
+        self.assertGreater(populated["completed"], 0)
+        self.assertEqual(set(env._summarize_roots([])), set(populated))
+
     def test_reward_penalizes_cost(self):
         env = self._make_env(build_single_service_env)
         summary = env._summarize_roots([])
@@ -571,6 +627,94 @@ class TestPopulationAccounting(unittest.TestCase):
         _, j_defer_on, _ = self._run_episode((1, 0, 0), terminal_drain_penalty=True)
         _, j_fail_on, _ = self._run_episode((0, 0, 0), terminal_drain_penalty=True)
         self.assertLess(abs(j_defer_on - j_fail_on), abs(j_defer_off - j_fail_off))
+
+    def test_drain_weight_uses_the_pre_drain_window_size(self):
+        """The drained tail must not inflate its own denominator.
+
+        The weight expresses the drained population as a number of
+        average-sized step windows. Reading the window size off the root index
+        *after* the drain has been folded into it understates the weight by
+        exactly horizon/(horizon+drained) — worst precisely when the agent
+        defers the most work past the horizon, which is what the flag punishes.
+        """
+
+        def run(penalty):
+            env = MicroservicesEnv(
+                EnvConfig(
+                    build=lambda seed: _build_slow_failing_env(seed, duration_s=3.0),
+                    action_spec=SLOW_SPEC,
+                    step_duration_s=1.0,
+                    episode_duration_s=3.0,
+                    terminal_drain_penalty=penalty,
+                    initial_action=(1, 0, 0),
+                )
+            )
+            env.reset(seed=42)
+            total = 0.0
+            terminated = truncated = False
+            while not (terminated or truncated):
+                _, reward, terminated, truncated, info = env.step((1, 0, 0))
+                total += float(reward)
+            return env, total, info
+
+        _, total_off, _ = run(False)
+        env, total_on, info = run(True)
+        drained = info["drained_summary"]
+        # Both populations must be substantial or the two denominators agree.
+        self.assertGreater(drained["completed"], 0)
+        self.assertGreater(env._horizon_root_count, 0)
+
+        per_step = env._horizon_root_count / env._episode_steps
+        weight = drained["completed"] / max(1.0, per_step)
+        self.assertAlmostEqual(
+            total_on - total_off, weight * env._reward_from_summary(drained), places=9
+        )
+        # The post-drain population would have priced the same tail far cheaper.
+        post_drain_weight = drained["completed"] / max(1.0, env._last_root_idx / env._episode_steps)
+        self.assertGreater(weight, 2.0 * post_drain_weight)
+
+    def test_drain_weight_falls_back_to_the_expected_window_size(self):
+        # Nothing completes in-horizon here (every root outlives the episode),
+        # so there is no measured window size; the offered rate supplies one
+        # instead of the whole drain being priced as N one-root windows.
+        _, total_off, _ = self._run_episode((1, 0, 0))
+        env, total_on, info = self._run_episode((1, 0, 0), terminal_drain_penalty=True)
+        drained = info["drained_summary"]
+        self.assertEqual(env._horizon_root_count, 0)
+        self.assertGreater(drained["completed"], 0)
+        weight = drained["completed"] / env._roots_per_window
+        self.assertAlmostEqual(
+            total_on - total_off, weight * env._reward_from_summary(drained), places=9
+        )
+
+
+class TestSeedNormalization(unittest.TestCase):
+    """`build_X(None)` must be `build_X(1)`, not a hybrid.
+
+    The builders resolved None twice: the simulator and the fault RNG to 1, the
+    Workload to whatever `Workload.__post_init__` falls back to (0). Both are
+    deterministic, so nothing looked broken — but the two calls produced
+    identical fault windows and service-time streams over *different* arrival
+    processes, and nothing said which stream had moved.
+    """
+
+    @staticmethod
+    def _arrival_times(workload):
+        sim = Simulator(seed=0)
+        times: list[int] = []
+        workload.drive(sim, lambda s: times.append(s.timestep))
+        sim.run()
+        return times
+
+    def test_none_seed_resolves_to_one_in_every_stream(self):
+        for builder in (build_single_service_env, build_chain_env, build_multichain_env):
+            with self.subTest(builder=builder.__name__):
+                default = builder(None, 3.0)
+                explicit = builder(1, 3.0)
+                self.assertEqual(default.workload.rng_seed, 1)
+                arrivals = self._arrival_times(default.workload)
+                self.assertGreater(len(arrivals), 0)
+                self.assertEqual(arrivals, self._arrival_times(explicit.workload))
 
 
 @unittest.skipIf(gymnasium is None, "gymnasium not installed")

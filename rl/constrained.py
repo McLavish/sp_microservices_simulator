@@ -31,7 +31,9 @@ from rl.rollout import model_actor, run_episode
 from rl.sb3_support import import_sb3
 from rl.spec import ActionSpec, RewardWeights
 
-PPO, make_vec_env, _, SubprocVecEnv, _SB3_IMPORT_ERROR = import_sb3()
+_SB3 = import_sb3()
+PPO, make_vec_env, SubprocVecEnv = _SB3.ppo, _SB3.make_vec_env, _SB3.subproc_vec_env
+_SB3_IMPORT_ERROR = _SB3.import_error
 
 
 @dataclass
@@ -93,6 +95,14 @@ def train_constrained_ppo(cfg: ConstrainedTrainConfig) -> SB3Policy:
             "stable-baselines3 is required for constrained training"
         ) from _SB3_IMPORT_ERROR
 
+    # Validate before allocating: `make_vec_env` below spawns `n_envs` worker
+    # interpreters, and a config error raised after that leaves them orphaned.
+    if cfg.chunk_timesteps <= 0:
+        # chunk=0 would call learn(0) forever: `trained` never advances.
+        raise ValueError(f"chunk_timesteps must be > 0, got {cfg.chunk_timesteps}")
+    if cfg.timesteps <= 0:
+        raise ValueError(f"timesteps must be > 0, got {cfg.timesteps}")
+
     weights = replace(
         cfg.base_weights,
         retries=0.0 if cfg.zero_retry_penalty else cfg.base_weights.retries,
@@ -133,29 +143,32 @@ def train_constrained_ppo(cfg: ConstrainedTrainConfig) -> SB3Policy:
     eval_env = make_env()
     eval_env.reset(seed=cfg.eval_seed)
 
-    if cfg.chunk_timesteps <= 0:
-        # chunk=0 would call learn(0) forever: `trained` never advances.
-        raise ValueError(f"chunk_timesteps must be > 0, got {cfg.chunk_timesteps}")
-    if cfg.timesteps <= 0:
-        raise ValueError(f"timesteps must be > 0, got {cfg.timesteps}")
-
     lam = cfg.lambda_init
     curve: list[tuple[int, float, float, float]] = []
     trained = 0
-    while trained < cfg.timesteps:
-        chunk = min(cfg.chunk_timesteps, cfg.timesteps - trained)
-        # SB3 semantics: with reset_num_timesteps=False, learn() trains
-        # `total_timesteps` ADDITIONAL steps (_setup_learn adds the current
-        # num_timesteps). Pass the per-chunk increment; the counter, schedules,
-        # and in-flight episodes still continue across chunks.
-        model.learn(total_timesteps=chunk, reset_num_timesteps=False)
-        trained = int(model.num_timesteps)  # true cumulative; curve rows stay honest
-        eval_objective, eval_cost = evaluate_objective_and_cost(
-            model, eval_env, cfg.eval_episodes, cfg.base_weights
-        )
-        lam = dual_ascent_update(lam, eval_cost, cfg.budget, cfg.lambda_lr)
-        vec_env.env_method("set_cost_weight", lam)
-        curve.append((trained, eval_objective, eval_cost, lam))
+    try:
+        while trained < cfg.timesteps:
+            chunk = min(cfg.chunk_timesteps, cfg.timesteps - trained)
+            # SB3 semantics: with reset_num_timesteps=False, learn() trains
+            # `total_timesteps` ADDITIONAL steps (_setup_learn adds the current
+            # num_timesteps). Pass the per-chunk increment; the counter,
+            # schedules, and in-flight episodes still continue across chunks.
+            model.learn(total_timesteps=chunk, reset_num_timesteps=False)
+            trained = int(model.num_timesteps)  # true cumulative; curve rows stay honest
+            eval_objective, eval_cost = evaluate_objective_and_cost(
+                model, eval_env, cfg.eval_episodes, cfg.base_weights
+            )
+            lam = dual_ascent_update(lam, eval_cost, cfg.budget, cfg.lambda_lr)
+            vec_env.env_method("set_cost_weight", lam)
+            curve.append((trained, eval_objective, eval_cost, lam))
+    finally:
+        # Nothing else closes it: SB3 defines no __del__ on VecEnv, and the
+        # returned policy keeps model -> model.env alive, so a caller training
+        # several arms in one process (rl.experiments.constrained_retry) would
+        # hold every arm's workers open until the process exits. Only
+        # `model.predict` is used afterwards, which never touches the env.
+        vec_env.close()
+        eval_env.close()
 
     if cfg.learning_curve_csv and curve:
         with open(cfg.learning_curve_csv, "w", newline="") as f:

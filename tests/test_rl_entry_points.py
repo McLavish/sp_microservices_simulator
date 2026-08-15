@@ -19,7 +19,7 @@ except Exception:  # pragma: no cover
 
 from rl.sb3_support import import_sb3
 
-_PPO = import_sb3()[0]
+_PPO = import_sb3().ppo
 
 
 @unittest.skipIf(gymnasium is None, "gymnasium not installed")
@@ -64,6 +64,103 @@ class TestComparePoliciesEntryPoint(unittest.TestCase):
     def test_unknown_policy_name_is_rejected(self):
         with self.assertRaises(SystemExit):
             self._run(["--policies", "fixed,not_a_policy"])
+
+    def test_one_zero_success_seed_does_not_void_the_p95_column(self):
+        """`Metrics.summary().p95` is nan when no root succeeded — deliberately.
+
+        Averaging the eval seeds with plain np.mean propagated that nan into the
+        reported cell and threw away every other seed's data.
+        """
+        import math
+
+        from caller import ClientConfig, ClientRuntime
+        from core import TimeInterval, ms_to_ns, s_to_ns
+        from faults import PartialFailure
+        from retry_policies import FixedBackoffRetryPolicy
+        from rl.env import EnvComponents, EnvConfig, MicroservicesEnv
+        from rl.experiments.compare_policies import _evaluate
+        from rl.policies.fixed import FixedPolicy
+        from rl.spec import ActionSpec
+        from service import ServiceConfig, ServiceRuntime
+        from simulator import Simulator
+        from timeout_controllers import StaticTimeoutController
+        from workload import Workload
+
+        def build(seed):
+            # Odd seeds fail every request, so that episode reports p95 = nan.
+            p_fail = 1.0 if int(seed) % 2 else 0.0
+            sim = Simulator(seed=int(seed))
+            svc_cfg = ServiceConfig(
+                name="svc",
+                latency_median=ms_to_ns(5),
+                latency_lognorm_sigma=0.1,
+                workers=32,
+                partial_failures=[
+                    PartialFailure(duration=TimeInterval(begin=0, end=s_to_ns(1000)), p_fail=p_fail)
+                ],
+            )
+            timeout_ctrl = StaticTimeoutController(
+                global_timeout=None, attempt_timeout=ms_to_ns(50)
+            )
+            retry = FixedBackoffRetryPolicy(max_attempts=1, delay=0)
+            client = ClientRuntime(
+                cfg=ClientConfig(retry=retry, timeout_controller=timeout_ctrl),
+                service=ServiceRuntime(cfg=svc_cfg).bind(),
+            )
+
+            def apply_knobs(values):
+                timeout_ctrl.attempt_timeout = ms_to_ns(values.attempt_timeout_ms)
+                retry.max_attempts = values.max_attempts
+                retry.delay = ms_to_ns(values.backoff_ms)
+
+            return EnvComponents(
+                sim=sim,
+                workload=Workload(
+                    base_rps=50.0, duration_s=2.0, load_spikes=[], rng_seed=int(seed)
+                ),
+                client=client,
+                apply_knobs=apply_knobs,
+            )
+
+        spec = ActionSpec(attempt_timeout_ms=[50], max_attempts=[1], backoff_ms=[0])
+        env = MicroservicesEnv(
+            EnvConfig(build=build, action_spec=spec, step_duration_s=1.0, episode_duration_s=2.0)
+        )
+        metrics = _evaluate(env, FixedPolicy(action=(0, 0, 0)), [1, 2])
+        self.assertFalse(math.isnan(metrics["p95_ms"]), "one nan seed voided the whole column")
+        self.assertGreater(metrics["p95_ms"], 0.0)
+
+    def test_ppo_import_error_names_the_real_cause(self):
+        # import_sb3 catches bare Exception, so a broken torch/sb3 install must
+        # not be reported as a missing package with the cause thrown away.
+        import rl.experiments.compare_policies as mod
+
+        cause = RuntimeError("torch ABI mismatch")
+        saved = (mod.PPO, mod.make_vec_env, mod._SB3_IMPORT_ERROR)
+        mod.PPO = None
+        mod.make_vec_env = None
+        mod._SB3_IMPORT_ERROR = cause
+        try:
+            with tempfile.TemporaryDirectory() as d, self.assertRaises(ImportError) as ctx:
+                mod.main(
+                    [
+                        "--fault-scenario",
+                        "none",
+                        "--episode-duration-s",
+                        "2.0",
+                        "--eval-seeds",
+                        "1",
+                        "--policies",
+                        "ppo",
+                        "--output-csv",
+                        os.path.join(d, "r.csv"),
+                        "--traces-csv",
+                        os.path.join(d, "t.csv"),
+                    ]
+                )
+        finally:
+            mod.PPO, mod.make_vec_env, mod._SB3_IMPORT_ERROR = saved
+        self.assertIs(ctx.exception.__cause__, cause)
 
     def test_traces_csv_records_one_row_per_window(self):
         from rl.experiments.compare_policies import main
@@ -125,6 +222,41 @@ class TestConstrainedRetryEntryPoint(unittest.TestCase):
         # regression this guards against - an always-succeed exit. Pin the
         # verdict: this configuration deterministically fails the gate.
         self.assertEqual(ctx.exception.code, 1)
+
+    def test_calibration_rejects_a_grid_without_a_no_retry_baseline(self):
+        """`--max-attempts 2,3` is a legal ActionSpec but has no no-retry arm.
+
+        Criteria (a)/(d)/(e) are all stated against that baseline, and the gate
+        used to run the whole (expensive) sweep and then die on `max()` of an
+        empty sequence.
+        """
+        from rl.experiments.constrained_retry import _run_calibration
+        from rl.policies.action_space import ActionGrid
+        from rl.spec import ActionSpec
+
+        spec = ActionSpec(attempt_timeout_ms=[30], max_attempts=[2, 3], backoff_ms=[0])
+        env = self._chain_env(spec)
+        with self.assertRaises(SystemExit) as ctx:
+            _run_calibration(env, ActionGrid(spec), [1], [1], [0.1])
+        self.assertIn("max_attempts", str(ctx.exception))
+
+    def test_calibration_reports_an_infeasible_budget(self):
+        from rl.experiments.constrained_retry import _run_calibration
+        from rl.policies.action_space import ActionGrid
+        from rl.spec import ActionSpec
+
+        spec = ActionSpec(attempt_timeout_ms=[30], max_attempts=[1], backoff_ms=[0])
+        env = self._chain_env(spec)
+        with self.assertRaises(SystemExit) as ctx:
+            _run_calibration(env, ActionGrid(spec), [1], [1], [-1.0])
+        self.assertIn("-1.0", str(ctx.exception))
+
+    @staticmethod
+    def _chain_env(spec):
+        from rl.env import SCENARIO_BUILDERS
+        from rl.experiments.constrained_retry import _make_env
+
+        return _make_env(lambda seed: SCENARIO_BUILDERS["chain"](seed, 2.0), spec, 2.0)
 
     def test_calibration_exits_zero_when_the_gate_passes(self):
         """The passing branch, which no run ever reached."""
@@ -291,6 +423,50 @@ class TestRolloutIsShared(unittest.TestCase):
         )
         expected = 0.8 - 0.1 - 0.05 - 0.05 - 0.0 - 100.0 * weights.p95_latency_ms
         self.assertAlmostEqual(result.objective(weights), expected, places=12)
+
+    def test_compare_policies_episode_returns_the_shared_result(self):
+        """`_episode` used to flatten EpisodeResult into a positional 4-tuple.
+
+        That flattening is why `_evaluate` re-implemented
+        EpisodeResult.success_rate inline while every other caller used the
+        accessor, and why bystander_success_rate()/drained_summary were out of
+        reach from this path.
+        """
+        from rl.env import SCENARIO_BUILDERS
+        from rl.experiments.compare_policies import _episode
+        from rl.experiments.constrained_retry import _make_env
+        from rl.policies.fixed import FixedPolicy
+        from rl.rollout import EpisodeResult
+        from rl.spec import ActionSpec
+
+        spec = ActionSpec([30, 80], [1, 2], [0, 20])
+        env = _make_env(lambda seed: SCENARIO_BUILDERS["chain"](seed, 3.0), spec, 3.0)
+        result = _episode(env, FixedPolicy(action=(1, 1, 1)), 321)
+        self.assertIsInstance(result, EpisodeResult)
+        horizon = result.in_horizon
+        assert horizon is not None
+        self.assertAlmostEqual(
+            result.success_rate(in_horizon=True),
+            horizon.succeeded / horizon.total,
+            places=12,
+        )
+
+    def test_mean_ignoring_nan_keeps_the_seeds_that_reported(self):
+        import math
+
+        from rl.rollout import mean_ignoring_nan
+
+        self.assertAlmostEqual(mean_ignoring_nan([float("nan"), 1.0, 3.0]), 2.0)
+        self.assertEqual(mean_ignoring_nan([]), 0.0)
+        # All missing stays visibly missing rather than collapsing to 0 ms.
+        self.assertTrue(math.isnan(mean_ignoring_nan([float("nan"), float("nan")])))
+
+    def test_sb3_shim_exposes_named_slots(self):
+        # Four modules unpacked this shim; positional unpacking meant inserting
+        # or reordering a slot silently rebound every caller.
+        self.assertEqual(
+            import_sb3()._fields, ("ppo", "make_vec_env", "subproc_vec_env", "import_error")
+        )
 
     def test_eval_arm_cost_matches_the_shared_pooled_cost(self):
         import numpy as np

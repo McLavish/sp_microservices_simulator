@@ -39,11 +39,13 @@ from rl.env import (
 )
 from rl.policies.action_space import ActionGrid
 from rl.policies.fixed import FixedPolicy
-from rl.rollout import policy_actor, run_episode
+from rl.rollout import mean_ignoring_nan, policy_actor, run_episode
 from rl.sb3_support import import_sb3
 from rl.spec import RewardWeights
 
-PPO, _, _, _, _SB3_IMPORT_ERROR = import_sb3()
+_SB3 = import_sb3()
+PPO = _SB3.ppo
+_SB3_IMPORT_ERROR = _SB3.import_error
 
 BASE_WEIGHTS = RewardWeights()
 
@@ -113,10 +115,13 @@ def _eval_arm(
         "J_mean": float(np.mean(objectives)),
         "J_std": float(np.std(objectives)),
         "success_rate": float(np.mean(successes)) if successes else 0.0,
-        "p95_ms": float(np.mean(p95s)) if p95s else 0.0,
+        # Percentiles are nan for a seed whose episode had no successful root
+        # (Metrics.summary reports missing data as nan, not 0 ms); averaging
+        # them plainly would void the cell for every other seed as well.
+        "p95_ms": mean_ignoring_nan(p95s),
         # Full-population above (incl. drained roots); reward-visible below.
         "success_rate_in_horizon": float(np.mean(successes_horizon)) if successes_horizon else 0.0,
-        "p95_ms_in_horizon": float(np.mean(p95s_horizon)) if p95s_horizon else 0.0,
+        "p95_ms_in_horizon": mean_ignoring_nan(p95s_horizon),
         "cost_mean": float(np.mean(costs)),
         "violation_rate": float(np.mean(violations)) if violations else "",
         # Empty when the scenario has no bystander chain (CSV-shape convention
@@ -158,6 +163,14 @@ def _run_calibration(
     a bystander chain exists) the agent's retries must measurably hurt it.
     Returns True when every applicable criterion passes.
     """
+    # Check the grid up front, not after minutes of sweeping: criteria (a), (d)
+    # and (e) are all stated against a no-retry baseline, and ActionSpec happily
+    # accepts a max_attempts list that omits 1 (e.g. `--max-attempts 2,3`).
+    if not any(grid.values_for(idx).max_attempts == 1 for idx in grid.indices):
+        raise SystemExit(
+            "--calibrate needs a no-retry baseline: none of the actions in this "
+            "grid has max_attempts == 1. Add 1 to --max-attempts."
+        )
     print(f"[calibrate] sweeping {len(grid.indices)} fixed actions on seeds {list(oracle_seeds)}")
     sweep: list[tuple[tuple[int, ...], dict]] = []
     for action_idx in grid.indices:
@@ -190,8 +203,16 @@ def _run_calibration(
     # Feasible optimum per budget, selected on the sweep's cost (as arm C's
     # oracle would see it), re-evaluated on the eval seeds for tighter stats.
     feasible: dict[float, dict] = {}
+    cheapest = min(item[1]["cost_mean"] for item in sweep)
     for budget in sorted(budgets):
         candidates = [item for item in sweep if item[1]["cost_mean"] <= budget]
+        if not candidates:
+            # Unreachable for a non-negative budget once a no-retry action is in
+            # the grid (its cost is exactly 0), so this is a bad --budgets value.
+            raise SystemExit(
+                f"budget {budget} is infeasible: the cheapest action in this grid "
+                f"costs {cheapest:.3f}. Raise --budgets or widen --max-attempts."
+            )
         idx, _ = max(candidates, key=lambda item: item[1]["J_mean"])
         feasible[budget] = re_eval(idx)
 

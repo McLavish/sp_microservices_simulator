@@ -167,8 +167,7 @@ class MicroservicesEnv(_GymEnvBase):
         self._horizon_root_count = 0
         self._bystander_horizon_count = 0
         self._last_admitted = 0
-        self._cost_roots_seen = 0.0
-        self._cost_windows = 0
+        self._roots_per_window = 0.0
         self._episode_steps = 0
         self._current_time_ns: TimePoint = 0
         self._end_time_ns: TimePoint = 0
@@ -217,6 +216,13 @@ class MicroservicesEnv(_GymEnvBase):
             else self._require_workload().duration_s
         )
         self._end_time_ns = s_to_ns(episode_s)
+        # How many roots a step window is EXPECTED to carry at the offered
+        # arrival rate. Fixed at reset, so every window-level quantity divided
+        # by it (the cost penalty, the terminal-drain weight) stays independent
+        # of the order the windows arrive in and of the traffic the drain adds.
+        self._roots_per_window = (
+            max(0.0, self._require_workload().base_rps) * self._cfg.step_duration_s
+        )
 
         self._last_root_idx = 0
         self._last_cost_root_idx = 0
@@ -224,8 +230,6 @@ class MicroservicesEnv(_GymEnvBase):
         self._horizon_root_count = 0
         self._bystander_horizon_count = 0
         self._last_admitted = 0
-        self._cost_roots_seen = 0.0
-        self._cost_windows = 0
         self._episode_steps = 0
         self._require_workload().drive(
             self._require_sim(), lambda s: self._require_client().start_request(s)
@@ -327,8 +331,19 @@ class MicroservicesEnv(_GymEnvBase):
                 # window's completions, so a flat drained-window rate would
                 # penalize 2 drained roots as hard as 100. Scale by how many
                 # average-sized step windows the drained population represents.
-                total_completed = self._last_root_idx
-                per_step = total_completed / max(1, self._episode_steps)
+                # The window size is measured on the PRE-drain population:
+                # `_last_root_idx` has already absorbed the drained tail above,
+                # and dividing by that inflated denominator understates the
+                # weight by exactly horizon/(horizon+drained) — worst precisely
+                # when the agent defers the most, which is what the flag exists
+                # to punish.
+                per_step = self._horizon_root_count / max(1, self._episode_steps)
+                if per_step <= 0.0:
+                    # Nothing completed in-horizon (every root outlives the
+                    # episode), so there is no measured window size. Fall back
+                    # to the expected one rather than to a window of one root,
+                    # which would price the whole drain as N whole windows.
+                    per_step = self._roots_per_window
                 weight = drained_summary["completed"] / max(1.0, per_step)
                 reward += weight * self._reward_from_summary(drained_summary)
         if terminated:
@@ -429,48 +444,33 @@ class MicroservicesEnv(_GymEnvBase):
         return float(reward)
 
     def _cost_penalty(self, summary: dict[str, float]) -> float:
-        """Per-window cost term whose episode SUM tracks the pooled ratio.
+        """Per-window cost term whose episode SUM is proportional to the retries.
 
-        `retries_t / mean_roots_per_window` sums to `total_retries / mean_roots`
-        = `T * pooled_ratio`, so minimising it minimises the pooled amplification
-        the constraint is stated in. Falls back to the raw ratio before any
-        cost-client root has completed.
+        Each window's retry COUNT is divided by ``_roots_per_window``, a
+        constant fixed at reset (the roots a window is expected to carry at the
+        offered arrival rate), so the episode sum is exactly
+        ``total_retries / _roots_per_window``. Two properties follow, and both
+        fail for the running mean of observed roots-per-window this used to
+        divide by: the sum does not depend on the ORDER of the windows, and a
+        retry costs the same wherever in the episode it falls. When the realised
+        roots per window match the expectation the sum is ``T * pooled_ratio``,
+        the quantity the dual ascends on (``EpisodeResult.pooled_cost``); a
+        workload that over- or under-delivers rescales the whole episode by one
+        factor instead of reweighting its windows against each other.
+
+        Falls back to the raw per-window ratio when no arrival rate is known
+        (a zero-rate workload, or a summary scored before ``reset()``).
         """
-        roots = summary.get("cost_roots", 0.0)
-        retries = summary.get("cost_retries", 0.0)
-        self._cost_roots_seen += roots
-        self._cost_windows += 1 if roots else 0
-        if not self._cost_windows:
+        if self._roots_per_window <= 0.0:
             return float(summary.get("cost", 0.0))
-        mean_roots = self._cost_roots_seen / self._cost_windows
-        return float(retries / mean_roots) if mean_roots > 0 else 0.0
+        return float(summary.get("cost_retries", 0.0)) / self._roots_per_window
 
     def _summarize_roots(self, roots) -> dict[str, float]:
-        if not roots:
-            return {
-                "completed": 0,
-                "success_rate": 0.0,
-                "deadline_drop_rate": 0.0,
-                "queue_drop_rate": 0.0,
-                "server_drop_rate": 0.0,
-                "cancelled_rate": 0.0,
-                "cost_retries": 0.0,
-                "cost_roots": 0.0,
-                "circuit_open_drop_rate": 0.0,
-                "avg_latency_ms": 0.0,
-                "p95_latency_ms": 0.0,
-                "retries_per_root": 0.0,
-                "queue_avg": 0.0,
-                "cost": 0.0,
-            }
-
         # Attempt-less roots are skipped by both Metrics paths, so exclude them
         # from the denominator too — counting them in `completed` while no
         # outcome bucket claims them leaves the rates not summing to 1.
         roots = [root for root in roots if root.attempts]
         completed = len(roots)
-        if not completed:
-            return self._summarize_roots([])
         successes = 0
         deadline_drops = 0
         queue_drops = 0
@@ -510,25 +510,29 @@ class MicroservicesEnv(_GymEnvBase):
         )
         queue_avg = float(np.mean(queue_sizes)) if queue_sizes else 0.0
 
+        # ONE literal defines the schema. An empty window must carry exactly the
+        # same keys as a populated one — a consumer reading info["summary"] must
+        # never KeyError depending on whether the window had traffic — and two
+        # hand-synced dicts only kept that promise until the next key was added
+        # to one of them. `denom` leaves every rate at 0.0 when nothing
+        # completed, reproducing the old empty-window values exactly.
+        denom = completed or 1
         return {
             "completed": completed,
-            "success_rate": successes / completed,
-            "deadline_drop_rate": deadline_drops / completed,
-            "queue_drop_rate": queue_drops / completed,
-            "server_drop_rate": server_drops / completed,
+            "success_rate": successes / denom,
+            "deadline_drop_rate": deadline_drops / denom,
+            "queue_drop_rate": queue_drops / denom,
+            "server_drop_rate": server_drops / denom,
             # Reported for visibility; deliberately carries no reward weight
             # and no observation feature, since cancelled work is abandoned
             # rather than a failure of this service.
-            "cancelled_rate": cancelled_drops / completed,
-            "circuit_open_drop_rate": circuit_open_drops / completed,
+            "cancelled_rate": cancelled_drops / denom,
+            "circuit_open_drop_rate": circuit_open_drops / denom,
             "avg_latency_ms": avg_latency_ms,
             "p95_latency_ms": p95_latency_ms,
-            "retries_per_root": (attempts_total - completed) / completed,
+            "retries_per_root": (attempts_total - completed) / denom,
             "queue_avg": queue_avg,
             # Overridden by step() with the cost-client window when one exists.
-            # Kept here so the empty-window and populated dicts carry identical
-            # keys — a consumer reading info["summary"] must never KeyError
-            # depending on whether the window had traffic.
             "cost": 0.0,
             "cost_retries": 0.0,
             "cost_roots": 0.0,
@@ -705,7 +709,12 @@ def _single_service_components(
     partial_failures: list[PartialFailure] | None = None,
     load_spikes: list[LoadSpike] | None = None,
 ) -> EnvComponents:
-    sim = Simulator(seed=1 if seed is None else seed)
+    # Normalize `None` ONCE and use it everywhere: passing the raw `seed` on to
+    # Workload made its own None fallback (0) disagree with the simulator's (1),
+    # so `build_X(None)` was a seed-1 simulator driven by a seed-0 arrival
+    # process — reproducible, but not the same scenario as `build_X(1)`.
+    build_seed = 1 if seed is None else int(seed)
+    sim = Simulator(seed=build_seed)
     svc_cfg = ServiceConfig(
         name="svc-A",
         latency_median=ms_to_ns(20),
@@ -727,7 +736,7 @@ def _single_service_components(
         base_rps=200.0,
         duration_s=duration,
         load_spikes=load_spikes or [],
-        rng_seed=seed,
+        rng_seed=build_seed,
     )
 
     return EnvComponents(
@@ -789,7 +798,7 @@ def build_randomized_faulty_single_service_env(
     to observed degradation. Same seed reproduces the same fault draw.
     """
     duration = 30.0 if duration_s is None else float(duration_s)
-    rng = random.Random((1 if seed is None else seed) + _FAULT_SEED_OFFSET)
+    rng = random.Random((1 if seed is None else int(seed)) + _FAULT_SEED_OFFSET)
 
     def window() -> TimeInterval:
         onset = rng.uniform(0.05, 0.6) * duration
@@ -823,9 +832,9 @@ def build_chain_env(
     ``cost_client`` so its retry amplification can serve as a constraint cost.
 
     ``retry_budget_ratio`` wraps the edge policy in a ``RetryBudgetPolicy``
-    (the hand-coded baseline for constrained-RL comparisons). Note the wrapper
-    limits retries against *successes* (token award), which approximates
-    retries-per-root only at high success rates.
+    (the hand-coded baseline for constrained-RL comparisons). The wrapper
+    deposits once per admitted *request*, so it limits retries against requests
+    — the same denominator as the retries-per-root cost measured here.
     """
     build_seed = 1 if seed is None else int(seed)
     sim = Simulator(seed=build_seed)
@@ -909,7 +918,7 @@ def build_chain_env(
         base_rps=180.0,
         duration_s=duration,
         load_spikes=[],
-        rng_seed=seed,
+        rng_seed=build_seed,
     )
 
     return EnvComponents(
@@ -1064,7 +1073,7 @@ def build_multichain_env(
         base_rps=180.0,
         duration_s=duration,
         load_spikes=[],
-        rng_seed=seed,
+        rng_seed=build_seed,
     )
     # The env only drives EnvComponents.workload, so the bystander arrival
     # process is scheduled here; drive() just pushes tick events onto the sim

@@ -14,14 +14,35 @@ with the caller; only the loop and the aggregations that must agree live here.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+
+import numpy as np
 
 from core import Summary
 from rl.spec import RewardWeights
 
 ActFn = Callable[[Any, dict], Sequence[int]]
+
+
+def mean_ignoring_nan(values: Sequence[float]) -> float:
+    """Mean over the seeds that produced data; 0.0 for an empty sequence.
+
+    `Metrics.summary()` reports latency percentiles as nan when no root
+    succeeded — deliberately, so a missing value cannot be averaged toward
+    zero. Plain `np.mean` then propagates that nan across every other eval
+    seed, so one degenerate seed voids the whole cell and discards the rest.
+    Keep the seeds that did report, and return nan only when NONE of them did,
+    so a wholly missing column stays visibly missing.
+    """
+    if not values:
+        return 0.0
+    finite = [v for v in values if not math.isnan(v)]
+    if not finite:
+        return float("nan")
+    return float(np.mean(finite))
 
 
 class _SupportsAct(Protocol):
