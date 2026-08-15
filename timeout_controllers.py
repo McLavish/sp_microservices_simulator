@@ -68,6 +68,29 @@ class AdaptiveTimeoutController(TimeoutController):
     _current_attempt_timeout: TimeDuration | None = field(default=None, init=False)
 
     def __post_init__(self):
+        # Reject a self-contradictory configuration instead of silently serving
+        # or silently clamping it. `initial_attempt_timeout` is handed out
+        # verbatim until enough SUCCESSFUL samples accumulate, so an initial
+        # outside the bounds escapes them for that whole window — while every
+        # adaptation path applies them. Clamping instead would override an
+        # operator's explicit setting, so this validates at construction, the
+        # way resilience4j checks its timeout config.
+        if self.min_timeout < 0:
+            raise ValueError(f"min_timeout must be >= 0 ns, got {self.min_timeout}")
+        if self.max_timeout is not None and self.max_timeout < self.min_timeout:
+            raise ValueError(
+                f"max_timeout ({self.max_timeout} ns) must be >= "
+                f"min_timeout ({self.min_timeout} ns)"
+            )
+        if self.initial_attempt_timeout is not None:
+            above_max = (
+                self.max_timeout is not None and self.initial_attempt_timeout > self.max_timeout
+            )
+            if self.initial_attempt_timeout < self.min_timeout or above_max:
+                raise ValueError(
+                    f"initial_attempt_timeout ({self.initial_attempt_timeout} ns) must lie within "
+                    f"[{self.min_timeout}, {self.max_timeout}] ns"
+                )
         self._latencies = deque(maxlen=self.window_size)
         self._successes = deque(maxlen=self.success_rate_window)
         self._current_global_timeout = self.initial_global_timeout

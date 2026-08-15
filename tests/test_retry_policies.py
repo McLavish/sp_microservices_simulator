@@ -8,6 +8,7 @@ from retry_policies import (
     BurstyRateLimiterPolicy,
     CBState,
     CountBasedCircuitBreakerPolicy,
+    DelayDecision,
     ExponentialBackoffRetryPolicy,
     ExponentialBackoffWithJitterRetryPolicy,
     FixedBackoffRetryPolicy,
@@ -17,6 +18,7 @@ from retry_policies import (
     NoRetryPolicy,
     RetryBudgetPolicy,
     RetryContext,
+    RetryPolicy,
     TimeBasedCircuitBreakerPolicy,
 )
 from service import ServiceConfig, ServiceRuntime
@@ -273,6 +275,23 @@ class TestRetryPolicies(unittest.TestCase):
         # once wall-clock passes the reserved slot, no extra delay is added
         self.assertEqual(policy.next_delay(RetryContext(attempt=4, now=1000)), (True, 0))
 
+    def test_leaky_rate_limiter_keeps_the_fractional_remainder(self):
+        """Rounding the reserved slot every step dropped the same remainder each
+        time, so the achieved spacing was floor(period / max_requests) and the
+        bucket ran permanently fast: 3 per 100 ns admitted a 4th at 99 ns."""
+        policy = LeakyRateLimiterPolicy(max_requests=3, max_attempts=10, period=100)
+        delays = [policy.next_delay(RetryContext(attempt=i, now=0)).delay for i in range(1, 5)]
+        self.assertEqual(delays, [0, 34, 67, 100])
+        self.assertEqual(sum(1 for d in delays if d < 100), policy.max_requests)
+
+        # The exact-half case rounded to 2 ns instead of 2.5 ns, a permanent
+        # 25% rate inflation.
+        halved = LeakyRateLimiterPolicy(max_requests=2, max_attempts=10, period=5)
+        self.assertEqual(
+            [halved.next_delay(RetryContext(attempt=i, now=0)).delay for i in range(1, 4)],
+            [0, 3, 5],
+        )
+
     def test_retry_budget_depletes_and_refills(self):
         policy = RetryBudgetPolicy(
             budget_ratio=0.1,  # deposit = 10
@@ -497,6 +516,179 @@ class TestRetryBudgetExactArithmetic(unittest.TestCase):
             self.assertFalse(policy.can_retry())
             policy.on_request_start(now=0)
             self.assertTrue(policy.can_retry())
+
+    def test_tiny_ratio_is_still_a_ratio(self):
+        """A ratio below ~1/20000 used to rationalize to a zero deposit, so the
+        budget never refilled: 1e-5, 1e-7 and 1e-9 all became "max_retries
+        retries for the whole run", silently and identically."""
+        policy = self._drained(1e-5)
+        self.assertEqual((policy._deposit, policy._retry_cost), (1, 100_000))
+        for _ in range(99_999):
+            policy.on_request_start(now=0)
+        self.assertFalse(policy.can_retry())
+        policy.on_request_start(now=0)
+        self.assertTrue(policy.can_retry())
+
+    def test_unrepresentable_ratio_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "budget_ratio"):
+            RetryBudgetPolicy(
+                budget_ratio=1e-12, max_retries=1, underlying_strategy=NoRetryPolicy()
+            )
+
+
+class TestAdmissionGateOrdering(unittest.TestCase):
+    """Finagle's RetryFilter deposits per request that ENTERS the filter.
+
+    `_notify_request_start` therefore has to run below the admission gate:
+    a request an open breaker sheds never becomes a retryable request, so
+    funding retries with it hands the few admitted requests the whole
+    shed storm's worth of budget at exactly the moment it should bind.
+    """
+
+    def test_shed_request_does_not_deposit_into_a_wrapped_budget(self):
+        sim = Simulator(seed=1)
+        svc = ServiceRuntime(
+            cfg=ServiceConfig(
+                name="svc",
+                latency_median=1,
+                latency_lognorm_sigma=0.1,
+                workers=4,
+                partial_failures=[PartialFailure(TimeInterval(0, s_to_ns(100)), p_fail=1.0)],
+            )
+        ).bind()
+        budget = RetryBudgetPolicy(
+            budget_ratio=0.1,
+            max_retries=1,
+            underlying_strategy=FixedBackoffRetryPolicy(max_attempts=2, delay=0),
+        )
+        while budget.can_retry():  # drain, so deposits are visible below the cap
+            budget.next_delay(RetryContext(attempt=1, now=0))
+        breaker = CountBasedCircuitBreakerPolicy(
+            failure_threshold_ratio=(1, 1),
+            success_threshold_ratio=(1, 1),
+            underlying_strategy=budget,
+            half_open_delay=s_to_ns(1000),  # stays open for the whole test
+        )
+        client = ClientRuntime(
+            cfg=ClientConfig(retry=breaker, timeout_controller=StaticTimeoutController()),
+            service=svc,
+        )
+
+        client.start_request(sim)
+        sim.run()
+        self.assertEqual(breaker.get_state(), CBState.OPEN)
+        after_admitted = budget._tokens
+
+        for _ in range(50):
+            client.start_request(sim)
+        self.assertEqual(
+            [r.attempts[-1].drop_reason for r in client.roots[1:]],
+            [DropReason.CIRCUIT_OPEN] * 50,
+        )
+        self.assertEqual(budget._tokens, after_admitted)
+
+
+class TestBreakerConfigValidation(unittest.TestCase):
+    def test_count_breaker_rejects_impossible_ratios(self):
+        def build(failure=(1, 1), success=(1, 1), half_open_delay=0):
+            return CountBasedCircuitBreakerPolicy(
+                failure_threshold_ratio=failure,
+                success_threshold_ratio=success,
+                underlying_strategy=NoRetryPolicy(),
+                half_open_delay=half_open_delay,
+            )
+
+        with self.assertRaisesRegex(ValueError, "failure_threshold_ratio"):
+            build(failure=(3, 2))
+        with self.assertRaisesRegex(ValueError, "failure_threshold_ratio"):
+            build(failure=(0, 0))
+        with self.assertRaisesRegex(ValueError, "success_threshold_ratio"):
+            build(success=(-1, 2))
+        with self.assertRaisesRegex(ValueError, "half_open_delay"):
+            build(half_open_delay=-1)
+
+    def test_time_breaker_rejects_invalid_config(self):
+        def build(
+            failure_threshold_rate=0.5,
+            success_threshold_rate=0.5,
+            min_requests=2,
+            window_duration=1000,
+            half_open_delay=10,
+            half_open_min_requests=1,
+        ):
+            return TimeBasedCircuitBreakerPolicy(
+                failure_threshold_rate=failure_threshold_rate,
+                success_threshold_rate=success_threshold_rate,
+                min_requests=min_requests,
+                window_duration=window_duration,
+                underlying_strategy=NoRetryPolicy(),
+                half_open_delay=half_open_delay,
+                half_open_min_requests=half_open_min_requests,
+            )
+
+        # A negative window evicts every prior result, so the breaker could
+        # never reach min_requests and silently never opened.
+        with self.assertRaisesRegex(ValueError, "window_duration"):
+            build(window_duration=-1)
+        with self.assertRaisesRegex(ValueError, "failure_threshold_rate"):
+            build(failure_threshold_rate=1.5)
+        with self.assertRaisesRegex(ValueError, "success_threshold_rate"):
+            build(success_threshold_rate=-0.1)
+        with self.assertRaisesRegex(ValueError, "min_requests"):
+            build(min_requests=0)
+        with self.assertRaisesRegex(ValueError, "half_open_min_requests"):
+            build(half_open_min_requests=0)
+        with self.assertRaisesRegex(ValueError, "half_open_delay"):
+            build(half_open_delay=-1)
+
+
+class TestDeferredRollbackIsOptIn(unittest.TestCase):
+    """A policy that charges in `next_delay` must not be refunded late by
+    default: the deferred path (a cancel arriving mid-backoff) can rewind a
+    reservation that belongs to a different live root."""
+
+    def test_base_default_is_fail_safe(self):
+        self.assertFalse(RetryPolicy().supports_deferred_rollback)
+        for policy in (
+            LeakyRateLimiterPolicy(max_requests=1, max_attempts=2, period=100),
+            RetryBudgetPolicy(budget_ratio=0.1, max_retries=1, underlying_strategy=NoRetryPolicy()),
+            BurstyRateLimiterPolicy(
+                max_requests=1, refill_rate=1, period=100, underlying_strategy=NoRetryPolicy()
+            ),
+            FixedWindowBurstyLimiterPolicy(
+                max_requests=1, period=100, underlying_strategy=NoRetryPolicy()
+            ),
+        ):
+            with self.subTest(policy=type(policy).__name__):
+                self.assertFalse(policy.supports_deferred_rollback)
+
+    def test_a_new_side_effecting_policy_is_skipped_without_opting_in(self):
+        class ConcurrencyLimiterPolicy(RetryPolicy):
+            """Reserves a permit in next_delay, returns it in rollback."""
+
+            def __init__(self):
+                self.refunds = 0
+
+            def next_delay(self, context):
+                return DelayDecision(True, 0)
+
+            def rollback(self, context):
+                self.refunds += 1
+
+        policy = ConcurrencyLimiterPolicy()
+        client = ClientRuntime(
+            cfg=ClientConfig(retry=policy, timeout_controller=StaticTimeoutController()),
+            service=ServiceRuntime(
+                cfg=ServiceConfig(
+                    name="svc", latency_median=1, latency_lognorm_sigma=0.1, workers=1
+                )
+            ).bind(),
+        )
+        context = RetryContext(attempt=1, now=0)
+        client._rollback_policy(policy, context, deferred=True)
+        self.assertEqual(policy.refunds, 0)
+        client._rollback_policy(policy, context)
+        self.assertEqual(policy.refunds, 1)
 
 
 class TestBackoffValidation(unittest.TestCase):

@@ -107,6 +107,35 @@ class TestAdaptiveTimeoutController(unittest.TestCase):
         self.assertEqual(ctrl.get_global_timeout(), s_to_ns(1))
 
 
+class TestAdaptiveTimeoutConfigValidation(unittest.TestCase):
+    """`initial_attempt_timeout` is served verbatim until enough SUCCESSFUL
+    samples accumulate, so an initial outside `[min_timeout, max_timeout]`
+    escaped bounds every adaptation path applies. Rejected at construction
+    rather than clamped: clamping would override an explicit setting."""
+
+    def test_initial_above_max_timeout_rejected(self):
+        with self.assertRaisesRegex(ValueError, "initial_attempt_timeout"):
+            AdaptiveTimeoutController(
+                initial_attempt_timeout=ms_to_ns(100), max_timeout=ms_to_ns(30)
+            )
+
+    def test_initial_below_min_timeout_rejected(self):
+        with self.assertRaisesRegex(ValueError, "initial_attempt_timeout"):
+            AdaptiveTimeoutController(initial_attempt_timeout=ms_to_ns(0.05))
+
+    def test_contradictory_bounds_rejected(self):
+        with self.assertRaisesRegex(ValueError, "max_timeout"):
+            AdaptiveTimeoutController(min_timeout=ms_to_ns(10), max_timeout=ms_to_ns(5))
+        with self.assertRaisesRegex(ValueError, "min_timeout"):
+            AdaptiveTimeoutController(min_timeout=-1)
+
+    def test_initial_inside_the_bounds_is_served_unchanged(self):
+        ctrl = AdaptiveTimeoutController(
+            initial_attempt_timeout=ms_to_ns(20), min_timeout=ms_to_ns(1), max_timeout=ms_to_ns(30)
+        )
+        self.assertEqual(ctrl.get_attempt_timeout(), ms_to_ns(20))
+
+
 class TestAdaptiveTimeoutScenario(unittest.TestCase):
     def _run_scenario(self, seed: int):
         """Single service with a 10x latency injection from t=10s to t=20s.

@@ -28,6 +28,14 @@ class _SupportsUnderlying(Protocol):
     underlying_strategy: RetryPolicy
 
 
+#: The service -> client completion callback: (success, occupancy, drop reason,
+#: queue size, occupancy_censored). Spelled out rather than `Callable[..., None]`
+#: because the last argument carries statistical semantics — it marks the
+#: occupancy sample as a LOWER BOUND for the censored MLE — so a producer that
+#: omits it silently reports a truncated sample as a complete observation.
+AttemptDoneCallback = Callable[[bool, TimeDuration, DropReason, int, bool], None]
+
+
 class ServiceLike(Protocol):
     """Structural type for anything ClientRuntime can submit attempts to.
 
@@ -40,7 +48,7 @@ class ServiceLike(Protocol):
     def submit_attempt(
         self,
         sim: Simulator,
-        on_done: Callable[..., None],
+        on_done: AttemptDoneCallback,
         attempt_deadline: TimePoint | None = None,
     ) -> AttemptControl: ...
 
@@ -55,8 +63,6 @@ class ClientConfig:
 class AttemptCtx:
     root: RootRequest
     req: Request
-    last_delay: TimeDuration = 0
-    total_delay: TimeDuration = 0
     # Handle on the attempt currently at the service (None while backing off).
     control: "AttemptControl | None" = None
     # Scheduled retry event, so cancellation can drop a pending backoff.
@@ -68,6 +74,11 @@ class AttemptCtx:
     # Set before tearing down, so _on_attempt_done completes the root instead
     # of scheduling the next retry.
     cancelling: bool = False
+    # Set when a cancel could NOT take effect because the attempt had already
+    # committed to an outcome. Distinct from `cancelling`, which would rewrite
+    # that outcome as CANCELLED: this one leaves the attempt alone and only
+    # forbids further ones. Survives the `cancelling` reset in `_cancel_root`.
+    abandoned: bool = False
 
 
 @dataclass
@@ -150,9 +161,9 @@ class ClientRuntime:
         """Abandon this root: no further attempts, and give back in-flight work.
 
         Idempotent and safe to call from a completion callback — a root that
-        has already finished is left alone.
+        has already finished, or is already being abandoned, is left alone.
         """
-        if ctx.root.done or ctx.cancelling:
+        if ctx.root.done or ctx.cancelling or ctx.abandoned:
             return
         now = sim.timestep
         # Tentative: these only stand if something was still cancellable. A node
@@ -191,6 +202,11 @@ class ClientRuntime:
         # callback and trip the "Root request was already done!" guard.
         ctx.cancelling = False
         ctx.root.cancelled = False
+        # The abandonment itself still stands, though: without this the retry
+        # branch of _on_attempt_done would launch a fresh attempt into a subtree
+        # nobody is waiting on any more — the load propagate_cancellation exists
+        # to eliminate — and book the root by whatever that late attempt did.
+        ctx.abandoned = True
 
     def start_request(
         self,
@@ -199,11 +215,6 @@ class ClientRuntime:
         override_global_deadline: TimePoint | None = None,
     ):
         root_req = RootRequest()
-
-        # One budget deposit per admitted request (Finagle's RetryFilter deposits
-        # before attempting, not per outcome), so retry budgets are a ratio of
-        # requests rather than of successes.
-        self._notify_request_start(self.cfg.retry, sim.timestep)
 
         # Compute global deadline: min(override, controller)
         global_timeout = self.cfg.timeout_controller.get_global_timeout()
@@ -233,6 +244,13 @@ class ClientRuntime:
             self._complete_root(root_req, sim.timestep)
             return root_req
 
+        # One budget deposit per ADMITTED request (Finagle's RetryFilter
+        # deposits per request that enters the filter, not per outcome), so
+        # retry budgets are a ratio of requests rather than of successes. Below
+        # the gate, so a request an outer circuit breaker sheds does not fund
+        # retries for the few requests that do get through.
+        self._notify_request_start(self.cfg.retry, sim.timestep)
+
         # Start first attempt
         # Create dummy request that will be replaced in _start_attempt
         dummy_req = Request(
@@ -240,7 +258,7 @@ class ClientRuntime:
             interval=TimeInterval(begin=sim.timestep, end=sim.timestep),
             deadline=None,
         )
-        initial_ctx = AttemptCtx(root=root_req, req=dummy_req, last_delay=0, total_delay=0)
+        initial_ctx = AttemptCtx(root=root_req, req=dummy_req)
         root_req.cancel = partial(self._cancel_root, initial_ctx, sim)
         self._start_attempt(sim, initial_ctx)
         return root_req
@@ -277,7 +295,7 @@ class ClientRuntime:
         svc_time: TimeDuration,
         drop_reason: DropReason,
         queue_size: int,
-        occupancy_censored: bool = False,
+        occupancy_censored: bool,
     ):
         if ctx.root.done:
             raise RuntimeError("Root request was already done!")
@@ -323,6 +341,18 @@ class ClientRuntime:
         self.cfg.timeout_controller.record_result(success_effective, request_latency)
 
         if ctx.req.success:
+            self._complete_root(ctx.root, sim.timestep)
+            return
+
+        # An upstream abandoned this root while the attempt above was already
+        # committing to its outcome, so the cancel could not take effect. That
+        # outcome is genuine and has just been reported as itself (and fed to
+        # the policy and the timeout controller — the service really produced
+        # it), but the root is abandoned: no further attempts, and it is
+        # classified as cancelled rather than by the reason of an attempt whose
+        # caller had already given up.
+        if ctx.abandoned:
+            ctx.root.cancelled = True
             self._complete_root(ctx.root, sim.timestep)
             return
 

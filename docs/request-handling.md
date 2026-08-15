@@ -20,7 +20,12 @@ timeout_controller)` and a `service` (anything matching `ServiceLike` — a plai
 2. Ask the policy stack whether the request is allowed (`_allow_policy_request`). If
    a circuit breaker is open, record a single `CIRCUIT_OPEN` attempt and complete
    the root immediately.
-3. Otherwise launch the first attempt.
+3. Otherwise announce the *admitted* request to every policy layer
+   (`_notify_request_start` -> `on_request_start`) — this is the retry-budget
+   deposit, and it fires **below** the gate, so a request an outer breaker sheds
+   never funds anybody's retries (Finagle's `RetryFilter` likewise deposits per
+   request that enters the filter).
+4. Launch the first attempt.
 
 ### Each attempt
 
@@ -81,6 +86,11 @@ A controller supplies two timeouts and receives feedback:
   - The **global** timeout is intentionally *not* adapted: it's the caller's
     deadline budget. If the success rate falls below `min_success_rate`, the attempt
     timeout is inflated to cut failures.
+  - `initial_attempt_timeout` is served verbatim until `min_samples` successful
+    latencies accumulate, so it must itself lie within `[min_timeout,
+    max_timeout]`. A config that violates that (or `max_timeout < min_timeout`)
+    raises at construction rather than being silently clamped — clamping would
+    override an explicitly configured value.
 
 ## Retry policies (`retry_policies.py`)
 
@@ -116,6 +126,12 @@ only partially implemented.)
 | `CountBasedCircuitBreakerPolicy` (`retry_policies.py`) | `failure_threshold_ratio` e.g. `(5,10)` = 5 failures in last 10 | `success_threshold_ratio` successes among half-open probes |
 | `TimeBasedCircuitBreakerPolicy` (`retry_policies.py`) | failure **rate** > `failure_threshold_rate` over `window_duration` (needs `min_requests`) | failure rate falls below `1 - success_threshold_rate` |
 
+Both validate their configuration in `__post_init__` and raise `ValueError`:
+thresholds within range, `min_requests >= 1`, `window_duration > 0`,
+`half_open_delay >= 0`. A window that can never fill (a non-positive
+`window_duration` evicts every prior result) would otherwise leave the breaker
+permanently closed with no signal.
+
 ### Rate limiters & budget (wrapping, except leaky)
 
 These throttle retries. The limiters require `context.now` to be set (the client
@@ -123,10 +139,26 @@ sets it).
 
 | Policy | Params | Mechanism |
 | --- | --- | --- |
-| `LeakyRateLimiterPolicy` (`retry_policies.py`) | `max_requests`, `max_attempts`, `period` | leaky-bucket-as-queue: spaces retries `period/max_requests` apart, returns the delay. Does **not** wrap an underlying policy. |
+| `LeakyRateLimiterPolicy` (`retry_policies.py`) | `max_requests`, `max_attempts`, `period` | leaky-bucket-as-queue: spaces retries exactly `period/max_requests` apart (the reserved slot is kept as a rational instant, so an uneven division does not accumulate a rounding gain), returns the whole-ns delay. Does **not** wrap an underlying policy. |
 | `BurstyRateLimiterPolicy` (`retry_policies.py`) | `max_requests`, `refill_rate`, `period`, `underlying_strategy` | token bucket with continuous refill; one token per retry |
 | `FixedWindowBurstyLimiterPolicy` (`retry_policies.py`) | `max_requests`, `period`, `underlying_strategy` | fixed-window quota, reset on each window boundary |
-| `RetryBudgetPolicy` (`retry_policies.py`) | `budget_ratio`, `max_retries`, `underlying_strategy` | token economy: each **request** deposits `100 * budget_ratio` tokens (cap `100 * max_retries`), each retry costs 100 and is refunded if the retry is never issued. Finagle semantics — the ratio is retries per *request*. No deposit TTL (documented divergence) |
+| `RetryBudgetPolicy` (`retry_policies.py`) | `budget_ratio`, `max_retries`, `underlying_strategy` | token economy: each **admitted request** deposits `100 * budget_ratio` tokens (cap `100 * max_retries`), each retry costs 100 and is refunded if the retry is never issued. Finagle semantics — the ratio is retries per *request*. No deposit TTL (documented divergence). `budget_ratio` is rationalized exactly; a ratio too small to represent (below roughly `1e-9`) is rejected rather than silently becoming a zero deposit |
+
+The three wrapping throttles share one `next_delay`/`rollback` implementation
+(`_ThrottledRetryPolicy`): quota is charged **only** on the path that returns
+`allow=True`, and `rollback` refunds exactly one unit. That matters because the
+client asks for a delay before it knows whether the global deadline will veto
+the retry (`caller.py`); a policy whose `next_delay` has side effects must
+therefore implement `rollback`. `RetryPolicy.supports_deferred_rollback` says
+whether that refund is still correct when it arrives *late* (a root cancelled
+mid-backoff). It defaults to **False** — capped balances and single-slot
+reservations both mis-refund out of order, so a new side-effecting policy is
+safe without opting out; skipping the refund over-counts, which is the
+conservative direction.
+
+Both breakers likewise share their admission half (`_CircuitBreakerBase`:
+`allow_request`, the OPEN -> HALF_OPEN transition and retry delegation), so the
+uncapped half-open probe admission noted above is one code path, not two.
 
 ### Example: a circuit breaker around no-retry
 
@@ -251,6 +283,25 @@ Mechanically, `ServiceRuntime.submit_attempt` returns an `AttemptControl` whose
 completion cannot double-complete. Custom behaviours publish their own teardown
 via the `register_cancel` callback; that teardown must still route through
 `finalize`, so the exactly-once guards cover the cancel path too.
+
+### Cancelling an attempt that has already committed
+
+A cancel can arrive after the abandoned node committed to an outcome but before
+it finalized — `_fail_from` runs `_commit()` -> `_abandon_siblings()` ->
+`_finalize()`, and in a diamond topology the teardown of one sibling can unwind
+back into an ancestor's fan-out. `AttemptControl.cancel()` then returns False,
+and `ClientRuntime._cancel_root` splits the outcome in two:
+
+- **The attempt keeps its own drop reason.** It really did fail (or time out) at
+  the service, so it is reported as itself and still feeds the circuit breaker
+  and the timeout controller. Rewriting it as `CANCELLED` would hide a genuine
+  failure from the breaker.
+- **The root is still abandoned** (`AttemptCtx.abandoned`). No further attempt
+  is issued — the retry would be load nobody is waiting for, which is exactly
+  what `propagate_cancellation` exists to eliminate — and the root is classified
+  `CANCELLED`, not by the reason of an attempt whose caller had already given up.
+
+`tests/test_cancellation_client.py` pins both halves.
 
 
 ## `service_time_ns` is worker occupancy, not node latency
