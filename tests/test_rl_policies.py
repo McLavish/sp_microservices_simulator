@@ -2,6 +2,7 @@ import tempfile
 import unittest
 import warnings
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -10,7 +11,13 @@ from rl.model_io import check_action_spec, save_action_spec
 from rl.policies.action_space import ActionGrid
 from rl.policies.aimd import AIMDPolicy
 from rl.policies.bayesian import BayesianPolicy
-from rl.policies.model_based import ModelBasedPolicy, _simulate_action
+from rl.policies.model_based import (
+    LatencyBuffer,
+    ModelBasedPolicy,
+    _action_cost_key,
+    _argmax_over_grid,
+    _simulate_action,
+)
 from rl.spec import ActionValues
 
 
@@ -510,6 +517,171 @@ class TestAIMDBothArmsReachable(unittest.TestCase):
                         obs, _, terminated, _, info = env.step(action)
                 self.assertGreater(increases, 0, "increase arm never fired")
                 self.assertGreater(decreases, 0, "decrease arm never fired")
+
+
+class TestColdStartAndCensoredWindows(unittest.TestCase):
+    """Neither policy may fall back to the grid CORNER.
+
+    Index 0 on every knob is the shortest timeout with the fewest attempts,
+    measured pathological (~11% success) - which is why the env seeds mid-grid
+    (rl/env.py). A policy that emits it burns window 0 of 10, and mid-episode
+    it is self-reinforcing: the corner guarantees the next window is censored
+    too, so the policy pins itself there for the rest of the fault.
+    """
+
+    def setUp(self):
+        self.spec = ActionSpec(attempt_timeout_ms=[10, 80], max_attempts=[1], backoff_ms=[0])
+        self.grid = ActionGrid(self.spec)
+
+    def test_model_based_cold_start_is_mid_grid(self):
+        policy = ModelBasedPolicy(grid=self.grid, sample_size=50)
+        action = policy.act(np.zeros(1), {"attempt_latencies_ms": [], "attempt_censored": []})
+        self.assertEqual(action, self.grid.midpoint_indices())
+        self.assertNotEqual(action, self.grid.indices[0])
+
+    def test_bayesian_cold_start_is_mid_grid(self):
+        policy = BayesianPolicy(grid=self.grid, sample_size=50)
+        action = policy.act(np.zeros(1), {"attempt_latencies_ms": [], "attempt_censored": []})
+        self.assertEqual(action, self.grid.midpoint_indices())
+        self.assertNotEqual(action, self.grid.indices[0])
+
+    def test_fully_censored_window_holds_the_previous_fit(self):
+        # buffer_size == window size, so the censored window fully evicts the
+        # clean one - the shape the identifiability guard was written for.
+        policy = ModelBasedPolicy(grid=self.grid, sample_size=50, buffer_size=50)
+        clean = policy.act(
+            np.zeros(1),
+            {"attempt_latencies_ms": [40.0] * 50, "attempt_censored": [False] * 50},
+        )
+        self.assertEqual(clean, (1, 0, 0))  # only the 80 ms timeout covers 40 ms
+
+        held = policy.act(
+            np.zeros(1),
+            {"attempt_latencies_ms": [10.0] * 50, "attempt_censored": [True] * 50},
+        )
+        self.assertEqual(policy._fit_buffer().data().size, 0)  # nothing usable left
+        self.assertEqual(held, clean)
+        self.assertNotEqual(held, self.grid.indices[0])
+
+
+class TestConsecutiveWindowStreams(unittest.TestCase):
+    """Common random numbers WITHIN a window, fresh draws ACROSS windows.
+
+    Every candidate is scored from the same saved state, so a window consumes
+    hundreds of words; nudging the generator by a single `random()` call left
+    the next window re-scoring on the same samples, turning the Monte-Carlo
+    error into a fixed per-episode bias instead of noise that averages out.
+    """
+
+    def setUp(self):
+        self.grid = ActionGrid(
+            ActionSpec(attempt_timeout_ms=[10, 80], max_attempts=[1], backoff_ms=[0])
+        )
+        self.info = {
+            "attempt_latencies_ms": [20.0, 25.0, 22.0, 24.0] * 10,
+            "attempt_censored": [False] * 40,
+        }
+
+    def _draws_per_window(self, act):
+        recorded: list[list[float]] = []
+
+        def recorder(model, action, weights, rng, n_roots, queue_delay_ms, queue_delay_mode):
+            recorded.append(rng.random(n_roots).tolist())
+            return 1.0
+
+        with mock.patch("rl.policies.model_based._simulate_action", recorder):
+            act()
+            first = list(recorded)
+            recorded.clear()
+            act()
+            second = list(recorded)
+        return first, second
+
+    def _assert_crn_within_and_fresh_across(self, first, second):
+        self.assertEqual(len(first), len(self.grid.indices))
+        self.assertEqual(first[0], first[1], "candidates must share one stream (CRN)")
+        self.assertEqual(second[0], second[1], "candidates must share one stream (CRN)")
+        self.assertFalse(
+            set(first[0]) & set(second[0]),
+            "consecutive windows re-used the previous window's draws",
+        )
+
+    def test_model_based_windows_draw_disjoint_samples(self):
+        policy = ModelBasedPolicy(grid=self.grid, sample_size=16)
+        first, second = self._draws_per_window(lambda: policy.act(np.zeros(1), self.info))
+        self._assert_crn_within_and_fresh_across(first, second)
+
+    def test_bayesian_windows_draw_disjoint_samples(self):
+        policy = BayesianPolicy(grid=self.grid, sample_size=16)
+        first, second = self._draws_per_window(lambda: policy.act(np.zeros(1), self.info))
+        self._assert_crn_within_and_fresh_across(first, second)
+
+
+class TestGlobalTimeoutTieBreak(unittest.TestCase):
+    """`global_timeout_ms=None` is the most permissive setting of that knob, so
+    the cheapest-of-equals tie-break must rank it last, not first."""
+
+    def test_none_sorts_after_every_numeric_budget(self):
+        numeric = _action_cost_key(ActionValues(50, 2, 0, 500))
+        unbounded = _action_cost_key(ActionValues(50, 2, 0, None))
+        self.assertLess(numeric, unbounded)
+
+    def test_tied_scores_select_the_bounded_budget(self):
+        grid = ActionGrid(ActionSpec([100], [1], [0], [None, 500]))
+        idx = _argmax_over_grid(
+            grid,
+            _ConstantModel(10.0),
+            RewardWeights(),
+            np.random.default_rng(0),
+            sample_size=20,
+            queue_delay_ms=0.0,
+            queue_delay_mode="deterministic",
+        )
+        self.assertEqual(grid.values_for(idx).global_timeout_ms, 500)
+
+
+class TestLatencyBufferIngestion(unittest.TestCase):
+    """Padding mismatched flags with `False` feeds deadline-cut attempts to the
+    censored MLE as complete observations, which inflates E[S] several-fold -
+    the exact failure `add` already raises on."""
+
+    def test_mismatched_flags_raise_instead_of_padding(self):
+        buffer = LatencyBuffer(max_samples=10)
+        with self.assertRaises(ValueError):
+            buffer.ingest_info(
+                {"attempt_latencies_ms": [1.0, 2.0, 3.0], "attempt_censored": [True, False]}
+            )
+
+    def test_absent_flags_mean_uncensored(self):
+        buffer = LatencyBuffer(max_samples=10)
+        buffer.ingest_info({"attempt_latencies_ms": [1.0, 2.0]})
+        self.assertEqual(buffer.censored, [False, False])
+
+    def test_service_stream_uses_the_same_rule(self):
+        grid = ActionGrid(ActionSpec(attempt_timeout_ms=[50], max_attempts=[1], backoff_ms=[0]))
+        policy = ModelBasedPolicy(grid=grid, include_queue_delay=True)
+        with self.assertRaises(ValueError):
+            policy.act(
+                np.zeros(1),
+                {
+                    "attempt_service_ms": [20.0, 21.0],
+                    "attempt_service_censored": [True],
+                },
+            )
+
+
+class TestAIMDSeedingHasOneSource(unittest.TestCase):
+    """The EMA seeding rule is a calibration result; it must live in `reset`
+    alone, since that is the path `compare_policies` runs per eval seed."""
+
+    def test_construction_goes_through_reset(self):
+        class _RecalibratedAIMD(AIMDPolicy):
+            def reset(self, seed: int | None = None) -> None:
+                super().reset(seed)
+                self._ema_success = 0.123
+
+        policy = _RecalibratedAIMD(grid=ActionGrid(ActionSpec([10, 50], [1, 2], [0])))
+        self.assertEqual(policy._ema_success, 0.123)
 
 
 if __name__ == "__main__":

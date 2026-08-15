@@ -1,3 +1,4 @@
+import math
 import unittest
 
 import numpy as np
@@ -64,6 +65,28 @@ class TestRLModels(unittest.TestCase):
         self.assertGreater(p99, 0.0)
         cdf_val = model.cdf(np.array([p99]))[0]
         self.assertGreaterEqual(cdf_val, 0.9)
+
+    def test_evt_body_density_is_evaluated_in_log_space(self):
+        """A tight body fit puts a low outlier tens of sigmas out: going
+        through the density (exp then log) underflows to 0.0 and reports -inf,
+        so one such sample wipes out the whole log-likelihood. The tail branch
+        is already computed in log space; the body must be too."""
+        x = self.rng.lognormal(mean=np.log(60.0), sigma=0.012, size=5000)
+        x[0] = 20.0
+        model = EVTTailModel().fit(x)
+
+        body_logpdf = float(model.body.logpdf(np.array([20.0]))[0])
+        self.assertLess(body_logpdf, -745.0)  # exp() of this is 0.0 in float64
+        self.assertTrue(np.isfinite(body_logpdf))
+
+        logpdf = float(model.logpdf(np.array([20.0]))[0])
+        self.assertTrue(np.isfinite(logpdf))
+        self.assertTrue(np.isfinite(model.log_likelihood(x)))
+
+        # Exactly the value the probability-space form intends, minus the
+        # underflow: body density renormalized onto the body's mass share.
+        expected = body_logpdf + math.log(model.p_u / model._body_cdf_u)
+        self.assertAlmostEqual(logpdf, expected, places=9)
 
 
 if __name__ == "__main__":

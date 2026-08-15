@@ -6,7 +6,7 @@ import numpy as np
 
 from rl.models.lognormal import LogNormalModel
 from rl.policies.action_space import ActionGrid
-from rl.policies.model_based import LatencyBuffer, _action_cost_key, _simulate_action
+from rl.policies.model_based import LatencyBuffer, _argmax_over_grid
 from rl.spec import RewardWeights
 
 
@@ -72,44 +72,26 @@ class BayesianPolicy:
         data = self._buffer.data()
         data = data[data > 0]  # defense in depth: log(0) would collapse the posterior
         if data.size == 0:
-            return self.grid.indices[0]
+            # Cold start: no posterior update yet, so start mid-grid like the
+            # env's own warm-up action instead of at the pathological corner.
+            return self.grid.midpoint_indices()
 
         log_data = np.log(data)
         mu, sigma = self.prior.sample(self._rng, log_data)
         model = LogNormalModel(mu=mu, sigma=sigma)
 
-        # Common random numbers: score every candidate against the SAME draws.
-        # With independent sequential streams the sampling error dominates the
-        # true spread among near-tied actions, so the argmax depended on the
-        # order the grid happened to be enumerated in — reversing the same
-        # physical grid changed the selected action. Also removes the
-        # winner's-curse bias in taking a max over noisy estimates.
-        state = self._rng.bit_generator.state
-        best_idx = self.grid.indices[0]
-        best_value = -float("inf")
-        best_key: tuple = ()
-        for action_idx, action_vals in zip(self.grid.indices, self.grid.values, strict=False):
-            self._rng.bit_generator.state = state
-            reward = _simulate_action(
-                model,
-                action_vals,
-                self.reward_weights,
-                self._rng,
-                self.sample_size,
-                0.0,
-                "deterministic",
-            )
-            if reward > best_value or (
-                reward == best_value and _action_cost_key(action_vals) < best_key
-            ):
-                best_value = reward
-                best_idx = action_idx
-                best_key = _action_cost_key(action_vals)
-
-        # Advance once so consecutive steps do not reuse the same draws.
-        self._rng.bit_generator.state = state
-        self._rng.random()
-        return best_idx
+        # Same common-random-numbers scoring as the model-based policy; the
+        # Thompson draw above is what makes this one Bayesian. There is no
+        # queueing term here, hence the (0.0, "deterministic") arguments.
+        return _argmax_over_grid(
+            self.grid,
+            model,
+            self.reward_weights,
+            self._rng,
+            self.sample_size,
+            0.0,
+            "deterministic",
+        )
 
     def update(self, obs: np.ndarray, reward: float, done: bool, info: dict) -> None:
         return

@@ -47,14 +47,11 @@ class AIMDPolicy:
         if not 0.0 < self.timeout_decrease_factor < 1.0:
             raise ValueError("timeout_decrease_factor must be in (0, 1)")
         self._has_global = self.grid.spec.global_timeout_ms is not None
-        # Seed AT the targets, not at the first window's rates. Window 0 runs
-        # the env's initial action before any feedback exists; seeding from it
-        # started the controller deep in debt, and with the shipped ema_alpha
-        # the decrease arm could not clear the targets for ~21 windows against
-        # a 10-window episode - it was unreachable, so "AIMD" was a one-way ramp.
-        self._ema_success = self.success_target
-        self._ema_deadline = self.deadline_target
-        self._init_state()
+        # Construction goes through reset() so the seeding rule below exists in
+        # ONE place: compare_policies re-resets per eval seed, so a
+        # recalibration applied to only one of the two copies would silently
+        # not reach the scored episodes.
+        self.reset()
 
     def reset(self, seed: int | None = None) -> None:
         # Seed AT the targets, not at the first window's rates. Window 0 runs
@@ -62,6 +59,7 @@ class AIMDPolicy:
         # started the controller deep in debt, and with the shipped ema_alpha
         # the decrease arm could not clear the targets for ~21 windows against
         # a 10-window episode - it was unreachable, so "AIMD" was a one-way ramp.
+        # No RNG here, so `seed` is accepted for protocol compatibility only.
         self._ema_success = self.success_target
         self._ema_deadline = self.deadline_target
         self._init_state()

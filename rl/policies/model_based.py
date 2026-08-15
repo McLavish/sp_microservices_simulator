@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -39,14 +40,27 @@ class LatencyBuffer:
             self.censored = self.censored[-self.max_samples :]
         self._cache = None
 
-    def ingest_info(self, info: dict) -> None:
-        latencies = info.get("attempt_latencies_ms", [])
-        if not latencies:
+    def ingest_info(
+        self,
+        info: dict,
+        values_key: str = "attempt_latencies_ms",
+        flags_key: str = "attempt_censored",
+    ) -> None:
+        """Append one window's samples from an env `info` dict.
+
+        An absent (or empty) flags key means "nothing was censored"; flags that
+        are present but of the wrong length are a caller bug and raise through
+        `add`, rather than being silently padded with `False` — padding would
+        feed deadline-cut attempts to the censored MLE as complete
+        observations, which inflates the fitted E[S] several-fold.
+        """
+        values = info.get(values_key) or []
+        if not values:
             return
-        flags = [bool(f) for f in info.get("attempt_censored", [])]
-        if len(flags) != len(latencies):
-            flags = [False] * len(latencies)
-        self.add([float(v) for v in latencies], flags)
+        flags = [bool(f) for f in info.get(flags_key) or []]
+        if not flags:
+            flags = [False] * len(values)
+        self.add([float(v) for v in values], flags)
 
     def censored_data(self) -> tuple[np.ndarray, np.ndarray]:
         """All samples plus their right-censoring flags."""
@@ -70,14 +84,17 @@ def _action_cost_key(values) -> tuple:
     outcome (e.g. any timeout comfortably above the latency distribution), and a
     strict `>` then keeps whichever the grid happened to enumerate first — so
     reversing the same physical grid changed the selection. Ordering ties by
-    (timeout, attempts, backoff) makes the choice a property of the action, not
-    of the iteration order, and picks the least aggressive of equals.
+    (timeout, attempts, backoff, global timeout) makes the choice a property of
+    the action, not of the iteration order, and picks the least aggressive of
+    equals. `global_timeout_ms is None` means NO global deadline, the most
+    permissive setting of that knob (`_simulate_action` then never breaks out
+    of the retry loop early), so it sorts last rather than first.
     """
     return (
         values.attempt_timeout_ms,
         values.max_attempts,
         values.backoff_ms,
-        -1 if values.global_timeout_ms is None else values.global_timeout_ms,
+        math.inf if values.global_timeout_ms is None else values.global_timeout_ms,
     )
 
 
@@ -154,6 +171,73 @@ def _simulate_action(
     )
 
 
+def _advance_stream(rng: np.random.Generator) -> None:
+    """Move `rng` onto a substream that shares no draws with the current one.
+
+    Every candidate in a window is scored from the same saved state (common
+    random numbers), so a window consumes an unknown number of raw words —
+    at least `sample_size` per candidate. Nudging the generator by a single
+    `random()` call therefore left the next window re-scoring on essentially
+    the previous window's samples: the Monte-Carlo error stayed common-mode
+    for the whole episode (a fixed bias in the argmax) instead of averaging
+    out over the ~10 windows. A jump advances the stream by 2**127 words, so
+    consecutive windows are independent while CRN still holds inside one.
+    """
+    bit_generator = rng.bit_generator
+    jumped = getattr(bit_generator, "jumped", None)  # PCG64 (default_rng) has one
+    if jumped is None:  # bit generator without a jump: burn a block instead
+        rng.random(1 << 12)
+        return
+    bit_generator.state = jumped().state
+
+
+def _argmax_over_grid(
+    grid: ActionGrid,
+    model: LatencyModel,
+    weights: RewardWeights,
+    rng: np.random.Generator,
+    sample_size: int,
+    queue_delay_ms: float,
+    queue_delay_mode: str,
+) -> tuple[int, ...]:
+    """Score every candidate against the SAME random stream, then take the max.
+
+    Without common random numbers each action carries independent sampling
+    error (sd ~0.004 at the default sample_size) that swamps the true spread
+    among the top candidates (~0.002), so the argmax - and the knob traces the
+    experiments export - is resampled noise rather than a decision. It also
+    removes the winner's-curse bias in taking a max over noisy estimates.
+    Exact ties are broken by `_action_cost_key`, so the selection is a property
+    of the action rather than of grid enumeration order.
+
+    `rng` is left on a fresh substream (see `_advance_stream`).
+    """
+    state = rng.bit_generator.state
+    best_idx = grid.indices[0]
+    best_value = -float("inf")
+    best_key: tuple = ()
+
+    for action_idx, action_vals in zip(grid.indices, grid.values, strict=False):
+        rng.bit_generator.state = state
+        value = _simulate_action(
+            model,
+            action_vals,
+            weights,
+            rng,
+            sample_size,
+            queue_delay_ms,
+            queue_delay_mode,
+        )
+        if value > best_value or (value == best_value and _action_cost_key(action_vals) < best_key):
+            best_value = value
+            best_idx = action_idx
+            best_key = _action_cost_key(action_vals)
+
+    rng.bit_generator.state = state
+    _advance_stream(rng)
+    return best_idx
+
+
 @dataclass
 class ModelBasedPolicy:
     grid: ActionGrid
@@ -197,17 +281,14 @@ class ModelBasedPolicy:
 
     def act(self, obs: np.ndarray, info: dict) -> tuple[int, ...]:
         self._buffer.ingest_info(info)
-        service = [float(v) for v in info.get("attempt_service_ms", [])]
-        if service:
-            flags = [bool(f) for f in info.get("attempt_service_censored", [])]
-            if len(flags) != len(service):
-                flags = [False] * len(service)
-            self._service_buffer.add(service, flags)
+        self._service_buffer.ingest_info(
+            info,
+            values_key="attempt_service_ms",
+            flags_key="attempt_service_censored",
+        )
         values, censored = self._fit_buffer().censored_data()
         uncensored = values[~censored]
         uncensored = uncensored[uncensored > 0]
-        if uncensored.size == 0:
-            return self.grid.indices[0]
 
         # Identifiability guard: with almost every sample censored, the censored
         # MLE is unidentified and swings wildly (observed median 877ms -> 93ms ->
@@ -215,13 +296,23 @@ class ModelBasedPolicy:
         # 0.07). Under such a fit every action scores success-rate 0, the argmax
         # falls to the grid corner - shortest timeout, one attempt - and that
         # corner guarantees the next window is censored too, so the policy locks
-        # itself there mid-fault. Hold the previous fit instead.
+        # itself there mid-fault. Hold the previous fit instead. This must be
+        # checked BEFORE the empty-buffer bail-out below: a fully censored
+        # window is the extreme the guard was written for, not an exception to
+        # it.
         censored_fraction = float(np.mean(censored)) if censored.size else 0.0
         identifiable = uncensored.size >= self._min_uncensored and censored_fraction < 0.9
         if not identifiable and self._last_model is not None:
             base_model = self._last_model
             queue_delay = self._estimate_queue_delay(info)
             return self._argmax_action(base_model, queue_delay)
+
+        if uncensored.size == 0:
+            # Cold start: nothing to fit and no previous fit to hold. Fall back
+            # to the middle of the grid, matching the env's own warm-up action
+            # (rl/env.py) - the corner at index 0 is the shortest timeout with
+            # no retries, measured pathological (~11% success).
+            return self.grid.midpoint_indices()
 
         base_model = self.model_factory()
         fit_censored = getattr(base_model, "fit_censored", None)
@@ -236,41 +327,15 @@ class ModelBasedPolicy:
         return self._argmax_action(base_model, queue_delay)
 
     def _argmax_action(self, model: LatencyModel, queue_delay: float) -> tuple[int, ...]:
-        """Score every candidate against the SAME random stream.
-
-        Without common random numbers each action carries independent sampling
-        error (sd ~0.004 at the default sample_size) that swamps the true spread
-        among the top candidates (~0.002), so the argmax - and the knob traces
-        the experiments export - is resampled noise rather than a decision. It
-        also removes the winner's-curse bias in taking a max over noisy estimates.
-        """
-        state = self._rng.bit_generator.state
-        best_idx = self.grid.indices[0]
-        best_value = -float("inf")
-        best_key: tuple = ()
-
-        for action_idx, action_vals in zip(self.grid.indices, self.grid.values, strict=False):
-            self._rng.bit_generator.state = state
-            value = _simulate_action(
-                model,
-                action_vals,
-                self.reward_weights,
-                self._rng,
-                self.sample_size,
-                queue_delay,
-                self.queue_delay_mode,
-            )
-            if value > best_value or (
-                value == best_value and _action_cost_key(action_vals) < best_key
-            ):
-                best_value = value
-                best_idx = action_idx
-                best_key = _action_cost_key(action_vals)
-
-        # Advance the stream once so consecutive steps do not reuse the draws.
-        self._rng.bit_generator.state = state
-        self._rng.random()
-        return best_idx
+        return _argmax_over_grid(
+            self.grid,
+            model,
+            self.reward_weights,
+            self._rng,
+            self.sample_size,
+            queue_delay,
+            self.queue_delay_mode,
+        )
 
     def update(self, obs: np.ndarray, reward: float, done: bool, info: dict) -> None:
         return

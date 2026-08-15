@@ -54,6 +54,23 @@ class ActionGrid:
                             self._indices.append(indices)
                             self._values.append(values)
 
+    def midpoint_indices(self) -> tuple[int, ...]:
+        """Mid-grid action: the neutral choice when no data supports one yet.
+
+        Mirrors `MicroservicesEnv`'s warm-up action (`rl/env.py`): index 0 on
+        every knob is the grid CORNER — shortest timeout, fewest attempts, no
+        backoff — which measured ~11% success, so a policy that has nothing to
+        fit must not emit it.
+        """
+        sizes = [
+            len(self._spec.attempt_timeout_ms),
+            len(self._spec.max_attempts),
+            len(self._spec.backoff_ms),
+        ]
+        if self._spec.global_timeout_ms is not None:
+            sizes.append(len(self._spec.global_timeout_ms))
+        return tuple(n // 2 for n in sizes)
+
     def values_for(self, indices: Sequence[int]) -> ActionValues:
         idx = tuple(int(i) for i in indices)
         if self._spec.global_timeout_ms is None and len(idx) != 3:

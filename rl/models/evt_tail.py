@@ -7,13 +7,6 @@ from rl.models.lognormal import LogNormalModel
 from rl.models.utils import ensure_positive
 
 
-def _log_or_neg_inf(values: np.ndarray) -> np.ndarray:
-    """Elementwise log, with -inf where the value is non-positive."""
-    out = np.full_like(values, -math.inf, dtype=np.float64)
-    np.log(values, where=values > 0, out=out)
-    return out
-
-
 @dataclass
 class EVTTailModel:
     """Lognormal body with a Pareto tail above a quantile threshold.
@@ -92,9 +85,16 @@ class EVTTailModel:
         tail_mask = ~body_mask
 
         if np.any(body_mask):
-            body_pdf = np.exp(self.body.logpdf(x_pos[body_mask]))
             scale = self.p_u / self._body_cdf_u if self.p_u > 0 else 0.0
-            out[idx[body_mask]] = _log_or_neg_inf(body_pdf * scale)
+            if scale <= 0.0:
+                out[idx[body_mask]] = -math.inf
+            else:
+                # Evaluate in LOG space, like the tail branch below. Going
+                # through the density underflows to 0.0 — and reports -inf —
+                # for any point whose body log-density is below ~-745, which a
+                # tight body fit reaches a few dozen sigmas out; a single such
+                # sample then wipes out the whole log-likelihood.
+                out[idx[body_mask]] = self.body.logpdf(x_pos[body_mask]) + math.log(scale)
 
         if np.any(tail_mask):
             x_tail = x_pos[tail_mask]
