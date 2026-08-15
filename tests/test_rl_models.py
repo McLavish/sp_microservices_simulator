@@ -13,10 +13,18 @@ class TestRLModels(unittest.TestCase):
         self.rng = np.random.default_rng(123)
 
     def test_lognormal_model(self):
+        """The uncensored MLE must RECOVER the generating parameters.
+
+        `quantile(0.5) > 0` and a finite log-likelihood hold for any (mu, sigma)
+        — including an unfitted default — so they cannot tell a fit from a no-op.
+        """
         data = self.rng.lognormal(mean=3.0, sigma=0.5, size=1000)
         model = LogNormalModel().fit(data)
+        self.assertAlmostEqual(model.mu, 3.0, delta=0.05)  # sd of mu-hat ~0.016
+        self.assertAlmostEqual(model.sigma, 0.5, delta=0.05)
         p50 = model.quantile(0.5)
         self.assertGreater(p50, 0.0)
+        self.assertAlmostEqual(p50, math.exp(3.0), delta=1.0)  # the median is exp(mu)
         ll = model.log_likelihood(data)
         self.assertTrue(np.isfinite(ll))
 
@@ -58,6 +66,31 @@ class TestRLModels(unittest.TestCase):
         p95 = model.quantile(0.95)
         self.assertGreater(p95, 0.0)
 
+    def test_lognormal_mixture_recovers_well_separated_components(self):
+        """Weights summing to 1 is structural; the component parameters are not.
+
+        Two far-apart components make the EM solution essentially exact, so the
+        fitted (weight, mu, sigma) triples must match the generating ones.
+        """
+        data = np.concatenate(
+            [
+                self.rng.lognormal(mean=2.0, sigma=0.3, size=1000),
+                self.rng.lognormal(mean=5.0, sigma=0.3, size=1000),
+            ]
+        )
+        model = LogNormalMixtureModel().fit(data)
+        weights, mus, sigmas = model.weights, model.mus, model.sigmas
+        assert weights is not None and mus is not None and sigmas is not None
+        order = np.argsort(mus)  # components come out in arbitrary order
+        for fitted, true in zip(mus[order], (2.0, 5.0), strict=True):
+            self.assertAlmostEqual(float(fitted), true, delta=0.05)
+        for fitted, true in zip(sigmas[order], (0.3, 0.3), strict=True):
+            self.assertAlmostEqual(float(fitted), true, delta=0.05)
+        for fitted in weights[order]:
+            self.assertAlmostEqual(float(fitted), 0.5, delta=0.03)
+        p95 = model.quantile(0.95)
+        self.assertAlmostEqual(float(model.cdf(np.array([p95]))[0]), 0.95, places=6)
+
     def test_evt_tail_model(self):
         data = self.rng.lognormal(mean=3.0, sigma=0.8, size=1000)
         model = EVTTailModel().fit(data)
@@ -65,6 +98,26 @@ class TestRLModels(unittest.TestCase):
         self.assertGreater(p99, 0.0)
         cdf_val = model.cdf(np.array([p99]))[0]
         self.assertGreaterEqual(cdf_val, 0.9)
+        # quantile and cdf must be mutual inverses across the body/tail seam,
+        # which `>= 0.9` alone does not pin.
+        self.assertAlmostEqual(float(cdf_val), 0.99, places=6)
+
+    def test_evt_tail_recovers_a_pareto_index(self):
+        """The Hill estimator is the MLE for a power-law tail, so a sample drawn
+        from an exact Pareto must recover its index, threshold and quantiles.
+
+        Nothing else pins `u`/`alpha`: the body fit is covered separately, and
+        every structural assertion above holds for any tail index.
+        """
+        alpha_true = 2.5
+        x = (1.0 - self.rng.random(20_000)) ** (-1.0 / alpha_true)  # Pareto(1, alpha)
+        model = EVTTailModel(threshold_quantile=0.95).fit(x)
+
+        self.assertAlmostEqual(model.alpha, alpha_true, delta=0.15)
+        self.assertAlmostEqual(model.u, 20.0 ** (1.0 / alpha_true), delta=0.1)
+        self.assertAlmostEqual(model.p_u, 0.95, places=6)
+        self.assertAlmostEqual(model.quantile(0.99), 100.0 ** (1.0 / alpha_true), delta=0.2)
+        self.assertAlmostEqual(model.quantile(0.999), 1000.0 ** (1.0 / alpha_true), delta=0.6)
 
     def test_evt_body_density_is_evaluated_in_log_space(self):
         """A tight body fit puts a low outlier tens of sigmas out: going

@@ -349,6 +349,35 @@ class TestServiceConfigOwnsItsRanges(unittest.TestCase):
             ServiceConfig(name="svc", latency_median=0, latency_lognorm_sigma=0.5, workers=1)
 
 
+class _FinalizeAtOffsetService:
+    """A `ServiceLike` whose attempts finalize SUCCESS at a fixed offset from the
+    attempt deadline, through the custom-`behavior` path.
+
+    `ServiceRuntime` deadline-enforces only its DEFAULT behavior
+    (`_finish_service`), so on this path nothing but the client's half-open rule
+    can reclassify a completion that lands exactly on the deadline.
+    """
+
+    def __init__(self, service: ServiceRuntime, offset_ns: int) -> None:
+        self.service = service
+        self.cfg = service.cfg
+        self.offset_ns = offset_ns
+
+    def submit_attempt(self, sim, on_done, attempt_deadline=None):
+        def behavior(service, sim_, deadline, finalize, begin_at, release_worker, register_cancel):
+            if deadline is None:
+                raise AssertionError("this fixture needs an attempt deadline")
+
+            def finish() -> None:
+                finalize(True, sim_.timestep - begin_at, DropReason.NONE)
+
+            sim_.schedule(deadline + self.offset_ns, finish)
+
+        return self.service.submit_attempt(
+            sim, on_done, attempt_deadline=attempt_deadline, behavior=behavior
+        )
+
+
 class TestStrictDeadlineInvariant(unittest.TestCase):
     """CLAUDE.md calls this load-bearing, and the review found it untested:
     a root finishing EXACTLY at its deadline is a drop, not a success."""
@@ -395,6 +424,39 @@ class TestStrictDeadlineInvariant(unittest.TestCase):
         sim.run()
         self.assertTrue(client.roots[0].attempts[-1].success)
 
+    def _custom_behavior_attempt(self, offset_ns: int):
+        """One attempt that reports SUCCESS `offset_ns` from its deadline."""
+        sim = Simulator(seed=1)
+        svc = ServiceRuntime(
+            cfg=ServiceConfig(
+                name="svc", latency_median=ms_to_ns(10), latency_lognorm_sigma=1e-9, workers=1
+            )
+        ).bind()
+        client = ClientRuntime(
+            cfg=ClientConfig(
+                retry=NoRetryPolicy(),
+                timeout_controller=StaticTimeoutController(None, ms_to_ns(50)),
+            ),
+            service=_FinalizeAtOffsetService(svc, offset_ns),
+        )
+        client.start_request(sim)
+        sim.run()
+        return client.roots[0].attempts[-1]
+
+    def test_custom_behavior_success_at_the_deadline_is_a_drop(self):
+        """The CLIENT's rule, not the service's. The two cases above are decided
+        by `ServiceRuntime._finish_service`, so they hold even with the client
+        check inverted; a custom behavior is not deadline-enforced by the
+        service, which is exactly the extension point CLAUDE.md warns about."""
+        attempt = self._custom_behavior_attempt(offset_ns=0)
+        self.assertFalse(attempt.success)
+        self.assertEqual(attempt.drop_reason, DropReason.DEADLINE)
+
+    def test_custom_behavior_success_one_ns_earlier_stands(self):
+        attempt = self._custom_behavior_attempt(offset_ns=-1)
+        self.assertTrue(attempt.success)
+        self.assertEqual(attempt.drop_reason, DropReason.NONE)
+
 
 class TestExportCsvBucketSemantics(unittest.TestCase):
     """The documented start-vs-end bucketing split had no per-bucket assertion,
@@ -432,6 +494,51 @@ class TestExportCsvBucketSemantics(unittest.TestCase):
         self.assertEqual(int(df.loc[1, "root_requests"]), 0)
         self.assertEqual(int(df.loc[1, "success_root"]), 1)  # end bucket
 
+    def test_retries_are_bucketed_by_start_and_failed_retries_by_end(self):
+        """The other half of the documented split, and the half no assertion
+        reached: `retries` is bucketed at the retry's START, `failure_retry`
+        counts only attempts AFTER the first, at their END. This run separates
+        all three instants — a first attempt that fails, a retry that starts in
+        one bucket and fails in the next, and a retry that succeeds."""
+        sim = Simulator(seed=1)
+        svc = ServiceRuntime(
+            cfg=ServiceConfig(
+                name="svc",
+                latency_median=s_to_ns(0.5),
+                latency_lognorm_sigma=1e-9,
+                workers=1,
+                # Attempts 1 and 2 end inside the window and fail; attempt 3 ends
+                # after it and succeeds.
+                partial_failures=[PartialFailure(TimeInterval(0, s_to_ns(3)), p_fail=1.0)],
+            )
+        ).bind()
+        client = ClientRuntime(
+            cfg=ClientConfig(
+                retry=FixedBackoffRetryPolicy(max_attempts=3, delay=s_to_ns(1.2)),
+                timeout_controller=StaticTimeoutController(s_to_ns(10), s_to_ns(5)),
+            ),
+            service=svc,
+        )
+        client.start_request(sim)
+        sim.run()
+        # attempt 1 [0.0, 0.5) fails, retry 1 [1.7, 2.2) fails, retry 2 [3.4, 3.9) succeeds.
+        self.assertEqual(
+            [(a.interval.begin, a.interval.end, a.success) for a in client.roots[0].attempts],
+            [
+                (0, 500_000_303, False),
+                (1_700_000_303, 2_200_000_178, False),
+                (3_400_000_178, 3_900_000_685, True),
+            ],
+        )
+        df = self._export(client)
+        self.assertEqual(list(df["root_requests"]), [1, 0, 0, 0])  # start bucket
+        self.assertEqual(list(df["retries"]), [0, 1, 0, 1])  # retry START buckets
+        # Only the failed RETRY counts, and at its end: the first attempt failed
+        # in bucket 0 and the retry that failed started in bucket 1.
+        self.assertEqual(list(df["failure_retry"]), [0, 0, 1, 0])
+        self.assertEqual(list(df["completed"]), [1, 0, 1, 1])  # attempt END buckets
+        self.assertEqual(list(df["success_root"]), [0, 0, 0, 1])  # root END bucket
+
     def test_latency_columns_cover_successful_roots_only(self):
         client = _single_service_run()
         df = self._export(client)
@@ -453,10 +560,6 @@ class TestExportCsvBucketSemantics(unittest.TestCase):
         self.assertEqual(
             int(df["success_root"].sum()) + int(df["failure_root"].sum()), summary.total
         )
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestRootClassificationAgreement(unittest.TestCase):
@@ -608,3 +711,7 @@ class TestRootClassificationAgreement(unittest.TestCase):
             + summary.dropped_cancelled,
             summary.total,
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

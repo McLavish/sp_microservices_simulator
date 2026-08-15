@@ -1,3 +1,4 @@
+import functools
 import os
 import tempfile
 import unittest
@@ -83,26 +84,78 @@ class TestConstrainedTraining(unittest.TestCase):
             self.assertLess(final_lambda, 1.0)
 
     def test_subproc_workers_receive_lambda_broadcast(self):
-        # Exercises the SubprocVecEnv path: env factories must survive
-        # cloudpickle and lambda must reach workers via env_method.
-        cfg = ConstrainedTrainConfig(
-            build=lambda seed: build_chain_env(seed, duration_s=3),
-            action_spec=ActionSpec(
-                attempt_timeout_ms=[50, 80],
-                max_attempts=[1, 2],
-                backoff_ms=[20],
-            ),
-            episode_duration_s=3.0,
-            timesteps=128,
-            chunk_timesteps=64,
-            n_envs=2,
-            eval_episodes=1,
-            budget=0.001,  # tight: lambda must rise above its init
-            lambda_init=0.0,
-            lambda_lr=1.0,
-        )
-        policy = train_constrained_ppo(cfg)
+        """The multiplier must land in the WORKER processes' reward weights.
+
+        Exercises the SubprocVecEnv path (the env factory must survive
+        cloudpickle) and reads the weight back out of every worker after each
+        broadcast. Without the read-back a lost broadcast is invisible: the
+        parent-side curve still shows dual ascent while every worker keeps
+        training on `lambda_init`, i.e. unconstrained PPO.
+
+        The budget is generous and max_attempts caps the cost at 1 retry/root,
+        so `1.0 + 0.5 * (cost - 5.0)` is projected to exactly 0.0 on every
+        chunk — a value distinct from `lambda_init`, which is what the workers
+        were constructed with.
+        """
+        import rl.constrained as mod
+
+        broadcasts: list[tuple[float, list[float]]] = []
+        original = mod.make_vec_env
+
+        def spy(*args, **kwargs):
+            vec_env = original(*args, **kwargs)
+            inner_env_method = vec_env.env_method
+
+            def env_method(method_name, *m_args, **m_kwargs):
+                result = inner_env_method(method_name, *m_args, **m_kwargs)
+                if method_name == "set_cost_weight":
+                    # Round-trips each worker's own config out of its process.
+                    weights = [
+                        float(worker.reward_weights.cost) for worker in vec_env.get_attr("_cfg")
+                    ]
+                    broadcasts.append((float(m_args[0]), weights))
+                return result
+
+            vec_env.env_method = env_method
+            return vec_env
+
+        mod.make_vec_env = spy
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                curve_path = os.path.join(tmp, "curve.csv")
+                cfg = ConstrainedTrainConfig(
+                    # A picklable partial, not a lambda: the workers ship their
+                    # EnvConfig back for inspection. The factory itself is still
+                    # a closure, so cloudpickle is still on the path.
+                    build=functools.partial(build_chain_env, duration_s=3),
+                    action_spec=ActionSpec(
+                        attempt_timeout_ms=[50, 80],
+                        max_attempts=[1, 2],
+                        backoff_ms=[20],
+                    ),
+                    episode_duration_s=3.0,
+                    timesteps=128,
+                    chunk_timesteps=64,
+                    n_envs=2,
+                    eval_episodes=1,
+                    budget=5.0,
+                    lambda_init=1.0,
+                    lambda_lr=0.5,
+                    learning_curve_csv=curve_path,
+                )
+                policy = train_constrained_ppo(cfg)
+                with open(curve_path) as f:
+                    curve = f.read().strip().splitlines()
+        finally:
+            mod.make_vec_env = original
+
         self.assertEqual(policy.name, "constrained_ppo")
+        self.assertTrue(broadcasts, "lambda was never broadcast to the workers")
+        for lam, worker_weights in broadcasts:
+            self.assertEqual(worker_weights, [lam] * cfg.n_envs)
+            self.assertNotEqual(lam, cfg.lambda_init)  # or the read-back proves nothing
+        # The workers saw the same multiplier the curve reports.
+        self.assertEqual(broadcasts[-1][0], float(curve[-1].split(",")[-1]))
 
     def _tiny_cfg(self, **overrides) -> ConstrainedTrainConfig:
         base = ConstrainedTrainConfig(

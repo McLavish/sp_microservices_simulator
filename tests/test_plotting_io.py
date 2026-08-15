@@ -47,6 +47,31 @@ class TestLoadMetricsTrim(unittest.TestCase):
         # carries real latency/failure data and must survive.
         self.assertEqual(list(out["timepoint"]), [0.0, 1.0])
 
+    def test_root_completion_only_final_bucket_is_kept(self):
+        """`completed` alone does not cover the trim rule. A root cancelled while
+        backing off completes AFTER its last attempt ended, so its bucket has
+        `completed == 0` and only a root-completion column set — the row
+        metrics.py widened its bucket range to preserve."""
+        from plotting.utils.io import load_metrics
+
+        for column in ("success_root", "failure_root"):
+            with self.subTest(column=column):
+                df = pd.DataFrame(
+                    {
+                        "timepoint": [0.0, 1.0, 2.0],
+                        "root_requests": [1, 0, 0],
+                        "completed": [1, 0, 0],
+                        "success_root": [0, 0, 0],
+                        "failure_root": [0, 0, 0],
+                    }
+                )
+                df.loc[2, column] = 1
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = os.path.join(tmp, "t.csv")
+                    df.to_csv(path, index=False)
+                    out = load_metrics(path)
+                self.assertEqual(list(out["timepoint"]), [0.0, 1.0, 2.0])
+
 
 class TestHeaderOnlyCsv(unittest.TestCase):
     def _header_only_csv(self, tmp):

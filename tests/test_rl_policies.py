@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 import warnings
@@ -7,7 +8,7 @@ from unittest import mock
 import numpy as np
 
 from rl.env import ActionSpec, RewardWeights
-from rl.model_io import check_action_spec, save_action_spec
+from rl.model_io import check_action_spec, save_action_spec, sidecar_path
 from rl.policies.action_space import ActionGrid
 from rl.policies.aimd import AIMDPolicy
 from rl.policies.bayesian import BayesianPolicy
@@ -50,6 +51,10 @@ class TestRLPolicies(unittest.TestCase):
         }
         action = policy.act(np.zeros(12, dtype=np.float32), info)
         self.assertIn(action, self.grid.indices)
+        # Pin the DECISION, not its type: every observed latency (12-18 ms)
+        # exceeds the 10 ms grid entry, so the 20 ms timeout is the only one
+        # that can succeed and retrying is free under it.
+        self.assertEqual(action, (1, 1, 0))
 
     def test_model_based_policy_queue_delay(self):
         policy = ModelBasedPolicy(
@@ -73,6 +78,11 @@ class TestRLPolicies(unittest.TestCase):
         }
         action = policy.act(np.zeros(12, dtype=np.float32), info)
         self.assertIn(action, self.grid.indices)
+        # The queue variant fits the SERVICE stream, and this info carries none,
+        # so there is nothing to fit and nothing held: the decision must be the
+        # mid-grid warm-up, never the grid corner (shortest timeout, no retry).
+        self.assertEqual(action, self.grid.midpoint_indices())
+        self.assertNotEqual(action, self.grid.indices[0])
 
     def test_queue_delay_matches_mm1_closed_form(self):
         # Service moments with E[S] = 1 ms and E[S^2] = 2 ms^2 (CV^2 = 1, the
@@ -124,6 +134,9 @@ class TestRLPolicies(unittest.TestCase):
         }
         action = policy.act(np.zeros(12, dtype=np.float32), info)
         self.assertIn(action, self.grid.indices)
+        # Same crafted stream as the model-based case: the posterior puts no
+        # mass below 10 ms, so only the 20 ms timeout can succeed.
+        self.assertEqual(action, (1, 1, 0))
 
     def test_aimd_policy_act(self):
         policy = AIMDPolicy(
@@ -145,6 +158,9 @@ class TestRLPolicies(unittest.TestCase):
         }
         action = policy.act(np.zeros(12, dtype=np.float32), info)
         self.assertIn(action, self.grid.indices)
+        # 20% deadline drops is unhealthy, so the additive-increase arm fires on
+        # both adjusted knobs: one timeout step up and one more attempt.
+        self.assertEqual(action, (1, 1, 0))
 
     def test_aimd_multiplicative_decrease_snaps_to_grid(self):
         spec = ActionSpec(
@@ -192,6 +208,9 @@ class TestRLPolicies(unittest.TestCase):
         action = policy.act(np.zeros(12, dtype=np.float32), info)
         self.assertEqual(len(action), 4)
         self.assertIn(action, grid.indices)
+        # The extra dimension must carry the requested budget (100 ms -> index
+        # 0), not shift the knobs it was appended to.
+        self.assertEqual(action, (1, 0, 0, 0))
 
 
 class TestServiceMoments(unittest.TestCase):
@@ -230,6 +249,78 @@ class TestServiceMoments(unittest.TestCase):
         plain_policy = ModelBasedPolicy(grid=grid)
         plain_policy.act(np.zeros(1), info)
         self.assertAlmostEqual(float(plain_policy._fit_buffer().data().mean()), 40.0)
+
+
+class TestQueueModelGroundTruth(unittest.TestCase):
+    """The env's own queue measurements must beat the sampled-client fallback.
+
+    `modeled_admitted` counts every attempt admitted at the modelled service and
+    `modeled_workers` is its real concurrency; the fallbacks (the sampled edge's
+    attempt count, the configured `queue_workers`) undercount a shared queue and
+    describe a scenario-independent default service.
+    """
+
+    def setUp(self):
+        self.grid = ActionGrid(
+            ActionSpec(attempt_timeout_ms=[30, 80], max_attempts=[1], backoff_ms=[0])
+        )
+
+    def _policy(self):
+        return ModelBasedPolicy(
+            grid=self.grid,
+            include_queue_delay=True,
+            queue_workers=16,
+            step_duration_s=1.0,
+        )
+
+    @staticmethod
+    def _info(admitted=None, workers=None):
+        # Constant 20 ms occupancy: E[S] = 20 ms, CV^2 = 0. Only 5 sampled edge
+        # attempts, so the fallback lambda is 20x smaller than the real one.
+        info = {
+            "attempt_latencies_ms": [20.0] * 5,
+            "attempt_censored": [False] * 5,
+            "attempt_service_ms": [20.0] * 50,
+            "attempt_service_censored": [False] * 50,
+            "summary": {"completed": 5.0, "retries_per_root": 0.0},
+        }
+        if admitted is not None:
+            info["modeled_admitted"] = admitted
+        if workers is not None:
+            info["modeled_workers"] = workers
+        return info
+
+    def test_modeled_admitted_is_preferred_over_the_sampled_attempt_count(self):
+        policy = self._policy()
+        policy._service_buffer.add([20.0] * 50)
+        # c = 1, lambda = 30/1000 per ms, E[S] = 20 ms -> rho = 0.6 and the
+        # M/M/1 wait is rho/(1-rho) * E[S] = 30 ms, halved by (1 + CV^2)/2.
+        self.assertAlmostEqual(policy._estimate_queue_delay(self._info(30, 1)), 15.0, places=9)
+        # The fallback would see 5 attempts (lambda = 0.005/ms, rho = 0.1), a
+        # 13x smaller wait: 0.1/(1 - 0.1) * 20 ms / 2.
+        fallback = policy._estimate_queue_delay(self._info(workers=1))
+        self.assertAlmostEqual(fallback, 10.0 / 9.0, places=9)
+
+    def test_modeled_workers_overrides_the_configured_default(self):
+        policy = self._policy()  # queue_workers=16, the scenario-blind default
+        policy._service_buffer.add([20.0] * 50)
+        self.assertAlmostEqual(policy._estimate_queue_delay(self._info(30, 1)), 15.0, places=9)
+        # Same offered load spread over 16 workers barely queues at all.
+        self.assertLess(policy._estimate_queue_delay(self._info(30)), 1e-9)
+
+    def test_queue_delay_moves_the_selected_timeout(self):
+        """The delay must reach the argmax, not just the estimator.
+
+        Identical service stream and identical sampled-attempt count: only the
+        modelled queue's arrival count differs. Under the light load a 20 ms
+        service fits inside the 30 ms timeout, so the cheaper knob wins; under
+        the heavy one the 15 ms queueing delay pushes it past 30 ms and only the
+        80 ms timeout can succeed.
+        """
+        light = self._policy().act(np.zeros(1), self._info(1, 1))
+        heavy = self._policy().act(np.zeros(1), self._info(30, 1))
+        self.assertEqual(light, (0, 0, 0))
+        self.assertEqual(heavy, (1, 0, 0))
 
 
 class TestTraceTimeAxis(unittest.TestCase):
@@ -289,6 +380,33 @@ class TestActionSpecSidecar(unittest.TestCase):
             path = str(Path(tmp) / "model.zip")
             save_action_spec(path, self.spec, step_duration_s=1.0, fault_scenario="chain")
             check_action_spec(path, self.spec)  # no raise
+            stored = json.loads(Path(sidecar_path(path)).read_text())
+            self.assertEqual(stored["step_duration_s"], 1.0)
+            self.assertEqual(stored["fault_scenario"], "chain")
+
+    def test_step_duration_mismatch_is_rejected(self):
+        # Both production callers pass the step duration; a model trained on 1 s
+        # windows reads every rate feature and the episode-time fraction on a
+        # different scale under 0.1 s windows.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "model.zip")
+            save_action_spec(path, self.spec, step_duration_s=1.0)
+            check_action_spec(path, self.spec, 1.0)  # matching: no raise
+            with self.assertRaises(ValueError) as ctx:
+                check_action_spec(path, self.spec, 0.1)
+            self.assertIn("step_duration_s", str(ctx.exception))
+
+    def test_legacy_sidecar_without_a_step_duration_is_accepted(self):
+        # Sidecars written before the field existed carry no step duration:
+        # they must still pass the grid check rather than raise on the guard.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "model.zip")
+            save_action_spec(path, self.spec, step_duration_s=1.0)
+            sidecar = Path(sidecar_path(path))
+            payload = json.loads(sidecar.read_text())
+            del payload["step_duration_s"]
+            sidecar.write_text(json.dumps(payload))
+            check_action_spec(path, self.spec, 0.1)  # no raise
 
     def test_different_grid_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

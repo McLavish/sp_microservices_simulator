@@ -791,9 +791,11 @@ class TestVetoedRetriesAreRefunded(unittest.TestCase):
 
     def test_leaky_limiter_releases_vetoed_slot(self):
         policy = LeakyRateLimiterPolicy(max_requests=10, max_attempts=10, period=s_to_ns(1))
-        # A retry is issued here (leaky delay is 0 on an idle bucket), so the
-        # reservation stands; the invariant is that _next_at advances once per
-        # ISSUED retry, never for a vetoed one.
+        # `next_delay` DOES reserve a slot here (leaky delay is 0 on an idle
+        # bucket, so _next_at briefly advances to 105 ms), but the retry is never
+        # issued: the 5 ms global deadline vetoes it and `rollback` puts _next_at
+        # back. The invariant is that _next_at advances once per ISSUED retry,
+        # never for a vetoed one.
         issued = self._run(policy, attempt_timeout_ms=5, global_timeout_ms=5)
         self.assertEqual(issued, 0)
         self.assertIsNone(policy._next_at)
@@ -813,6 +815,78 @@ class TestVetoedRetriesAreRefunded(unittest.TestCase):
         # Both layers charged during next_delay; both must refund.
         self.assertEqual(outer._tokens, outer_before)
         self.assertEqual(inner._tokens, inner_before)
+
+
+class TestPolicyFeedbackReachesWrappedLayers(unittest.TestCase):
+    """Results and request starts must reach EVERY layer, not just the outermost.
+
+    `_update_policy_results` and `_notify_request_start` walk the chain, and
+    CLAUDE.md warns that circuit breakers and retry budgets update *only*
+    through those paths. Every other test drives an `add_result`-bearing policy
+    as the top-level `ClientConfig.retry`, where reaching the outermost layer
+    alone is enough — so a walk collapsed to `policy` itself changed nothing.
+    """
+
+    def _client(self, policy, p_fail: float):
+        failures = [PartialFailure(TimeInterval(0, s_to_ns(100)), p_fail=p_fail)] if p_fail else []
+        svc = ServiceRuntime(
+            cfg=ServiceConfig(
+                name="svc",
+                latency_median=1,
+                latency_lognorm_sigma=0.1,
+                workers=4,
+                partial_failures=failures,
+            )
+        ).bind()
+        return ClientRuntime(
+            cfg=ClientConfig(retry=policy, timeout_controller=StaticTimeoutController()),
+            service=svc,
+        )
+
+    def test_attempt_results_reach_a_wrapped_breaker(self):
+        breaker = CountBasedCircuitBreakerPolicy(
+            failure_threshold_ratio=(2, 2),
+            success_threshold_ratio=(1, 1),
+            underlying_strategy=FixedBackoffRetryPolicy(max_attempts=3, delay=0),
+            half_open_delay=s_to_ns(1000),  # stays open once tripped
+        )
+        # RetryBudgetPolicy has no add_result of its own, so the breaker only
+        # ever sees an outcome if the walk descends into underlying_strategy.
+        client = self._client(
+            RetryBudgetPolicy(budget_ratio=1.0, max_retries=5, underlying_strategy=breaker),
+            p_fail=1.0,
+        )
+        sim = Simulator(seed=1)
+        client.start_request(sim)
+        sim.run()
+
+        self.assertEqual(len(client.roots[0].attempts), 2)  # both failures fed in
+        self.assertEqual(breaker.get_state(), CBState.OPEN)
+
+    def test_request_starts_reach_a_wrapped_budget(self):
+        budget = RetryBudgetPolicy(
+            budget_ratio=0.1,
+            max_retries=1,
+            underlying_strategy=FixedBackoffRetryPolicy(max_attempts=10, delay=0),
+        )
+        while budget.can_retry():  # drain, so deposits are visible below the cap
+            budget.next_delay(RetryContext(attempt=1, now=0))
+        self.assertEqual(budget._tokens, 0)
+        breaker = CountBasedCircuitBreakerPolicy(
+            failure_threshold_ratio=(1, 1),
+            success_threshold_ratio=(1, 1),
+            underlying_strategy=budget,
+            half_open_delay=0,
+        )
+        client = self._client(breaker, p_fail=0.0)  # healthy: no retries, no withdrawals
+        sim = Simulator(seed=1)
+        for _ in range(3):
+            client.start_request(sim)
+            sim.run()
+
+        self.assertEqual([root.attempts[-1].success for root in client.roots], [True] * 3)
+        # One deposit per admitted root request, through the wrapper.
+        self.assertEqual(budget._tokens, 3 * budget._deposit)
 
 
 if __name__ == "__main__":

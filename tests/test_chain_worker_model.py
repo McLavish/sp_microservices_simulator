@@ -212,10 +212,6 @@ class TestFinalizeExactlyOnce(unittest.TestCase):
         self.assertGreaterEqual(svc.in_flight, 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestCancellationPropagation(unittest.TestCase):
     """propagate_cancellation selects between two real architectures.
 
@@ -979,3 +975,7 @@ class TestOccupancyCensoring(unittest.TestCase):
         # The attempt's latency IS censored; its occupancy is not.
         self.assertEqual(samples["attempt_censored"], [True])
         self.assertEqual(samples["attempt_service_censored"], [False])
+
+
+if __name__ == "__main__":
+    unittest.main()

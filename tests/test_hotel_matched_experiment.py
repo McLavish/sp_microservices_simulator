@@ -6,6 +6,9 @@ import pytest
 
 from core import ms_to_ns
 from experiments.hotel_matched import (
+    _DEFAULT_BASE_RPS,
+    _DEFAULT_DURATION_S,
+    _DEFAULT_RECOMMENDATION_FRACTION,
     DEFAULT_PROFILE_FAULT,
     HotelMatchedConfig,
     _build_runtime,
@@ -16,6 +19,9 @@ from experiments.hotel_matched import (
     _parse_load_spike,
     _parse_profile_fault,
     _positive_float,
+    _recommendation_fraction_from,
+    _validated_base_rps,
+    _validated_duration,
     _validated_load_spike,
     _validated_profile_fault,
     config_from_args,
@@ -134,6 +140,104 @@ def test_run_hotel_matched_writes_root_service_and_fault_outputs(tmp_path):
         "latency_injection",
         "partial_failure",
     }
+
+
+def test_run_hotel_matched_follows_the_recorded_workload(tmp_path):
+    """With no CLI overrides the run must take rate, duration AND mix from the
+    recording — the branch every other calibration test skips by pinning all
+    three in the config. Ignoring the recording ran the "matched" scenario at
+    the built-in 100 rps for 60 s against workers/queue_capacity read from that
+    same file, and generated 75% search traffic against a
+    recommendations-heavy recording.
+    """
+    calibration_json = tmp_path / "calibration.json"
+    calibration_json.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "services": {
+                    name: _service(1.0, workers=16)
+                    for name in (
+                        "search",
+                        "geo",
+                        "rate",
+                        "reservation",
+                        "profile",
+                        "recommendation",
+                    )
+                },
+                "workload": {
+                    # Deliberately unlike the built-in defaults (100 rps, 60 s,
+                    # 25% recommendations): 3 of every 4 requests are reads of
+                    # the recommendation path.
+                    "base_rps": 20.0,
+                    "duration_s": 2.0,
+                    "path": {
+                        "/recommendation.Recommendation/GetRecommendations": 3,
+                        "/search.Search/Nearby": 1,
+                    },
+                    "load_spikes": [],
+                },
+                "fault_scenario": [],
+            }
+        )
+    )
+
+    outputs = run_hotel_matched(
+        HotelMatchedConfig(
+            output_dir=tmp_path / "out",
+            calibration_json=calibration_json,
+            base_rps=None,
+            duration_s=None,
+            recommendation_fraction=None,
+            seed=99,
+        )
+    )
+
+    root_rows = _read_rows(outputs["root_csv"])
+    total_roots = sum(int(row["root_requests"]) for row in root_rows)
+    # The recorded 2 s, not the 60 s default: two one-second buckets.
+    assert [row["timepoint"] for row in root_rows] == ["0.000", "1.000"]
+    # 20 rps x 2 s ~= 40 roots; the default rate would offer ~6000.
+    assert 15 <= total_roots <= 100
+
+    recommendation_roots = sum(
+        int(row["root_requests"]) for row in _read_rows(outputs["svc_recommendation_csv"])
+    )
+    search_roots = sum(int(row["root_requests"]) for row in _read_rows(outputs["svc_search_csv"]))
+    # 75/25 split from workload.path; the default fraction reverses this.
+    assert recommendation_roots > 2 * search_roots
+    assert search_roots > 0
+
+
+def test_recommendation_fraction_comes_from_the_recorded_mix():
+    recorded = {
+        "path": {
+            "/recommendation.Recommendation/GetRecommendations": 3,
+            "/search.Search/Nearby": 1,
+        }
+    }
+    assert _recommendation_fraction_from(recorded) == 0.75
+    # Nothing recorded about the mix -> the built-in default.
+    assert _recommendation_fraction_from({}) == _DEFAULT_RECOMMENDATION_FRACTION
+    assert _recommendation_fraction_from({"path": {}}) == _DEFAULT_RECOMMENDATION_FRACTION
+    with pytest.raises(ValueError):
+        _recommendation_fraction_from({"path": {"/search.Search/Nearby": -1}})
+
+
+def test_recorded_rate_and_duration_are_bound_checked():
+    assert _validated_base_rps(None) == _DEFAULT_BASE_RPS
+    assert _validated_base_rps("12.5") == 12.5
+    assert _validated_base_rps(0) == 0.0  # a silent recording is legal
+    with pytest.raises(ValueError):
+        _validated_base_rps(-1.0)
+
+    assert _validated_duration(None) == _DEFAULT_DURATION_S
+    assert _validated_duration("2.5") == 2.5
+    with pytest.raises(ValueError):
+        _validated_duration(0.0)  # a zero-length run exports nothing
+    with pytest.raises(ValueError):
+        _validated_duration(-3.0)
 
 
 def test_run_hotel_matched_uses_default_profile_fault_when_no_calibration(tmp_path):

@@ -107,6 +107,58 @@ class TestAdaptiveTimeoutController(unittest.TestCase):
         self.assertEqual(ctrl.get_global_timeout(), s_to_ns(1))
 
 
+class TestColdStartInflation(unittest.TestCase):
+    """The escape hatch for a timeout that is too tight from t=0.
+
+    With no SUCCESSFUL sample the percentile stays None forever, so the old code
+    returned early and the attempt timeout froze at its initial value — the
+    documented death spiral. Every other test in this module feeds >= min_samples
+    successful latencies first, which makes this branch unreachable, so replacing
+    its condition with `if False:` used to leave the whole suite green.
+    """
+
+    def test_failures_only_inflate_off_the_initial_timeout(self):
+        ctrl = AdaptiveTimeoutController(initial_attempt_timeout=ms_to_ns(10))
+        _feed(ctrl, s_to_ns(1), n=20, success=False)
+        self.assertIsNone(ctrl._calculate_percentile_timeout())  # no successes to fit
+        # Success rate 0.0 floors at 0.1, so the nudge tops out at 10x.
+        self.assertEqual(ctrl.get_attempt_timeout(), ms_to_ns(100))
+
+    def test_partial_successes_inflate_by_the_inverse_success_rate(self):
+        ctrl = AdaptiveTimeoutController(initial_attempt_timeout=ms_to_ns(10))
+        _feed(ctrl, ms_to_ns(8), n=3)  # 3 successful latencies: below min_samples
+        _feed(ctrl, 0, n=7, success=False)  # 3 / 10 results = 0.3
+        self.assertIsNone(ctrl._calculate_percentile_timeout())
+        self.assertEqual(ctrl.get_attempt_timeout(), 33_333_333)  # 10 ms / 0.3
+
+    def test_success_rate_at_the_threshold_does_not_inflate(self):
+        ctrl = AdaptiveTimeoutController(initial_attempt_timeout=ms_to_ns(10))
+        _feed(ctrl, ms_to_ns(8), n=3)
+        _feed(ctrl, 0, n=3, success=False)  # exactly min_success_rate: strict <
+        self.assertEqual(ctrl.get_attempt_timeout(), ms_to_ns(10))
+
+    def test_inflation_compounds_off_the_initial_value_not_the_current_one(self):
+        ctrl = AdaptiveTimeoutController(initial_attempt_timeout=ms_to_ns(10))
+        _feed(ctrl, 0, n=20, success=False)
+        self.assertEqual(ctrl.get_attempt_timeout(), ms_to_ns(100))
+        # A second window of the same evidence must not multiply again: 10x is
+        # the whole budget, and max_timeout is unbounded by default.
+        _feed(ctrl, 0, n=20, success=False)
+        self.assertEqual(ctrl.get_attempt_timeout(), ms_to_ns(100))
+
+    def test_max_timeout_caps_the_cold_start_inflation(self):
+        ctrl = AdaptiveTimeoutController(
+            initial_attempt_timeout=ms_to_ns(10), max_timeout=ms_to_ns(50)
+        )
+        _feed(ctrl, 0, n=20, success=False)
+        self.assertEqual(ctrl.get_attempt_timeout(), ms_to_ns(50))
+
+    def test_without_an_initial_timeout_there_is_nothing_to_inflate(self):
+        ctrl = AdaptiveTimeoutController()
+        _feed(ctrl, 0, n=20, success=False)
+        self.assertIsNone(ctrl.get_attempt_timeout())
+
+
 class TestAdaptiveTimeoutConfigValidation(unittest.TestCase):
     """`initial_attempt_timeout` is served verbatim until enough SUCCESSFUL
     samples accumulate, so an initial outside `[min_timeout, max_timeout]`

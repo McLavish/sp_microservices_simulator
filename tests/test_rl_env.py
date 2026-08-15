@@ -529,10 +529,53 @@ class TestMicroservicesEnv(unittest.TestCase):
         full = env.bystander_metrics_summary()
         assert in_horizon is not None and full is not None
         self.assertGreater(in_horizon.total, 0)
-        # In-horizon is a strict prefix of the full population: the drain still
-        # completes in-flight bystander roots, it just admits no new ones.
-        self.assertLessEqual(in_horizon.total, full.total)
+
+        # Pin the partition the way the agent-side twin does, not just
+        # `in_horizon <= full`: the prefix slice makes that inequality true for
+        # ANY horizon count, so booking the whole drained tail as reward-visible
+        # would satisfy it. Recompute the reward-visible population from the
+        # roots' own completion times.
+        bystander = env._require_components().bystander_client
+        assert bystander is not None
+        roots = bystander.roots
+        visible = [
+            root
+            for root in roots
+            if root.completed_at is not None and root.completed_at <= env._end_time_ns
+        ]
+        drained = len(roots) - len(visible)
+        self.assertGreater(drained, 0, "fixture must leave a drained tail to distinguish")
+        self.assertEqual(in_horizon.total, len(visible))
+        self.assertEqual(full.total, len(visible) + drained)
+        self.assertLess(in_horizon.total, full.total)
         self.assertEqual(in_horizon.total, info["bystander_summary_in_horizon"]["completed"])
+
+    def test_modeled_queue_ground_truth_describes_the_shared_service(self):
+        """`modeled_admitted`/`modeled_workers` describe svc-C, not the sampled edge.
+
+        A queueing policy left without them falls back to the sampled client's
+        attempt count — which halves rho here, since C is fed by the agent's
+        edge AND the bystander's — and to a scenario-independent worker default
+        instead of C's real worker count.
+        """
+        env = self._make_env(build_multichain_env, episode_duration_s=3.0)
+        env.reset(seed=11)
+        _, _, _, _, first = env.step(np.array([1, 1, 0]))
+        _, _, _, _, second = env.step(np.array([1, 1, 0]))
+
+        modeled = env._require_components().modeled_service
+        assert modeled is not None
+        self.assertGreater(modeled.cfg.workers, 0)
+        self.assertEqual(first["modeled_workers"], modeled.cfg.workers)
+        self.assertEqual(second["modeled_workers"], modeled.cfg.workers)
+        # Per-window deltas of the queue's OWN admitted-attempt counter.
+        self.assertGreater(first["modeled_admitted"], 0)
+        self.assertGreater(second["modeled_admitted"], 0)
+        self.assertEqual(
+            first["modeled_admitted"] + second["modeled_admitted"], modeled.admitted_total
+        )
+        # Strictly more than the sampled edge's own attempts in the same window.
+        self.assertGreater(second["modeled_admitted"], len(second["attempt_latencies_ms"]))
 
     def test_bystander_summary_absent_without_bystander(self):
         env = self._make_env(build_chain_env, episode_duration_s=1.0)
