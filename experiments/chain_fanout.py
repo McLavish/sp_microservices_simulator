@@ -34,11 +34,20 @@ if __name__ == "__main__":
 
     # Define services A -> B -> (C & E). The leaves are sized so retry demand
     # during the fault window stays inside their capacity: 32 workers x ~68 ms
-    # mean is ~470 rps each against 188 rps of offered load. Sized at 16 workers
-    # (~235 rps, ~80% utilization) the nested retry layers tipped the run into a
-    # metastable collapse the moment svc-C degraded — root success went to zero
-    # at t=12 s and never recovered, so ~80% of the exported buckets, and of the
-    # figures plot.sh renders from them, were empty.
+    # mean is ~470 rps against 188 rps of offered load for svc-E, and svc-C —
+    # the faulted leaf, where the retries pile up — gets 64 (~940 rps). Sized at
+    # 16 workers (~235 rps, ~80% utilization) the nested retry layers tipped the
+    # run into a metastable collapse the moment svc-C degraded — root success
+    # went to zero at t=12 s and never recovered, so ~80% of the exported
+    # buckets, and of the figures plot.sh renders from them, were empty.
+    #
+    # With that headroom the fault has to be SEVERE to survive three nested
+    # retry layers (3 x 3 x 3 = up to 27 attempts at C per root): at p_fail=0.5
+    # the top-level client failed zero roots in all 61 buckets, so its
+    # failure-reason figure came out blank. At p_fail=0.8 roughly 5% of the
+    # roots completing during the window fail (mostly deadline drops, the 2 s
+    # budget spent on retries) and the run is back to zero failures one bucket
+    # after the window closes.
     a_cfg = ServiceConfig(
         name="svc-A",
         latency_median=ms_to_ns(60),
@@ -57,10 +66,10 @@ if __name__ == "__main__":
         name="svc-C",
         latency_median=ms_to_ns(60),
         latency_lognorm_sigma=0.5,
-        workers=32,
+        workers=64,
         queue_capacity=10000000,
         partial_failures=[
-            PartialFailure(duration=TimeInterval(begin=s_to_ns(10), end=s_to_ns(20)), p_fail=0.5)
+            PartialFailure(duration=TimeInterval(begin=s_to_ns(10), end=s_to_ns(20)), p_fail=0.8)
         ],
     )
     e_cfg = ServiceConfig(

@@ -61,8 +61,9 @@ def linear_reward(
     it as the reward-with-penalties-zeroed.
 
     `cost_term` is a parameter rather than a summary key because the constraint
-    cost is not a plain rate: the env penalises the window's retry COUNT
-    normalised by a constant fixed at reset (see `_cost_penalty`).
+    cost is not a plain rate: the env penalises the linearized constraint
+    `cost_retries - cost_budget * cost_roots` (or, with no budget configured, a
+    normalised retry count) — see `MicroservicesEnv._cost_penalty`.
     """
     return float(
         summary["success_rate"] * weights.success

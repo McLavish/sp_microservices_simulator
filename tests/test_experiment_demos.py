@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from core import ns_to_ms
+from core import ns_to_s
 
 
 def _run_demo(module: str, cwd: Path) -> dict:
@@ -31,8 +31,16 @@ def _rows(path: Path) -> list[dict]:
         return list(csv.DictReader(fh))
 
 
-def _finite(values):
-    return [float(v) for v in values if v not in ("", "nan")]
+def _spill_bound(globs, client_cfg_name: str) -> float:
+    """Latest bucket a run may legally reach: workload + one global timeout.
+
+    The last root the workload admits starts just before `duration_s` and its
+    whole retry sequence is capped by the client's global timeout, so a bucket
+    past that carries backlog the run never worked off, not service.
+    """
+    global_timeout = globs[client_cfg_name].timeout_controller.get_global_timeout()
+    assert global_timeout is not None, f"{client_cfg_name} must bound its roots"
+    return globs["wl"].duration_s + ns_to_s(global_timeout)
 
 
 @pytest.fixture(scope="module")
@@ -57,18 +65,46 @@ def test_chain_fanout_demo_reports_traffic_for_its_whole_run(chain_fanout):
     ~80% of the CSV, and of the figures plot.sh renders from it.
     """
     cwd, globs = chain_fanout
-    duration_s = globs["wl"].duration_s
     rows = _rows(cwd / "chain_output.csv")
 
     assert rows
     assert [row["timepoint"] for row in rows if int(row["success_root"]) == 0] == []
     assert [row["timepoint"] for row in rows if row["p50"] in ("", "nan")] == []
-    # In-flight work drains within one bucket of the workload horizon.
-    assert float(rows[-1]["timepoint"]) <= duration_s + 1
+    assert float(rows[-1]["timepoint"]) <= _spill_bound(globs, "top_client_cfg")
 
+
+def test_chain_fanout_demo_shows_the_fault_at_the_top_level(chain_fanout):
+    """The fault has to reach the figures the demo is actually read from.
+
+    Calibrating the collapse away overshot: with `p_fail=0.5` the three nested
+    retry layers (up to 3 x 3 x 3 attempts at svc-C per root) masked the window
+    completely, so chain_output.csv had ZERO failures in all 61 buckets and the
+    top-level failure-reason panel rendered blank. The window must be visible at
+    the top level, and it must close again.
+    """
+    cwd, globs = chain_fanout
+    fault = globs["c_cfg"].partial_failures[0].duration
+    rows = {float(row["timepoint"]): row for row in _rows(cwd / "chain_output.csv")}
+
+    def failure_rate(row) -> float:
+        completed = int(row["completed"])
+        return int(row["failure_root"]) / completed if completed else 0.0
+
+    during = [
+        failure_rate(rows[float(t)])
+        for t in range(int(ns_to_s(fault.begin)), int(ns_to_s(fault.end)))
+    ]
+    assert sum(1 for rate in during if rate > 0.02) >= 5
+
+    # ... and recovers: roots admitted during the window are gone one global
+    # timeout after it closes, and nothing fails at the top level from there on.
     global_timeout = globs["top_client_cfg"].timeout_controller.get_global_timeout()
     assert global_timeout is not None
-    assert max(_finite(row["max"] for row in rows)) <= ns_to_ms(global_timeout)
+    recovered_from = ns_to_s(fault.end) + ns_to_s(global_timeout)
+    still_failing = [
+        t for t, row in rows.items() if t >= recovered_from and int(row["failure_root"])
+    ]
+    assert still_failing == []
 
 
 def test_chain_fanout_demo_still_shows_the_fault_window(chain_fanout):
@@ -108,11 +144,7 @@ def test_leaky_limiter_demo_keeps_its_reservation_queue_bounded(rate_limiter_lea
     not limiter behaviour.
     """
     cwd, globs = rate_limiter_leaky
-    duration_s = globs["wl"].duration_s
-    global_timeout = globs["cli_cfg"].timeout_controller.get_global_timeout()
     rows = _rows(cwd / "rate_limiter_leaky_output.csv")
 
     assert rows
-    assert global_timeout is not None
-    assert float(rows[-1]["timepoint"]) <= duration_s + 1
-    assert max(_finite(row["max"] for row in rows)) <= ns_to_ms(global_timeout)
+    assert float(rows[-1]["timepoint"]) <= _spill_bound(globs, "cli_cfg")

@@ -1,8 +1,11 @@
 import csv
 import tempfile
 import unittest
+from enum import Enum, auto
 from pathlib import Path
+from unittest import mock
 
+import core
 from core import (
     FAILURE_OUTCOMES,
     DropReason,
@@ -220,12 +223,37 @@ class TestExportGranularity(unittest.TestCase):
             self.assertEqual(df["timepoint"].nunique(), len(df))
 
 
+class _NewOutcome(Enum):
+    """A `RootOutcome` member no consumer table knows about yet."""
+
+    THROTTLED = auto()
+
+
+class _ExtendedRootOutcome:
+    """`core.RootOutcome` with one member added.
+
+    Python forbids subclassing an enum that already has members, and
+    `require_outcome_coverage` looks `RootOutcome` up as a module global on
+    every call — so patching this stand-in over it is what growing the enum
+    looks like from inside the guard.
+    """
+
+    SUCCESS = RootOutcome.SUCCESS
+
+    def __iter__(self):
+        yield from RootOutcome
+        yield _NewOutcome.THROTTLED
+
+
 class TestOutcomeCoverageGuard(unittest.TestCase):
     """A consumer table missing a non-success outcome must fail loudly.
 
     The guard is what turns "new RootOutcome silently booked as a server drop"
     into an import-time error, so it must reject an incomplete mapping and not
-    compare a table against itself.
+    compare a table against itself: `core.FAILURE_OUTCOMES` is one of its own
+    callers, so checking a mapping against that table instead of against the
+    enum would pass unconditionally — the silent no-op this guard exists to
+    prevent.
     """
 
     def test_complete_mapping_passes(self):
@@ -239,9 +267,31 @@ class TestOutcomeCoverageGuard(unittest.TestCase):
         self.assertIn("CANCELLED", str(ctx.exception))
         self.assertIn("tests.incomplete_table", str(ctx.exception))
 
-    def test_success_needs_no_entry(self):
-        no_success = {k: v for k, v in FAILURE_OUTCOMES.items() if k is not RootOutcome.SUCCESS}
-        require_outcome_coverage(no_success, owner="test")
+    def test_a_new_enum_member_fails_even_the_core_table(self):
+        # The whole point: adding an outcome must break the tables that predate
+        # it, FAILURE_OUTCOMES included. A guard comparing a mapping against
+        # itself (or against FAILURE_OUTCOMES) sees nothing here.
+        with (
+            mock.patch.object(core, "RootOutcome", _ExtendedRootOutcome()),
+            self.assertRaises(RuntimeError) as ctx,
+        ):
+            require_outcome_coverage(FAILURE_OUTCOMES, owner="core.FAILURE_OUTCOMES")
+        message = str(ctx.exception)
+        self.assertIn("THROTTLED", message)
+        self.assertNotIn("DEADLINE", message)
+
+    def test_success_entry_cannot_stand_in_for_a_missing_failure(self):
+        # SUCCESS needs no entry, and having one is harmless...
+        padded = dict(FAILURE_OUTCOMES)
+        padded[RootOutcome.SUCCESS] = FAILURE_OUTCOMES[RootOutcome.DEADLINE]
+        require_outcome_coverage(padded, owner="test")
+
+        # ... but it must not pay for a missing failure outcome: this table is
+        # the same SIZE as the complete one and still misses DEADLINE.
+        del padded[RootOutcome.DEADLINE]
+        with self.assertRaises(RuntimeError) as ctx:
+            require_outcome_coverage(padded, owner="tests.success_padded_table")
+        self.assertIn("DEADLINE", str(ctx.exception))
 
 
 if __name__ == "__main__":

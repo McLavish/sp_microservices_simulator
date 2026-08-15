@@ -120,6 +120,14 @@ class EnvConfig:
     step_duration_s: float = 1.0
     episode_duration_s: float | None = None
     reward_weights: RewardWeights = field(default_factory=RewardWeights)
+    # Retry-amplification budget the constraint is stated against, in retries
+    # per cost-client root — the same quantity `EpisodeResult.pooled_cost`
+    # reports and `dual_ascent_update` ascends on. Set, it makes the per-window
+    # cost term the linearization of `pooled_cost <= cost_budget` (see
+    # `_cost_penalty`), which is what pairs the primal with the dual. Left None
+    # (the default), `RewardWeights.cost` is a plain soft penalty on retries
+    # with no constraint attached.
+    cost_budget: float | None = None
     drain_on_done: bool = True
     initial_action: tuple[int, ...] | None = None
     emit_latency_samples: bool = True
@@ -154,6 +162,11 @@ class MicroservicesEnv(_GymEnvBase):
             )
         if config.episode_duration_s is not None and config.episode_duration_s <= 0:
             raise ValueError("episode_duration_s must be > 0")
+        if config.cost_budget is not None and config.cost_budget < 0:
+            # Retries per root is non-negative, so a negative budget states a
+            # constraint no policy can satisfy — and it would flip the sign of
+            # the linearized term against the dual's (cost - budget).
+            raise ValueError(f"cost_budget must be >= 0, got {config.cost_budget!r}")
         self._cfg = config
 
         self._action_sizes = [
@@ -237,8 +250,9 @@ class MicroservicesEnv(_GymEnvBase):
         self._end_time_ns = s_to_ns(episode_s)
         # How many roots a step window is EXPECTED to carry at the offered
         # arrival rate. Fixed at reset, so every window-level quantity divided
-        # by it (the cost penalty, the terminal-drain weight) stays independent
-        # of the order the windows arrive in and of the traffic the drain adds.
+        # by it (the no-budget cost penalty, the terminal-drain weight fallback)
+        # stays independent of the order the windows arrive in and of the
+        # traffic the drain adds.
         self._roots_per_window = (
             max(0.0, self._require_workload().base_rps) * self._cfg.step_duration_s
         )
@@ -364,7 +378,17 @@ class MicroservicesEnv(_GymEnvBase):
                     # which would price the whole drain as N whole windows.
                     per_step = self._roots_per_window
                 weight = drained_summary["completed"] / max(1.0, per_step)
-                reward += weight * self._reward_from_summary(drained_summary)
+                weights = self._cfg.reward_weights
+                # Only the RATE terms are count-adjusted. They are per-completion
+                # averages, so a drained window has to be scaled by how many
+                # average windows it stands for. The cost term is already a
+                # COUNT-style quantity (retries minus budget x roots over the
+                # drained population), so multiplying it by the same weight
+                # would price the drained tail's retries at a factor that
+                # depends on the window size and break the episode identity
+                # sum(r) - budget*sum(n) the dual is paired with.
+                reward += weight * linear_reward(drained_summary, weights, cost_term=0.0)
+                reward -= self._cost_penalty(drained_summary) * weights.cost
         if terminated:
             components = self._components
             if components is not None and components.bystander_client is not None:
@@ -445,34 +469,53 @@ class MicroservicesEnv(_GymEnvBase):
     def _reward_from_summary(self, summary: dict[str, float]) -> float:
         # The linear form itself lives in rl.spec, shared with
         # `EpisodeResult.objective` so J cannot drift away from the reward.
-        # The cost term is count-weighted: the dual ascends on the POOLED
-        # retries-per-root, so the primal must penalise a quantity whose episode
-        # sum is proportional to it. Penalising the raw per-window RATIO instead
-        # makes a Lagrangian whose primal and dual optimise different
-        # constraints (measured 1.104 window-mean vs 1.253 pooled), and dual
-        # ascent then converges to neither.
         return linear_reward(
             summary, self._cfg.reward_weights, cost_term=self._cost_penalty(summary)
         )
 
     def _cost_penalty(self, summary: dict[str, float]) -> float:
-        """Per-window cost term whose episode SUM is proportional to the retries.
+        """Per-window cost term: the linearized retry-amplification constraint.
 
-        Each window's retry COUNT is divided by ``_roots_per_window``, a
-        constant fixed at reset (the roots a window is expected to carry at the
-        offered arrival rate), so the episode sum is exactly
-        ``total_retries / _roots_per_window``. Two properties follow, and both
-        fail for the running mean of observed roots-per-window this used to
-        divide by: the sum does not depend on the ORDER of the windows, and a
-        retry costs the same wherever in the episode it falls. When the realised
-        roots per window match the expectation the sum is ``T * pooled_ratio``,
-        the quantity the dual ascends on (``EpisodeResult.pooled_cost``); a
-        workload that over- or under-delivers rescales the whole episode by one
-        factor instead of reweighting its windows against each other.
+        With ``EnvConfig.cost_budget = b`` set, the constraint the dual ascends
+        on is the POOLED amplification ``sum(r) / sum(n) <= b`` (r = the
+        window's ``cost_retries``, n = its ``cost_roots``), which linearizes to
+        ``sum(r) - b * sum(n) <= 0``. This returns that constraint's per-window
+        contribution, ``r - b * n``, so the episode sum is exactly
+        ``sum(r) - b * sum(n) = sum(n) * (pooled_cost - b)``. What that buys:
 
-        Falls back to the raw per-window ratio when no arrival rate is known
-        (a zero-rate workload, or a summary scored before ``reset()``).
+        - numerator and subtrahend are measured on the SAME population (the cost
+          client's roots), so nothing is normalised by a count from a different,
+          action-dependent population;
+        - the sum is independent of the order of the windows and of how the
+          episode is cut into them;
+        - given any edge traffic at all (``sum(n) > 0``) it is zero exactly when
+          the pooled constraint binds, and otherwise carries the sign of
+          ``pooled_cost - b`` — the same sign ``dual_ascent_update`` moves lambda
+          on, so at a KKT point ``lambda * (sum(r) - b*sum(n)) = 0`` iff
+          ``lambda * (pooled - b) = 0``.
+
+        Dividing the retry count by expected roots-per-window (the top-level
+        arrival rate) instead broke the first point: edge roots are a different
+        population — upstream retries create more of them — so the episode sum
+        was not proportional to the pooled cost the dual reads, and the two
+        ranked actions differently (measured inversions across the action grid).
+
+        Without a budget (``cost_budget=None``) there is no constraint to
+        linearize and ``RewardWeights.cost`` is a plain soft penalty on retries:
+        the window's retry COUNT divided by ``_roots_per_window``, a constant
+        fixed at reset. That keeps the episode sum order-independent, but it is
+        an APPROXIMATION of amplification, not the pooled ratio: the divisor is
+        the expected TOP-LEVEL roots per window, while the retries are the cost
+        client's, so its scale drifts with the realised edge traffic. Use it to
+        discourage retries, not to enforce a budget. It falls back to the raw
+        per-window ratio when no arrival rate is known (a zero-rate workload, or
+        a summary scored before ``reset()``).
         """
+        budget = self._cfg.cost_budget
+        if budget is not None:
+            return float(summary.get("cost_retries", 0.0)) - budget * float(
+                summary.get("cost_roots", 0.0)
+            )
         if self._roots_per_window <= 0.0:
             return float(summary.get("cost", 0.0))
         return float(summary.get("cost_retries", 0.0)) / self._roots_per_window

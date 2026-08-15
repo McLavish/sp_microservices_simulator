@@ -100,6 +100,7 @@ class TestConstrainedTraining(unittest.TestCase):
         import rl.constrained as mod
 
         broadcasts: list[tuple[float, list[float]]] = []
+        budgets: list[float | None] = []
         original = mod.make_vec_env
 
         def spy(*args, **kwargs):
@@ -110,9 +111,9 @@ class TestConstrainedTraining(unittest.TestCase):
                 result = inner_env_method(method_name, *m_args, **m_kwargs)
                 if method_name == "set_cost_weight":
                     # Round-trips each worker's own config out of its process.
-                    weights = [
-                        float(worker.reward_weights.cost) for worker in vec_env.get_attr("_cfg")
-                    ]
+                    configs = vec_env.get_attr("_cfg")
+                    weights = [float(worker.reward_weights.cost) for worker in configs]
+                    budgets.extend(worker.cost_budget for worker in configs)
                     broadcasts.append((float(m_args[0]), weights))
                 return result
 
@@ -151,6 +152,10 @@ class TestConstrainedTraining(unittest.TestCase):
 
         self.assertEqual(policy.name, "constrained_ppo")
         self.assertTrue(broadcasts, "lambda was never broadcast to the workers")
+        # The budget has to reach the workers too, or lambda multiplies a plain
+        # retry penalty in the primal while the dual ascends on amplification
+        # against the budget — two different constraints, one reported curve.
+        self.assertEqual(set(budgets), {cfg.budget})
         for lam, worker_weights in broadcasts:
             self.assertEqual(worker_weights, [lam] * cfg.n_envs)
             self.assertNotEqual(lam, cfg.lambda_init)  # or the read-back proves nothing

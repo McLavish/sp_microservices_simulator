@@ -22,7 +22,7 @@ from rl.env import (
     build_randomized_faulty_single_service_env,
     build_single_service_env,
 )
-from rl.spec import ActionValues
+from rl.spec import ActionValues, RewardWeights, linear_reward
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import StaticTimeoutController
@@ -65,7 +65,15 @@ class TestMicroservicesEnv(unittest.TestCase):
         _, _, terminated, _, _ = env.step(action)
         self.assertTrue(terminated)
 
-    def _make_env(self, build, episode_duration_s=2.0, duration=None):
+    def _make_env(
+        self,
+        build,
+        episode_duration_s=2.0,
+        duration=None,
+        cost_budget=None,
+        reward_weights=None,
+        terminal_drain_penalty=False,
+    ):
         action_spec = ActionSpec(
             attempt_timeout_ms=[10, 50],
             max_attempts=[1, 2],
@@ -81,8 +89,31 @@ class TestMicroservicesEnv(unittest.TestCase):
             action_spec=action_spec,
             step_duration_s=1.0,
             episode_duration_s=episode_duration_s,
+            cost_budget=cost_budget,
+            reward_weights=RewardWeights() if reward_weights is None else reward_weights,
+            terminal_drain_penalty=terminal_drain_penalty,
         )
         return MicroservicesEnv(cfg)
+
+    @staticmethod
+    def _run_fixed_action(env, action, seed):
+        """Drive a whole episode with one fixed action.
+
+        Returns `(total_reward, window_summaries, final_info)` — the reward the
+        agent actually accumulated plus the per-window summaries the env
+        exposes, so a test can check the reward against the windows it came
+        from rather than against a re-derivation of the same formula.
+        """
+        env.reset(seed=seed)
+        total = 0.0
+        windows = []
+        terminated = truncated = False
+        info: dict = {}
+        while not (terminated or truncated):
+            _, reward, terminated, truncated, info = env.step(np.asarray(action))
+            total += float(reward)
+            windows.append(info["summary"])
+        return total, windows, info
 
     def test_unseeded_resets_use_distinct_build_seeds(self):
         # Regression: SB3 vector envs only seed the first reset; unseeded resets
@@ -222,7 +253,7 @@ class TestMicroservicesEnv(unittest.TestCase):
         return summary
 
     def test_cost_penalty_sum_is_order_independent(self):
-        """The episode's cost term must price total retries, not their order.
+        """The episode's cost term must price the constraint, not the order.
 
         Dividing each window by a RUNNING mean of roots-per-window made the sum
         depend on where the retry-heavy windows fell: windows (5 retries/5
@@ -230,6 +261,28 @@ class TestMicroservicesEnv(unittest.TestCase):
         0.095 — identical pooled cost, 10.5x apart. The dual ascends on
         EpisodeResult.pooled_cost, which carries no such weighting, so primal
         and dual were priced on different quantities.
+        """
+        budget = 0.1
+        env = self._make_env(build_chain_env, episode_duration_s=2.0, cost_budget=budget)
+        env.reset(seed=11)
+        heavy = self._cost_window(env, 5, 5)
+        light = self._cost_window(env, 0, 100)
+
+        forward = env._cost_penalty(heavy) + env._cost_penalty(light)
+        backward = env._cost_penalty(light) + env._cost_penalty(heavy)
+        self.assertAlmostEqual(forward, backward, places=12)
+
+        # The sum is exactly sum(retries) - budget * sum(roots): the linearized
+        # constraint, over the same population on both sides.
+        self.assertAlmostEqual(forward, 5.0 - budget * 105.0, places=12)
+
+    def test_cost_penalty_without_budget_prices_retry_counts(self):
+        """No budget, no constraint: the term is a soft penalty on retries.
+
+        Still order-independent (a constant divisor fixed at reset), but only
+        an approximation of amplification — the divisor counts TOP-LEVEL roots
+        while the retries are the edge client's. Documented as such; it must
+        not silently become something else.
         """
         env = self._make_env(build_chain_env, episode_duration_s=2.0)
         env.reset(seed=11)
@@ -239,11 +292,129 @@ class TestMicroservicesEnv(unittest.TestCase):
         forward = env._cost_penalty(heavy) + env._cost_penalty(light)
         backward = env._cost_penalty(light) + env._cost_penalty(heavy)
         self.assertAlmostEqual(forward, backward, places=12)
-
-        # The sum is exactly total_retries / expected_roots_per_window: a fixed
-        # multiple of the retries the constraint is stated over.
         expected_roots = env._require_components().workload.base_rps * env.step_duration_s
         self.assertAlmostEqual(forward, 5.0 / expected_roots, places=12)
+
+    def test_episode_cost_terms_sum_to_the_linearized_constraint(self):
+        """On a REAL episode: the cost terms sum to sum(r) - budget * sum(n).
+
+        This is the property that pairs primal with dual — the sum equals
+        sum(roots) * (pooled_cost - budget), the quantity `dual_ascent_update`
+        moves lambda on. Normalising each window's retry count by the expected
+        TOP-LEVEL roots per window broke it: edge roots are a different,
+        action-dependent population (upstream retries create more of them), so
+        the sum tracked raw retries and ranked actions differently from
+        `EpisodeResult.pooled_cost`.
+        """
+        budget = 0.1
+        action = (0, 1, 0)  # 10 ms edge timeout, 2 attempts: real amplification
+        env = self._make_env(
+            build_multichain_env, episode_duration_s=4.0, duration=4.0, cost_budget=budget
+        )
+        baseline_reward, windows, _ = self._run_fixed_action(env, action, seed=11)
+
+        retries = sum(w["cost_retries"] for w in windows)
+        roots = sum(w["cost_roots"] for w in windows)
+        # An episode with no edge traffic would satisfy the identity vacuously.
+        self.assertGreater(retries, 0.0)
+        self.assertGreater(roots, 0.0)
+        self.assertAlmostEqual(
+            sum(env._cost_penalty(w) for w in windows), retries - budget * roots, places=6
+        )
+
+        # ...and the REWARD carries exactly that sum: same seeded episode, one
+        # non-zero cost weight. The reward is what training sees; an identity
+        # that held only for `_cost_penalty` would prove nothing about it.
+        cost_weight = 0.01
+        weighted = self._make_env(
+            build_multichain_env,
+            episode_duration_s=4.0,
+            duration=4.0,
+            cost_budget=budget,
+            reward_weights=RewardWeights(cost=cost_weight),
+        )
+        weighted_reward, _, _ = self._run_fixed_action(weighted, action, seed=11)
+        self.assertAlmostEqual(
+            weighted_reward - baseline_reward, -cost_weight * (retries - budget * roots), places=6
+        )
+
+    def test_cost_term_sign_agrees_with_the_dual(self):
+        """The episode's cost term is negative exactly when the arm is inside
+        its budget — the sign the dual moves lambda on.
+
+        The old term was a non-negative multiple of the retry count: an arm
+        comfortably inside its budget still paid a positive penalty, and since
+        edge-root counts vary with the action, two arms could rank one way on
+        the penalty and the other way on the pooled cost.
+        """
+        budget = 0.1
+        pooled_costs = []
+        # A no-retry action (inside any budget) and an aggressive one (outside).
+        for action in ((1, 0, 0), (0, 1, 0)):
+            with self.subTest(action=action):
+                env = self._make_env(
+                    build_multichain_env,
+                    episode_duration_s=3.0,
+                    duration=3.0,
+                    cost_budget=budget,
+                )
+                _, windows, _ = self._run_fixed_action(env, action, seed=11)
+                retries = sum(w["cost_retries"] for w in windows)
+                roots = sum(w["cost_roots"] for w in windows)
+                self.assertGreater(roots, 0.0)
+                pooled = retries / roots
+                pooled_costs.append(pooled)
+                term_sum = sum(env._cost_penalty(w) for w in windows)
+                self.assertAlmostEqual(term_sum, roots * (pooled - budget), places=6)
+                self.assertEqual(term_sum > 0.0, pooled > budget)
+        # Non-vacuous only if the two arms straddle the budget.
+        self.assertLess(min(pooled_costs), budget)
+        self.assertGreater(max(pooled_costs), budget)
+
+    def test_drained_cost_term_is_not_count_weighted(self):
+        """`terminal_drain_penalty` count-adjusts the RATE terms only.
+
+        The drain weight exists because per-window rewards are per-completion
+        rates: a drained window of 2 roots must not be penalized as hard as a
+        full window of 100. The cost term is already a count (retries minus
+        budget x roots over the drained population), so scaling it by the same
+        weight prices the drained tail's retries by a factor that depends on
+        the window size — and breaks the sum(r) - budget*sum(n) identity the
+        dual is paired with.
+        """
+        budget = 0.05
+        cost_weight = 0.01
+        action = (0, 1, 0)
+
+        def run(penalty):
+            env = self._make_env(
+                build_multichain_env,
+                episode_duration_s=3.0,
+                duration=3.0,
+                cost_budget=budget,
+                reward_weights=RewardWeights(cost=cost_weight),
+                terminal_drain_penalty=penalty,
+            )
+            total, _, info = self._run_fixed_action(env, action, seed=11)
+            return env, total, info
+
+        _, total_off, _ = run(False)
+        env, total_on, info = run(True)
+        drained = info["drained_summary"]
+        self.assertGreater(drained["completed"], 0)
+        self.assertGreater(drained["cost_roots"], 0.0)
+
+        per_step = env._horizon_root_count / env._episode_steps
+        weight = drained["completed"] / max(1.0, per_step)
+        rate_part = linear_reward(drained, env._cfg.reward_weights, cost_term=0.0)
+        cost_part = env._cost_penalty(drained) * cost_weight
+        # The two forms only differ when the drain is not exactly one window.
+        self.assertNotAlmostEqual(weight, 1.0, places=2)
+        self.assertGreater(abs(cost_part), 1e-3)
+
+        self.assertAlmostEqual(total_on - total_off, weight * rate_part - cost_part, places=6)
+        # Weighting the cost term too (the old form) is measurably different.
+        self.assertNotAlmostEqual(total_on - total_off, weight * (rate_part - cost_part), places=4)
 
     def test_cost_penalty_is_a_pure_function_of_the_window(self):
         """Scoring one window must not reprice the next.

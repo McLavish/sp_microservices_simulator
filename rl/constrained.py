@@ -8,6 +8,17 @@ between training chunks:
 
     lambda <- max(0, lambda + lr * (cost - budget))
 
+The primal is paired with that dual by handing the budget to the env
+(``EnvConfig.cost_budget = cfg.budget``): each window is then penalised by
+``cost_retries - budget * cost_roots``, whose episode sum is exactly
+``sum(retries) - budget * sum(roots) = sum(roots) * (pooled_cost - budget)`` —
+the same sign, and zero at the same point, as the ``cost - budget`` above.
+
+Scale note: that term is a COUNT (hundreds of retries per window at the study's
+arrival rates), not a per-root rate, so lambda multiplies a much larger number
+than it did before this pairing existed. Lambda values — and ``lambda_lr`` —
+from earlier runs are not comparable; re-tune if dual ascent oscillates.
+
 During constrained training the hand-tuned ``retries`` penalty is zeroed so
 the learned multiplier is the only retry pressure. Evaluation always reports
 the *base objective* J (reward with retry and cost penalties zeroed) plus the
@@ -40,6 +51,9 @@ _SB3_IMPORT_ERROR = _SB3.import_error
 class ConstrainedTrainConfig:
     build: Callable[[int | None], EnvComponents]
     action_spec: ActionSpec
+    # Retries per cost-client root allowed in expectation. Drives BOTH sides of
+    # the Lagrangian: the dual step below and the env's per-window cost term
+    # (via EnvConfig.cost_budget).
     budget: float = 0.1
     lambda_init: float = 0.0
     lambda_lr: float = 0.5
@@ -102,6 +116,9 @@ def train_constrained_ppo(cfg: ConstrainedTrainConfig) -> SB3Policy:
         raise ValueError(f"chunk_timesteps must be > 0, got {cfg.chunk_timesteps}")
     if cfg.timesteps <= 0:
         raise ValueError(f"timesteps must be > 0, got {cfg.timesteps}")
+    if cfg.budget < 0:
+        # The env rejects it too, but only once the workers are already up.
+        raise ValueError(f"budget must be >= 0, got {cfg.budget}")
 
     weights = replace(
         cfg.base_weights,
@@ -112,7 +129,10 @@ def train_constrained_ppo(cfg: ConstrainedTrainConfig) -> SB3Policy:
     def make_env() -> MicroservicesEnv:
         # Each env gets its own weights copy: lambda updates are broadcast via
         # env_method (works across SubprocVecEnv process boundaries, where a
-        # shared mutable object would not).
+        # shared mutable object would not). The budget, unlike lambda, is fixed
+        # for the whole arm, so it travels with the config at construction —
+        # and it must travel, or the primal penalises retries while the dual
+        # ascends on amplification.
         return MicroservicesEnv(
             EnvConfig(
                 build=cfg.build,
@@ -120,6 +140,7 @@ def train_constrained_ppo(cfg: ConstrainedTrainConfig) -> SB3Policy:
                 step_duration_s=cfg.step_duration_s,
                 episode_duration_s=cfg.episode_duration_s,
                 reward_weights=replace(weights),
+                cost_budget=cfg.budget,
             )
         )
 
