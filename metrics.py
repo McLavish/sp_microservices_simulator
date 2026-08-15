@@ -21,7 +21,21 @@ from core import (
 @dataclass
 class Metrics:
     roots: list[RootRequest]
-    attempts_total: int
+    # LIFETIME attempt counter as supplied by the constructing client(s). A
+    # different population from `roots`: clients bump it at attempt START while
+    # roots are appended at COMPLETION, so it over-reports whenever work is
+    # still in flight (a mid-run export, the RL env's in-horizon window). Read
+    # it through `client_attempts_total()`; every `Summary` field, including
+    # `attempts_total`, is computed over `roots` instead.
+    attempts_total: int = 0
+
+    def attempts_on_roots(self) -> int:
+        """Attempts recorded on the roots being summarized."""
+        return sum(len(request.attempts) for request in self.roots)
+
+    def client_attempts_total(self) -> int:
+        """The constructing client's lifetime attempt counter (start-time population)."""
+        return self.attempts_total
 
     def _percentile_ms(self, p: float, vals: list[int]) -> float:
         if not vals:
@@ -71,7 +85,7 @@ class Metrics:
         # lifetime counter: those disagree whenever work is still in flight
         # (mid-run exports, the RL env's in-horizon population), and every other
         # field here is computed over completed roots.
-        attempts_on_roots = sum(len(request.attempts) for request in self.roots)
+        attempts_on_roots = self.attempts_on_roots()
         retries_per_root = (attempts_on_roots - total) / total if total > 0 else 0.0
         return Summary(
             total=total,
@@ -89,7 +103,7 @@ class Metrics:
             mean=mean_ms,
             max=max_ms,
             retries_per_root=retries_per_root,
-            attempts_total=self.attempts_total,
+            attempts_total=attempts_on_roots,
             dropped_cancelled=dropped_cancelled,
         )
 
@@ -117,7 +131,7 @@ class Metrics:
         Notes:
         - failures are root-level, attributed to the final attempt's drop_reason,
         bucketed by the root's completion time (last attempt end).
-        - failure_retry_count counts failed RETRY attempts (after the first), bucketed by attempt end.
+        - failure_retry counts failed RETRY attempts (after the first), bucketed by attempt end.
         - latencies are for successful roots completed in the bucket.
         """
         # Lazy import: pandas is a dev dependency; the simulation core stays
@@ -137,7 +151,7 @@ class Metrics:
             "timepoint",
             "root_requests",  # bucketed at the start
             "retries",  # bucketed at the start
-            "success_root",  # # bucketed at the end. Actually should be the same as success_retry
+            "success_root",  # roots that succeeded, bucketed at the end
             "completed",  # all attempts completed, bucketed at the end
             "failure_root",
             "failure_retry",
@@ -146,8 +160,8 @@ class Metrics:
             "failure_server",
             "failure_circuit_open",
             "failure_cancelled",
-            "total_request",  # bucketed at the start. rename total_started_roots?
-            "total_failure",  # bucketed at the end. rename total_failed_roots_completed?
+            "total_request",  # cumulative root_requests, bucketed at the start
+            "total_failure",  # cumulative failure_root, bucketed at the end
             "p50",  # percentiles are all bucketed at the end
             "p90",
             "p95",

@@ -15,13 +15,18 @@ together. Always export both from the same run.
 
 ## `Metrics` (`metrics.py`)
 
-Construct via `client.metrics()` (it wraps `roots` + `attempts_total`).
+Construct via `client.metrics()` (it wraps `roots` plus the client's lifetime
+attempt counter, readable as `Metrics.client_attempts_total()`). That counter is
+a *different population* from `roots` — clients bump it at attempt **start**
+while roots are appended at **completion** — so no `Summary` field is derived
+from it.
 
 ### `summary()` (`metrics.py`)
 
 Returns a `Summary` (`core.py`): `total`, `succeeded`, `dropped_*` by reason,
 latency percentiles `p50..p99_99`, `mean`, `max`, `retries_per_root`,
-`attempts_total`. Notes:
+`attempts_total`. Every field, `attempts_total` included, is computed over the
+roots being summarized (`Metrics.attempts_on_roots()`). Notes:
 
 - A root's **latency is wall-clock**: `max(attempt.end) - min(attempt.begin)`, i.e.
   including queueing and every retry, counted only for **successful** roots.

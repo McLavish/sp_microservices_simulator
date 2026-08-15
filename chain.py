@@ -17,7 +17,7 @@ class _FanOutAttempt:
     """One logical attempt at a `ServiceNodeRuntime`, as an explicit state machine.
 
     The lifecycle is: local service stage -> (optionally) fan out to every
-    downstream edge -> settle. It settles exactly once, through `_commit`, on
+    downstream edge -> settle. It settles exactly once, through `_settle`, on
     whichever of these happens first:
 
     * the local stage expires against the deadline, or the local service fails;
@@ -98,9 +98,23 @@ class _FanOutAttempt:
     def _elapsed(self) -> TimeDuration:
         return self.sim.timestep - self.begin_at
 
-    def _settle(self, success: bool, drop: DropReason) -> None:
+    def _settle(self, success: bool, drop: DropReason, keep: RootRequest | None = None) -> None:
+        """The one settling path: every transition above ends here.
+
+        Full teardown in a fixed order — drop the pending local completion,
+        drop the deadline guard, abandon downstream calls nobody is waiting for
+        (all but `keep`, the one that reported the outcome), then finalize.
+        Each step is a no-op on the paths that do not need it, so there is no
+        reason for a caller to skip one: a settle that skipped the sibling
+        teardown would leave abandoned calls consuming downstream capacity and
+        recording outcomes of their own.
+        """
         self._commit()
+        if self._local_event is not None:
+            self._local_event.cancelled = True  # still in the local stage
+            self._local_event = None
         self._cancel_deadline_guard()
+        self._abandon_siblings(except_root=keep)
         self._finalize(success, self._elapsed(), drop)
 
     # -- cancellation --------------------------------------------------------
@@ -109,16 +123,12 @@ class _FanOutAttempt:
         """Abandon this node from above; unwinds the subtree if it fans out."""
         if self.settled:
             return
-        self._commit()
-        if self._local_event is not None:
-            self._local_event.cancelled = True  # still in the local stage
-        self._cancel_deadline_guard()
-        self._abandon_siblings()
-        self._finalize(False, self._elapsed(), DropReason.CANCELLED)
+        self._settle(False, DropReason.CANCELLED)
 
     def _cancel_deadline_guard(self) -> None:
         if self._deadline_event is not None:
             self._deadline_event.cancelled = True
+            self._deadline_event = None
 
     def _abandon_siblings(self, except_root: RootRequest | None = None) -> None:
         """Tear down downstream calls nobody is waiting for any more.
@@ -203,12 +213,9 @@ class _FanOutAttempt:
         self._fail_from(root)  # AND semantics: first failure short-circuits
 
     def _fail_from(self, root: RootRequest) -> None:
-        self._commit()
-        self._cancel_deadline_guard()
-        # `settled` is already set, so the cancellations below re-enter
-        # _on_downstream_done harmlessly.
-        self._abandon_siblings(except_root=root)
-        self._finalize(False, self._elapsed(), self._drop_reason_of(root))
+        # `_settle` latches `settled` first, so the sibling teardown it runs
+        # re-enters _on_downstream_done harmlessly.
+        self._settle(False, self._drop_reason_of(root), keep=root)
 
     @staticmethod
     def _drop_reason_of(root: RootRequest) -> DropReason:
@@ -221,9 +228,7 @@ class _FanOutAttempt:
     def _on_deadline(self) -> None:
         if self.settled:
             return
-        self._commit()
-        self._abandon_siblings()
-        self._finalize(False, self._elapsed(), DropReason.DEADLINE)
+        self._settle(False, DropReason.DEADLINE)
 
 
 @dataclass

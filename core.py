@@ -135,7 +135,6 @@ class Request:
     service: str  # name of the service that handled the request
     interval: TimeInterval  # indicates the lifespan of the request
     deadline: TimePoint | None = None  # maybe refactor into a policy
-    valid: bool = True  # unused for now. TODO: add invalid requests
     success: bool = False
     drop_reason: DropReason = DropReason.NONE
     # Captured at attempt end by the service: current queue length
@@ -205,6 +204,9 @@ class Summary:
     mean: float
     max: float
     retries_per_root: float
+    # Attempts recorded on the summarized roots — the same population as every
+    # other field here, NOT a client's lifetime counter (which is incremented at
+    # attempt start and so over-reports while work is still in flight).
     attempts_total: int
     # Abandoned by an upstream cancellation. Deliberately its own bucket and
     # NOT folded into the other dropped_* counts: cancelled work did not fail,

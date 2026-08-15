@@ -33,20 +33,34 @@ injections and partial failures into a `FaultEventsTracker` for plotting.
 
 ### `ServiceRuntime` (`service.py`)
 
-Holds the live queue state (`in_flight`, `queue`). Call `.bind()` to (re)initialize
-before use. The one method clients call is:
+Holds the live queue state (`in_flight`, `queue`). Construction already initializes
+it; `.bind()` resets that state back to empty and returns `self`, so the
+`ServiceRuntime(cfg=...).bind()` spelling used throughout the repo is a
+constructor-chaining idiom, not required setup. The one method clients call is:
 
 ```python
-submit_attempt(sim, on_done, attempt_deadline=None, behavior=None)
+submit_attempt(sim, on_done, attempt_deadline=None, behavior=None) -> AttemptControl
 ```
 
-`on_done(success, service_time, drop_reason, queue_size)` is invoked exactly once
-when the attempt resolves. The optional `behavior` hook is what chains use to run
-multi-stage work on a worker — see [request-handling](request-handling.md).
+`on_done(success, occupancy, drop_reason, queue_size, occupancy_censored)` is
+invoked exactly once when the attempt resolves — all five arguments are passed
+positionally, so a shorter callback raises `TypeError` at the first completion.
+The second argument is **worker occupancy**, not end-to-end node latency: for a
+tandem chain node it covers the local stage only, because the worker is handed
+back before the downstream wait (end-to-end latency is `Request.interval`).
+`occupancy_censored` is True when that occupancy is a lower bound — the worker
+was still held when a deadline or a cancellation cut the attempt short. The
+returned `AttemptControl.cancel()` abandons the attempt while it is still
+outstanding and is a no-op afterwards. The optional `behavior` hook is what
+chains use to run multi-stage work on a worker — see
+[request-handling](request-handling.md).
 
 **Service time** (`_sample_service_time`, `service.py`) draws
 `lognormvariate(mu=log(median), sigma)` from the simulator RNG, applies any active
 latency injections, and floors the result at **100 µs** (`max(100_000, ...)`).
+`ServiceConfig.__post_init__` owns both input ranges: it rejects a median below
+1 ns and floors sigma at `MIN_LOGNORM_SIGMA` (1e-6), so a config asking for a
+near-deterministic service reports back the sigma that will actually be sampled.
 
 **Latency injection math** (`_adjust_latency`, `service.py`): across all *active*
 injections, multipliers multiply and additive terms sum, applied as
@@ -148,6 +162,14 @@ Three small dataclasses, each scoped to a half-open `TimeInterval`:
 
 `LatencyInjection` and `PartialFailure` expose `active(t)`. Multiple overlapping
 windows compose as described above (latency multiplies+adds; failure takes the max).
+
+All three validate their fields at construction, **finiteness included**: NaN and
+inf pass every ordering check (`nan < 0` is False), and a fault that survives
+construction is exported and shaded on the plots even when it has silently
+collapsed the physics — a NaN multiplier blacks the spike window out, a NaN
+`add_latency` makes the service *faster* than baseline, and an infinite value
+either saturates the 1 ns interarrival clamp or overflows the event clock
+mid-run.
 
 ## Fault events: overlays for plots (`fault_events.py`)
 

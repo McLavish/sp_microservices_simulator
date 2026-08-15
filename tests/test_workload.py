@@ -127,5 +127,32 @@ class TestWorkloadSeeding(unittest.TestCase):
         self.assertEqual(self._arrivals(None), self._arrivals(0))
 
 
+class TestLoadSpikeValidation(unittest.TestCase):
+    """A non-finite multiplier used to survive construction and then delete the
+    spike it configured.
+
+    `nan < 0` is False, so NaN passed the sign check; `rps_at` then computed
+    `base * nan = nan` and `max(0.0, nan)` returned 0.0, so the window produced
+    ZERO arrivals while the spike was still exported and shaded on every plot —
+    verbatim the failure the negative-multiplier message exists to prevent.
+    `inf` went the other way: infinite exposure put every arrival on `drive`'s
+    1 ns interarrival clamp.
+    """
+
+    def test_non_finite_multiplier_is_rejected(self):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(rps_multiplier=bad), self.assertRaises(ValueError):
+                LoadSpike(TimeInterval(s_to_ns(1), s_to_ns(2)), bad)
+
+    def test_finite_multiplier_still_scales_the_rate(self):
+        wl = Workload(
+            base_rps=100.0,
+            duration_s=3,
+            load_spikes=[LoadSpike(TimeInterval(s_to_ns(1), s_to_ns(2)), 2.0)],
+        )
+        self.assertAlmostEqual(wl.rps_at(s_to_ns(1.5)), 200.0)
+        self.assertAlmostEqual(wl.rps_at(s_to_ns(2.5)), 100.0)
+
+
 if __name__ == "__main__":
     unittest.main()

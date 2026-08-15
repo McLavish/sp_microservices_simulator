@@ -86,6 +86,47 @@ class TestMetricsSummary(unittest.TestCase):
         self.assertEqual(rows[0]["timepoint"], "5.000")
 
 
+class TestSummaryPopulation(unittest.TestCase):
+    """Every Summary field is computed over the roots being summarized.
+
+    `attempts_total` used to be a pass-through of whatever the constructor was
+    handed, and the three construction sites hand it different populations: a
+    client's LIFETIME counter (bumped at attempt start, while roots are
+    appended at completion), the attempts on these roots, or a sum of lifetime
+    counters across clients. A consumer computing amplification as
+    `attempts_total / total` therefore got `retries_per_root + 1` from one site
+    and an in-flight-inflated number from another, while `print_stats` printed
+    the two side by side as if they agreed.
+    """
+
+    def _root(self, attempts: int) -> RootRequest:
+        return RootRequest(
+            attempts=[
+                Request(
+                    service="svc",
+                    interval=TimeInterval(begin=i * 10, end=i * 10 + 10),
+                    success=(i == attempts - 1),
+                    drop_reason=DropReason.NONE if i == attempts - 1 else DropReason.DEADLINE,
+                )
+                for i in range(attempts)
+            ]
+        )
+
+    def test_attempts_total_counts_the_summarized_roots_not_the_client_counter(self):
+        # 17 attempts started lifetime-wide; 2 recorded on the one root here.
+        metrics = Metrics(roots=[self._root(2)], attempts_total=17)
+        summary = metrics.summary()
+
+        self.assertEqual(summary.attempts_total, 2)
+        self.assertAlmostEqual(summary.retries_per_root, 1.0)
+
+    def test_both_populations_stay_readable_under_distinct_names(self):
+        metrics = Metrics(roots=[self._root(2)], attempts_total=17)
+
+        self.assertEqual(metrics.attempts_on_roots(), 2)
+        self.assertEqual(metrics.client_attempts_total(), 17)
+
+
 class TestTiedFinalAttempts(unittest.TestCase):
     def test_tied_final_attempts_use_completion_order(self):
         # Zero-backoff retry rejected synchronously: SERVER_FAILURE at t, then

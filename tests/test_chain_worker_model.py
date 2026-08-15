@@ -3,7 +3,7 @@ import random
 import unittest
 
 from caller import ClientConfig, ClientRuntime
-from chain import DownstreamEdge, ServiceNodeRuntime
+from chain import DownstreamEdge, ServiceNodeRuntime, _FanOutAttempt
 from core import DropReason, RootRequest, TimeInterval, ms_to_ns, s_to_ns
 from faults import PartialFailure
 from retry_policies import (
@@ -325,6 +325,69 @@ class TestCancellationPropagation(unittest.TestCase):
         self.assertEqual(summary.dropped_server_failure, 0)
         self.assertEqual(summary.dropped_deadline, 0)
         self.assertEqual(summary.dropped_queue, 0)
+
+
+class TestSettleIsTheOnlyTeardownPath(unittest.TestCase):
+    """Every settling transition runs the same teardown, in the same order.
+
+    `_settle` used to be a partial teardown wearing the general name: commit,
+    cancel the deadline guard, finalize — and no sibling teardown, which the
+    other three settling paths each layered on top by hand. It was correct only
+    because its callers happened to run with nothing launched or everything
+    already done, a precondition recorded nowhere. A new completion path
+    (quorum: succeed when k of n downstreams return) reaching for it would
+    leave the outstanding siblings running, consuming shared downstream
+    capacity and recording outcomes of their own — precisely the retry
+    externality the multichain scenario measures.
+    """
+
+    def _attempt(self):
+        sim = Simulator(seed=1)
+        node = ServiceNodeRuntime(
+            service=ServiceRuntime(
+                cfg=ServiceConfig(
+                    name="node",
+                    latency_median=ms_to_ns(1),
+                    latency_lognorm_sigma=1e-6,
+                    workers=1,
+                )
+            ).bind(),
+            propagate_cancellation=True,
+        )
+        finalized: list[tuple[bool, DropReason]] = []
+        attempt = _FanOutAttempt(
+            node=node,
+            svc=node.service,
+            sim=sim,
+            deadline=None,
+            finalize=lambda success, _elapsed, drop: finalized.append((success, drop)),
+            begin_at=0,
+            release_worker=lambda: None,
+            register_cancel=lambda _fn: None,
+        )
+        return attempt, finalized
+
+    def test_settle_abandons_downstream_calls_still_in_flight(self):
+        attempt, finalized = self._attempt()
+        cancelled: list[str] = []
+        attempt._launched = [RootRequest(cancel=lambda: cancelled.append("sibling"))]
+
+        attempt._settle(True, DropReason.NONE)
+
+        self.assertEqual(cancelled, ["sibling"])
+        self.assertEqual(finalized, [(True, DropReason.NONE)])
+
+    def test_settle_keeps_the_root_that_reported_the_outcome(self):
+        attempt, finalized = self._attempt()
+        cancelled: list[str] = []
+        reporter = RootRequest(cancel=lambda: cancelled.append("reporter"))
+        sibling = RootRequest(cancel=lambda: cancelled.append("sibling"))
+        attempt._launched = [reporter, sibling]
+
+        attempt._settle(False, DropReason.SERVER_FAILURE, keep=reporter)
+
+        self.assertEqual(cancelled, ["sibling"])
+        self.assertEqual(finalized, [(False, DropReason.SERVER_FAILURE)])
 
 
 class TestCancellationIntegration(unittest.TestCase):

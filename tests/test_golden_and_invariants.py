@@ -23,7 +23,7 @@ from core import DropReason, TimeInterval, ms_to_ns, s_to_ns
 from faults import LatencyInjection, PartialFailure
 from metrics import Metrics
 from retry_policies import FixedBackoffRetryPolicy, NoRetryPolicy
-from service import ServiceConfig, ServiceRuntime
+from service import MIN_LOGNORM_SIGMA, ServiceConfig, ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import StaticTimeoutController
 from workload import Workload
@@ -292,6 +292,61 @@ class TestLatencyInjectionInvariants(unittest.TestCase):
         ).bind()
         # base * multiplier + add == 10*2 + 5
         self.assertAlmostEqual(self._sample(sim, svc, s_to_ns(1)) / ms_to_ns(1), 25.0, delta=0.1)
+
+
+class TestFaultFinitenessValidation(unittest.TestCase):
+    """NaN and inf pass every ordering guard, then corrupt the physics silently.
+
+    `LatencyInjection(iv, add_latency=nan)` made `_adjust_latency` compute
+    `max(0, base * mult + nan)`, which returns 0 (two-arg `max` keeps the left
+    operand when the comparison is False), floored to the 100 us minimum: a
+    fault configured to ADD 40 ms made a 50 ms service ~500x FASTER for the
+    whole window, exported and plotted as a latency injection all the while. An
+    infinite value produced an infinite service time and crashed
+    `Simulator.schedule`'s `int(at)` mid-run.
+
+    Both fields are declared `int`, so `ty` rejects these calls statically —
+    reaching the defect at all takes an untyped caller (a config loader, a
+    runtime draw), which is exactly the population the guard is for.
+    """
+
+    def test_non_finite_latency_injection_fields_are_rejected(self):
+        window = TimeInterval(0, s_to_ns(1))
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(add_latency=bad), self.assertRaises(ValueError):
+                LatencyInjection(duration=window, add_latency=bad)  # ty: ignore[invalid-argument-type]
+            with self.subTest(multiplier=bad), self.assertRaises(ValueError):
+                LatencyInjection(duration=window, multiplier=bad)  # ty: ignore[invalid-argument-type]
+
+    def test_finite_fields_still_construct(self):
+        window = TimeInterval(0, s_to_ns(1))
+        inj = LatencyInjection(duration=window, add_latency=ms_to_ns(40), multiplier=2)
+        self.assertEqual((inj.add_latency, inj.multiplier), (ms_to_ns(40), 2))
+
+
+class TestServiceConfigOwnsItsRanges(unittest.TestCase):
+    """One authority per rule: the sampler reads the config, it does not re-clamp.
+
+    The lognormal sigma floor is load-bearing, not defensive — every pinned
+    seeded result was produced with it — so it lives on the config, where
+    `latency_lognorm_sigma` reports the value that will actually be sampled.
+    """
+
+    def test_sub_floor_sigma_is_normalized_at_construction(self):
+        cfg = ServiceConfig(
+            name="svc", latency_median=ms_to_ns(50), latency_lognorm_sigma=1e-9, workers=1
+        )
+        self.assertEqual(cfg.latency_lognorm_sigma, MIN_LOGNORM_SIGMA)
+
+    def test_sigma_above_the_floor_is_untouched(self):
+        cfg = ServiceConfig(
+            name="svc", latency_median=ms_to_ns(50), latency_lognorm_sigma=0.5, workers=1
+        )
+        self.assertEqual(cfg.latency_lognorm_sigma, 0.5)
+
+    def test_sub_nanosecond_median_is_rejected_not_clamped(self):
+        with self.assertRaises(ValueError):
+            ServiceConfig(name="svc", latency_median=0, latency_lognorm_sigma=0.5, workers=1)
 
 
 class TestStrictDeadlineInvariant(unittest.TestCase):

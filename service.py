@@ -1,13 +1,21 @@
 import heapq
 import math
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from functools import partial
 
 from core import DropReason, TimeDuration, TimePoint
 from fault_events import FaultEventsTracker
 from faults import LatencyInjection, PartialFailure
 from simulator import Simulator
+
+# Floor applied to the lognormal shape parameter. Load-bearing, not defensive:
+# the sampler has floored sigma here since the first commit, so every pinned
+# seeded result was produced with it, and configs that ask for a
+# near-deterministic service (sigma=1e-9) really are sampled at 1e-6. It lives
+# on the config so `cfg.latency_lognorm_sigma` reports the sigma actually used
+# instead of the one that was asked for.
+MIN_LOGNORM_SIGMA = 1e-6
 
 
 # https://en.wikipedia.org/wiki/Log-normal_distribution
@@ -36,6 +44,8 @@ class ServiceConfig:
             raise ValueError(
                 f"latency_lognorm_sigma must be >= 0, got {self.latency_lognorm_sigma}"
             )
+        if self.latency_lognorm_sigma < MIN_LOGNORM_SIGMA:
+            object.__setattr__(self, "latency_lognorm_sigma", MIN_LOGNORM_SIGMA)
         if self.queue_capacity is not None and self.queue_capacity < 0:
             raise ValueError(f"queue_capacity must be >= 0 or None, got {self.queue_capacity}")
 
@@ -147,11 +157,20 @@ class ServiceRuntime:
     admitted_total: int = 0
 
     def bind(self):
-        self.in_flight = 0
-        self.queue.clear()
-        self._seq = 0
-        self._queued = 0
-        self.admitted_total = 0
+        """Reset the live queue state back to a freshly-constructed runtime.
+
+        Derived from the field declarations rather than restating them: fields
+        without a default are inputs (`cfg`) and are left alone, everything else
+        is state and goes back to its declared default. A second, hand-written
+        copy of the defaults could silently drift from this list — nothing
+        exercises the reset path today, since every call site is
+        `ServiceRuntime(cfg=...).bind()` on a fresh instance.
+        """
+        for f in fields(self):
+            if f.default_factory is not MISSING:
+                setattr(self, f.name, f.default_factory())
+            elif f.default is not MISSING:
+                setattr(self, f.name, f.default)
         return self
 
     def queue_len(self) -> int:
@@ -169,10 +188,10 @@ class ServiceRuntime:
 
     def _sample_service_time(self, t: TimePoint, sim: Simulator) -> TimeDuration:
         rng = sim.rng()
-        median = max(1, self.cfg.latency_median)
-        sigma = max(1e-6, self.cfg.latency_lognorm_sigma)
-        mu = math.log(median)  # since median = exp(mu)
-        raw = rng.lognormvariate(mu, sigma)
+        # Both ranges are owned by ServiceConfig.__post_init__ on a frozen
+        # dataclass: median >= 1 ns is validated there, sigma is floored there.
+        mu = math.log(self.cfg.latency_median)  # since median = exp(mu)
+        raw = rng.lognormvariate(mu, self.cfg.latency_lognorm_sigma)
         adj = self._adjust_latency(t, int(raw))
         return max(100_000, adj)  # put 1_000_000 to fix 1ms
 
