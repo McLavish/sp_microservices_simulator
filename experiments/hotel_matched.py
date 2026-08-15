@@ -135,7 +135,6 @@ def run_hotel_matched(config: HotelMatchedConfig) -> dict[str, str]:
 
     sim = Simulator(seed=config.seed)
     run = _build_runtime(
-        sim,
         calibration=calibration,
         profile_faults=profile_faults,
         seed=config.seed,
@@ -215,7 +214,6 @@ def run_hotel_matched(config: HotelMatchedConfig) -> dict[str, str]:
 
 
 def _build_runtime(
-    sim: Simulator,
     *,
     calibration: dict[str, Any],
     profile_faults: list[tuple[float, float, float, float]],
@@ -493,6 +491,7 @@ def _validated_profile_fault(
 def _validated_load_spike(
     start_s: float, end_s: float, multiplier: float, origin: str
 ) -> tuple[float, float, float]:
+    """Bound check shared by the CLI parser and the calibration-JSON path."""
     if start_s < 0:
         raise ValueError(f"{origin}: start must be >= 0, got {start_s}")
     if end_s < start_s:
@@ -583,21 +582,24 @@ def _fraction(value: str) -> float:
 
 
 def _parse_profile_fault(value: str) -> tuple[float, float, float, float]:
+    """Split + finiteness, then the same bound checks the JSON path applies.
+
+    Finiteness is the CLI's own job: the calibration path gets it from
+    `_load_calibration._check_finite`. Everything else delegates, so a bound
+    added to `_validated_profile_fault` cannot be enforced on one path only.
+    """
     parts = value.split(",")
     if len(parts) != 4:
         raise argparse.ArgumentTypeError("profile fault must be start,end,add_latency_ms,p_fail")
     start_s, end_s, add_latency_ms, p_fail = (float(part) for part in parts)
     if not all(math.isfinite(part) for part in (start_s, end_s, add_latency_ms, p_fail)):
         raise argparse.ArgumentTypeError("profile fault values must be finite")
-    if start_s < 0:
-        raise argparse.ArgumentTypeError("profile fault start must be >= 0")
-    if end_s < start_s:
-        raise argparse.ArgumentTypeError("profile fault end must be >= start")
-    if add_latency_ms < 0:
-        raise argparse.ArgumentTypeError("profile fault add_latency_ms must be >= 0")
-    if not 0 <= p_fail <= 1:
-        raise argparse.ArgumentTypeError("profile fault p_fail must be in [0,1]")
-    return start_s, end_s, add_latency_ms, p_fail
+    try:
+        return _validated_profile_fault(
+            start_s, end_s, add_latency_ms, p_fail, origin="--profile-fault"
+        )
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _parse_load_spike(value: str) -> tuple[float, float, float]:
@@ -607,13 +609,10 @@ def _parse_load_spike(value: str) -> tuple[float, float, float]:
     start_s, end_s, multiplier = (float(part) for part in parts)
     if not all(math.isfinite(part) for part in (start_s, end_s, multiplier)):
         raise argparse.ArgumentTypeError("load spike values must be finite")
-    if start_s < 0:
-        raise argparse.ArgumentTypeError("load spike start must be >= 0")
-    if end_s < start_s:
-        raise argparse.ArgumentTypeError("load spike end must be >= start")
-    if multiplier < 0:
-        raise argparse.ArgumentTypeError("load spike multiplier must be >= 0")
-    return start_s, end_s, multiplier
+    try:
+        return _validated_load_spike(start_s, end_s, multiplier, origin="--load-spike")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:

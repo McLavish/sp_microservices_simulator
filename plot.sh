@@ -3,7 +3,9 @@ set -e
 
 # CSVs below are produced by `python -m experiments.chain_fanout`, whose fault
 # overlay is chain_fault_events.json (fault_events.json is experiments.default's).
-for pair in chain:chain svc-A:svA svc-B:svB svc-C:svC svc-E:svE; do
+# chain_output.csv IS the svc-A view (the top client is A's only caller), so
+# there is no separate svc-A pair to render.
+for pair in chain:chain svc-B:svB svc-C:svC svc-E:svE; do
     csv="${pair%%:*}_output.csv"
     out="chain_results/${pair##*:}"
     mkdir -p "$out"

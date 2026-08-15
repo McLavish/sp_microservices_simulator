@@ -38,7 +38,9 @@ if __name__ == "__main__":
     svc = ServiceRuntime(cfg=svc_cfg).bind()
     svc_cfg.register_fault_events(fault_tracker)
 
-    # Retry budget: retries can be at most 10% of successes, max 4 consecutive retries
+    # Retry budget (Finagle-style): retries capped at 10% of admitted *requests*
+    # — not of successes — with a token bucket that bursts up to 50 retries; the
+    # underlying backoff allows 4 attempts (3 retries) per request.
     cli_cfg = ClientConfig(
         retry=RetryBudgetPolicy(
             budget_ratio=0.1,

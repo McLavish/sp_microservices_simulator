@@ -27,7 +27,11 @@ if __name__ == "__main__":
     svc = ServiceRuntime(cfg=svc_cfg).bind()
     svc_cfg.register_fault_events(fault_tracker)
 
-    # Leaky bucket rate limiter: 100 requests per second max
+    # Leaky bucket rate limiter: 100 requests per second max. The bucket is a
+    # queue — a granted retry reserves the next free slot however far ahead it
+    # is — so the global timeout is what bounds the wait: retries scheduled past
+    # it are vetoed (and their slot refunded via rollback) instead of being
+    # issued seconds after the request they belong to.
     cli_cfg = ClientConfig(
         retry=LeakyRateLimiterPolicy(
             max_requests=100,
@@ -35,7 +39,7 @@ if __name__ == "__main__":
             max_attempts=3,
         ),
         timeout_controller=StaticTimeoutController(
-            global_timeout=None,
+            global_timeout=ms_to_ns(500),
             attempt_timeout=ms_to_ns(50),
         ),
     )

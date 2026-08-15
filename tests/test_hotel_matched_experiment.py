@@ -16,11 +16,12 @@ from experiments.hotel_matched import (
     _parse_load_spike,
     _parse_profile_fault,
     _positive_float,
+    _validated_load_spike,
+    _validated_profile_fault,
     config_from_args,
     run_hotel_matched,
 )
 from retry_policies import ExponentialBackoffWithJitterRetryPolicy, JitterMode, NoRetryPolicy
-from simulator import Simulator
 
 
 def test_config_from_args_accepts_calibration_fault_and_load_spike(tmp_path):
@@ -154,7 +155,6 @@ def test_run_hotel_matched_uses_default_profile_fault_when_no_calibration(tmp_pa
 
 def test_hotel_matched_retry_policies_follow_real_resilience_profiles():
     run = _build_runtime(
-        Simulator(seed=123),
         calibration={},
         profile_faults=[],
         seed=123,
@@ -290,6 +290,30 @@ def test_fault_and_spike_windows_validated():
         _parse_load_spike("10,20,-3")  # negative multiplier
     with pytest.raises(argparse.ArgumentTypeError):
         _parse_load_spike("-5,20,2")  # negative start
+
+
+def test_cli_parsers_delegate_to_the_shared_validators():
+    """The CLI must enforce the JSON path's bounds, not a private copy of them.
+
+    Pinned through the diagnostics only `_validated_*` produce: a second copy of
+    the checks passes the bound but not the message, so this fails if the CLI
+    goes back to re-implementing them.
+    """
+    assert _parse_profile_fault("1,2,20,0.3") == _validated_profile_fault(
+        1.0, 2.0, 20.0, 0.3, origin="--profile-fault"
+    )
+    assert _parse_load_spike("1,2,1.5") == _validated_load_spike(
+        1.0, 2.0, 1.5, origin="--load-spike"
+    )
+
+    with pytest.raises(argparse.ArgumentTypeError, match="--profile-fault.*silently inert"):
+        _parse_profile_fault("20,10,50,0.2")
+    with pytest.raises(argparse.ArgumentTypeError, match="did you pass a percentage"):
+        _parse_profile_fault("10,20,50,20")
+    with pytest.raises(argparse.ArgumentTypeError, match="--load-spike.*traffic blackout"):
+        _parse_load_spike("10,20,-3")
+    with pytest.raises(argparse.ArgumentTypeError, match="--load-spike.*must be >= start"):
+        _parse_load_spike("20,10,1.5")
 
 
 def test_calibration_json_rejects_non_finite(tmp_path):

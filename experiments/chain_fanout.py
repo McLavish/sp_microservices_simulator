@@ -10,14 +10,20 @@ from timeout_controllers import StaticTimeoutController
 from workload import Workload
 
 
-def make_client_cfg(attempt_timeout_ms: int, max_attempts: int, delay_ms: int) -> ClientConfig:
+def make_client_cfg(
+    attempt_timeout_ms: int,
+    max_attempts: int,
+    delay_ms: int,
+    global_timeout_ms: int | None = None,
+) -> ClientConfig:
     return ClientConfig(
         retry=FixedBackoffRetryPolicy(
             max_attempts=max_attempts,
             delay=ms_to_ns(delay_ms),
         ),
         timeout_controller=StaticTimeoutController(
-            global_timeout=None, attempt_timeout=ms_to_ns(attempt_timeout_ms)
+            global_timeout=None if global_timeout_ms is None else ms_to_ns(global_timeout_ms),
+            attempt_timeout=ms_to_ns(attempt_timeout_ms),
         ),
     )
 
@@ -26,7 +32,13 @@ if __name__ == "__main__":
     sim = Simulator(seed=1234)
     fault_tracker = FaultEventsTracker()
 
-    # Define services A -> B -> (C & E)
+    # Define services A -> B -> (C & E). The leaves are sized so retry demand
+    # during the fault window stays inside their capacity: 32 workers x ~68 ms
+    # mean is ~470 rps each against 188 rps of offered load. Sized at 16 workers
+    # (~235 rps, ~80% utilization) the nested retry layers tipped the run into a
+    # metastable collapse the moment svc-C degraded — root success went to zero
+    # at t=12 s and never recovered, so ~80% of the exported buckets, and of the
+    # figures plot.sh renders from them, were empty.
     a_cfg = ServiceConfig(
         name="svc-A",
         latency_median=ms_to_ns(60),
@@ -45,7 +57,7 @@ if __name__ == "__main__":
         name="svc-C",
         latency_median=ms_to_ns(60),
         latency_lognorm_sigma=0.5,
-        workers=16,
+        workers=32,
         queue_capacity=10000000,
         partial_failures=[
             PartialFailure(duration=TimeInterval(begin=s_to_ns(10), end=s_to_ns(20)), p_fail=0.5)
@@ -55,7 +67,7 @@ if __name__ == "__main__":
         name="svc-E",
         latency_median=ms_to_ns(60),
         latency_lognorm_sigma=0.5,
-        workers=16,
+        workers=32,
         queue_capacity=10000000,
     )
 
@@ -73,17 +85,17 @@ if __name__ == "__main__":
     # Per-edge client configurations
     # B's client to C and E (fanout)
     b_to_c_client = ClientRuntime(
-        cfg=make_client_cfg(attempt_timeout_ms=200, max_attempts=4, delay_ms=40),
+        cfg=make_client_cfg(attempt_timeout_ms=250, max_attempts=3, delay_ms=40),
         service=c_node,
     )
     b_to_e_client = ClientRuntime(
-        cfg=make_client_cfg(attempt_timeout_ms=200, max_attempts=4, delay_ms=40),
+        cfg=make_client_cfg(attempt_timeout_ms=250, max_attempts=3, delay_ms=40),
         service=e_node,
     )
 
     # A's client to B
     a_to_b_client = ClientRuntime(
-        cfg=make_client_cfg(attempt_timeout_ms=800, max_attempts=4, delay_ms=60),
+        cfg=make_client_cfg(attempt_timeout_ms=800, max_attempts=3, delay_ms=60),
         service=b_node,
     )
 
@@ -97,12 +109,12 @@ if __name__ == "__main__":
     for cfg in (a_cfg, b_cfg, c_cfg, e_cfg):
         cfg.register_fault_events(fault_tracker)
 
-    # Top-level client calling A
-    top_client_cfg = ClientConfig(
-        retry=FixedBackoffRetryPolicy(max_attempts=4, delay=ms_to_ns(100)),
-        timeout_controller=StaticTimeoutController(
-            global_timeout=None, attempt_timeout=ms_to_ns(3200)
-        ),
+    # Top-level client calling A. The global timeout is what bounds the work one
+    # root can put on the leaves: it propagates down the graph as each node's
+    # deadline (chain.py hands it to every downstream call), so a root cannot
+    # keep re-driving the whole subtree once its budget is spent.
+    top_client_cfg = make_client_cfg(
+        attempt_timeout_ms=1000, max_attempts=3, delay_ms=100, global_timeout_ms=2000
     )
     top_client = ClientRuntime(cfg=top_client_cfg, service=a_node)
 
@@ -122,9 +134,11 @@ if __name__ == "__main__":
     m.export_csv(path="chain_output.csv", granularity_s=1.0)
     fault_tracker.export_json("chain_fault_events.json")
 
-    # Per-service CSVs via the client that targets each node
+    # Per-service CSVs via the client that targets each node. svc-A has no entry
+    # of its own: the top client is the only caller of A, so its view IS
+    # chain_output.csv above — exporting it again as svc-A_output.csv produced a
+    # byte-identical file and a duplicate set of figures.
     per_service_clients = [
-        (top_client, a_node.cfg.name),
         (a_to_b_client, b_node.cfg.name),
         (b_to_c_client, c_node.cfg.name),
         (b_to_e_client, e_node.cfg.name),
@@ -141,9 +155,13 @@ if __name__ == "__main__":
         cli.metrics().print_stats()
 
     # Simple AND-fanout sanity: successes must be monotonic
-    sA = m.summary().succeeded
+    top_summary = m.summary()
+    sA = top_summary.succeeded
     sB = a_to_b_client.metrics().summary().succeeded
     sC = b_to_c_client.metrics().summary().succeeded
     sE = b_to_e_client.metrics().summary().succeeded
     print("Sanity check (AND-fanout): succ(A) <= succ(B) <= min(succ(C), succ(E))")
     print(f"succ(A)={sA}, succ(B)={sB}, succ(C)={sC}, succ(E)={sE}")
+    # A collapsed run satisfies the monotonicity above just as well as a healthy
+    # one (0 <= 0 <= 0), so report the rate the figures are drawn from too.
+    print(f"top-level success rate: {sA / max(1, top_summary.total):.3f}")
