@@ -155,16 +155,18 @@ does not — what it subtracts depends on whether a budget is configured.
 ascends on is the *pooled* amplification over the episode,
 `Σr / Σn ≤ b` (`r` = a window's `cost_retries`, `n` its `cost_roots`), which
 linearizes to `Σr − b·Σn ≤ 0`. The reward therefore subtracts that constraint's
-per-window contribution, `cost_term = r − b·n`, times `RewardWeights.cost`. The
-episode sum is then **exactly** `Σr − b·Σn = Σn · (pooled_cost − b)`, which is:
+per-window contribution, `cost_term = (r − b·n) / R` — `R` the constant expected
+roots-per-window fixed at reset — times `RewardWeights.cost`. The episode sum is
+then **exactly** `(Σr − b·Σn) / R = Σn · (pooled_cost − b) / R`, which is:
 independent of the order of the windows and of how the episode is cut into them;
-measured on one population on both sides (no count from a different population
-enters); zero exactly when the pooled constraint binds; and *signed* like
-`pooled_cost − b`, the quantity `dual_ascent_update` moves λ on — so at a KKT
-point `λ·(Σr − b·Σn) = 0` iff `λ·(pooled − b) = 0`. Note the term is a **count**,
-not a rate: λ multiplies hundreds of retries per window at the study's arrival
-rates, so λ values (and a suitable `--lambda-lr`) are not comparable with runs
-made before the primal was paired with the dual this way.
+measured on one population on both sides (`R` is a pure, action-independent
+rescale — no count from a different population weights any window); zero exactly
+when the pooled constraint binds; and *signed* like `pooled_cost − b`, the
+quantity `dual_ascent_update` moves λ on — so at a KKT point
+`λ·(Σr − b·Σn) = 0` iff `λ·(pooled − b) = 0`. The `R` rescale keeps the term
+O(1): λ and the default `--lambda-lr 0.5` keep the scale they were tuned for,
+where the unscaled count would need both to be ~`R`× smaller and the dual's few
+chunk updates would never reach a binding multiplier.
 
 One honest consequence: because the constraint is a *ratio*, the `− b·n` half
 gives the agent a second way to satisfy it — inflate the denominator by
@@ -287,8 +289,8 @@ ascent converges to neither. The hand `retries` penalty is zeroed during
 constrained training; evaluation always reports the base objective **J** (reward
 with retry/cost penalties zeroed) so arms with different training weights stay
 comparable. Honest caveats: the constraint is enforced **in expectation** (not
-per episode/window — report violation rates); λ multiplies a retry *count*, so
-its magnitude and a good `--lambda-lr` differ from pre-pairing runs; and
+per episode/window — report violation rates); the cost term's constant-`R`
+rescale keeps λ and `--lambda-lr` at their pre-pairing O(1) scale; and
 `RetryBudgetPolicy.budget_ratio` limits retries against *requests* (Finagle
 semantics), matching the retries-per-root the constraint cost measures.
 

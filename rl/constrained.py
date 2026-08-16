@@ -10,14 +10,15 @@ between training chunks:
 
 The primal is paired with that dual by handing the budget to the env
 (``EnvConfig.cost_budget = cfg.budget``): each window is then penalised by
-``cost_retries - budget * cost_roots``, whose episode sum is exactly
-``sum(retries) - budget * sum(roots) = sum(roots) * (pooled_cost - budget)`` —
-the same sign, and zero at the same point, as the ``cost - budget`` above.
-
-Scale note: that term is a COUNT (hundreds of retries per window at the study's
-arrival rates), not a per-root rate, so lambda multiplies a much larger number
-than it did before this pairing existed. Lambda values — and ``lambda_lr`` —
-from earlier runs are not comparable; re-tune if dual ascent oscillates.
+``(cost_retries - budget * cost_roots) / R`` — ``R`` the constant expected
+roots-per-window fixed at reset — whose episode sum is exactly
+``(sum(retries) - budget * sum(roots)) / R``: the same sign, and zero at the
+same point, as the ``cost - budget`` above. The constant ``R`` rescale keeps
+the term O(1), so lambda stays at the scale the default ``lambda_lr`` was
+tuned for; an unscaled count (hundreds of retries per window at the study's
+arrival rates) needs lambda and ``lambda_lr`` roughly ``R`` times smaller,
+and with only ``timesteps / chunk_timesteps`` dual updates per run the ascent
+then never reaches a binding multiplier.
 
 During constrained training the hand-tuned ``retries`` penalty is zeroed so
 the learned multiplier is the only retry pressure. Evaluation always reports

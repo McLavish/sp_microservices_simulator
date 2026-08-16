@@ -480,8 +480,10 @@ class MicroservicesEnv(_GymEnvBase):
         on is the POOLED amplification ``sum(r) / sum(n) <= b`` (r = the
         window's ``cost_retries``, n = its ``cost_roots``), which linearizes to
         ``sum(r) - b * sum(n) <= 0``. This returns that constraint's per-window
-        contribution, ``r - b * n``, so the episode sum is exactly
-        ``sum(r) - b * sum(n) = sum(n) * (pooled_cost - b)``. What that buys:
+        contribution, ``(r - b * n) / R``, where ``R`` is the constant expected
+        top-level roots per window fixed at reset — so the episode sum is
+        exactly ``(sum(r) - b * sum(n)) / R = sum(n) * (pooled_cost - b) / R``.
+        What that buys:
 
         - numerator and subtrahend are measured on the SAME population (the cost
           client's roots), so nothing is normalised by a count from a different,
@@ -513,9 +515,18 @@ class MicroservicesEnv(_GymEnvBase):
         """
         budget = self._cfg.cost_budget
         if budget is not None:
-            return float(summary.get("cost_retries", 0.0)) - budget * float(
+            linearized = float(summary.get("cost_retries", 0.0)) - budget * float(
                 summary.get("cost_roots", 0.0)
             )
+            # Rescaled by a constant fixed at reset so the term stays O(1) and
+            # lambda (RewardWeights.cost) keeps the scale the dual's default
+            # step size was tuned for. A constant, action-independent divisor
+            # preserves every property above — the sum is (sum(r) - b*sum(n))
+            # divided by the same number for every action, so zeros, signs and
+            # rankings are untouched; this is NOT the per-window normalisation
+            # by another population that the docstring warns about.
+            scale = self._roots_per_window if self._roots_per_window > 0.0 else 1.0
+            return linearized / scale
         if self._roots_per_window <= 0.0:
             return float(summary.get("cost", 0.0))
         return float(summary.get("cost_retries", 0.0)) / self._roots_per_window

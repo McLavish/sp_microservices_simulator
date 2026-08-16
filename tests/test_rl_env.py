@@ -272,9 +272,12 @@ class TestMicroservicesEnv(unittest.TestCase):
         backward = env._cost_penalty(light) + env._cost_penalty(heavy)
         self.assertAlmostEqual(forward, backward, places=12)
 
-        # The sum is exactly sum(retries) - budget * sum(roots): the linearized
-        # constraint, over the same population on both sides.
-        self.assertAlmostEqual(forward, 5.0 - budget * 105.0, places=12)
+        # The sum is exactly (sum(retries) - budget * sum(roots)) / R: the
+        # linearized constraint over the same population on both sides, rescaled
+        # by the constant expected roots-per-window fixed at reset.
+        scale = env._roots_per_window
+        self.assertGreater(scale, 0.0)
+        self.assertAlmostEqual(forward, (5.0 - budget * 105.0) / scale, places=12)
 
     def test_cost_penalty_without_budget_prices_retry_counts(self):
         """No budget, no constraint: the term is a soft penalty on retries.
@@ -318,8 +321,12 @@ class TestMicroservicesEnv(unittest.TestCase):
         # An episode with no edge traffic would satisfy the identity vacuously.
         self.assertGreater(retries, 0.0)
         self.assertGreater(roots, 0.0)
+        scale = env._roots_per_window
+        self.assertGreater(scale, 0.0)
         self.assertAlmostEqual(
-            sum(env._cost_penalty(w) for w in windows), retries - budget * roots, places=6
+            sum(env._cost_penalty(w) for w in windows),
+            (retries - budget * roots) / scale,
+            places=6,
         )
 
         # ...and the REWARD carries exactly that sum: same seeded episode, one
@@ -335,7 +342,9 @@ class TestMicroservicesEnv(unittest.TestCase):
         )
         weighted_reward, _, _ = self._run_fixed_action(weighted, action, seed=11)
         self.assertAlmostEqual(
-            weighted_reward - baseline_reward, -cost_weight * (retries - budget * roots), places=6
+            weighted_reward - baseline_reward,
+            -cost_weight * (retries - budget * roots) / scale,
+            places=6,
         )
 
     def test_cost_term_sign_agrees_with_the_dual(self):
@@ -365,7 +374,10 @@ class TestMicroservicesEnv(unittest.TestCase):
                 pooled = retries / roots
                 pooled_costs.append(pooled)
                 term_sum = sum(env._cost_penalty(w) for w in windows)
-                self.assertAlmostEqual(term_sum, roots * (pooled - budget), places=6)
+                self.assertGreater(env._roots_per_window, 0.0)
+                self.assertAlmostEqual(
+                    term_sum, roots * (pooled - budget) / env._roots_per_window, places=6
+                )
                 self.assertEqual(term_sum > 0.0, pooled > budget)
         # Non-vacuous only if the two arms straddle the budget.
         self.assertLess(min(pooled_costs), budget)
@@ -410,7 +422,7 @@ class TestMicroservicesEnv(unittest.TestCase):
         cost_part = env._cost_penalty(drained) * cost_weight
         # The two forms only differ when the drain is not exactly one window.
         self.assertNotAlmostEqual(weight, 1.0, places=2)
-        self.assertGreater(abs(cost_part), 1e-3)
+        self.assertGreater(abs(cost_part), 1e-5)
 
         self.assertAlmostEqual(total_on - total_off, weight * rate_part - cost_part, places=6)
         # Weighting the cost term too (the old form) is measurably different.
