@@ -333,45 +333,45 @@ criteria are stated against a no-retry baseline, so the grid must contain
 is rejected up front rather than after the sweep, and a budget below the
 cheapest action in the grid is reported as infeasible.
 
-#### Findings (multichain sweep, 30k timesteps, 10 eval seeds)
+#### Findings (multichain sweep, 100k timesteps, 10 eval seeds)
 
-Reference run of the commands above (defaults; sample output committed as
-`rl_constrained_comparison_multichain.csv`). **Stale for the constrained-PPO
-arm**: it was produced before the primal was paired with the dual (the reward
-then penalised a normalised retry count instead of `Σr − b·Σn`), so arm B and
-its λ curves need a re-run — with `--lambda-lr` retuned for the new λ scale.
-Arms A and C are unaffected (λ = 0 and no PPO respectively), as is J, which
-zeroes the cost weight by construction.
+Reference run of the commands above (`--timesteps 100000`, otherwise defaults;
+output committed as `rl_constrained_comparison_multichain.csv`). Produced
+2026-08-16 on the review-fixed code: the reward is the paired Lagrangian
+(`(r − b·n)/R`, default `--lambda-lr 0.5`), and the chunk loop now trains the
+timesteps it reports — the earlier reference's "30k" actually trained ~105k
+via the chunk-loop bug, so 100k is the honest match for its effective compute.
+(At an honest 30k the study is basin-dominated: arm B's outcome is insensitive
+to λ entirely, and the b=0.2 dual only starts binding after the last chunk.)
 
 | arm | budget | J | edge cost | violations | bystander | p95 |
 | --- | --- | --- | --- | --- | --- | --- |
-| unconstrained PPO | — | **6.74** | 0.318 | — | 0.797 | 242 ms |
-| constrained PPO | 0.05 | 6.25 | 0.000 | 0% | 0.865 | 135 ms |
-| retry_budget | 0.05 | 6.29 | 0.011 | 0% | 0.861 | 137 ms |
-| constrained PPO | 0.1 | 6.25 | 0.000 | 0% | 0.865 | 135 ms |
-| retry_budget | 0.1 | 6.30 | 0.016 | 0% | 0.861 | 135 ms |
-| constrained PPO | 0.2 | 6.55 | 0.251 | 70% | 0.818 | 262 ms |
-| retry_budget | 0.2 | 6.46 | 0.029 | 0% | 0.858 | 147 ms |
+| unconstrained PPO | — | **6.35** | 0.300 | — | 0.767 | 258 ms |
+| constrained PPO | 0.05 | 5.95 | 0.057 | 60% | 0.827 | 154 ms |
+| retry_budget | 0.05 | 5.88 | 0.027 | 0% | 0.836 | 144 ms |
+| constrained PPO | 0.1 | 5.90 | 0.005 | 0% | 0.840 | 142 ms |
+| retry_budget | 0.1 | 5.95 | 0.050 | 0% | 0.834 | 156 ms |
+| constrained PPO | 0.2 | 6.11 | 0.138 | 20% | 0.808 | 180 ms |
+| retry_budget | 0.2 | 6.07 | 0.094 | 0% | 0.818 | 178 ms |
 
 Three results worth keeping:
 
-1. **The trade-off is real and two-sided.** J rises monotonically with
-   amplification (6.25 → 6.55 → 6.74) and the bystander chain pays for it
-   symmetrically (0.865 → 0.818 → 0.797, ~7 p.p. at the unconstrained
+1. **The trade-off is real and two-sided.** J rises with allowed amplification
+   (≈5.9 at the tight budgets → 6.11 → 6.35) and the bystander chain pays for
+   it symmetrically (0.83–0.84 → 0.808 → 0.767, ~7 p.p. at the unconstrained
    optimum) — the externality production retry budgets exist to bound.
    Contrast with `chain`, where every arm sits at cost 0 and the same study
    shows nothing.
-2. **Dual ascent behaves as designed but only enforces the mean.** λ climbs
-   while eval cost exceeds the budget, decays under slack, and holds an
-   interior point at b=0.2 — yet that arm violates its budget on 7/10 eval
-   seeds (mean cost 0.251 vs 0.2), and the curve shows λ still rising at 30k
-   steps. Longer training tightens this; per-episode guarantees need more
-   than a Lagrangian.
-3. **The hand-coded token bucket is competitive where it matters.** At tight
-   budgets constrained PPO retreats to the zero-retry corner (it cannot see
-   the budget in its observation) and `RetryBudgetPolicy` edges it out while
-   never violating; constrained PPO only wins at the loose budget. RL earns
-   its keep in adaptivity, not in replacing the 30-line mechanism.
+2. **Dual ascent enforces the mean, not the episode.** λ climbs while eval
+   cost exceeds the budget, decays under slack, and holds interior points:
+   b=0.2 is satisfied in expectation with real slack used (0.138 vs 0.2,
+   2/10 seed violations) and b=0.05 sits at its budget (0.057, over by small
+   margins on 6/10 seeds). Per-episode guarantees need more than a Lagrangian
+   — report violation rates alongside the means.
+3. **The hand-coded token bucket is competitive where it matters.** It never
+   violates at any budget, and constrained PPO buys only near-equal J at the
+   cost of in-expectation enforcement. RL earns its keep in adaptivity, not
+   in replacing the 30-line mechanism.
 
 Calibration history (why the builder's constants look the way they do): at
 p_fail U(0.3, 0.6) and retrying relay edges, upstream layers recovered blips
