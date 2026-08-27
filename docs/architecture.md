@@ -44,7 +44,10 @@ ClientRuntime._on_attempt_done
 
 The same `submit_attempt` path is reused by **chains**: a `ServiceNodeRuntime`
 wraps a `ServiceRuntime` and injects a custom *behavior* that fans out to
-downstream nodes before finalizing. See [request-handling](request-handling.md).
+downstream nodes before finalizing. A `TransportLink` (`transport.py`) can sit
+between a client and its service — a `ServiceLike` decorator that adds a
+lognormal network delay to each leg of every attempt's round trip. See
+[request-handling](request-handling.md).
 
 ## Time model
 
@@ -136,6 +139,7 @@ workload        Poisson arrivals         <- faults, fault_events, simulator
 retry_policies  retry / circuit-breaker / rate-limit / budget
 timeout_controllers  static / adaptive timeouts
 caller          client + retry loop      <- retry_policies, timeout_controllers, service, metrics
+transport       per-link delay decorator <- caller, service, simulator
 chain           fan-out nodes            <- caller, service, simulator
 metrics         aggregation + CSV export
 

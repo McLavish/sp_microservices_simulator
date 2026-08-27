@@ -244,6 +244,122 @@ a.add_downstream(DownstreamEdge(client=a_to_c, target=ServiceNodeRuntime(service
 # a is ServiceLike: drive it with a top-level ClientRuntime(service=a)
 ```
 
+## Transport delay (`transport.py`)
+
+`TransportLink` (`transport.py`) puts a network delay on **each leg** of the
+round trip between a client and the service it calls. It is a `ServiceLike`
+*decorator*: it forwards `cfg` and implements `submit_attempt`, so a client
+drives it exactly like the thing it wraps.
+
+```python
+from caller import ClientRuntime
+from chain import DownstreamEdge
+from core import ms_to_ns
+from transport import TransportDelay, TransportLink
+
+delay = TransportDelay(median=ms_to_ns(2), sigma=0.4)
+a_to_b = ClientRuntime(cfg=edge_cfg, service=TransportLink(node_b, delay))
+a.add_downstream(DownstreamEdge(client=a_to_b, target=node_b))
+```
+
+The link wraps the target *as the edge's client sees it*: `node_b`'s own
+`ServiceNodeRuntime.service` stays a `ServiceRuntime`, and `DownstreamEdge` is
+unchanged. The delay lives on the caller's side of the edge, not inside the node.
+
+> **Why a decorator and not a change to `chain.py`.** `_launch_fanout`
+> (`chain.py`) runs once per downstream *root request*, but retries are issued
+> from `ClientRuntime._start_attempt` (`caller.py`) and never pass through
+> `chain.py` at all. A delay added to the fan-out loop would therefore be charged
+> once per root instead of once per attempt. Wrapping the service is the one
+> place every attempt — first try and retry alike — crosses.
+
+### Per-leg, per-attempt draws
+
+Every attempt draws **two independent delays**: `d_f` at submit (forward leg) and
+`d_r` when the target reports (return leg). Both come from `TransportDelay.sample`
+(`transport.py`), a lognormal around `median` with shape `sigma`, drawn through
+`sim.rng()` so a seed reproduces the run.
+
+`sigma == 0.0` means *exactly* `median` and takes **no** RNG draw at all. Unlike
+`ServiceConfig.latency_lognorm_sigma`, `TransportDelay.sigma` is deliberately
+**not** floored at `MIN_LOGNORM_SIGMA` (`service.py`), so a genuinely
+deterministic link is expressible and testable. A scenario with no `TransportLink`
+in it draws nothing and schedules nothing extra, so existing seeded results are
+untouched.
+
+### Deadlines on the wire
+
+The attempt deadline the client computed (`min(global_deadline, now +
+attempt_timeout)`) is passed through the link unchanged and applied to both legs.
+Both rules are the strict half-open rule — `end_time < deadline` is required for
+success — carried onto the transport leg:
+
+| Leg | Rule |
+| --- | --- |
+| forward | `arrive_at = now + d_f`. If `arrive_at >= deadline` the request expires in transit: the target is **never called**, and the client is delivered a `DEADLINE` drop at *exactly* the deadline (the caller's clock fires there, not where the packet would have landed). |
+| return | `deliver_at = now + d_r`. If `deliver_at >= deadline` the response is late: delivery is clamped to the deadline and rewritten to `DEADLINE`, while `service_time_ns` and `service_time_censored` stay **exactly** as the service reported them — the work really was done, only the answer was late. `deliver_at == deadline` is a `DEADLINE`, not a success. |
+
+Both rows really clamp to `max(deadline, now)`, because the past cannot be
+scheduled (`Simulator.schedule` raises on it). The `max` only bites when the
+clock is already past the deadline: at submit on the forward row (a deadline
+handed down that has already elapsed — the analogue of `ServiceRuntime`'s
+already-expired drop), or on the return row when the target itself reports
+*after* the deadline — a `ServiceRuntime` deadline drop at dequeue fires whenever
+a worker frees late (`service.py`). Delivery is then immediate instead of
+retroactive; everywhere else `now` is still short of the deadline and the clamp
+lands on the deadline itself.
+
+An attempt that expires in forward transit never reaches a queue, so the target's
+`admitted_total` is untouched (it counts arrivals *at the queue*) and
+`queue_size_at_end` is `None` — the same convention `CIRCUIT_OPEN` uses in
+`caller.py`, because reporting `0` would inject a fabricated "queue is empty"
+sample into `queue_avg_at_attempt_end`.
+
+### Cancellation, phase by phase
+
+`submit_attempt` returns an `AttemptControl` immediately, and `cancel()` keeps the
+truthful-`False` contract that `chain.py`'s teardown and
+`ClientRuntime._cancel_root` rely on: `True` means something was actually torn
+down *and* `on_done` has already been delivered synchronously.
+
+| Phase | `cancel()` does | Returns |
+| --- | --- | --- |
+| forward transit | cancels the pending arrival (or the pending expiry event) and reports `CANCELLED` synchronously, with queue size `None` | `True` |
+| at the service | delegates to the inner `AttemptControl` and returns **its** answer; the outer handle settles only when the inner said `True`, so a target that has already committed keeps its own outcome | the inner's |
+| return transit | cancels the pending delivery and reports `CANCELLED` synchronously, keeping the occupancy, queue size and censoring flag the service reported | `True` |
+| delivered | nothing — the attempt is settled | `False` |
+
+`on_done` fires **exactly once** per attempt on every one of those paths. A
+`CANCELLED` outcome coming back from the target is delivered to the client
+synchronously with *no* return leg: cancellation is client-initiated and needs no
+network.
+
+The stock targets (`ServiceRuntime`, `ServiceNodeRuntime`, a nested
+`TransportLink`) all report `CANCELLED` from inside their own `cancel()`, which
+settles the attempt before that `cancel()` even returns. A target is not obliged
+to: `AttemptControl.cancel()` only promises `True` when something was torn down,
+so a target may answer with a *real* outcome instead ("I already have the answer,
+take it now"). The link then treats the attempt as being in return transit — it
+kills the delivery it had just put on the wire and reports `CANCELLED` carrying
+the occupancy, queue size and censoring flag the target reported. Letting that
+delivery survive would hand the client a second outcome for one attempt a leg
+later, which a `ClientRuntime` meets as `Root request was already done!`. `_deliver`
+therefore cancels *any* event still pending, rather than merely dropping the
+reference to it.
+
+### `service_time_ns` excludes transport
+
+`Request.service_time_ns` keeps its meaning unchanged — worker occupancy at the
+handling service, transport **excluded**. End-to-end attempt latency including
+both legs is `Request.interval` (`d_f` + queue + service + `d_r`). The split is
+load-bearing: `rl/env.py` feeds `service_time_ns` into the `attempt_service_ms`
+stream the queue-aware `ModelBasedPolicy` fits, so folding wire time into it would
+inflate `E[S]` exactly the way reporting a tandem node's downstream wait as
+occupancy would.
+
+`Request.service` stays the *target's* `cfg.name`: the link forwards `cfg`, so an
+attempt is booked under the service that handled it, never under the link.
+
 ## See also
 
 - [services-and-workload](services-and-workload.md) — the `submit_attempt` / `behavior`
@@ -251,6 +367,9 @@ a.add_downstream(DownstreamEdge(client=a_to_c, target=ServiceNodeRuntime(service
 - [experiments](experiments.md) — `single/` demos for each policy, plus the chain
   scenarios.
 - [observability](observability.md) — how attempts become metrics.
+- [architecture](architecture.md) — the module map, the half-open time convention
+  the transport deadline rules follow, and the event heap a `TransportLink`
+  schedules its two legs on.
 
 ## Cancellation propagation
 
