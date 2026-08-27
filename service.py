@@ -65,9 +65,16 @@ class ServiceConfig:
 #: because the last argument carries statistical semantics — it marks the
 #: occupancy sample as a LOWER BOUND for the censored MLE — so a producer that
 #: omits it silently reports a truncated sample as a complete observation.
-#: Lives here, with the only producer: `caller.ServiceLike` and `chain` describe
-#: the same callback and import it.
-AttemptDoneCallback = Callable[[bool, TimeDuration, DropReason, int, bool], None]
+#: Lives here, with the original producer; `caller.ServiceLike`, `chain` and
+#: `transport.TransportLink` (which produces it too, on the client's side of the
+#: wire) describe the same callback and import it.
+#:
+#: The queue size is `None` for an attempt that never reached a service queue at
+#: all — shed by a circuit breaker, or expired on the wire in front of a
+#: `transport.TransportLink`. Reporting 0 there would inject a fabricated "the
+#: queue is empty" sample into `queue_avg_at_attempt_end` at exactly the moments
+#: work is being shed hardest; `metrics` already reads `None` as NaN.
+AttemptDoneCallback = Callable[[bool, TimeDuration, DropReason, int | None, bool], None]
 
 
 # Custom attempt behavior:

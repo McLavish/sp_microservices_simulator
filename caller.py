@@ -286,7 +286,7 @@ class ClientRuntime:
         success: bool,
         svc_time: TimeDuration,
         drop_reason: DropReason,
-        queue_size: int,
+        queue_size: int | None,
         occupancy_censored: bool,
     ):
         if ctx.root.done:
