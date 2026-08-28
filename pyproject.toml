@@ -15,15 +15,8 @@ dev = [
     "pytest",
     "pytest-cov",
     "scipy",
-    "scikit-learn",
     "matplotlib",
     "pandas",
-    "gymnasium",
-]
-# Opt-in: PPO baseline + rl.train_sb3 (pulls in torch, ~GBs).
-# Install with `uv sync --group dev --group rl`.
-rl = [
-    "stable-baselines3",
 ]
 
 [tool.uv]
@@ -70,7 +63,6 @@ known-first-party = [
     "timeout_controllers",
     "experiments",
     "plotting",
-    "rl",
 ]
 
 [tool.ruff.format]
@@ -111,7 +103,6 @@ source = [
     "timeout_controllers",
     "experiments",
     "plotting",
-    "rl",
 ]
 omit = [
     "*/tests/*",
