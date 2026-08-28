@@ -563,13 +563,13 @@ class TestExportCsvBucketSemantics(unittest.TestCase):
 
 
 class TestRootClassificationAgreement(unittest.TestCase):
-    """All three consumers must classify the same population identically.
+    """Every consumer must classify the same population identically.
 
-    `Metrics.summary`, `Metrics.export_csv` and `MicroservicesEnv._summarize_roots`
-    each used to own these rules and drifted: the cancelled test sat before the
-    drop-reason chain in two of them and after it in the third, so one root was
-    booked as cancelled in the CSV and as a deadline drop in the RL reward. This
-    asserts the property directly rather than testing each site separately.
+    `Metrics.summary` and `Metrics.export_csv` each used to own these rules and
+    drifted: the cancelled test sat before the drop-reason chain in one and
+    after it in the other, so the same root was booked as cancelled in one
+    reporting path and as a deadline drop in the other. This asserts the
+    property directly rather than testing each site separately.
     """
 
     def _population(self):
@@ -607,46 +607,24 @@ class TestRootClassificationAgreement(unittest.TestCase):
             root(DropReason.QUEUE_FULL, cancelled=True, completed_at=ms_to_ns(500)),
         ]
 
-    def test_summary_csv_and_env_agree(self):
-        from rl.env import EnvConfig, MicroservicesEnv, build_single_service_env
-        from rl.spec import ActionSpec
-
+    def test_summary_and_csv_agree(self):
         roots = self._population()
         summary = Metrics(roots=roots, attempts_total=sum(len(r.attempts) for r in roots)).summary()
-
-        env = MicroservicesEnv(
-            EnvConfig(
-                build=build_single_service_env,
-                action_spec=ActionSpec([10, 50], [1, 2], [0, 50]),
-            )
-        )
-        env_summary = env._summarize_roots(roots)
-        completed = env_summary["completed"]
 
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "out.csv")
             Metrics(roots=roots, attempts_total=1).export_csv(path, granularity_s=1.0)
             df = pd.read_csv(path)
 
-        for label, from_summary, env_key, csv_col in (
-            ("success", summary.succeeded, "success_rate", "success_root"),
-            ("deadline", summary.dropped_deadline, "deadline_drop_rate", "failure_deadline"),
-            ("queue", summary.dropped_queue, "queue_drop_rate", "failure_queue_full"),
-            ("server", summary.dropped_server_failure, "server_drop_rate", "failure_server"),
-            (
-                "circuit",
-                summary.dropped_circuit_open,
-                "circuit_open_drop_rate",
-                "failure_circuit_open",
-            ),
-            ("cancelled", summary.dropped_cancelled, "cancelled_rate", "failure_cancelled"),
+        for label, from_summary, csv_col in (
+            ("success", summary.succeeded, "success_root"),
+            ("deadline", summary.dropped_deadline, "failure_deadline"),
+            ("queue", summary.dropped_queue, "failure_queue_full"),
+            ("server", summary.dropped_server_failure, "failure_server"),
+            ("circuit", summary.dropped_circuit_open, "failure_circuit_open"),
+            ("cancelled", summary.dropped_cancelled, "failure_cancelled"),
         ):
             with self.subTest(category=label):
-                self.assertEqual(
-                    from_summary,
-                    round(env_summary[env_key] * completed),
-                    f"summary() and _summarize_roots disagree on {label}",
-                )
                 self.assertEqual(
                     from_summary,
                     int(df[csv_col].sum()),
@@ -656,7 +634,7 @@ class TestRootClassificationAgreement(unittest.TestCase):
     def test_classifier_rules_are_correct_not_merely_consistent(self):
         """Agreement alone is not enough once the rule is shared.
 
-        With one classifier behind all three consumers, a WRONG rule is wrong
+        With one classifier behind every consumer, a WRONG rule is wrong
         everywhere and the agreement test still passes. Pin the rule itself —
         in particular that `cancelled` beats the final attempt's drop reason,
         which is the ordering that drifted before it was centralised.

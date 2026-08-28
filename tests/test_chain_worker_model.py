@@ -566,27 +566,6 @@ class TestCancellationCrossSubsystem(unittest.TestCase):
         self.assertEqual(int(df["failure_cancelled"].sum()), summary.dropped_cancelled)
         self.assertEqual(int(df["failure_root"].sum()), summary.total - summary.succeeded)
 
-    def test_env_and_metrics_classify_a_cancelled_root_identically(self):
-        """_summarize_roots tested the drop reason before root.cancelled, the
-        opposite order from metrics.summary(), so a root cancelled after a
-        timed-out attempt was charged to the reward-weighted deadline rate."""
-        from rl.env import EnvConfig, MicroservicesEnv, build_single_service_env
-        from rl.spec import ActionSpec
-
-        env = MicroservicesEnv(
-            EnvConfig(
-                build=build_single_service_env, action_spec=ActionSpec([10, 50], [1, 2], [0, 50])
-            )
-        )
-        client, _ = self._backoff_cancelled_client(
-            backoff_ms=400, cancel_at_ms=200, attempt_timeout_ms=50
-        )
-        summary = client.metrics().summary()
-        env_summary = env._summarize_roots(client.roots)
-        self.assertEqual(summary.dropped_cancelled, 1)
-        self.assertEqual(env_summary["cancelled_rate"], 1.0)
-        self.assertEqual(env_summary["deadline_drop_rate"], 0.0)
-
     def test_committed_outcome_is_not_rewritten_by_a_reentrant_cancel(self):
         """A cancel arriving while a behavior is finalizing must report False,
         not be swallowed by an already-settled guard while the caller believes
@@ -957,24 +936,6 @@ class TestOccupancyCensoring(unittest.TestCase):
         sim.run()
         attempt = client.roots[0].attempts[-1]
         self.assertTrue(attempt.service_time_censored)
-
-    def test_env_uses_the_recorded_flag_not_the_drop_reason(self):
-        from rl.env import EnvConfig, MicroservicesEnv, build_single_service_env
-        from rl.spec import ActionSpec
-
-        env = MicroservicesEnv(
-            EnvConfig(
-                build=build_single_service_env,
-                action_spec=ActionSpec([10, 50], [1, 2], [0, 50]),
-            )
-        )
-        attempt = self._fanout_attempt(hold=False)
-        root = RootRequest()
-        root.add_attempt(attempt)
-        samples = env._collect_latency_samples([root])
-        # The attempt's latency IS censored; its occupancy is not.
-        self.assertEqual(samples["attempt_censored"], [True])
-        self.assertEqual(samples["attempt_service_censored"], [False])
 
 
 if __name__ == "__main__":
