@@ -110,6 +110,22 @@ class TestExactNHPP(unittest.TestCase):
         sim.run()
         self.assertEqual(len(times), count_at_stop)
 
+    def test_stop_from_inside_on_arrival_is_a_latch(self):
+        # stop() called while the arrival event is executing cannot cancel that
+        # event (it has already been popped), so the halt must also suppress the
+        # re-arm in schedule_next — otherwise the process keeps running.
+        sim = Simulator(seed=1)
+        times = []
+        wl = Workload(base_rps=100.0, duration_s=10, load_spikes=[], rng_seed=1)
+
+        def on_arrival(s):
+            times.append(s.timestep)
+            wl.stop()
+
+        wl.drive(sim, on_arrival)
+        sim.run()
+        self.assertEqual(len(times), 1)
+
 
 class TestFractionalDuration(unittest.TestCase):
     def _times(self, duration_s):

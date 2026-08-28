@@ -63,10 +63,11 @@ class RootOutcome(Enum):
 
     Single source of truth: `Metrics.summary` and `Metrics.export_csv` — and any
     other consumer that books roots by outcome — classify the same populations,
-    and they previously each re-implemented the rules. They drifted — the
-    cancelled test ended up before the drop-reason chain in one and after it in
-    the other, so the same root was booked as cancelled in one reporting path
-    and as a deadline drop in another.
+    and they previously each re-implemented the rules. They drifted: both
+    `Metrics` paths tested `cancelled` before the drop-reason chain while a
+    consumer that kept its own outcome table tested it after, so a root
+    cancelled during backoff whose last attempt still carried DEADLINE was
+    booked cancelled here and as a deadline drop there.
     """
 
     SUCCESS = auto()
@@ -144,10 +145,10 @@ FAILURE_OUTCOMES: "dict[RootOutcome, OutcomeReporting]" = {
 def require_outcome_coverage(mapping: "Mapping[RootOutcome, object]", *, owner: str) -> None:
     """Fail at import time when `mapping` misses a non-success `RootOutcome`.
 
-    For consumers that must name the outcomes in their own vocabulary (per-outcome
-    rate keys, say) and so cannot read `FAILURE_OUTCOMES` directly. Raising where
-    the table is DEFINED turns "a new outcome is silently booked as a server
-    drop" into one clear error naming the table that needs the entry.
+    For consumers that must name the outcomes in their own vocabulary and so
+    cannot read `FAILURE_OUTCOMES` directly. Raising where the table is DEFINED
+    turns "a new outcome is silently booked as a server drop" into one clear
+    error naming the table that needs the entry.
     """
     # Checked against the ENUM, not against FAILURE_OUTCOMES: the core table is
     # itself a caller here, and comparing a mapping with itself would pass

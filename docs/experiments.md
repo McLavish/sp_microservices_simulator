@@ -8,8 +8,8 @@ python -m experiments.<name>
 ```
 
 Output files are written to the **current directory** (the repo root) and are
-gitignored; the `*_output.csv` / `*_fault_events.json` committed at the root are
-disposable samples from earlier runs.
+gitignored; any `*_output.csv` / `*_fault_events.json` lying around at the root
+are disposable leftovers from earlier runs.
 
 ## The shape of an experiment
 

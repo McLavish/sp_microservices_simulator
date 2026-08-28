@@ -5,6 +5,9 @@ models queues, retries, timeouts, partial failures, latency injection, and load
 spikes across single services, chains, and fan-outs, and exports per-second CSV
 metrics and fault-event JSON for plotting.
 
+A reinforcement-learning layer that built on the simulator (Gymnasium env, learned
+retry policies, PPO training) lives on the `rl-layer` branch, not here.
+
 - **Services** — M/G/c/K queues with lognormal service times, bounded queues, and
   configurable workers.
 - **Clients** — retry policies (fixed/exponential/jittered backoff, circuit

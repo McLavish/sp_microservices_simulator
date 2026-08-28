@@ -333,8 +333,8 @@ class TestSettleIsTheOnlyTeardownPath(unittest.TestCase):
     already done, a precondition recorded nowhere. A new completion path
     (quorum: succeed when k of n downstreams return) reaching for it would
     leave the outstanding siblings running, consuming shared downstream
-    capacity and recording outcomes of their own — precisely the retry
-    externality `experiments/multichain_retry_storm.py` measures.
+    capacity and recording outcomes of their own — precisely the cross-chain
+    retry externality `experiments/multichain_retry_storm.py` exhibits.
     """
 
     def _attempt(self):

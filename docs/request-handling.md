@@ -435,6 +435,6 @@ the occupancy model:
 
 End-to-end node latency is always `Request.interval`, so nothing is lost by the
 narrower definition. The distinction matters for any queueing analysis that
-takes `E[S]` and utilisation from this field: reporting a tandem node's
+takes `E[S]` and utilization from this field: reporting a tandem node's
 downstream wait as occupancy inflates `E[S]` by the entire subtree latency and
 makes the estimate meaningless.

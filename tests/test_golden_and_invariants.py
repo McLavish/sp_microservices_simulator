@@ -565,11 +565,12 @@ class TestExportCsvBucketSemantics(unittest.TestCase):
 class TestRootClassificationAgreement(unittest.TestCase):
     """Every consumer must classify the same population identically.
 
-    `Metrics.summary` and `Metrics.export_csv` each used to own these rules and
-    drifted: the cancelled test sat before the drop-reason chain in one and
-    after it in the other, so the same root was booked as cancelled in one
-    reporting path and as a deadline drop in the other. This asserts the
-    property directly rather than testing each site separately.
+    `Metrics.summary` and `Metrics.export_csv` each used to own these rules, and
+    a third consumer that owned them too tested `cancelled` after the drop-reason
+    chain instead of before it — booking the same root as cancelled in the CSV
+    and as a deadline drop in its own accounting. `classify_root` is now the one
+    rule; this asserts the property directly rather than testing each site
+    separately.
     """
 
     def _population(self):
@@ -607,7 +608,11 @@ class TestRootClassificationAgreement(unittest.TestCase):
             root(DropReason.QUEUE_FULL, cancelled=True, completed_at=ms_to_ns(500)),
         ]
 
-    def test_summary_and_csv_agree(self):
+    def test_summary_and_csv_agree_on_every_outcome(self):
+        """Both consumers dispatch on `classify_root`, so what this still catches
+        is the reporting half — the `FAILURE_OUTCOMES` table and the bucket range
+        (the `completed_at=500 ms` roots in `_population`) — not the rule itself,
+        which `test_classifier_rules_are_correct_not_merely_consistent` pins."""
         roots = self._population()
         summary = Metrics(roots=roots, attempts_total=sum(len(r.attempts) for r in roots)).summary()
 

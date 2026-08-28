@@ -33,14 +33,14 @@ it, and the label `print_stats` prints. Every one of those lists is generated
 from that mapping, in its declaration order — which is what fixes the CSV
 header, so appending an outcome is safe and reordering rewrites it.
 
-Adding a `RootOutcome` member is therefore a forced edit: `core.py` raises at
-import if the new member has no `FAILURE_OUTCOMES` entry (or if an entry names a
-`Summary` field that does not exist). Any consumer outside `core` that keeps its
+Adding a `RootOutcome` member therefore forces exactly one edit: `core.py` raises
+at import if the new member has no `FAILURE_OUTCOMES` entry (or if an entry names
+a `Summary` field that does not exist). Any consumer outside `core` that keeps its
 own per-outcome table gets the same check by calling
-`core.require_outcome_coverage(table, owner=...)` next to it.
-`plotting/failures_over_time.py` derives its `REASON_COLUMNS` from the
-same table (it still tolerates a column missing from an older CSV), so a new
-outcome flows into the failure-mix figure without a manual edit.
+`core.require_outcome_coverage(table, owner=...)` next to it, and
+`plotting/failures_over_time.py` derives its `REASON_COLUMNS` from the same table
+(it still tolerates a column missing from an older CSV), so a new outcome flows
+into the failure-mix figure without a manual edit.
 
 ### `summary()` (`metrics.py`)
 

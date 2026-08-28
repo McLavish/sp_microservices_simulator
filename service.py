@@ -63,8 +63,9 @@ class ServiceConfig:
 #: The service -> client completion callback: (success, occupancy, drop reason,
 #: queue size, occupancy_censored). Spelled out rather than `Callable[..., None]`
 #: because the last argument carries statistical semantics — it marks the
-#: occupancy sample as a LOWER BOUND for a censored-data estimator — so a producer that
-#: omits it silently reports a truncated sample as a complete observation.
+#: occupancy sample as a LOWER BOUND for a censored-data estimator — so a
+#: producer that omits it silently reports a truncated sample as a complete
+#: observation.
 #: Lives here, with the original producer; `caller.ServiceLike`, `chain` and
 #: `transport.TransportLink` (which produces it too, on the client's side of the
 #: wire) describe the same callback and import it.
