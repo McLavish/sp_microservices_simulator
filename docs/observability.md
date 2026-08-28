@@ -24,9 +24,8 @@ from it.
 ### One outcome table (`core.py`)
 
 `classify_root(root)` (`core.py`) is the single classifier: it returns a
-`RootOutcome`, and `Metrics.summary`, `Metrics.export_csv` and the RL env's
-`_summarize_roots` all book roots by its answer rather than re-deriving the
-rules.
+`RootOutcome`, and both `Metrics.summary` and `Metrics.export_csv` book roots by
+its answer rather than re-deriving the rules.
 
 `core.FAILURE_OUTCOMES` then maps each **non-success** outcome to where it is
 reported: the `Summary` field it increments, the `export_csv` column that books
@@ -34,13 +33,12 @@ it, and the label `print_stats` prints. Every one of those lists is generated
 from that mapping, in its declaration order — which is what fixes the CSV
 header, so appending an outcome is safe and reordering rewrites it.
 
-Adding a `RootOutcome` member is therefore two edits, and both are forced:
-`core.py` raises at import if the new member has no `FAILURE_OUTCOMES` entry (or
-if an entry names a `Summary` field that does not exist), and `rl/env.py` raises
-at import if its `_OUTCOME_RATE_KEYS` table — the env needs rate keys, not CSV
-column names — has no key for it. Consumers outside `core` get that check by
-calling `core.require_outcome_coverage(table, owner=...)` next to their own
-table. `plotting/failures_over_time.py` derives its `REASON_COLUMNS` from the
+Adding a `RootOutcome` member is therefore a forced edit: `core.py` raises at
+import if the new member has no `FAILURE_OUTCOMES` entry (or if an entry names a
+`Summary` field that does not exist). Any consumer outside `core` that keeps its
+own per-outcome table gets the same check by calling
+`core.require_outcome_coverage(table, owner=...)` next to it.
+`plotting/failures_over_time.py` derives its `REASON_COLUMNS` from the
 same table (it still tolerates a column missing from an older CSV), so a new
 outcome flows into the failure-mix figure without a manual edit.
 
@@ -57,7 +55,7 @@ roots being summarized (`Metrics.attempts_on_roots()`). Notes:
 - `retries_per_root = (attempts on the summarized roots - total) / total`.
   Counted over the roots being summarized, not the client's lifetime attempt
   counter — those disagree whenever work is still in flight (a mid-run export,
-  or the RL env's in-horizon population).
+  or any summary taken over a sub-window of the run).
 - `dropped_cancelled` counts roots abandoned by an upstream cancellation. It is
   deliberately its own bucket, NOT folded into the other `dropped_*` counts:
   cancelled work did not fail, and charging it to a failure category would count
@@ -112,8 +110,6 @@ With `--fault-events`, the active fault windows are shaded/annotated over the se
 | `qps_over_time` | `root_requests`, `retries`, `failure_root` | throughput, retries, failures over time |
 | `queue_size_over_time` | `queue_avg_at_attempt_end` | average queue depth over time |
 | `latency_distribution` | *(none — synthetic)* | lognormal PDF/CDF for `--median` (ms) / `--sigma` |
-| `rl_traces_over_time` | trace CSV from `compare_policies` | per-step knob + success-rate traces (`--seed`, `--policies`) |
-| `rl_pareto` | `rl_constrained_comparison*.csv` | goodput-vs-amplification Pareto (+ bystander panel) |
 
 Each script writes a PNG via `--output`/`-o` (defaults: `latencies_over_time.png`,
 `qps_over_time.png`, `queue_size_over_time.png`, `latency_distribution.png`, and
@@ -123,11 +119,10 @@ CSV; both must be finite and positive — degenerate values used to render a bla
 figure and still report it as saved.
 `plot.sh` batch-renders the standard chain figures.
 
-Selectors and overlays fail loudly rather than rendering an empty-but-plausible
-figure: a missing `--fault-events` file, an unknown fault `event_type` in that JSON,
-and an unmatched `--seed`/`--policies` in `rl_traces_over_time` all exit with a
-message naming what *is* available. Buckets in which no root completed are drawn as
-a gap, never as a 0% failure rate.
+Overlays fail loudly rather than rendering an empty-but-plausible figure: a
+missing `--fault-events` file and an unknown fault `event_type` in that JSON both
+exit with a message naming what *is* available. Buckets in which no root
+completed are drawn as a gap, never as a 0% failure rate.
 
 ### Example
 

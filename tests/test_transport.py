@@ -12,8 +12,8 @@ seeded draw in the run. That is what lets these tests say
 
 The two populations a link must keep apart:
 
-* `Request.service_time_ns` is WORKER OCCUPANCY and excludes transport (the RL
-  queue-aware policy fits that stream);
+* `Request.service_time_ns` is WORKER OCCUPANCY and excludes transport (it is
+  the service-time stream, not the round-trip one);
 * `Request.interval` is end-to-end and spans both legs.
 """
 
@@ -359,7 +359,7 @@ class TestRoundTripTiming(unittest.TestCase):
 
         A sigma=0 link draws nothing, so the service-time sample is bit-identical
         in both runs: `service_time_ns` must be UNCHANGED (it is worker
-        occupancy, the stream `rl/env.py` fits) while the interval grows by
+        occupancy, which the wire never touches) while the interval grows by
         exactly one round trip.
         """
         median = ms_to_ns(4)
@@ -609,7 +609,7 @@ class TestReportFidelity(unittest.TestCase):
 
         Both carry statistical semantics downstream — `queue_size_at_end` feeds
         `queue_avg_at_attempt_end`, and `service_time_censored` marks the
-        occupancy as a LOWER BOUND for the censored MLE the latency models fit —
+        occupancy as a LOWER BOUND rather than an exact observation —
         so a link that flattened either to its default would corrupt them
         silently. Every stock service in these tests happens to report an empty
         queue and an uncensored occupancy, which is precisely why this one is

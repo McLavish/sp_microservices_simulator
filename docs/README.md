@@ -11,4 +11,3 @@ subsystem you care about.
 | [request-handling](request-handling.md) | Clients and the attempt loop, retry-policy catalog, timeout controllers, and chain/fan-out. |
 | [observability](observability.md) | `Metrics` summary, the per-bucket CSV schema, and the plotting scripts. |
 | [experiments](experiments.md) | Runnable scenarios (`experiments/`), their outputs, and how to write your own. |
-| [rl](rl.md) | The Gymnasium environment, baseline policies, latency models, and training/comparison entry points. |

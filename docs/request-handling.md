@@ -75,7 +75,7 @@ A controller supplies two timeouts and receives feedback:
 
 - **`StaticTimeoutController`** (`timeout_controllers.py`) — fixed
   `global_timeout` and `attempt_timeout`; `record_result` is a no-op. This is the
-  default for nearly every experiment and the only one the RL env supports.
+  default for nearly every experiment.
 - **`AdaptiveTimeoutController`** (`timeout_controllers.py`) — adapts the
   **attempt** timeout to `target_percentile` (default p95) of observed latency times
   a `safety_margin` (default 2.0), clamped to `[min_timeout, max_timeout]`. Two
@@ -352,10 +352,9 @@ reference to it.
 `Request.service_time_ns` keeps its meaning unchanged — worker occupancy at the
 handling service, transport **excluded**. End-to-end attempt latency including
 both legs is `Request.interval` (`d_f` + queue + service + `d_r`). The split is
-load-bearing: `rl/env.py` feeds `service_time_ns` into the `attempt_service_ms`
-stream the queue-aware `ModelBasedPolicy` fits, so folding wire time into it would
-inflate `E[S]` exactly the way reporting a tandem node's downstream wait as
-occupancy would.
+load-bearing: `service_time_ns` is the service-time sample any utilization or
+`E[S]` estimate is built from, so folding wire time into it would inflate `E[S]`
+exactly the way reporting a tandem node's downstream wait as occupancy would.
 
 `Request.service` stays the *target's* `cfg.name`: the link forwards `cfg`, so an
 attempt is booked under the service that handled it, never under the link.
@@ -435,7 +434,7 @@ the occupancy model:
 | `True` (thread-per-request) | the whole subtree, because the worker is genuinely held throughout |
 
 End-to-end node latency is always `Request.interval`, so nothing is lost by the
-narrower definition. The distinction matters because `ModelBasedPolicy` derives
-its Erlang-C `E[S]` and utilisation from this field: reporting a tandem node's
+narrower definition. The distinction matters for any queueing analysis that
+takes `E[S]` and utilisation from this field: reporting a tandem node's
 downstream wait as occupancy inflates `E[S]` by the entire subtree latency and
-makes the queueing estimate meaningless.
+makes the estimate meaningless.

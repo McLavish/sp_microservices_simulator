@@ -334,7 +334,7 @@ class TestSettleIsTheOnlyTeardownPath(unittest.TestCase):
     (quorum: succeed when k of n downstreams return) reaching for it would
     leave the outstanding siblings running, consuming shared downstream
     capacity and recording outcomes of their own — precisely the retry
-    externality the multichain scenario measures.
+    externality `experiments/multichain_retry_storm.py` measures.
     """
 
     def _attempt(self):
@@ -727,8 +727,8 @@ class TestWorkerOccupancyReporting(unittest.TestCase):
     A tandem node (hold_worker_during_fanout=False) hands its worker back after
     the local stage and finalizes only once the whole subtree returns, so the
     duration its behavior reports spans a downstream wait during which no worker
-    of this service was held. Reporting that as occupancy inflates the E[S] the
-    Erlang-C queueing model derives from it.
+    of this service was held. Reporting that as occupancy inflates any
+    service-time statistic (E[S], utilization) derived from it.
     """
 
     def _fanout(self, hold: bool, local_ms=10, leaf_ms=200):
@@ -861,8 +861,8 @@ class TestOccupancyCensoring(unittest.TestCase):
 
     A tandem node hands its worker back before the downstream wait, so a later
     deadline censors the ATTEMPT while the local stage it measured ran to
-    completion. Inferring the flag from drop_reason fed complete observations to
-    the censored MLE as lower bounds and inflated the fitted E[S] several-fold.
+    completion. Inferring the flag from drop_reason marks complete observations
+    as lower bounds, which inflates any occupancy estimate built from the samples.
     """
 
     def _fanout_attempt(self, hold: bool):

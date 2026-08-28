@@ -61,12 +61,12 @@ class DropReason(Enum):
 class RootOutcome(Enum):
     """How a completed root request ended.
 
-    Single source of truth: `Metrics.summary`, `Metrics.export_csv` and
-    `MicroservicesEnv._summarize_roots` all classify the same populations, and
-    they previously each re-implemented the rules. They drifted — the cancelled
-    test ended up before the drop-reason chain in two of them and after it in
-    the third, so the same root was booked as cancelled in the CSV and as a
-    deadline drop in the RL reward.
+    Single source of truth: `Metrics.summary` and `Metrics.export_csv` — and any
+    other consumer that books roots by outcome — classify the same populations,
+    and they previously each re-implemented the rules. They drifted — the
+    cancelled test ended up before the drop-reason chain in one and after it in
+    the other, so the same root was booked as cancelled in one reporting path
+    and as a deadline drop in another.
     """
 
     SUCCESS = auto()
@@ -103,10 +103,12 @@ class OutcomeReporting:
 #:
 #: Every consumer derives its own list from this one — the summary counters, the
 #: `Summary` fields, `print_stats`, the CSV columns and per-reason buckets, and
-#: (through `require_outcome_coverage`) the RL env's rate keys. The set used to
-#: be hand-written in each of them, so adding an outcome meant finding all of
-#: them: the ones that raised were noticed, the ones that silently booked the
-#: new outcome under an existing reason were not.
+#: the failure-mix figure's `REASON_COLUMNS` (`plotting/failures_over_time.py`);
+#: consumers that keep a table in their own vocabulary check it against this one
+#: through `require_outcome_coverage`. The set used to be hand-written in each of
+#: them, so adding an outcome meant finding all of them: the ones that raised
+#: were noticed, the ones that silently booked the new outcome under an existing
+#: reason were not.
 #:
 #: ORDER IS LOAD-BEARING for `csv_column`: it fixes the column order of every
 #: exported CSV, so appending is safe and reordering rewrites the header.
@@ -142,11 +144,10 @@ FAILURE_OUTCOMES: "dict[RootOutcome, OutcomeReporting]" = {
 def require_outcome_coverage(mapping: "Mapping[RootOutcome, object]", *, owner: str) -> None:
     """Fail at import time when `mapping` misses a non-success `RootOutcome`.
 
-    For consumers that must name the outcomes in their own vocabulary (the RL
-    env's per-outcome rate keys) and so cannot read `FAILURE_OUTCOMES`
-    directly. Raising where the table is DEFINED turns "a new outcome is
-    silently booked as a server drop" into one clear error naming the table
-    that needs the entry.
+    For consumers that must name the outcomes in their own vocabulary (per-outcome
+    rate keys, say) and so cannot read `FAILURE_OUTCOMES` directly. Raising where
+    the table is DEFINED turns "a new outcome is silently booked as a server
+    drop" into one clear error naming the table that needs the entry.
     """
     # Checked against the ENUM, not against FAILURE_OUTCOMES: the core table is
     # itself a caller here, and comparing a mapping with itself would pass
@@ -177,9 +178,9 @@ def classify_root(root: "RootRequest") -> RootOutcome:
         return RootOutcome.CANCELLED
     if not root.attempts:
         # Fail loud rather than inventing an outcome. Both Metrics paths SKIP
-        # attempt-less roots while the RL env would have counted one, so any
-        # silent answer here makes the three consumers disagree; the pre-refactor
-        # env raised IndexError on this shape, and callers already guard it.
+        # attempt-less roots, so any silent answer here would make a consumer
+        # that does count them disagree with the CSV; callers already guard
+        # this shape.
         raise ValueError("cannot classify a RootRequest with no attempts")
     # Append order is completion order (ties on end time are ambiguous).
     return _OUTCOME_BY_DROP_REASON.get(root.attempts[-1].drop_reason, RootOutcome.SERVER_FAILURE)

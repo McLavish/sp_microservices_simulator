@@ -25,7 +25,7 @@ class Metrics:
     # LIFETIME attempt counter as supplied by the constructing client(s). A
     # different population from `roots`: clients bump it at attempt START while
     # roots are appended at COMPLETION, so it over-reports whenever work is
-    # still in flight (a mid-run export, the RL env's in-horizon window). Read
+    # still in flight (a mid-run export, a summary over a sub-window). Read
     # it through `client_attempts_total()`; every `Summary` field, including
     # `attempts_total`, is computed over `roots` instead.
     attempts_total: int = 0
@@ -81,7 +81,7 @@ class Metrics:
         max_ms = ns_to_ms(max(succ_lat)) if succ_lat else float("nan")
         # Count attempts on the roots we are summarizing, not the client's
         # lifetime counter: those disagree whenever work is still in flight
-        # (mid-run exports, the RL env's in-horizon population), and every other
+        # (mid-run exports, summaries over a sub-window), and every other
         # field here is computed over completed roots.
         attempts_on_roots = self.attempts_on_roots()
         retries_per_root = (attempts_on_roots - total) / total if total > 0 else 0.0

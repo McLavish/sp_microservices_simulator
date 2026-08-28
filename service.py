@@ -63,7 +63,7 @@ class ServiceConfig:
 #: The service -> client completion callback: (success, occupancy, drop reason,
 #: queue size, occupancy_censored). Spelled out rather than `Callable[..., None]`
 #: because the last argument carries statistical semantics — it marks the
-#: occupancy sample as a LOWER BOUND for the censored MLE — so a producer that
+#: occupancy sample as a LOWER BOUND for a censored-data estimator — so a producer that
 #: omits it silently reports a truncated sample as a complete observation.
 #: Lives here, with the original producer; `caller.ServiceLike`, `chain` and
 #: `transport.TransportLink` (which produces it too, on the client's side of the
@@ -390,8 +390,9 @@ class ServiceRuntime:
                     # and finalizes only once the whole subtree returns, so the
                     # duration the behavior reports spans the downstream wait —
                     # time no worker of THIS service was held. Utilization-style
-                    # consumers (the Erlang-C E[S]) need the occupancy; the
-                    # end-to-end node latency is still in Request.interval.
+                    # consumers (anything deriving a queueing model's E[S] from
+                    # this stream) need the occupancy; the end-to-end node
+                    # latency is still in Request.interval.
                     occupancy = released_at - begin_at if released_at is not None else 0
                     # Released early: the worker was handed back before whatever
                     # cut the attempt short, so this occupancy is a COMPLETE

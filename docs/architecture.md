@@ -118,9 +118,9 @@ There are **two** independent random streams:
   run via `Simulator(seed=...)`.
 - `Workload._rng` — interarrival times only. Seeded separately from `rng_seed`
   (default `0`), offset by `_ARRIVAL_SEED_OFFSET` so that passing the *same*
-  integer to `Simulator(seed=...)` and `Workload(rng_seed=...)` — which every
-  builder in `rl/env.py` does — still yields two genuinely independent streams
-  rather than one stream drawn twice. See `Workload.__post_init__`.
+  integer to `Simulator(seed=...)` and `Workload(rng_seed=...)` — which callers
+  routinely do — still yields two genuinely independent streams rather than one
+  stream drawn twice. See `Workload.__post_init__`.
 
 Keeping arrivals on their own RNG means you can change the simulator seed (to
 resample service/failure behavior) while the **arrival pattern stays fixed** across
@@ -145,7 +145,6 @@ metrics         aggregation + CSV export
 
 experiments/    runnable scenarios (entry points)   --> CSV + fault JSON
 plotting/       render CSV + fault JSON to PNG
-rl/             Gymnasium env + policies + latency models   (builds on caller/service/workload)
 ```
 
 ## Minimal example
@@ -171,4 +170,3 @@ sim.run()
 - [request-handling](request-handling.md) — clients, retries, timeouts, and chains.
 - [observability](observability.md) — metrics, CSV export, and plotting.
 - [experiments](experiments.md) — runnable scenarios.
-- [rl](rl.md) — the reinforcement-learning layer.

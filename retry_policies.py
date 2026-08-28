@@ -463,13 +463,13 @@ class RetryBudgetPolicy(_ThrottledRetryPolicy):
     ages them out on a TTL (default 60 s) so a long-idle client cannot bank
     unlimited retry credit; this implementation caps the balance at
     `max_retries` worth of tokens instead, which bounds the burst but not the
-    staleness. Adequate for episode-length simulations; would need the TTL to
+    staleness. Adequate for the short simulation runs here; would need the TTL to
     model a long-lived client faithfully.
 
     Note the denominator is *requests*, not *successes*. Depositing only on
     success would enforce `retries <= ratio x successes`, which is strictly
     tighter during exactly the failure storms a budget exists to damp, and does
-    not match the retries-per-root constraint the RL cost measures.
+    not match a retries-per-root amplification constraint.
     """
 
     budget_ratio: float  # retries can be at most this ratio of requests (e.g., 0.1 for 10%)

@@ -134,6 +134,9 @@ deterministically at t=0).
   spike's `rps_multiplier`.
 - `drive(sim, on_arrival)` (`workload.py`) — schedules the arrival chain; calls
   `on_arrival(sim)` at each arrival (typically `client.start_request`).
+- `stop()` (`workload.py`) — cancels the pending arrival so nothing further is
+  generated; lets a caller close the arrival process early and drain only the
+  in-flight work when the workload's own `duration_s` outlives the run.
 - Zero-rate segments are skipped exactly and consume no extra RNG (one Exp(1)
   draw per arrival regardless of how many segments it crosses), so arrival
   timing stays identical across runs whenever the RPS-positive intervals match.

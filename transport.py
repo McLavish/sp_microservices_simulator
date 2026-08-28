@@ -20,10 +20,9 @@ callers.
 Attempts stay booked under the target's name (`cfg` forwards to the target), and
 the delay is deliberately NOT folded into service time:
 
-* `Request.service_time_ns` stays WORKER OCCUPANCY and excludes transport. The
-  RL stack feeds it into the `attempt_service_ms` stream the queue-aware policy
-  fits its Erlang-C moments from, so widening it to "occupancy + wire time"
-  would silently corrupt those fits.
+* `Request.service_time_ns` stays WORKER OCCUPANCY and excludes transport. It is
+  the service-time sample any utilization or E[S] estimate is built from, so
+  widening it to "occupancy + wire time" would silently corrupt those estimates.
 * End-to-end attempt latency, both legs included, is `Request.interval`.
 
 Deadlines are enforced against the caller's clock, not the packet's: a request

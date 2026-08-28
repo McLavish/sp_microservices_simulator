@@ -93,8 +93,8 @@ class TestServiceTimeRecording(unittest.TestCase):
     def test_timeout_records_occupancy_not_latent_service_time(self):
         # A 100 ms latent draw cut by a 10 ms attempt deadline frees the worker
         # at 10 ms; the recorded service time must be the ~10 ms of actual
-        # occupancy, not the latent 100 ms (which would corrupt utilization /
-        # Erlang-C moments downstream).
+        # occupancy, not the latent 100 ms (which would corrupt the utilization
+        # and service-time moments derived from it downstream).
         sim = Simulator(seed=1)
         svc = ServiceRuntime(
             cfg=ServiceConfig(

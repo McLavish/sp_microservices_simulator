@@ -4,11 +4,11 @@ This file provides guidance to the Agent when working with code in this reposito
 
 ## What this is
 
-Discrete-event simulator of microservice request flows: queues, retries, timeouts, partial failures, latency injections, load spikes. Simulates single services, chains, and fan-outs, exports per-bucket CSV metrics + fault-event JSON for plotting, and exposes the simulator as a Gymnasium environment for RL experiments on retry/timeout policies.
+Discrete-event simulator of microservice request flows: queues, retries, timeouts, partial failures, latency injections, load spikes. Simulates single services, chains, and fan-outs, exports per-bucket CSV metrics + fault-event JSON for plotting. (A reinforcement-learning layer — Gymnasium env, learned/model-based retry policies, PPO training — used to live in `rl/`; it was split out to the `rl-layer` branch on 2026-08-28 and is not part of this branch.)
 
-The project is uv-managed but **not an installable package** (`pyproject.toml` sets `package = false`). Everything runs as `python -m <module>` from the repo root against the in-tree `.venv`. Imports are flat (`from core import ...`, `from service import ...`, `from transport import ...`), so the cwd must be the repo root. The simulator core depends only on `numpy` + stdlib; `scipy`, `scikit-learn`, `matplotlib`, `pandas`, `gymnasium`, `stable-baselines3` are dev/optional deps pulled in only by plotting, RL entry points, and `Metrics.export_csv` (which imports `pandas` lazily at export time).
+The project is uv-managed but **not an installable package** (`pyproject.toml` sets `package = false`). Everything runs as `python -m <module>` from the repo root against the in-tree `.venv`. Imports are flat (`from core import ...`, `from service import ...`, `from transport import ...`), so the cwd must be the repo root. The simulator core depends only on `numpy` + stdlib; `scipy`, `matplotlib`, `pandas` are dev deps pulled in only by plotting and `Metrics.export_csv` (which imports `pandas` lazily at export time).
 
-Deeper reference docs live in `docs/` — start with `docs/architecture.md`, then the subsystem you're touching (`services-and-workload`, `request-handling`, `observability`, `experiments`, `rl`). Keep them in sync when changing the behavior they describe. `AGENTS.md` is a symlink to this file — edit `CLAUDE.md`, never create a separate agents file.
+Deeper reference docs live in `docs/` — start with `docs/architecture.md`, then the subsystem you're touching (`services-and-workload`, `request-handling`, `observability`, `experiments`). Keep them in sync when changing the behavior they describe. `AGENTS.md` is a symlink to this file — edit `CLAUDE.md`, never create a separate agents file.
 
 ## Architecture
 
@@ -30,7 +30,7 @@ The simulator is built around a single-threaded discrete-event loop. Events are 
 
 When adding completion paths in `behavior`, preserve AND semantics and route deadlines through `min(...)` rather than overwriting; the deadline guard schedules an `on_deadline` event that must be cancelled on success.
 
-**Transport delay** (`transport.py`). `TransportLink` is a `ServiceLike` *decorator* — it forwards `cfg` and implements `submit_attempt` — that puts an independent lognormal delay on each leg of an attempt's round trip: `ClientRuntime(cfg=..., service=TransportLink(node, delay))` with `DownstreamEdge(client, node)` unchanged (the link wraps the target *as the edge's client sees it*; `ServiceNodeRuntime.service` stays a `ServiceRuntime`). It has to be a decorator and not a `chain.py` change: retries are issued from `ClientRuntime._start_attempt` and never pass through `chain.py`, so a delay in the fan-out loop would be charged once per root instead of once per attempt. Deadlines keep the strict half-open rule — a forward leg arriving at or after the attempt deadline expires in transit (the target is never called, `admitted_total` untouched, `queue_size_at_end` `None` as for `CIRCUIT_OPEN`), and a response that would land at or after it is clamped to the deadline (or to now, when the target itself reported later still — the past cannot be scheduled) and booked `DEADLINE`, keeping the occupancy and censoring flag the service reported. `cancel()` stays truthful (`True` only when something was really torn down and `on_done` was delivered synchronously) and `on_done` fires exactly once per attempt in every phase. `Request.service_time_ns` remains worker occupancy and **excludes** transport (`rl/env.py` fits that stream); `Request.interval` spans both legs. `TransportDelay.sigma == 0.0` means exactly `median` with no RNG draw (deliberately not floored by `MIN_LOGNORM_SIGMA`), and a scenario with no link draws nothing from `sim.rng()` and schedules no extra event, so the goldens are unaffected.
+**Transport delay** (`transport.py`). `TransportLink` is a `ServiceLike` *decorator* — it forwards `cfg` and implements `submit_attempt` — that puts an independent lognormal delay on each leg of an attempt's round trip: `ClientRuntime(cfg=..., service=TransportLink(node, delay))` with `DownstreamEdge(client, node)` unchanged (the link wraps the target *as the edge's client sees it*; `ServiceNodeRuntime.service` stays a `ServiceRuntime`). It has to be a decorator and not a `chain.py` change: retries are issued from `ClientRuntime._start_attempt` and never pass through `chain.py`, so a delay in the fan-out loop would be charged once per root instead of once per attempt. Deadlines keep the strict half-open rule — a forward leg arriving at or after the attempt deadline expires in transit (the target is never called, `admitted_total` untouched, `queue_size_at_end` `None` as for `CIRCUIT_OPEN`), and a response that would land at or after it is clamped to the deadline (or to now, when the target itself reported later still — the past cannot be scheduled) and booked `DEADLINE`, keeping the occupancy and censoring flag the service reported. `cancel()` stays truthful (`True` only when something was really torn down and `on_done` was delivered synchronously) and `on_done` fires exactly once per attempt in every phase. `Request.service_time_ns` remains worker occupancy and **excludes** transport (it is the service-time sample any utilization or `E[S]` estimate is built from); `Request.interval` spans both legs. `TransportDelay.sigma == 0.0` means exactly `median` with no RNG draw (deliberately not floored by `MIN_LOGNORM_SIGMA`), and a scenario with no link draws nothing from `sim.rng()` and schedules no extra event, so the goldens are unaffected.
 
 **Workload** (`workload.py`) is an exact nonhomogeneous Poisson process for the piecewise-constant rate (base RPS × active `LoadSpike.rps_multiplier`s): one Exp(1) budget per arrival is consumed across rate segments, so short spikes are never skipped and the first arrival is exponentially distributed (never deterministically at t=0). Zero-rate segments are skipped exactly without consuming RNG; an all-zero workload schedules no events.
 
@@ -42,14 +42,6 @@ When adding completion paths in `behavior`, preserve AND semantics and route dea
 - `queue_avg_at_attempt_end` averages `Request.queue_size_at_end` for attempts ending in the bucket.
 
 **Fault events** (`fault_events.py`) is a separate tracker that mirrors faults already configured on services/workloads, but emits them in seconds-based JSON for plotting overlays. Both `ServiceConfig.register_fault_events(tracker)` and `Workload.register_fault_events(tracker)` must be called explicitly — registration is *not* automatic.
-
-## RL layer (`rl/`)
-
-`MicroservicesEnv` (`rl/env.py`) wraps a build function into a Gymnasium env; `SCENARIO_BUILDERS` maps the `--fault-scenario` names: `none`, `basic` (fixed fault windows — memorizable, prefer `randomized` for training), `randomized` (fault onset/duration/intensity drawn from the seed), `chain` (A→B→C retry-storm topology: the agent tunes the B→C edge knobs, reward comes from the top-level client), `chain_budget` (edge wrapped in `RetryBudgetPolicy`), `multichain` (two chains A→B→C and X→Y→C share bottleneck C, which degrades with pure partial-failure blips so edge retries genuinely recover successes; the fixed-policy bystander chain is exposed as `EnvComponents.bystander_client` and its success rate gauges the retry externality — the scenario where the retry budget actually binds), and `multichain_budget`. The chain builders expose the edge as `EnvComponents.cost_client`; its retry amplification is the constraint cost the Lagrangian-PPO trainer in `rl/constrained.py` works against (dual ascent on the multiplier over the pooled ratio; three-arm study in `rl.experiments.constrained_retry`, which takes `--scenario {chain,multichain}` and a `--calibrate` mode that grid-checks the budget can bind before training). The reward's cost term (weighted by `RewardWeights.cost`) is the linearized constraint `(cost_retries − cost_budget·cost_roots)/R` per window when `EnvConfig.cost_budget` is set (`R` = constant expected roots/window, a pure rescale keeping λ at O(1) for the default `--lambda-lr`) — its episode sum is exactly `Σn·(pooled − budget)/R`, sign-paired with the dual — and a count-normalized soft retry penalty when no budget is set; `summary["cost"]` (the raw per-window ratio) remains what the observation exposes. Each `step()` advances the simulator by `step_duration_s` and returns reward + observation summarized over roots that completed in that window; on episode end, the arrival process is halted and in-flight work is drained *after* the final reward, reported under `info["drained_summary"]` — drained roots are strictly in-flight work even when the workload's own duration outlives the episode (`EnvConfig.terminal_drain_penalty` optionally folds drained outcomes into the final reward, count-weighted; a small boundary-tail residual remains, see docs/rl.md). Reported metrics distinguish populations: `metrics_summary()` covers all roots incl. drained, `in_horizon_summary()` only reward-visible ones; the experiment CSVs carry both (`*_in_horizon` columns). Latency samples fed to model-based/Bayesian policies come from the knob-actuated client (`cost_client` in chain scenarios) and include an `attempt_service_ms` stream of actual worker occupancy (queue-excluded, deadline cuts censored) — the queue-aware policy fits that stream and derives its Erlang-C moments and arrival rate from it; saved PPO models carry a `.spec.json` ActionSpec sidecar that loads verify. The action is a `MultiDiscrete` index into `ActionSpec` lists for `(attempt_timeout_ms, max_attempts, backoff_ms[, global_timeout_ms])`. Knob application is owned by the builder: each `build_*` function returns `EnvComponents` with an `apply_knobs` callback that maps decoded `ActionValues` onto its own policy/controller objects — the env itself is policy-agnostic, so new scenarios (chains, other retry policies) only need a builder that wires its own `apply_knobs`. Unseeded `reset()` draws a fresh build seed from the gym RNG; never make builders fall back to fixed seeds on the env path or SB3 training collapses to one episode.
-
-`rl/policies/` ships baselines (Fixed, AIMD, ModelBased, Bayesian, SB3 PPO, oracle-fixed grid search). `ModelBasedPolicy` optionally adds an M/G/c queueing-delay term (Erlang-C / Allen-Cunneen, arrival rate per millisecond to match the ms latency models); timed-out attempts are kept as right-censored samples and fitted via censored MLE (`LogNormalModel.fit_censored`). `rl/models/` has the latency models used by Bayesian/ModelBased: lognormal (`lognormal.py`), lognormal mixture (`lognormal_mixture.py`), EVT tail (`evt_tail.py`).
-
-`rl/policies/sb3.py` adapts a Stable-Baselines3 model to the `Policy` protocol. PPO training entry point is `rl.train_sb3`; multi-policy comparison (incl. early-stopped PPO and oracle search) is `rl.experiments.compare_policies`, which writes results/trace/learning-curve CSVs and supports `--ppo-save-path`/`--ppo-load-path` for cross-scenario evaluation. stable-baselines3 lives in the opt-in `rl` dependency group (`uv sync --group dev --group rl`; pulls in torch).
 
 ## Common commands
 
@@ -76,7 +68,7 @@ invalid. `docs/observability.md` records the mutations that once passed silently
 Tests (pytest; tests are `unittest`-style but run under pytest):
 ```bash
 uv run pytest                              # full suite
-uv run pytest tests/test_rl_env.py        # single module
+uv run pytest tests/test_transport.py     # single module
 uv run pytest -k chain_worker             # by keyword
 ```
 
@@ -103,24 +95,6 @@ python -m plotting.qps_over_time chain_output.csv --fault-events chain_fault_eve
 ./plot.sh   # batch-render the standard chain figures
 ```
 
-RL:
-```bash
-python -m rl.experiments.compare_models --dist {lognormal,mixture,pareto}
-python -m rl.experiments.compare_policies \
-    --policies fixed,aimd,model_based,model_based_queue,bayesian,ppo,oracle_fixed \
-    --fault-scenario randomized   # any SCENARIO_BUILDERS name: none, basic, randomized, chain, chain_budget, multichain, multichain_budget
-python -m rl.train_sb3 --timesteps 100000 --fault-scenario randomized --save-path rl_models/ppo.zip
-python -m rl.experiments.constrained_retry --budgets 0.05,0.1,0.2 --device cpu  # Lagrangian PPO vs RetryBudgetPolicy
-python -m rl.experiments.constrained_retry --scenario multichain --calibrate --device cpu  # gate: budget must bind
-python -m rl.experiments.constrained_retry --scenario multichain --budgets 0.05,0.1,0.2 --device cpu
-```
-
-RL result plots (consume the CSVs the experiments above write):
-```bash
-python -m plotting.rl_pareto rl_constrained_comparison_multichain.csv   # goodput-vs-amplification Pareto + bystander panel
-python -m plotting.rl_traces_over_time rl_traces_basic.csv              # per-step knob/success traces; fault overlay only lines up for `basic`
-```
-
 ## Conventions when extending
 
 - New retry policies that wrap another should expose `underlying_strategy` so `_update_policy_results`, `_rollback_policy` *and* `_notify_request_start` reach them. New stateful policies should implement `add_result(success, now)` (once per attempt) and/or `on_request_start(now)` (once per admitted root request — that's the hook `RetryBudgetPolicy` deposits on, since its ratio is retries per *request*).
@@ -131,7 +105,7 @@ python -m plotting.rl_traces_over_time rl_traces_basic.csv              # per-st
 - After running an experiment, call `Metrics.export_csv()` *and* `FaultEventsTracker.export_json()` so plotting overlays line up.
 - Keep internal time in nanoseconds; convert only at I/O / plotting boundaries.
 - `ty` is lenient on missing annotations but real type errors (None narrowing, protocol mismatches, numpy misuse) are kept clean — don't reintroduce them.
-- Generated artifacts (`*.csv`, `*.json`, `*.png`, `results/`) are gitignored. Exactly one is deliberately pinned past that ignore: `rl_constrained_comparison_multichain.csv`, the paper's reference result — do not regenerate it casually. Everything else at the repo root (`*_output.csv`, `*_fault_events.json`, …) is untracked local output from prior runs; treat it as disposable.
+- Generated artifacts (`*.csv`, `*.json`, `*.png`, `results/`) are gitignored. Anything of that kind at the repo root (`*_output.csv`, `*_fault_events.json`, …) is untracked local output from prior runs; treat it as disposable.
 
 ## Git Commits
 

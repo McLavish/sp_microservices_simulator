@@ -14,7 +14,7 @@ from simulator import Event, Simulator
 # Mersenne-Twister stream, so arrival times would be correlated with service
 # times and failure rolls instead of independent of them. Python seeds MT via
 # init_by_array, which scrambles thoroughly, so a fixed offset is enough to
-# decorrelate (same convention as the bystander workload in rl/env.py).
+# decorrelate.
 _ARRIVAL_SEED_OFFSET = 100_003
 
 
@@ -114,9 +114,9 @@ class Workload:
     def stop(self) -> None:
         """Cancel the pending arrival: no further arrivals are generated.
 
-        Used by the RL env at the episode horizon so the terminal drain only
-        completes in-flight work instead of admitting post-horizon traffic
-        when the workload's own duration outlives the episode.
+        Lets a caller close the arrival process early — e.g. to drain a run at a
+        chosen horizon so the tail only completes in-flight work instead of
+        admitting fresh traffic when the workload's own duration outlives it.
         """
         self._stopped = True
         if self._next_event is not None:
