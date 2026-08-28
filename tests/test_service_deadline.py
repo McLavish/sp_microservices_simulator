@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import fields
 
 from caller import ClientConfig, ClientRuntime
 from core import DropReason, ms_to_ns
@@ -21,12 +22,42 @@ class TestServiceDeadline(unittest.TestCase):
         svc = ServiceRuntime(cfg=cfg).bind()
         results = []
 
-        def on_done(success, _svc_time, drop_reason, _queue_size):
+        def on_done(success, _svc_time, drop_reason, _queue_size, _censored=False):
             results.append((success, drop_reason))
 
         svc.submit_attempt(sim, on_done, attempt_deadline=0)
 
         self.assertEqual(results, [(False, DropReason.DEADLINE)])
+
+
+class TestServiceRuntimeBind(unittest.TestCase):
+    def test_bind_restores_a_freshly_constructed_runtime(self):
+        """`bind()` must equal construction for EVERY state field.
+
+        It used to restate the field defaults by hand, so a state field added
+        to the declarations and forgotten in the reset would have gone
+        unnoticed: every call site is `ServiceRuntime(cfg=...).bind()` on a
+        fresh instance, which never exercises the reset at all. Compared
+        against an independently constructed runtime rather than against the
+        declarations, so a hand-written reset cannot satisfy it by accident.
+        """
+        cfg = ServiceConfig(
+            name="svc", latency_median=ms_to_ns(10), latency_lognorm_sigma=1e-6, workers=1
+        )
+        sim = Simulator(seed=1)
+        svc = ServiceRuntime(cfg=cfg).bind()
+        for _ in range(3):
+            svc.submit_attempt(sim, lambda *_a: None)  # 1 in service, 2 queued
+
+        svc.bind()
+
+        fresh = ServiceRuntime(cfg=cfg)
+        state = [f.name for f in fields(ServiceRuntime) if f.name != "cfg"]
+        self.assertEqual(
+            [getattr(svc, name) for name in state],
+            [getattr(fresh, name) for name in state],
+        )
+        self.assertIs(svc.cfg, cfg)  # inputs are left alone
 
 
 class TestServiceTimeRecording(unittest.TestCase):

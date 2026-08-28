@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from rl.policies.action_space import ActionGrid
+from rl.policies.action_space import UNSPECIFIED, ActionGrid
 
 
 @dataclass
@@ -30,11 +30,14 @@ class FixedValuePolicy:
     name: str = "fixed_values"
 
     def __post_init__(self):
+        # `None` here means "this policy has no global-timeout opinion", NOT
+        # "select the spec's None entry" — passing it through literally made a
+        # numeric-only grid such as [100, 200] raise.
         self._action = self.grid.nearest_indices(
             self.attempt_timeout_ms,
             self.max_attempts,
             self.backoff_ms,
-            self.global_timeout_ms,
+            UNSPECIFIED if self.global_timeout_ms is None else self.global_timeout_ms,
         )
 
     def reset(self, seed: int | None = None) -> None:

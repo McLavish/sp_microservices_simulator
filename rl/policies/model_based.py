@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -39,14 +40,27 @@ class LatencyBuffer:
             self.censored = self.censored[-self.max_samples :]
         self._cache = None
 
-    def ingest_info(self, info: dict) -> None:
-        latencies = info.get("attempt_latencies_ms", [])
-        if not latencies:
+    def ingest_info(
+        self,
+        info: dict,
+        values_key: str = "attempt_latencies_ms",
+        flags_key: str = "attempt_censored",
+    ) -> None:
+        """Append one window's samples from an env `info` dict.
+
+        An absent (or empty) flags key means "nothing was censored"; flags that
+        are present but of the wrong length are a caller bug and raise through
+        `add`, rather than being silently padded with `False` — padding would
+        feed deadline-cut attempts to the censored MLE as complete
+        observations, which inflates the fitted E[S] several-fold.
+        """
+        values = info.get(values_key) or []
+        if not values:
             return
-        flags = [bool(f) for f in info.get("attempt_censored", [])]
-        if len(flags) != len(latencies):
-            flags = [False] * len(latencies)
-        self.add([float(v) for v in latencies], flags)
+        flags = [bool(f) for f in info.get(flags_key) or []]
+        if not flags:
+            flags = [False] * len(values)
+        self.add([float(v) for v in values], flags)
 
     def censored_data(self) -> tuple[np.ndarray, np.ndarray]:
         """All samples plus their right-censoring flags."""
@@ -61,6 +75,27 @@ class LatencyBuffer:
         """Uncensored samples only."""
         values, flags = self.censored_data()
         return values[~flags]
+
+
+def _action_cost_key(values) -> tuple:
+    """Deterministic tie-break: prefer the CHEAPEST action among equals.
+
+    Monte-Carlo scores tie exactly whenever two actions predict the same
+    outcome (e.g. any timeout comfortably above the latency distribution), and a
+    strict `>` then keeps whichever the grid happened to enumerate first — so
+    reversing the same physical grid changed the selection. Ordering ties by
+    (timeout, attempts, backoff, global timeout) makes the choice a property of
+    the action, not of the iteration order, and picks the least aggressive of
+    equals. `global_timeout_ms is None` means NO global deadline, the most
+    permissive setting of that knob (`_simulate_action` then never breaks out
+    of the retry loop early), so it sorts last rather than first.
+    """
+    return (
+        values.attempt_timeout_ms,
+        values.max_attempts,
+        values.backoff_ms,
+        math.inf if values.global_timeout_ms is None else values.global_timeout_ms,
+    )
 
 
 def _simulate_action(
@@ -136,6 +171,73 @@ def _simulate_action(
     )
 
 
+def _advance_stream(rng: np.random.Generator) -> None:
+    """Move `rng` onto a substream that shares no draws with the current one.
+
+    Every candidate in a window is scored from the same saved state (common
+    random numbers), so a window consumes an unknown number of raw words —
+    at least `sample_size` per candidate. Nudging the generator by a single
+    `random()` call therefore left the next window re-scoring on essentially
+    the previous window's samples: the Monte-Carlo error stayed common-mode
+    for the whole episode (a fixed bias in the argmax) instead of averaging
+    out over the ~10 windows. A jump advances the stream by 2**127 words, so
+    consecutive windows are independent while CRN still holds inside one.
+    """
+    bit_generator = rng.bit_generator
+    jumped = getattr(bit_generator, "jumped", None)  # PCG64 (default_rng) has one
+    if jumped is None:  # bit generator without a jump: burn a block instead
+        rng.random(1 << 12)
+        return
+    bit_generator.state = jumped().state
+
+
+def _argmax_over_grid(
+    grid: ActionGrid,
+    model: LatencyModel,
+    weights: RewardWeights,
+    rng: np.random.Generator,
+    sample_size: int,
+    queue_delay_ms: float,
+    queue_delay_mode: str,
+) -> tuple[int, ...]:
+    """Score every candidate against the SAME random stream, then take the max.
+
+    Without common random numbers each action carries independent sampling
+    error (sd ~0.004 at the default sample_size) that swamps the true spread
+    among the top candidates (~0.002), so the argmax - and the knob traces the
+    experiments export - is resampled noise rather than a decision. It also
+    removes the winner's-curse bias in taking a max over noisy estimates.
+    Exact ties are broken by `_action_cost_key`, so the selection is a property
+    of the action rather than of grid enumeration order.
+
+    `rng` is left on a fresh substream (see `_advance_stream`).
+    """
+    state = rng.bit_generator.state
+    best_idx = grid.indices[0]
+    best_value = -float("inf")
+    best_key: tuple = ()
+
+    for action_idx, action_vals in zip(grid.indices, grid.values, strict=False):
+        rng.bit_generator.state = state
+        value = _simulate_action(
+            model,
+            action_vals,
+            weights,
+            rng,
+            sample_size,
+            queue_delay_ms,
+            queue_delay_mode,
+        )
+        if value > best_value or (value == best_value and _action_cost_key(action_vals) < best_key):
+            best_value = value
+            best_idx = action_idx
+            best_key = _action_cost_key(action_vals)
+
+    rng.bit_generator.state = state
+    _advance_stream(rng)
+    return best_idx
+
+
 @dataclass
 class ModelBasedPolicy:
     grid: ActionGrid
@@ -148,16 +250,21 @@ class ModelBasedPolicy:
     queue_workers: int = 16
     queue_max_utilization: float = 0.95
     step_duration_s: float = 1.0
+    # Minimum uncensored samples before the censored MLE is trusted.
+    min_uncensored: int = 30
     name: str = "model_based"
 
     def __post_init__(self):
         self._buffer = LatencyBuffer(self.buffer_size)
         self._service_buffer = LatencyBuffer(self.buffer_size)
         self._rng = np.random.default_rng(123)
+        self._min_uncensored = int(self.min_uncensored)
+        self._last_model: LatencyModel | None = None
 
     def reset(self, seed: int | None = None) -> None:
         self._buffer = LatencyBuffer(self.buffer_size)
         self._service_buffer = LatencyBuffer(self.buffer_size)
+        self._last_model = None
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
@@ -174,17 +281,38 @@ class ModelBasedPolicy:
 
     def act(self, obs: np.ndarray, info: dict) -> tuple[int, ...]:
         self._buffer.ingest_info(info)
-        service = [float(v) for v in info.get("attempt_service_ms", [])]
-        if service:
-            flags = [bool(f) for f in info.get("attempt_service_censored", [])]
-            if len(flags) != len(service):
-                flags = [False] * len(service)
-            self._service_buffer.add(service, flags)
+        self._service_buffer.ingest_info(
+            info,
+            values_key="attempt_service_ms",
+            flags_key="attempt_service_censored",
+        )
         values, censored = self._fit_buffer().censored_data()
         uncensored = values[~censored]
         uncensored = uncensored[uncensored > 0]
+
+        # Identifiability guard: with almost every sample censored, the censored
+        # MLE is unidentified and swings wildly (observed median 877ms -> 93ms ->
+        # 5308ms across three consecutive 1s windows, with sigma collapsing to
+        # 0.07). Under such a fit every action scores success-rate 0, the argmax
+        # falls to the grid corner - shortest timeout, one attempt - and that
+        # corner guarantees the next window is censored too, so the policy locks
+        # itself there mid-fault. Hold the previous fit instead. This must be
+        # checked BEFORE the empty-buffer bail-out below: a fully censored
+        # window is the extreme the guard was written for, not an exception to
+        # it.
+        censored_fraction = float(np.mean(censored)) if censored.size else 0.0
+        identifiable = uncensored.size >= self._min_uncensored and censored_fraction < 0.9
+        if not identifiable and self._last_model is not None:
+            base_model = self._last_model
+            queue_delay = self._estimate_queue_delay(info)
+            return self._argmax_action(base_model, queue_delay)
+
         if uncensored.size == 0:
-            return self.grid.indices[0]
+            # Cold start: nothing to fit and no previous fit to hold. Fall back
+            # to the middle of the grid, matching the env's own warm-up action
+            # (rl/env.py) - the corner at index 0 is the shortest timeout with
+            # no retries, measured pathological (~11% success).
+            return self.grid.midpoint_indices()
 
         base_model = self.model_factory()
         fit_censored = getattr(base_model, "fit_censored", None)
@@ -194,25 +322,20 @@ class ModelBasedPolicy:
             # Model without censored-MLE support: fall back to uncensored
             # samples only (biased optimistic when timeouts are frequent).
             base_model = base_model.fit(uncensored)
+        self._last_model = base_model
         queue_delay = self._estimate_queue_delay(info)
-        best_idx = self.grid.indices[0]
-        best_value = -float("inf")
+        return self._argmax_action(base_model, queue_delay)
 
-        for action_idx, action_vals in zip(self.grid.indices, self.grid.values, strict=False):
-            value = _simulate_action(
-                base_model,
-                action_vals,
-                self.reward_weights,
-                self._rng,
-                self.sample_size,
-                queue_delay,
-                self.queue_delay_mode,
-            )
-            if value > best_value:
-                best_value = value
-                best_idx = action_idx
-
-        return best_idx
+    def _argmax_action(self, model: LatencyModel, queue_delay: float) -> tuple[int, ...]:
+        return _argmax_over_grid(
+            self.grid,
+            model,
+            self.reward_weights,
+            self._rng,
+            self.sample_size,
+            queue_delay,
+            self.queue_delay_mode,
+        )
 
     def update(self, obs: np.ndarray, reward: float, done: bool, info: dict) -> None:
         return
@@ -242,11 +365,15 @@ class ModelBasedPolicy:
         """
         if not self.include_queue_delay:
             return 0.0
-        # Lambda = arrivals at the MODELED service: the sampled client's
-        # per-window attempt count (retries included by construction). Using
-        # top-level window completions would undercount the modeled queue's
-        # arrivals by the whole retry amplification in chain scenarios.
-        attempt_count = len(info.get("attempt_latencies_ms") or [])
+        # Lambda = arrivals at the MODELED queue. Prefer the env's own count of
+        # attempts that entered service there: it covers EVERY client feeding
+        # that queue. The sampled client's attempt count is a fallback and
+        # undercounts whenever the service is shared (in multichain, svc-C is fed
+        # by both the agent's edge and the bystander's, so it halves rho).
+        attempt_count = info.get("modeled_admitted")
+        if attempt_count is None:
+            attempt_count = len(info.get("attempt_latencies_ms") or [])
+        attempt_count = int(attempt_count)
         if attempt_count <= 0 or self.step_duration_s <= 0:
             return 0.0
         lambda_per_ms = attempt_count / (float(self.step_duration_s) * 1000.0)
@@ -255,7 +382,11 @@ class ModelBasedPolicy:
         if count < 10 or mean_s <= 0:
             return 0.0  # cold start: no reliable occupancy stream yet
 
-        workers = max(1, int(self.queue_workers))
+        # `c` from the modelled service itself; the CLI default is scenario-
+        # independent and was simply wrong on the chain scenarios (svc-C has 24
+        # workers in build_chain_env and 14 in build_multichain_env, against a
+        # default of 16).
+        workers = max(1, int(info.get("modeled_workers") or self.queue_workers))
         rho = min((lambda_per_ms * mean_s) / workers, self.queue_max_utilization)
         offered = rho * workers  # erlangs, consistent with the clamped utilization
 

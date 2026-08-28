@@ -195,9 +195,15 @@ class TestChainScenarios(unittest.TestCase):
         b = a_to_b.metrics().summary()
         c = b_to_c.metrics().summary()
         d = c_to_d.metrics().summary()
+        # The equality chain below holds vacuously when every counter is 0 —
+        # which is what a fan-out that never settles success produces. The
+        # scenario is fault-free and uncontended, so every root must succeed.
+        self.assertGreater(a.total, 900)  # ~1000 roots at 100 rps for 10 s
+        self.assertEqual(a.succeeded, a.total)
         self.assertEqual(a.succeeded, b.succeeded)
         self.assertEqual(b.succeeded, c.succeeded)
         self.assertLessEqual(c.succeeded, d.succeeded)
+        self.assertGreater(d.succeeded, 0)
 
 
 class TestFanoutLaunchesAllEdges(unittest.TestCase):
@@ -252,7 +258,9 @@ class TestFanoutLaunchesAllEdges(unittest.TestCase):
         for e in edges:
             parent.add_downstream(e)
         results = []
-        parent.submit_attempt(sim, lambda success, t, drop, q: results.append((success, drop)))
+        parent.submit_attempt(
+            sim, lambda success, t, drop, q, censored=False: results.append((success, drop))
+        )
         sim.run()
         ok_edge = edges[1] if reject_first else edges[0]
         return results, len(ok_edge.client.roots)
@@ -264,8 +272,14 @@ class TestFanoutLaunchesAllEdges(unittest.TestCase):
         self.assertEqual(results[0][1], DropReason.QUEUE_FULL)
 
     def test_edge_order_does_not_change_the_load_pattern(self):
-        _, ok_calls = self._run(reject_first=False)
+        results, ok_calls = self._run(reject_first=False)
         self.assertEqual(ok_calls, 1)
+        # `ok_calls == 1` is trivially true in this order — `ok` is launched
+        # first — so the parent's verdict is the only channel that can detect an
+        # order bug here. It must match the reject-first order exactly: the
+        # deferred synchronous rejection still short-circuits the parent, and
+        # with ITS OWN reason rather than a sibling's.
+        self.assertEqual(results, [(False, DropReason.QUEUE_FULL)])
 
 
 if __name__ == "__main__":

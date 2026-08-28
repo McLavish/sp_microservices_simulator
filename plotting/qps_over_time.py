@@ -26,9 +26,7 @@ def main(csv_file, output_file, fault_events_file=None):
     plt.plot(df["timepoint"], df["retries"] / width, label="Retries", linewidth=2)
     plt.plot(df["timepoint"], df["failure_root"] / width, label="Failures", linewidth=2)
 
-    if fault_events_file:
-        fault_events = load_fault_events(fault_events_file)
-        plot_fault_events(fault_events)
+    plot_fault_events(load_fault_events(fault_events_file), ax=plt.gca())
 
     plt.xlabel("Time (s)")
     plt.ylabel("QPS")

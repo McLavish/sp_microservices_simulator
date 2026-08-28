@@ -42,7 +42,7 @@ class TestChainFailureReason(unittest.TestCase):
 
         results = {}
 
-        def on_done(success, _svc_time, drop_reason, _queue_size):
+        def on_done(success, _svc_time, drop_reason, _queue_size, _censored=False):
             results["success"] = success
             results["drop_reason"] = drop_reason
 
@@ -89,7 +89,7 @@ class TestChainFailureReason(unittest.TestCase):
 
         results = {}
 
-        def on_done(success, _svc_time, drop_reason, _queue_size):
+        def on_done(success, _svc_time, drop_reason, _queue_size, _censored=False):
             results["success"] = success
             results["drop_reason"] = drop_reason
 

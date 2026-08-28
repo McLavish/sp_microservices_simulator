@@ -1,6 +1,6 @@
 import unittest
 
-from core import TimeInterval, s_to_ns
+from core import TimeInterval, ns_to_s, s_to_ns
 from faults import LoadSpike
 from simulator import Simulator
 from workload import Workload
@@ -48,9 +48,30 @@ class TestExactNHPP(unittest.TestCase):
         return times
 
     def test_first_arrival_is_never_at_time_zero(self):
-        for seed in range(50):
-            times = self._arrival_times(seed, base_rps=100.0, spikes=[])
-            self.assertGreater(times[0], 0)
+        """`times[0] > 0` on its own cannot fail: `drive` clamps every arrival to
+        `max(nxt, from_t + 1)`, so with `from_t = 0` the first event lands at
+        >= 1 ns whatever the sampler returned. Pin the sampler itself — the
+        pre-fix deterministic grid returns exactly 0 for every seed, and the
+        driven stream then sits on the 1 ns clamp instead of being exponential.
+        """
+        end_at = s_to_ns(1)
+        sampled = [
+            Workload(
+                base_rps=100.0, duration_s=1, load_spikes=[], rng_seed=seed
+            )._next_arrival_after(0, end_at)
+            for seed in range(50)
+        ]
+        self.assertTrue(all(t is not None and t > 0 for t in sampled))
+        # A deterministic grid would return the same instant for every seed.
+        self.assertGreater(len(set(sampled)), 1)
+        # Exp(1/rate): the sample mean of 50 draws sits near 1/100 s.
+        mean_s = ns_to_s(sum(t for t in sampled if t is not None)) / len(sampled)
+        self.assertAlmostEqual(mean_s, 0.01, delta=0.005)
+
+        firsts = [self._arrival_times(seed, base_rps=100.0, spikes=[])[0] for seed in range(50)]
+        self.assertGreater(len(set(firsts)), 1)
+        # Strictly above the 1 ns clamp: no seed's first arrival is a clamped 0.
+        self.assertGreater(min(firsts), 1)
 
     def test_short_spike_is_not_skipped(self):
         # Review scenario: 1 rps base, x100 on [0.1, 0.2) s. Correct NHPP mean
@@ -125,6 +146,33 @@ class TestWorkloadSeeding(unittest.TestCase):
         # emit identical streams, which is why concurrent workloads must pass
         # explicit distinct seeds (see experiments/multichain_retry_storm.py).
         self.assertEqual(self._arrivals(None), self._arrivals(0))
+
+
+class TestLoadSpikeValidation(unittest.TestCase):
+    """A non-finite multiplier used to survive construction and then delete the
+    spike it configured.
+
+    `nan < 0` is False, so NaN passed the sign check; `rps_at` then computed
+    `base * nan = nan` and `max(0.0, nan)` returned 0.0, so the window produced
+    ZERO arrivals while the spike was still exported and shaded on every plot —
+    verbatim the failure the negative-multiplier message exists to prevent.
+    `inf` went the other way: infinite exposure put every arrival on `drive`'s
+    1 ns interarrival clamp.
+    """
+
+    def test_non_finite_multiplier_is_rejected(self):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(rps_multiplier=bad), self.assertRaises(ValueError):
+                LoadSpike(TimeInterval(s_to_ns(1), s_to_ns(2)), bad)
+
+    def test_finite_multiplier_still_scales_the_rate(self):
+        wl = Workload(
+            base_rps=100.0,
+            duration_s=3,
+            load_spikes=[LoadSpike(TimeInterval(s_to_ns(1), s_to_ns(2)), 2.0)],
+        )
+        self.assertAlmostEqual(wl.rps_at(s_to_ns(1.5)), 200.0)
+        self.assertAlmostEqual(wl.rps_at(s_to_ns(2.5)), 100.0)
 
 
 if __name__ == "__main__":

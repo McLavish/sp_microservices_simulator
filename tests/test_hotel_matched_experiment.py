@@ -6,6 +6,9 @@ import pytest
 
 from core import ms_to_ns
 from experiments.hotel_matched import (
+    _DEFAULT_BASE_RPS,
+    _DEFAULT_DURATION_S,
+    _DEFAULT_RECOMMENDATION_FRACTION,
     DEFAULT_PROFILE_FAULT,
     HotelMatchedConfig,
     _build_runtime,
@@ -16,11 +19,15 @@ from experiments.hotel_matched import (
     _parse_load_spike,
     _parse_profile_fault,
     _positive_float,
+    _recommendation_fraction_from,
+    _validated_base_rps,
+    _validated_duration,
+    _validated_load_spike,
+    _validated_profile_fault,
     config_from_args,
     run_hotel_matched,
 )
 from retry_policies import ExponentialBackoffWithJitterRetryPolicy, JitterMode, NoRetryPolicy
-from simulator import Simulator
 
 
 def test_config_from_args_accepts_calibration_fault_and_load_spike(tmp_path):
@@ -114,6 +121,7 @@ def test_run_hotel_matched_writes_root_service_and_fault_outputs(tmp_path):
         "failure_deadline",
         "failure_server",
         "failure_circuit_open",
+        "failure_cancelled",
         "total_request",
         "total_failure",
         "p50",
@@ -132,6 +140,104 @@ def test_run_hotel_matched_writes_root_service_and_fault_outputs(tmp_path):
         "latency_injection",
         "partial_failure",
     }
+
+
+def test_run_hotel_matched_follows_the_recorded_workload(tmp_path):
+    """With no CLI overrides the run must take rate, duration AND mix from the
+    recording — the branch every other calibration test skips by pinning all
+    three in the config. Ignoring the recording ran the "matched" scenario at
+    the built-in 100 rps for 60 s against workers/queue_capacity read from that
+    same file, and generated 75% search traffic against a
+    recommendations-heavy recording.
+    """
+    calibration_json = tmp_path / "calibration.json"
+    calibration_json.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "services": {
+                    name: _service(1.0, workers=16)
+                    for name in (
+                        "search",
+                        "geo",
+                        "rate",
+                        "reservation",
+                        "profile",
+                        "recommendation",
+                    )
+                },
+                "workload": {
+                    # Deliberately unlike the built-in defaults (100 rps, 60 s,
+                    # 25% recommendations): 3 of every 4 requests are reads of
+                    # the recommendation path.
+                    "base_rps": 20.0,
+                    "duration_s": 2.0,
+                    "path": {
+                        "/recommendation.Recommendation/GetRecommendations": 3,
+                        "/search.Search/Nearby": 1,
+                    },
+                    "load_spikes": [],
+                },
+                "fault_scenario": [],
+            }
+        )
+    )
+
+    outputs = run_hotel_matched(
+        HotelMatchedConfig(
+            output_dir=tmp_path / "out",
+            calibration_json=calibration_json,
+            base_rps=None,
+            duration_s=None,
+            recommendation_fraction=None,
+            seed=99,
+        )
+    )
+
+    root_rows = _read_rows(outputs["root_csv"])
+    total_roots = sum(int(row["root_requests"]) for row in root_rows)
+    # The recorded 2 s, not the 60 s default: two one-second buckets.
+    assert [row["timepoint"] for row in root_rows] == ["0.000", "1.000"]
+    # 20 rps x 2 s ~= 40 roots; the default rate would offer ~6000.
+    assert 15 <= total_roots <= 100
+
+    recommendation_roots = sum(
+        int(row["root_requests"]) for row in _read_rows(outputs["svc_recommendation_csv"])
+    )
+    search_roots = sum(int(row["root_requests"]) for row in _read_rows(outputs["svc_search_csv"]))
+    # 75/25 split from workload.path; the default fraction reverses this.
+    assert recommendation_roots > 2 * search_roots
+    assert search_roots > 0
+
+
+def test_recommendation_fraction_comes_from_the_recorded_mix():
+    recorded = {
+        "path": {
+            "/recommendation.Recommendation/GetRecommendations": 3,
+            "/search.Search/Nearby": 1,
+        }
+    }
+    assert _recommendation_fraction_from(recorded) == 0.75
+    # Nothing recorded about the mix -> the built-in default.
+    assert _recommendation_fraction_from({}) == _DEFAULT_RECOMMENDATION_FRACTION
+    assert _recommendation_fraction_from({"path": {}}) == _DEFAULT_RECOMMENDATION_FRACTION
+    with pytest.raises(ValueError):
+        _recommendation_fraction_from({"path": {"/search.Search/Nearby": -1}})
+
+
+def test_recorded_rate_and_duration_are_bound_checked():
+    assert _validated_base_rps(None) == _DEFAULT_BASE_RPS
+    assert _validated_base_rps("12.5") == 12.5
+    assert _validated_base_rps(0) == 0.0  # a silent recording is legal
+    with pytest.raises(ValueError):
+        _validated_base_rps(-1.0)
+
+    assert _validated_duration(None) == _DEFAULT_DURATION_S
+    assert _validated_duration("2.5") == 2.5
+    with pytest.raises(ValueError):
+        _validated_duration(0.0)  # a zero-length run exports nothing
+    with pytest.raises(ValueError):
+        _validated_duration(-3.0)
 
 
 def test_run_hotel_matched_uses_default_profile_fault_when_no_calibration(tmp_path):
@@ -153,7 +259,6 @@ def test_run_hotel_matched_uses_default_profile_fault_when_no_calibration(tmp_pa
 
 def test_hotel_matched_retry_policies_follow_real_resilience_profiles():
     run = _build_runtime(
-        Simulator(seed=123),
         calibration={},
         profile_faults=[],
         seed=123,
@@ -291,8 +396,48 @@ def test_fault_and_spike_windows_validated():
         _parse_load_spike("-5,20,2")  # negative start
 
 
+def test_cli_parsers_delegate_to_the_shared_validators():
+    """The CLI must enforce the JSON path's bounds, not a private copy of them.
+
+    Pinned through the diagnostics only `_validated_*` produce: a second copy of
+    the checks passes the bound but not the message, so this fails if the CLI
+    goes back to re-implementing them.
+    """
+    assert _parse_profile_fault("1,2,20,0.3") == _validated_profile_fault(
+        1.0, 2.0, 20.0, 0.3, origin="--profile-fault"
+    )
+    assert _parse_load_spike("1,2,1.5") == _validated_load_spike(
+        1.0, 2.0, 1.5, origin="--load-spike"
+    )
+
+    with pytest.raises(argparse.ArgumentTypeError, match="--profile-fault.*silently inert"):
+        _parse_profile_fault("20,10,50,0.2")
+    with pytest.raises(argparse.ArgumentTypeError, match="did you pass a percentage"):
+        _parse_profile_fault("10,20,50,20")
+    with pytest.raises(argparse.ArgumentTypeError, match="--load-spike.*traffic blackout"):
+        _parse_load_spike("10,20,-3")
+    with pytest.raises(argparse.ArgumentTypeError, match="--load-spike.*must be >= start"):
+        _parse_load_spike("20,10,1.5")
+
+
 def test_calibration_json_rejects_non_finite(tmp_path):
     path = tmp_path / "cal.json"
     path.write_text('{"services": {"profile": {"median_ms": NaN}}}')
     with pytest.raises(ValueError):
         _load_calibration(path)
+
+
+def test_calibration_rejects_numbers_that_overflow_to_infinity(tmp_path):
+    """parse_constant only catches the literal NaN/Infinity tokens. A finite
+    literal that overflows the float type reaches inf without ever hitting it,
+    and an infinite rps multiplier schedules an arrival every nanosecond."""
+    cal = tmp_path / "cal.json"
+    cal.write_text('{"workload": {"load_spikes": [[1.0, 2.0, 1e309]]}}')
+    with pytest.raises(ValueError, match="non-finite"):
+        _load_calibration(cal)
+
+
+def test_calibration_still_accepts_ordinary_numbers(tmp_path):
+    cal = tmp_path / "cal.json"
+    cal.write_text('{"workload": {"base_rps": 8.0, "duration_s": 3.0, "load_spikes": []}}')
+    assert _load_calibration(cal)["workload"]["base_rps"] == 8.0

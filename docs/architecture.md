@@ -44,20 +44,23 @@ ClientRuntime._on_attempt_done
 
 The same `submit_attempt` path is reused by **chains**: a `ServiceNodeRuntime`
 wraps a `ServiceRuntime` and injects a custom *behavior* that fans out to
-downstream nodes before finalizing. See [request-handling](request-handling.md).
+downstream nodes before finalizing. A `TransportLink` (`transport.py`) can sit
+between a client and its service — a `ServiceLike` decorator that adds a
+lognormal network delay to each leg of every attempt's round trip. See
+[request-handling](request-handling.md).
 
 ## Time model
 
 All internal time is **integer nanoseconds**. Two aliases in `core.py` document
 intent (both are `int`): `TimePoint` (an absolute instant) and `TimeDuration` (a
-span). Convert only at boundaries with the helpers in `core.py:12`:
+span). Convert only at boundaries with the helpers in `core.py`:
 
 | Helper | Direction |
 | --- | --- |
 | `s_to_ns(s)` / `ms_to_ns(ms)` | seconds / milliseconds -> ns |
 | `ns_to_s(ns)` / `ns_to_ms(ns)` | ns -> seconds / milliseconds |
 
-`TimeInterval(begin, end)` (`core.py:29`) is **half-open** `[begin, end)`:
+`TimeInterval(begin, end)` (`core.py`) is **half-open** `[begin, end)`:
 `contains(t)` is `begin <= t < end`, and `duration()` is `end - begin`. Fault
 windows, request lifespans, and bucket ranges all use this convention.
 
@@ -67,30 +70,36 @@ windows, request lifespans, and bucket ranges all use this convention.
 
 ## Core data types (`core.py`)
 
-- **`DropReason`** (`core.py:41`) — `NONE`, `QUEUE_FULL`, `DEADLINE`,
-  `SERVER_FAILURE`, `CIRCUIT_OPEN`. Every non-success carries one of these.
-- **`Request`** (`core.py:49`) — a single attempt: the handling `service` name, its
-  `interval` (lifespan), the `deadline` it ran under, `success`, `drop_reason`, and
-  `queue_size_at_end` (queue length captured when the attempt finished).
-- **`RootRequest`** (`core.py:61`) — one client-visible request = a list of
-  `attempts` (original + retries), a `global_deadline`, a `done` flag, and an
-  optional `on_done` callback fired once on completion.
-- **`Summary`** (`core.py:79`) — the aggregate returned by `Metrics.summary()`
+- **`DropReason`** (`core.py`) — `NONE`, `QUEUE_FULL`, `DEADLINE`,
+  `SERVER_FAILURE`, `CIRCUIT_OPEN`, `CANCELLED`. Every non-success carries one of
+  these. `CANCELLED` means *abandoned, not failed* (an upstream fan-out
+  short-circuited); it is counted separately and kept out of the failure buckets.
+- **`Request`** (`core.py`) — a single attempt: the handling `service` name, its
+  `interval` (lifespan), the `deadline` it ran under, `success`, `drop_reason`,
+  `queue_size_at_end` (queue length when the attempt finished, `None` if it never
+  reached the service) and `service_time_ns` (queue-exclusive occupancy).
+- **`RootRequest`** (`core.py`) — one client-visible request = a list of
+  `attempts` (original + retries), a `global_deadline`, a `done` flag, an optional
+  `on_done` callback fired once on completion, a `cancelled` flag, a `cancel()`
+  handle, and `completed_at` (prefer it over the last attempt's end: a root
+  cancelled while backing off finishes later than any attempt it made).
+- **`Summary`** (`core.py`) — the aggregate returned by `Metrics.summary()`
   (counts by outcome, latency percentiles, retries per root). See
   [observability](observability.md).
 
 ## The event loop (`simulator.py`)
 
-`Simulator` (`simulator.py:20`) is the whole engine:
+`Simulator` (`simulator.py`) is the whole engine:
 
 - `schedule(at, fn) -> Event` — push a callback for time `at`; returns the `Event`,
   whose `cancelled` flag can be set to skip it (used by the chain deadline guard).
 - `run(until=None)` — pop and execute events while `heap[0].at <= until` (or to
   exhaustion if `until is None`), advancing `timestep` to each event. With `until`
-  set, `timestep` ends exactly at `until`.
+  set, `timestep` ends at `max(timestep, until)` — never *before* `until`, and
+  never rewound if a nested `run()` inside an event already advanced past it.
 - `rng()` — the single `random.Random` seeded in the constructor.
 
-`Event` (`simulator.py:9`) is ordered by `(at, seq)`; `seq` is a monotonic counter
+`Event` (`simulator.py`) is ordered by `(at, seq)`; `seq` is a monotonic counter
 so events scheduled for the same instant fire in insertion order — this keeps runs
 deterministic even under ties.
 
@@ -107,8 +116,11 @@ There are **two** independent random streams:
 
 - `Simulator.rng()` — service times, server-failure rolls, retry jitter. Seeded per
   run via `Simulator(seed=...)`.
-- `Workload._rng` — interarrival times only. Seeded separately (`rng_seed`, default
-  `0`; see `workload.py:19`).
+- `Workload._rng` — interarrival times only. Seeded separately from `rng_seed`
+  (default `0`), offset by `_ARRIVAL_SEED_OFFSET` so that passing the *same*
+  integer to `Simulator(seed=...)` and `Workload(rng_seed=...)` — which every
+  builder in `rl/env.py` does — still yields two genuinely independent streams
+  rather than one stream drawn twice. See `Workload.__post_init__`.
 
 Keeping arrivals on their own RNG means you can change the simulator seed (to
 resample service/failure behavior) while the **arrival pattern stays fixed** across
@@ -127,6 +139,7 @@ workload        Poisson arrivals         <- faults, fault_events, simulator
 retry_policies  retry / circuit-breaker / rate-limit / budget
 timeout_controllers  static / adaptive timeouts
 caller          client + retry loop      <- retry_policies, timeout_controllers, service, metrics
+transport       per-link delay decorator <- caller, service, simulator
 chain           fan-out nodes            <- caller, service, simulator
 metrics         aggregation + CSV export
 

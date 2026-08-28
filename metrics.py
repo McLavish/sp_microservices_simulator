@@ -3,13 +3,18 @@ from dataclasses import dataclass
 import numpy as np
 
 from core import (
+    FAILURE_OUTCOMES,
     MS_TO_NS,
     S_TO_NS,
     DropReason,
+    RootOutcome,
     RootRequest,
     Summary,
-    TimeInterval,
+    classify_root,
     ns_to_ms,
+    root_completed_at,
+    root_latency,
+    root_started_at,
     s_to_ns,
 )
 
@@ -17,7 +22,21 @@ from core import (
 @dataclass
 class Metrics:
     roots: list[RootRequest]
-    attempts_total: int
+    # LIFETIME attempt counter as supplied by the constructing client(s). A
+    # different population from `roots`: clients bump it at attempt START while
+    # roots are appended at COMPLETION, so it over-reports whenever work is
+    # still in flight (a mid-run export, the RL env's in-horizon window). Read
+    # it through `client_attempts_total()`; every `Summary` field, including
+    # `attempts_total`, is computed over `roots` instead.
+    attempts_total: int = 0
+
+    def attempts_on_roots(self) -> int:
+        """Attempts recorded on the roots being summarized."""
+        return sum(len(request.attempts) for request in self.roots)
+
+    def client_attempts_total(self) -> int:
+        """The constructing client's lifetime attempt counter (start-time population)."""
+        return self.attempts_total
 
     def _percentile_ms(self, p: float, vals: list[int]) -> float:
         if not vals:
@@ -27,61 +46,49 @@ class Metrics:
         q_ns = np.quantile(arr, p)
         return float(q_ns) / MS_TO_NS
 
-    def _compute_time_interval_from_attempts(self, root_request: RootRequest) -> TimeInterval:
-        if not root_request.attempts:
-            raise ValueError("No attempts found in RootRequest")
-
-        begin = min(attempt.interval.begin for attempt in root_request.attempts)
-        end = max(attempt.interval.end for attempt in root_request.attempts)
-
-        return TimeInterval(begin=begin, end=end)
-
     def summary(self) -> Summary:
         total = len(self.roots)
         succ_lat: list[int] = []
         succeeded = 0
-        dropped_q = 0
-        dropped_deadline = 0
-        dropped_server_failure = 0
-        dropped_circuit_open = 0
+        # Derived from the one authoritative table, so a new RootOutcome is
+        # counted here the moment it exists instead of raising KeyError below.
+        counters = dict.fromkeys(FAILURE_OUTCOMES, 0)
         for request in self.roots:
             if not request.attempts:
                 continue
+            if sum(1 for attempt in request.attempts if attempt.success) > 1:
+                raise ValueError("Multiple successful attempts in RootRequest")
 
-            success = False
-            for attempt in request.attempts:
-                if attempt.success:  # there should be only 1 success per root request
-                    if success:
-                        raise ValueError("Multiple successful attempts in RootRequest")
-                    success = True
-                    succeeded += 1
-                    succ_lat.append(self._compute_time_interval_from_attempts(request).duration())
-
-            if success:
+            outcome = classify_root(request)
+            if outcome is RootOutcome.SUCCESS:
+                succeeded += 1
+                succ_lat.append(root_latency(request))
                 continue
+            counters[outcome] += 1
 
-            # Append order is completion order; ties on end time (zero-backoff
-            # synchronous rejections) make max()/sort keys ambiguous.
-            last_attempt = request.attempts[-1]
-            if last_attempt.drop_reason == DropReason.QUEUE_FULL:
-                dropped_q += 1
-            elif last_attempt.drop_reason == DropReason.DEADLINE:
-                dropped_deadline += 1
-            elif last_attempt.drop_reason == DropReason.CIRCUIT_OPEN:
-                dropped_circuit_open += 1
-            else:
-                dropped_server_failure += 1
+        # Each outcome goes to the Summary field the table names for it; core
+        # validates those field names against Summary at import time.
+        dropped = {
+            reporting.summary_field: counters[outcome]
+            for outcome, reporting in FAILURE_OUTCOMES.items()
+        }
 
-        mean_ms = ns_to_ms(int(sum(succ_lat) / len(succ_lat))) if succ_lat else 0.0
-        max_ms = ns_to_ms(max(succ_lat)) if succ_lat else 0.0
-        retries_per_root = (self.attempts_total - total) / total if total > 0 else 0.0
+        # nan, not 0.0: "no successful request completed" is missing data, and
+        # the percentiles below already use nan. Reporting 0 ms made an empty
+        # window look like a perfect one, and a consumer averaging the column
+        # silently pulled its mean toward zero.
+        mean_ms = ns_to_ms(int(sum(succ_lat) / len(succ_lat))) if succ_lat else float("nan")
+        max_ms = ns_to_ms(max(succ_lat)) if succ_lat else float("nan")
+        # Count attempts on the roots we are summarizing, not the client's
+        # lifetime counter: those disagree whenever work is still in flight
+        # (mid-run exports, the RL env's in-horizon population), and every other
+        # field here is computed over completed roots.
+        attempts_on_roots = self.attempts_on_roots()
+        retries_per_root = (attempts_on_roots - total) / total if total > 0 else 0.0
         return Summary(
             total=total,
             succeeded=succeeded,
-            dropped_queue=dropped_q,
-            dropped_deadline=dropped_deadline,
-            dropped_server_failure=dropped_server_failure,
-            dropped_circuit_open=dropped_circuit_open,
+            **dropped,
             p50=self._percentile_ms(0.5, succ_lat),
             p90=self._percentile_ms(0.9, succ_lat),
             p95=self._percentile_ms(0.95, succ_lat),
@@ -91,17 +98,15 @@ class Metrics:
             mean=mean_ms,
             max=max_ms,
             retries_per_root=retries_per_root,
-            attempts_total=self.attempts_total,
+            attempts_total=attempts_on_roots,
         )
 
     def print_stats(self):
         summary = self.summary()
         print(f"Total Requests: {summary.total}")
         print(f"Succeeded: {summary.succeeded}")
-        print(f"Dropped (Queue Full): {summary.dropped_queue}")
-        print(f"Dropped (Deadline): {summary.dropped_deadline}")
-        print(f"Dropped (Server Failure): {summary.dropped_server_failure}")
-        print(f"Dropped (Circuit Open): {summary.dropped_circuit_open}")
+        for reporting in FAILURE_OUTCOMES.values():
+            print(f"{reporting.label}: {getattr(summary, reporting.summary_field)}")
         print(f"P50 Latency (ms): {summary.p50:.2f}")
         print(f"P95 Latency (ms): {summary.p95:.2f}")
         print(f"P99 Latency (ms): {summary.p99:.2f}")
@@ -117,7 +122,7 @@ class Metrics:
         Notes:
         - failures are root-level, attributed to the final attempt's drop_reason,
         bucketed by the root's completion time (last attempt end).
-        - failure_retry_count counts failed RETRY attempts (after the first), bucketed by attempt end.
+        - failure_retry counts failed RETRY attempts (after the first), bucketed by attempt end.
         - latencies are for successful roots completed in the bucket.
         """
         # Lazy import: pandas is a dev dependency; the simulation core stays
@@ -137,16 +142,17 @@ class Metrics:
             "timepoint",
             "root_requests",  # bucketed at the start
             "retries",  # bucketed at the start
-            "success_root",  # # bucketed at the end. Actually should be the same as success_retry
+            "success_root",  # roots that succeeded, bucketed at the end
             "completed",  # all attempts completed, bucketed at the end
             "failure_root",
             "failure_retry",
-            "failure_queue_full",
-            "failure_deadline",
-            "failure_server",
-            "failure_circuit_open",
-            "total_request",  # bucketed at the start. rename total_started_roots?
-            "total_failure",  # bucketed at the end. rename total_failed_roots_completed?
+            # Per-reason breakdown, in the table's order — which is what fixes
+            # this header, so appending an outcome is safe and reordering the
+            # table rewrites every exported CSV. A new RootOutcome gets its
+            # column here automatically (plotting still needs its own list).
+            *(reporting.csv_column for reporting in FAILURE_OUTCOMES.values()),
+            "total_request",  # cumulative root_requests, bucketed at the start
+            "total_failure",  # cumulative failure_root, bucketed at the end
             "p50",  # percentiles are all bucketed at the end
             "p90",
             "p95",
@@ -166,14 +172,13 @@ class Metrics:
             if not root.attempts:
                 continue
             attempts_by_begin = sorted(root.attempts, key=lambda a: a.interval.begin)
-            # Append order is completion order (ties on end time are ambiguous).
-            last_attempt = root.attempts[-1]
+            outcome = classify_root(root)
             root_rows.append(
                 {
-                    "begin": attempts_by_begin[0].interval.begin,
-                    "end": last_attempt.interval.end,
-                    "succeeded": any(a.success for a in root.attempts),
-                    "drop_reason": last_attempt.drop_reason,
+                    "begin": root_started_at(root),
+                    "end": root_completed_at(root),
+                    "succeeded": outcome is RootOutcome.SUCCESS,
+                    "outcome": outcome,
                 }
             )
             for i, a in enumerate(attempts_by_begin):
@@ -182,9 +187,11 @@ class Metrics:
                         "begin": a.interval.begin,
                         "end": a.interval.end,
                         "is_retry": i > 0,
+                        # Cancelled attempts were abandoned, not failed: they
+                        # are not evidence of a retry that went wrong.
                         "retry_failed": i > 0
                         and not a.success
-                        and a.drop_reason != DropReason.NONE,
+                        and a.drop_reason not in (DropReason.NONE, DropReason.CANCELLED),
                         "queue": float("nan")
                         if a.queue_size_at_end is None
                         else int(a.queue_size_at_end),
@@ -198,9 +205,18 @@ class Metrics:
         attempts = pd.DataFrame(attempt_rows)
         roots = pd.DataFrame(root_rows)
 
-        # Align to bucket boundaries
+        # Align to bucket boundaries. The upper bound must cover BOTH frames:
+        # roots are bucketed at `completed_at`, which for a root cancelled while
+        # backing off is strictly later than any of its attempt ends. Sizing the
+        # range from attempts alone put such a root past the last bucket, where
+        # `reindex(buckets, fill_value=0)` silently discarded it — it stayed in
+        # root_requests (bucketed at its first attempt's begin) but vanished from
+        # success_root/failure_root/failure_cancelled, so summary() and
+        # export_csv() disagreed about the same root.
+        # start_ns needs no such union: roots["begin"] IS attempts_by_begin[0].
         start_ns = int(attempts["begin"].min()) // bucket_ns * bucket_ns
-        end_ns = (int(attempts["end"].max()) // bucket_ns + 1) * bucket_ns
+        last_end = max(int(attempts["end"].max()), int(roots["end"].max()))
+        end_ns = (last_end // bucket_ns + 1) * bucket_ns
         buckets = pd.RangeIndex((end_ns - start_ns) // bucket_ns)
 
         def bucket_of(at: "pd.Series") -> "pd.Series":
@@ -244,18 +260,12 @@ class Metrics:
                 "completed": per_bucket_count(attempts["end"]),
                 "failure_root": per_bucket_count(failed["end"]),
                 "failure_retry": per_bucket_count(attempts.loc[attempts["retry_failed"], "end"]),
-                "failure_queue_full": per_bucket_count(
-                    failed.loc[failed["drop_reason"] == DropReason.QUEUE_FULL, "end"]
-                ),
-                "failure_deadline": per_bucket_count(
-                    failed.loc[failed["drop_reason"] == DropReason.DEADLINE, "end"]
-                ),
-                "failure_server": per_bucket_count(
-                    failed.loc[failed["drop_reason"] == DropReason.SERVER_FAILURE, "end"]
-                ),
-                "failure_circuit_open": per_bucket_count(
-                    failed.loc[failed["drop_reason"] == DropReason.CIRCUIT_OPEN, "end"]
-                ),
+                **{
+                    reporting.csv_column: per_bucket_count(
+                        failed.loc[failed["outcome"] == outcome, "end"]
+                    )
+                    for outcome, reporting in FAILURE_OUTCOMES.items()
+                },
                 # queue size at attempt END, by completion bucket
                 "queue_avg_at_attempt_end": (
                     with_queue.groupby(bucket_of(with_queue["end"]))["queue"]
@@ -273,7 +283,11 @@ class Metrics:
         # required precision is 9 minus its trailing decimal zeros — e.g.
         # 1.5 ms = 1_500_000 ns needs 4 decimals, not ceil(-log10) = 3).
         decimals = 3
-        if bucket_ns < S_TO_NS:
+        # Any bucket that is not a whole number of milliseconds needs more than
+        # 3 decimals, including buckets >= 1 s (e.g. 1.5 ms and 1500.5 ms are
+        # both mis-serialized at 3 dp). The old `< S_TO_NS` gate only covered
+        # sub-second widths.
+        if bucket_ns % (S_TO_NS // 1000) != 0 or bucket_ns < S_TO_NS:
             digits = 9
             b = bucket_ns
             while b % 10 == 0:

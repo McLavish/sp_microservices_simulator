@@ -11,20 +11,25 @@ import numpy as np
 from caller import ClientConfig, ClientRuntime
 from chain import DownstreamEdge, ServiceNodeRuntime
 from core import (
+    FAILURE_OUTCOMES,
     DropReason,
+    RootOutcome,
     Summary,
     TimeDuration,
     TimeInterval,
     TimePoint,
+    classify_root,
     ms_to_ns,
     ns_to_ms,
     ns_to_s,
+    require_outcome_coverage,
+    root_latency,
     s_to_ns,
 )
 from faults import LatencyInjection, LoadSpike, PartialFailure
 from metrics import Metrics
 from retry_policies import FixedBackoffRetryPolicy, RetryBudgetPolicy, RetryPolicy
-from rl.spec import ActionSpec, ActionValues, RewardWeights, coerce_action
+from rl.spec import ActionSpec, ActionValues, RewardWeights, coerce_action, linear_reward
 from service import ServiceConfig, ServiceRuntime
 from simulator import Simulator
 from timeout_controllers import StaticTimeoutController
@@ -50,6 +55,33 @@ else:
         _GYM_IMPORT_ERROR = exc
 
 
+# Domain separation for fault-parameter draws, same rationale as
+# workload._ARRIVAL_SEED_OFFSET: the builders seed their fault RNG with the same
+# integer they pass to `Simulator(seed=...)`, so without an offset both would
+# draw from the identical Mersenne-Twister stream and fault difficulty would
+# covary with the service times and failure rolls it is supposed to be
+# independent of. Distinct from the arrival offset so faults, arrivals and
+# service draws are three separate streams.
+_FAULT_SEED_OFFSET = 700_001
+
+# Observation/summary key each non-success outcome is reported under. The env
+# needs its own vocabulary (rates, not counts), so it cannot read the CSV column
+# names off core.FAILURE_OUTCOMES — but it must still cover every outcome, and
+# `require_outcome_coverage` makes a gap an import-time error here instead of a
+# new outcome quietly landing in whichever bucket a fallback `else` picked.
+_OUTCOME_RATE_KEYS: dict[RootOutcome, str] = {
+    RootOutcome.QUEUE_FULL: "queue_drop_rate",
+    RootOutcome.DEADLINE: "deadline_drop_rate",
+    RootOutcome.SERVER_FAILURE: "server_drop_rate",
+    RootOutcome.CIRCUIT_OPEN: "circuit_open_drop_rate",
+    # Reported for visibility; deliberately carries no reward weight and no
+    # observation feature, since cancelled work is abandoned rather than a
+    # failure of this service.
+    RootOutcome.CANCELLED: "cancelled_rate",
+}
+require_outcome_coverage(_OUTCOME_RATE_KEYS, owner="rl.env._OUTCOME_RATE_KEYS")
+
+
 @dataclass
 class EnvComponents:
     sim: Simulator
@@ -67,6 +99,18 @@ class EnvComponents:
     # Its success rate gauges the externality of the agent's edge retries; it
     # feeds reporting only, never reward or observation.
     bystander_client: ClientRuntime | None = None
+    # The service whose queue a queueing-model policy should reason about: the
+    # one the knobs actuate against (svc-C in the chain scenarios). Carries both
+    # the worker count and the true admitted-attempt stream, so a policy never
+    # has to guess `c` from a CLI default or infer lambda from one of several
+    # clients feeding the same queue.
+    modeled_service: ServiceRuntime | None = None
+    # Any additional arrival processes the builder drives beyond `workload`.
+    # The env halts EVERY registered workload at the episode horizon, so the
+    # terminal drain completes in-flight work only. A builder that drives a
+    # second Workload without registering it here would keep admitting brand-new
+    # post-horizon roots into the drained population.
+    extra_workloads: list[Workload] = field(default_factory=list)
 
 
 @dataclass
@@ -76,6 +120,14 @@ class EnvConfig:
     step_duration_s: float = 1.0
     episode_duration_s: float | None = None
     reward_weights: RewardWeights = field(default_factory=RewardWeights)
+    # Retry-amplification budget the constraint is stated against, in retries
+    # per cost-client root — the same quantity `EpisodeResult.pooled_cost`
+    # reports and `dual_ascent_update` ascends on. Set, it makes the per-window
+    # cost term the linearization of `pooled_cost <= cost_budget` (see
+    # `_cost_penalty`), which is what pairs the primal with the dual. Left None
+    # (the default), `RewardWeights.cost` is a plain soft penalty on retries
+    # with no constraint attached.
+    cost_budget: float | None = None
     drain_on_done: bool = True
     initial_action: tuple[int, ...] | None = None
     emit_latency_samples: bool = True
@@ -101,8 +153,20 @@ class MicroservicesEnv(_GymEnvBase):
         assert spaces is not None  # narrow for type checker after the check above
         if config.step_duration_s <= 0:
             raise ValueError("step_duration_s must be > 0")
+        if s_to_ns(config.step_duration_s) <= 0:
+            # A sub-nanosecond step rounds to 0 ns, so step() never advances the
+            # clock, the episode never terminates and the caller hangs forever.
+            raise ValueError(
+                f"step_duration_s={config.step_duration_s!r} rounds to 0 ns; the "
+                "minimum representable step is 1e-9 s"
+            )
         if config.episode_duration_s is not None and config.episode_duration_s <= 0:
             raise ValueError("episode_duration_s must be > 0")
+        if config.cost_budget is not None and config.cost_budget < 0:
+            # Retries per root is non-negative, so a negative budget states a
+            # constraint no policy can satisfy — and it would flip the sign of
+            # the linearized term against the dual's (cost - budget).
+            raise ValueError(f"cost_budget must be >= 0, got {config.cost_budget!r}")
         self._cfg = config
 
         self._action_sizes = [
@@ -133,6 +197,9 @@ class MicroservicesEnv(_GymEnvBase):
         self._last_cost_root_idx = 0
         self._last_sample_root_idx = 0
         self._horizon_root_count = 0
+        self._bystander_horizon_count = 0
+        self._last_admitted = 0
+        self._roots_per_window = 0.0
         self._episode_steps = 0
         self._current_time_ns: TimePoint = 0
         self._end_time_ns: TimePoint = 0
@@ -181,19 +248,32 @@ class MicroservicesEnv(_GymEnvBase):
             else self._require_workload().duration_s
         )
         self._end_time_ns = s_to_ns(episode_s)
+        # How many roots a step window is EXPECTED to carry at the offered
+        # arrival rate. Fixed at reset, so every window-level quantity divided
+        # by it (the no-budget cost penalty, the terminal-drain weight fallback)
+        # stays independent of the order the windows arrive in and of the
+        # traffic the drain adds.
+        self._roots_per_window = (
+            max(0.0, self._require_workload().base_rps) * self._cfg.step_duration_s
+        )
 
         self._last_root_idx = 0
         self._last_cost_root_idx = 0
         self._last_sample_root_idx = 0
         self._horizon_root_count = 0
+        self._bystander_horizon_count = 0
+        self._last_admitted = 0
         self._episode_steps = 0
         self._require_workload().drive(
             self._require_sim(), lambda s: self._require_client().start_request(s)
         )
 
-        initial_action = self._cfg.initial_action or tuple(
-            0 for _ in range(len(self._action_sizes))
-        )
+        # Window 0 runs before any feedback exists, so its action is pure
+        # warmup cost paid by every policy. Index 0 is the grid corner - the
+        # shortest timeout with no retries - which made that first window
+        # pathological (measured ~11% success) and poisoned any controller that
+        # seeds its state from it. Start mid-grid instead.
+        initial_action = self._cfg.initial_action or tuple(n // 2 for n in self._action_sizes)
         self._apply_action(initial_action)
 
         obs = self._build_observation(self._summarize_roots([]))
@@ -223,7 +303,12 @@ class MicroservicesEnv(_GymEnvBase):
         self._last_root_idx = len(self._require_client().roots)
 
         summary = self._summarize_roots(new_roots)
-        summary["cost"] = self._window_cost()
+        cost_ratio, cost_retries, cost_roots = self._window_cost()
+        summary["cost"] = cost_ratio
+        # Raw counts so a consumer can pool sum(retries)/sum(roots) over the
+        # episode rather than averaging per-window ratios.
+        summary["cost_retries"] = float(cost_retries)
+        summary["cost_roots"] = float(cost_roots)
         obs = self._build_observation(summary)
         reward = self._reward_from_summary(summary)
         terminated = self._current_time_ns >= self._end_time_ns
@@ -240,13 +325,27 @@ class MicroservicesEnv(_GymEnvBase):
             else:
                 sample_roots = new_roots
             info.update(self._collect_latency_samples(sample_roots))
+            # Ground truth for a queueing model: arrivals at the MODELLED queue
+            # (all clients, not just the sampled one) and its real worker count.
+            modeled = self._require_components().modeled_service
+            if modeled is not None:
+                admitted = modeled.admitted_total
+                info["modeled_admitted"] = admitted - self._last_admitted
+                info["modeled_workers"] = modeled.cfg.workers
+                self._last_admitted = admitted
 
         if terminated:
             self._horizon_root_count = self._last_root_idx
-            # The drain below completes IN-FLIGHT work only: halt the arrival
+            # The drain below completes IN-FLIGHT work only: halt EVERY arrival
             # process so a workload outliving the episode horizon cannot admit
-            # new post-horizon roots into the drained population.
+            # new post-horizon roots into the drained population. Builders that
+            # drive more than one Workload must register the rest in
+            # EnvComponents.extra_workloads or their traffic escapes this halt.
             self._require_workload().stop()
+            for extra in self._require_components().extra_workloads:
+                extra.stop()
+            bystander = self._require_components().bystander_client
+            self._bystander_horizon_count = 0 if bystander is None else len(bystander.roots)
         # Drain in-flight work after the reward is computed: drained roots complete
         # past the episode horizon and must not be credited to the final action
         # (unless terminal_drain_penalty explicitly folds them in).
@@ -255,38 +354,78 @@ class MicroservicesEnv(_GymEnvBase):
             drained = self._require_client().roots[self._last_root_idx :]
             self._last_root_idx = len(self._require_client().roots)
             drained_summary = self._summarize_roots(drained)
-            drained_summary["cost"] = self._window_cost()
+            drained_ratio, drained_retries, drained_roots = self._window_cost()
+            drained_summary["cost"] = drained_ratio
+            drained_summary["cost_retries"] = float(drained_retries)
+            drained_summary["cost_roots"] = float(drained_roots)
             info["drained_summary"] = drained_summary
             if self._cfg.terminal_drain_penalty:
                 # Count-consistent weighting: per-step rewards are rates over a
                 # window's completions, so a flat drained-window rate would
                 # penalize 2 drained roots as hard as 100. Scale by how many
                 # average-sized step windows the drained population represents.
-                total_completed = self._last_root_idx
-                per_step = total_completed / max(1, self._episode_steps)
+                # The window size is measured on the PRE-drain population:
+                # `_last_root_idx` has already absorbed the drained tail above,
+                # and dividing by that inflated denominator understates the
+                # weight by exactly horizon/(horizon+drained) — worst precisely
+                # when the agent defers the most, which is what the flag exists
+                # to punish.
+                per_step = self._horizon_root_count / max(1, self._episode_steps)
+                if per_step <= 0.0:
+                    # Nothing completed in-horizon (every root outlives the
+                    # episode), so there is no measured window size. Fall back
+                    # to the expected one rather than to a window of one root,
+                    # which would price the whole drain as N whole windows.
+                    per_step = self._roots_per_window
                 weight = drained_summary["completed"] / max(1.0, per_step)
-                reward += weight * self._reward_from_summary(drained_summary)
+                weights = self._cfg.reward_weights
+                # Only the RATE terms are count-adjusted. They are per-completion
+                # averages, so a drained window has to be scaled by how many
+                # average windows it stands for. The cost term is already a
+                # COUNT-style quantity (retries minus budget x roots over the
+                # drained population), so multiplying it by the same weight
+                # would price the drained tail's retries at a factor that
+                # depends on the window size and break the episode identity
+                # sum(r) - budget*sum(n) the dual is paired with.
+                reward += weight * linear_reward(drained_summary, weights, cost_term=0.0)
+                reward -= self._cost_penalty(drained_summary) * weights.cost
         if terminated:
             components = self._components
             if components is not None and components.bystander_client is not None:
-                info["bystander_summary"] = self._summarize_roots(components.bystander_client.roots)
+                roots = components.bystander_client.roots
+                info["bystander_summary"] = self._summarize_roots(roots)
+                # Score the externality on the same population as the agent's
+                # objective J, which only sees in-horizon roots. The full-
+                # population summary stays for continuity with existing columns.
+                info["bystander_summary_in_horizon"] = self._summarize_roots(
+                    roots[: self._bystander_horizon_count]
+                )
         return obs, reward, terminated, False, info
 
     def _build(self, seed: int | None) -> EnvComponents:
         return self._cfg.build(seed)
 
-    def _window_cost(self) -> float:
-        """Constraint cost: retry amplification (retries per root) at the cost
-        client over the roots it completed since the last call."""
+    def _window_cost(self) -> tuple[float, int, int]:
+        """Constraint cost at the cost client over the roots it completed since
+        the last call.
+
+        Returns ``(ratio, retries, roots)``. The raw counts are reported too so
+        consumers can pool them across windows: averaging the per-window RATIO
+        is a length-biased (Simpson) estimator, because high-amplification
+        windows also complete more edge roots. Measured 13-33% understatement of
+        the true episode amplification, and by different amounts per arm, so it
+        does not cancel in comparisons.
+        """
         components = self._components
         if components is None or components.cost_client is None:
-            return 0.0
+            return 0.0, 0, 0
         roots = components.cost_client.roots[self._last_cost_root_idx :]
         self._last_cost_root_idx = len(components.cost_client.roots)
         if not roots:
-            return 0.0
+            return 0.0, 0, 0
         attempts = sum(len(root.attempts) for root in roots)
-        return (attempts - len(roots)) / len(roots)
+        retries = attempts - len(roots)
+        return retries / len(roots), retries, len(roots)
 
     def _apply_action(self, action: tuple[int, ...]) -> None:
         spec = self._cfg.action_spec
@@ -295,6 +434,14 @@ class MicroservicesEnv(_GymEnvBase):
                 f"Action has {len(action)} entries but the action space expects "
                 f"{len(self._action_sizes)} (did a policy emit the wrong dimensionality?)"
             )
+        for position, (index, size) in enumerate(zip(action, self._action_sizes, strict=True)):
+            if not 0 <= index < size:
+                # Python would wrap a negative index to the end of the list, so
+                # an out-of-range action silently selected a valid-looking knob
+                # and returned an observation outside the declared Box.
+                raise ValueError(
+                    f"action[{position}]={index} is outside [0, {size}) for this ActionSpec"
+                )
         attempt_timeout_ms = spec.attempt_timeout_ms[action[0]]
         max_attempts = spec.max_attempts[action[1]]
         backoff_ms = spec.backoff_ms[action[2]]
@@ -320,63 +467,94 @@ class MicroservicesEnv(_GymEnvBase):
         self._last_action_indices = tuple(int(a) for a in action)
 
     def _reward_from_summary(self, summary: dict[str, float]) -> float:
-        w = self._cfg.reward_weights
-        reward = (
-            summary["success_rate"] * w.success
-            - summary["deadline_drop_rate"] * w.deadline_drop
-            - summary["queue_drop_rate"] * w.queue_drop
-            - summary["server_drop_rate"] * w.server_drop
-            - summary["circuit_open_drop_rate"] * w.circuit_open_drop
-            - summary["p95_latency_ms"] * w.p95_latency_ms
-            - summary["retries_per_root"] * w.retries
-            - summary["cost"] * w.cost
+        # The linear form itself lives in rl.spec, shared with
+        # `EpisodeResult.objective` so J cannot drift away from the reward.
+        return linear_reward(
+            summary, self._cfg.reward_weights, cost_term=self._cost_penalty(summary)
         )
-        return float(reward)
+
+    def _cost_penalty(self, summary: dict[str, float]) -> float:
+        """Per-window cost term: the linearized retry-amplification constraint.
+
+        With ``EnvConfig.cost_budget = b`` set, the constraint the dual ascends
+        on is the POOLED amplification ``sum(r) / sum(n) <= b`` (r = the
+        window's ``cost_retries``, n = its ``cost_roots``), which linearizes to
+        ``sum(r) - b * sum(n) <= 0``. This returns that constraint's per-window
+        contribution, ``(r - b * n) / R``, where ``R`` is the constant expected
+        top-level roots per window fixed at reset — so the episode sum is
+        exactly ``(sum(r) - b * sum(n)) / R = sum(n) * (pooled_cost - b) / R``.
+        What that buys:
+
+        - numerator and subtrahend are measured on the SAME population (the cost
+          client's roots), so nothing is normalised by a count from a different,
+          action-dependent population;
+        - the sum is independent of the order of the windows and of how the
+          episode is cut into them;
+        - given any edge traffic at all (``sum(n) > 0``) it is zero exactly when
+          the pooled constraint binds, and otherwise carries the sign of
+          ``pooled_cost - b`` — the same sign ``dual_ascent_update`` moves lambda
+          on, so at a KKT point ``lambda * (sum(r) - b*sum(n)) = 0`` iff
+          ``lambda * (pooled - b) = 0``.
+
+        Dividing the retry count by expected roots-per-window (the top-level
+        arrival rate) instead broke the first point: edge roots are a different
+        population — upstream retries create more of them — so the episode sum
+        was not proportional to the pooled cost the dual reads, and the two
+        ranked actions differently (measured inversions across the action grid).
+
+        Without a budget (``cost_budget=None``) there is no constraint to
+        linearize and ``RewardWeights.cost`` is a plain soft penalty on retries:
+        the window's retry COUNT divided by ``_roots_per_window``, a constant
+        fixed at reset. That keeps the episode sum order-independent, but it is
+        an APPROXIMATION of amplification, not the pooled ratio: the divisor is
+        the expected TOP-LEVEL roots per window, while the retries are the cost
+        client's, so its scale drifts with the realised edge traffic. Use it to
+        discourage retries, not to enforce a budget. It falls back to the raw
+        per-window ratio when no arrival rate is known (a zero-rate workload, or
+        a summary scored before ``reset()``).
+        """
+        budget = self._cfg.cost_budget
+        if budget is not None:
+            linearized = float(summary.get("cost_retries", 0.0)) - budget * float(
+                summary.get("cost_roots", 0.0)
+            )
+            # Rescaled by a constant fixed at reset so the term stays O(1) and
+            # lambda (RewardWeights.cost) keeps the scale the dual's default
+            # step size was tuned for. A constant, action-independent divisor
+            # preserves every property above — the sum is (sum(r) - b*sum(n))
+            # divided by the same number for every action, so zeros, signs and
+            # rankings are untouched; this is NOT the per-window normalisation
+            # by another population that the docstring warns about.
+            scale = self._roots_per_window if self._roots_per_window > 0.0 else 1.0
+            return linearized / scale
+        if self._roots_per_window <= 0.0:
+            return float(summary.get("cost", 0.0))
+        return float(summary.get("cost_retries", 0.0)) / self._roots_per_window
 
     def _summarize_roots(self, roots) -> dict[str, float]:
-        if not roots:
-            return {
-                "completed": 0,
-                "success_rate": 0.0,
-                "deadline_drop_rate": 0.0,
-                "queue_drop_rate": 0.0,
-                "server_drop_rate": 0.0,
-                "circuit_open_drop_rate": 0.0,
-                "avg_latency_ms": 0.0,
-                "p95_latency_ms": 0.0,
-                "retries_per_root": 0.0,
-                "queue_avg": 0.0,
-                "cost": 0.0,
-            }
-
+        # Attempt-less roots are skipped by both Metrics paths, so exclude them
+        # from the denominator too — counting them in `completed` while no
+        # outcome bucket claims them leaves the rates not summing to 1.
+        roots = [root for root in roots if root.attempts]
         completed = len(roots)
         successes = 0
-        deadline_drops = 0
-        queue_drops = 0
-        server_drops = 0
-        circuit_open_drops = 0
+        # One counter per non-success outcome, straight off the shared table, so
+        # no outcome can fall through to a catch-all bucket.
+        drops = dict.fromkeys(FAILURE_OUTCOMES, 0)
         latencies: list[int] = []
         attempts_total = 0
         queue_sizes: list[int] = []
 
         for root in roots:
             attempts_total += len(root.attempts)
-            if any(a.success for a in root.attempts):
+            # Same classifier as Metrics.summary() and export_csv(): these three
+            # populations must agree, and they drifted when each owned its rules.
+            outcome = classify_root(root)
+            if outcome is RootOutcome.SUCCESS:
                 successes += 1
-                begin = min(a.interval.begin for a in root.attempts)
-                end = max(a.interval.end for a in root.attempts)
-                latencies.append(end - begin)
+                latencies.append(root_latency(root))
             else:
-                # Append order is completion order (ties on end time are ambiguous).
-                last_attempt = root.attempts[-1]
-                if last_attempt.drop_reason == DropReason.DEADLINE:
-                    deadline_drops += 1
-                elif last_attempt.drop_reason == DropReason.QUEUE_FULL:
-                    queue_drops += 1
-                elif last_attempt.drop_reason == DropReason.CIRCUIT_OPEN:
-                    circuit_open_drops += 1
-                else:
-                    server_drops += 1
+                drops[outcome] += 1
 
             for attempt in root.attempts:
                 if attempt.queue_size_at_end is not None:
@@ -388,19 +566,26 @@ class MicroservicesEnv(_GymEnvBase):
         )
         queue_avg = float(np.mean(queue_sizes)) if queue_sizes else 0.0
 
+        # ONE return defines the schema. An empty window must carry exactly the
+        # same keys as a populated one — a consumer reading info["summary"] must
+        # never KeyError depending on whether the window had traffic — and two
+        # hand-synced dicts only kept that promise until the next key was added
+        # to one of them. `denom` leaves every rate at 0.0 when nothing
+        # completed, reproducing the old empty-window values exactly; the drop
+        # rates come from `_OUTCOME_RATE_KEYS`, so they are all present too.
+        denom = completed or 1
         return {
             "completed": completed,
-            "success_rate": successes / completed,
-            "deadline_drop_rate": deadline_drops / completed,
-            "queue_drop_rate": queue_drops / completed,
-            "server_drop_rate": server_drops / completed,
-            "circuit_open_drop_rate": circuit_open_drops / completed,
+            "success_rate": successes / denom,
+            **{_OUTCOME_RATE_KEYS[outcome]: count / denom for outcome, count in drops.items()},
             "avg_latency_ms": avg_latency_ms,
             "p95_latency_ms": p95_latency_ms,
-            "retries_per_root": (attempts_total - completed) / completed,
+            "retries_per_root": (attempts_total - completed) / denom,
             "queue_avg": queue_avg,
             # Overridden by step() with the cost-client window when one exists.
             "cost": 0.0,
+            "cost_retries": 0.0,
+            "cost_roots": 0.0,
         }
 
     def _build_observation(self, summary: dict[str, float]) -> np.ndarray:
@@ -476,13 +661,21 @@ class MicroservicesEnv(_GymEnvBase):
                     # see them through the drop-rate features instead. A zero
                     # would poison lognormal fits (log 0) as an uncensored value.
                     continue
+                # Deadline cuts and cancellations TRUNCATE the attempt, so its
+                # latency is a lower bound on what it would have been.
+                truncated = attempt.drop_reason in (DropReason.DEADLINE, DropReason.CANCELLED)
                 attempt_latencies.append(ns_to_ms(attempt.interval.end - attempt.interval.begin))
-                attempt_censored.append(attempt.drop_reason == DropReason.DEADLINE)
+                attempt_censored.append(truncated)
                 if attempt.service_time_ns is not None:
                     attempt_service.append(ns_to_ms(attempt.service_time_ns))
-                    # Deadline cuts truncate service occupancy at the deadline:
-                    # a right-censored observation of the latent service demand.
-                    attempt_service_censored.append(attempt.drop_reason == DropReason.DEADLINE)
+                    # The OCCUPANCY is censored only when the worker was still
+                    # held at the cut — the service records that directly. A
+                    # tandem node's local stage finishes before the worker is
+                    # handed back, so a later deadline censors the attempt but
+                    # not this sample; inferring the flag from the attempt's
+                    # drop reason fed complete observations to the censored MLE
+                    # as lower bounds and inflated E[S] several-fold.
+                    attempt_service_censored.append(attempt.service_time_censored)
 
         if self._cfg.max_latency_samples is not None:
             attempt_latencies = attempt_latencies[: self._cfg.max_latency_samples]
@@ -522,6 +715,18 @@ class MicroservicesEnv(_GymEnvBase):
             return None
         return self._components.bystander_client.metrics().summary()
 
+    def bystander_in_horizon_summary(self) -> Summary | None:
+        """Bystander summary over roots completed before the episode horizon.
+
+        Mirrors ``in_horizon_summary()`` so the retry externality is measured on
+        the same population as the agent's objective J. ``bystander_metrics_summary()``
+        is the full population including roots drained past the horizon.
+        """
+        if self._components is None or self._components.bystander_client is None:
+            return None
+        roots = self._components.bystander_client.roots[: self._bystander_horizon_count]
+        return Metrics(roots=roots, attempts_total=sum(len(r.attempts) for r in roots)).summary()
+
     def set_cost_weight(self, value: float) -> None:
         """Set the constraint-cost reward weight (the Lagrange multiplier).
 
@@ -554,7 +759,12 @@ def _single_service_components(
     partial_failures: list[PartialFailure] | None = None,
     load_spikes: list[LoadSpike] | None = None,
 ) -> EnvComponents:
-    sim = Simulator(seed=1 if seed is None else seed)
+    # Normalize `None` ONCE and use it everywhere: passing the raw `seed` on to
+    # Workload made its own None fallback (0) disagree with the simulator's (1),
+    # so `build_X(None)` was a seed-1 simulator driven by a seed-0 arrival
+    # process — reproducible, but not the same scenario as `build_X(1)`.
+    build_seed = 1 if seed is None else int(seed)
+    sim = Simulator(seed=build_seed)
     svc_cfg = ServiceConfig(
         name="svc-A",
         latency_median=ms_to_ns(20),
@@ -576,13 +786,14 @@ def _single_service_components(
         base_rps=200.0,
         duration_s=duration,
         load_spikes=load_spikes or [],
-        rng_seed=seed,
+        rng_seed=build_seed,
     )
 
     return EnvComponents(
         sim=sim,
         workload=workload,
         client=client,
+        modeled_service=svc,
         apply_knobs=_static_knob_applier(timeout_ctrl, retry),
     )
 
@@ -637,7 +848,7 @@ def build_randomized_faulty_single_service_env(
     to observed degradation. Same seed reproduces the same fault draw.
     """
     duration = 30.0 if duration_s is None else float(duration_s)
-    rng = random.Random(1 if seed is None else seed)
+    rng = random.Random((1 if seed is None else int(seed)) + _FAULT_SEED_OFFSET)
 
     def window() -> TimeInterval:
         onset = rng.uniform(0.05, 0.6) * duration
@@ -671,14 +882,14 @@ def build_chain_env(
     ``cost_client`` so its retry amplification can serve as a constraint cost.
 
     ``retry_budget_ratio`` wraps the edge policy in a ``RetryBudgetPolicy``
-    (the hand-coded baseline for constrained-RL comparisons). Note the wrapper
-    limits retries against *successes* (token award), which approximates
-    retries-per-root only at high success rates.
+    (the hand-coded baseline for constrained-RL comparisons). The wrapper
+    deposits once per admitted *request*, so it limits retries against requests
+    — the same denominator as the retries-per-root cost measured here.
     """
     build_seed = 1 if seed is None else int(seed)
     sim = Simulator(seed=build_seed)
     duration = 30.0 if duration_s is None else float(duration_s)
-    rng = random.Random(build_seed)
+    rng = random.Random(build_seed + _FAULT_SEED_OFFSET)
 
     onset = rng.uniform(0.1, 0.5) * duration
     length = rng.uniform(0.15, 0.35) * duration
@@ -757,7 +968,7 @@ def build_chain_env(
         base_rps=180.0,
         duration_s=duration,
         load_spikes=[],
-        rng_seed=seed,
+        rng_seed=build_seed,
     )
 
     return EnvComponents(
@@ -766,6 +977,7 @@ def build_chain_env(
         client=top_client,
         apply_knobs=_static_knob_applier(edge_timeout, edge_retry),
         cost_client=b_to_c,
+        modeled_service=c_node.service,
     )
 
 
@@ -801,7 +1013,7 @@ def build_multichain_env(
     build_seed = 1 if seed is None else int(seed)
     sim = Simulator(seed=build_seed)
     duration = 30.0 if duration_s is None else float(duration_s)
-    rng = random.Random(build_seed)
+    rng = random.Random(build_seed + _FAULT_SEED_OFFSET)
 
     # p_fail must be high enough that upstream retry layers (A->B x2, top x2:
     # up to 4 end-to-end C rolls) cannot recover blips on their own — at ~0.65
@@ -911,11 +1123,13 @@ def build_multichain_env(
         base_rps=180.0,
         duration_s=duration,
         load_spikes=[],
-        rng_seed=seed,
+        rng_seed=build_seed,
     )
     # The env only drives EnvComponents.workload, so the bystander arrival
     # process is scheduled here; drive() just pushes tick events onto the sim
-    # heap, and both workloads stop at duration_s so episode drain terminates.
+    # heap. It MUST also be registered in extra_workloads: the episode horizon
+    # can be shorter than `duration`, and an unregistered workload keeps
+    # admitting brand-new roots throughout the terminal drain.
     bystander_workload = Workload(
         base_rps=180.0,
         duration_s=duration,
@@ -930,7 +1144,9 @@ def build_multichain_env(
         client=top_client,
         apply_knobs=_static_knob_applier(edge_timeout, edge_retry),
         cost_client=b_to_c,
+        modeled_service=c_node.service,
         bystander_client=bystander_top,
+        extra_workloads=[bystander_workload],
     )
 
 

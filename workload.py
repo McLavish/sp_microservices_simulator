@@ -1,3 +1,4 @@
+import math
 import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -6,6 +7,15 @@ from core import TimePoint, ns_to_s, s_to_ns
 from fault_events import FaultEventsTracker
 from faults import LoadSpike
 from simulator import Event, Simulator
+
+# Domain separation between the arrival process and every other RNG in the
+# simulation. Callers routinely pass the SAME integer to `Simulator(seed=...)`
+# and `Workload(rng_seed=...)`; without an offset both would drive the identical
+# Mersenne-Twister stream, so arrival times would be correlated with service
+# times and failure rolls instead of independent of them. Python seeds MT via
+# init_by_array, which scrambles thoroughly, so a fixed offset is enough to
+# decorrelate (same convention as the bystander workload in rl/env.py).
+_ARRIVAL_SEED_OFFSET = 100_003
 
 
 @dataclass
@@ -16,10 +26,16 @@ class Workload:
     rng_seed: int | None = None
     _rng: random.Random = field(init=False, repr=False)
     _next_event: Event | None = field(init=False, default=None, repr=False)
+    _stopped: bool = field(init=False, default=False, repr=False)
 
     def __post_init__(self):
+        if not math.isfinite(self.base_rps) or self.base_rps < 0:
+            raise ValueError(f"base_rps must be finite and >= 0, got {self.base_rps}")
+        if not math.isfinite(self.duration_s) or self.duration_s < 0:
+            raise ValueError(f"duration_s must be finite and >= 0, got {self.duration_s}")
         # rng_seed=None falls back to seed 0 for cross-experiment determinism; pass an int explicitly to vary.
-        self._rng = random.Random(self.rng_seed if self.rng_seed is not None else 0)
+        base = self.rng_seed if self.rng_seed is not None else 0
+        self._rng = random.Random(base + _ARRIVAL_SEED_OFFSET)
 
     def register_fault_events(self, tracker: FaultEventsTracker):
         """Register all load spike events with the tracker"""
@@ -69,9 +85,17 @@ class Workload:
         return None
 
     def drive(self, sim: Simulator, on_arrival: Callable[[Simulator], None]):
+        self._stopped = False
         end_at = s_to_ns(self.duration_s)
 
         def schedule_next(from_t: TimePoint):
+            if self._stopped:
+                # stop() may be called from inside on_arrival, i.e. while the
+                # current arrival event is executing. Cancelling that event is a
+                # no-op (it has already been popped), so the halt has to be a
+                # latch that also suppresses re-arming.
+                self._next_event = None
+                return
             nxt = self._next_arrival_after(from_t, end_at)
             if nxt is not None:
                 # Keep the historical 1 ns minimum interarrival clamp.
@@ -94,6 +118,7 @@ class Workload:
         completes in-flight work instead of admitting post-horizon traffic
         when the workload's own duration outlives the episode.
         """
+        self._stopped = True
         if self._next_event is not None:
             self._next_event.cancelled = True
             self._next_event = None

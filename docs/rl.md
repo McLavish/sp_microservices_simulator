@@ -25,19 +25,36 @@ SB3 recommends CPU for small MLP policies; `--device` defaults to `auto`.
 `MicroservicesEnv` wraps a **build function** (which constructs a fresh
 `Simulator` + `Workload` + `ClientRuntime` and a knob applicator) into a Gym env.
 Each `step()` advances the sim by `step_duration_s` and summarizes the roots that
-completed in that window. On episode end, the arrival process is halted
-(`Workload.stop()`) and in-flight work is drained *after* the final reward,
-reported under `info["drained_summary"]` so the last action is not credited with
-the tail — drained roots are strictly in-flight work, even when the builder's
-workload duration outlives `episode_duration_s`. Accounting notes:
+completed in that window. On episode end, **every** arrival process is halted
+(`Workload.stop()` on `EnvComponents.workload` and on each entry of
+`EnvComponents.extra_workloads`) and in-flight work is drained *after* the final
+reward, reported under `info["drained_summary"]` so the last action is not
+credited with the tail — drained roots are strictly in-flight work, even when the
+builder's workload duration outlives `episode_duration_s`. Accounting notes:
 
+- **Multi-workload builders.** A builder that drives more than one `Workload`
+  *must* register the extras in `EnvComponents.extra_workloads`; the env halts
+  only what it can reach. `build_multichain_env` drives a second workload for the
+  bystander chain and registers it — before it did, the unbounded drain kept
+  admitting brand-new bystander roots until the builder's own `duration_s` (70%
+  of the population on a 3 s episode against a 10 s builder duration).
 - **Populations.** `metrics_summary()` covers *all* roots including drained ones;
   `in_horizon_summary()` covers only roots completed before the horizon — the
   population the reward actually saw. The experiment CSVs report both
   (`success_rate`/`p95_ms` = full population, `*_in_horizon` = reward-visible).
+  The bystander mirrors this split: `bystander_metrics_summary()` /
+  `info["bystander_summary"]` are the full population, while
+  `bystander_in_horizon_summary()` / `info["bystander_summary_in_horizon"]`
+  score the externality on the same population as J.
 - **`terminal_drain_penalty`** (default off) folds drained-root outcomes into the
   final step's reward, weighted by how many average-sized step windows the
-  drained population represents. It removes the bulk of the incentive to defer
+  drained population represents. That window size is measured on the
+  **in-horizon** population: the post-drain root count already includes the very
+  tail being priced, so dividing by it understates the weight by exactly
+  `horizon / (horizon + drained)` — worst precisely when the agent defers the
+  most. When nothing completed in-horizon there is no measured window size and
+  the expected roots per window (below) stands in. The flag removes the bulk of
+  the incentive to defer
   failures past the horizon; a small boundary residual remains (roughly one
   drained-tail window weight, ~2% of J in the slow-failure repro) because
   in-horizon windows are rate-scored while the drain is count-weighted — fully
@@ -61,24 +78,41 @@ seeds on the env path or training collapses to one repeated episode.
 ### Configuration
 
 - **`EnvConfig`** — `build`, `action_spec`, `step_duration_s` (default 1.0),
-  `episode_duration_s`, `reward_weights`, `drain_on_done`, `initial_action`,
-  `emit_latency_samples`, `max_latency_samples`, `terminal_drain_penalty`.
-  Durations may be fractional seconds; non-positive values raise at construction.
+  `episode_duration_s`, `reward_weights`, `cost_budget`, `drain_on_done`,
+  `initial_action`, `emit_latency_samples`, `max_latency_samples`,
+  `terminal_drain_penalty`. Durations may be fractional seconds; non-positive
+  values (and a negative `cost_budget`) raise at construction. `cost_budget` is
+  the retry-amplification budget the constraint is stated against and changes
+  what the cost term measures — see [Constraint cost](#constraint-cost).
 - **`ActionSpec`** (`rl/spec.py`) — the discrete choices: `attempt_timeout_ms`,
   `max_attempts`, `backoff_ms`, and optional `global_timeout_ms` (each a list). The
-  action space is a `MultiDiscrete` over the *indices* into these lists.
+  action space is a `MultiDiscrete` over the *indices* into these lists. The
+  study's default grid and seed lists live next to it as
+  `DEFAULT_ATTEMPT_TIMEOUTS_MS` `(10, 30, 50, 80)`, `DEFAULT_MAX_ATTEMPTS`
+  `(1, 2, 3)`, `DEFAULT_BACKOFF_MS` `(0, 20, 50)`, `DEFAULT_TRAIN_SEEDS` and
+  `DEFAULT_EVAL_SEEDS`; all three entry points (`rl.train_sb3`,
+  `compare_policies`, `constrained_retry`) take their CLI defaults from there, so
+  a saved model still loads into another entry point's grid (`check_action_spec`
+  rejects any mismatch) and separately reported experiments stay seed-comparable.
 - **`RewardWeights`** (`rl/spec.py`) — defaults `success=1.0`, `deadline_drop=1.0`,
   `queue_drop=1.0`, `server_drop=1.0`, `circuit_open_drop=1.0`,
   `p95_latency_ms=0.001`, `retries=0.1`.
 
-### Observation (normalized `Box`, 15 dims + 1 with a global-timeout dimension)
+### Observation (normalized `Box`, 16 dims + 1 with a global-timeout dimension)
 
 In order: a has-data flag (disambiguates "no traffic" from "all failed"),
 log-scaled completed count, the five outcome rates (success, deadline, queue,
 server, circuit-open), avg and p95 latency scaled by the largest attempt timeout in
-the spec, retries scaled by the max retry budget, log-scaled queue depth, the last
-action echoed as index fractions (one per action dimension), and the episode-time
-fraction.
+the spec, retries scaled by the max retry budget, the constraint cost — feature 11,
+the cost client's per-window retry amplification `summary["cost"]` (retries per
+edge root), scaled like retries — log-scaled queue depth, the last action echoed as
+index fractions (one per action dimension), and the episode-time fraction.
+
+Feature 11 is the *ratio*, deliberately: the agent observes the amplification it
+is causing. The reward's cost term is a different quantity (a count, see
+[Constraint cost](#constraint-cost)), and the budget itself is **not** in the
+observation — a constrained agent cannot see which budget it is being trained
+against, which is why it retreats to the zero-retry corner at tight budgets.
 
 ### Reward
 
@@ -87,16 +121,82 @@ reward = success_rate
        - deadline_drop_rate - queue_drop_rate - server_drop_rate - circuit_open_drop_rate
        - p95_latency_ms * 0.001
        - retries_per_root * 0.1            (each term scaled by its RewardWeights)
+       - cost_term * RewardWeights.cost    (see "Constraint cost" below)
 ```
+
+That linear form lives once, in `rl.spec.linear_reward`, and has exactly two
+callers: `MicroservicesEnv._reward_from_summary` (the training signal) and
+`EpisodeResult.objective` (the base objective **J**), which calls it with
+`retries` and `cost` weights replaced by 0. So "J is the reward with the retry
+and cost penalties zeroed" is enforced by construction rather than by two copies
+staying in step — a new weighted term is in the reward *and* in J, or in
+neither. `cost_term` is a parameter rather than a summary key because it is not
+a plain rate: the env penalises the linearized retry-amplification constraint
+(below).
+
+`cancelled_rate` is reported in the summary but deliberately carries **no**
+weight and no observation feature: cancelled work was abandoned by an upstream,
+not failed by this service.
 
 ### Constraint cost
 
 `EnvComponents.cost_client` (set by the chain builders to the B→C edge client)
 defines where the constraint cost is measured: `summary["cost"]` is the edge's
 retry amplification (retries per edge root) over each window — distinct from
-`retries_per_root`, which measures the top-level client. The reward subtracts
-`cost * RewardWeights.cost`; the weight defaults to 0 and doubles as the
-Lagrange multiplier in constrained training.
+`retries_per_root`, which measures the top-level client. `summary["cost_retries"]`
+and `summary["cost_roots"]` carry that window's raw counts so consumers can pool
+them across the episode instead of averaging ratios.
+
+The observation keeps that per-window **ratio** (feature 11, scaled like
+`retries_per_root`): the agent sees the amplification it is causing. The reward
+does not — what it subtracts depends on whether a budget is configured.
+
+**With `EnvConfig.cost_budget = b` (constrained mode).** The constraint the dual
+ascends on is the *pooled* amplification over the episode,
+`Σr / Σn ≤ b` (`r` = a window's `cost_retries`, `n` its `cost_roots`), which
+linearizes to `Σr − b·Σn ≤ 0`. The reward therefore subtracts that constraint's
+per-window contribution, `cost_term = (r − b·n) / R` — `R` the constant expected
+roots-per-window fixed at reset — times `RewardWeights.cost`. The episode sum is
+then **exactly** `(Σr − b·Σn) / R = Σn · (pooled_cost − b) / R`, which is:
+independent of the order of the windows and of how the episode is cut into them;
+measured on one population on both sides (`R` is a pure, action-independent
+rescale — no count from a different population weights any window); zero exactly
+when the pooled constraint binds; and *signed* like `pooled_cost − b`, the
+quantity `dual_ascent_update` moves λ on — so at a KKT point
+`λ·(Σr − b·Σn) = 0` iff `λ·(pooled − b) = 0`. The `R` rescale keeps the term
+O(1): λ and the default `--lambda-lr 0.5` keep the scale they were tuned for,
+where the unscaled count would need both to be ~`R`× smaller and the dual's few
+chunk updates would never reach a binding multiplier.
+
+One honest consequence: because the constraint is a *ratio*, the `− b·n` half
+gives the agent a second way to satisfy it — inflate the denominator by
+generating more edge roots (upstream failures create fresh ones). That is a
+property of the pooled constraint itself, which this term represents faithfully,
+and the hand-coded `RetryBudgetPolicy` baseline has the same shape (retries per
+*request*). Read `cost_roots` next to `cost_retries` before believing a
+suspiciously low pooled cost.
+
+**Without a budget (`cost_budget=None`, the default: plain soft-penalty mode).**
+There is no constraint to linearize, and `RewardWeights.cost` is simply a
+discouragement of retries: the term is the window's retry *count* divided by a
+constant fixed at `reset()` — the roots a window is expected to carry at the
+offered arrival rate, `base_rps × step_duration_s`. That keeps the episode sum
+order-independent (a *running* mean of observed roots-per-window did not: windows
+of (5 retries, 5 roots) then (0, 100) summed to 1.0 while the reverse order
+summed to 0.095, same pooled cost), but it is an **approximation** whose scale
+drifts with realised traffic and is *not* proportional to `pooled_cost`: the
+divisor counts expected **top-level** roots while the retries are the **edge**
+client's, and edge roots are action-dependent (upstream retries create more of
+them). It prices retries, not amplification — measured rank inversions against
+`pooled_cost` across the action grid. Use it to discourage retries; use a budget
+to enforce one. It falls back to the raw per-window ratio only when the workload
+declares no arrival rate.
+
+`terminal_drain_penalty` splits these two kinds of term: the drained window's
+**rate** terms are count-weighted (see above), while its cost term is added
+**once, unweighted**, because it is already a count — weighting it would price
+the drained tail's retries by a factor that depends on the window size and break
+the episode identity.
 
 ### Applying an action
 
@@ -138,6 +238,17 @@ provides `ActionGrid` (enumerate/snap-to-nearest) and `coerce_action`.
 The model-based surrogate only models attempt latency vs. timeout: queue-full drops
 and server failures are outside its vocabulary.
 
+Both search policies share `_argmax_over_grid` (`model_based.py`): candidates are
+scored against **common random numbers** inside a window (so the argmax is a
+decision, not resampling noise), exact ties break toward the cheapest action
+(`_action_cost_key`; `global_timeout_ms=None` counts as the *most* permissive
+setting of that knob), and the stream is then **jumped** so the next window draws
+fresh samples instead of re-scoring the previous window's. With nothing usable to
+fit — an empty buffer, or a fully censored one with no earlier fit to hold — they
+fall back to the **mid-grid** action, matching the env's warm-up action; index 0 is
+the pathological corner. A fully censored window with an earlier fit holds that fit
+(identifiability guard).
+
 ## Latency models (`rl/models/`)
 
 All implement `LatencyModel` (`rl/models/base.py`): `fit`, `logpdf`, `cdf`,
@@ -145,7 +256,7 @@ All implement `LatencyModel` (`rl/models/base.py`): `fit`, `logpdf`, `cdf`,
 
 | Model | Captures |
 | --- | --- |
-| `LogNormalModel` (`lognormal.py`) | a single lognormal backed by `scipy.stats.lognorm`; `fit_censored` does right-censored MLE via `scipy.stats.CensoredData`; `moments()` feeds the queueing math |
+| `LogNormalModel` (`lognormal.py`) | a single lognormal backed by `scipy.stats.lognorm`; `fit_censored` does right-censored MLE via `scipy.stats.CensoredData` (the queueing math takes its moments from the raw service buffer, not from a fitted model — see `ModelBasedPolicy._service_moments`) |
 | `LogNormalMixtureModel` (`lognormal_mixture.py`) | a K-component lognormal mixture fit in log-space, for multi-modal latency |
 | `EVTTailModel` (`evt_tail.py`) | a lognormal **body** plus a Pareto tail above a threshold quantile (Hill estimator, not GPD peaks-over-threshold) |
 
@@ -169,13 +280,19 @@ python -m rl.train_sb3 --timesteps 100000 --fault-scenario randomized \
 `train_constrained_ppo(ConstrainedTrainConfig(...))` is Lagrangian PPO: the
 env reward acts as the Lagrangian, with `RewardWeights.cost` as the multiplier
 λ on the edge-amplification cost, updated by projected dual ascent between
-training chunks (`λ ← max(0, λ + lr·(cost − budget))`). The hand `retries`
-penalty is zeroed during constrained training; evaluation always reports the
-base objective **J** (reward with retry/cost penalties zeroed) so arms with
-different training weights stay comparable. Honest caveats: the constraint is
-enforced **in expectation** (not per episode/window — report violation rates),
-and `RetryBudgetPolicy.budget_ratio` limits retries against *successes*, which
-approximates retries-per-root only at high success rates.
+training chunks (`λ ← max(0, λ + lr·(cost − budget))`). The trainer hands the
+budget to the env as well (`EnvConfig.cost_budget = cfg.budget`), so the primal
+penalises `Σr − b·Σn` — the linearization of the *same* pooled constraint the
+dual step reads (see [Constraint cost](#constraint-cost)). Without that pairing
+the primal prices raw retries while the dual prices amplification, and dual
+ascent converges to neither. The hand `retries` penalty is zeroed during
+constrained training; evaluation always reports the base objective **J** (reward
+with retry/cost penalties zeroed) so arms with different training weights stay
+comparable. Honest caveats: the constraint is enforced **in expectation** (not
+per episode/window — report violation rates); the cost term's constant-`R`
+rescale keeps λ and `--lambda-lr` at their pre-pairing O(1) scale; and
+`RetryBudgetPolicy.budget_ratio` limits retries against *requests* (Finagle
+semantics), matching the retries-per-root the constraint cost measures.
 
 `compare_policies` accepts `constrained_ppo` as a policy name
 (`--retry-budget`, `--lambda-lr`, `--lambda-init`); the three-arm study is:
@@ -210,42 +327,51 @@ whether the scenario supports the study at all: the unconstrained optimum
 must retry (max_attempts ≥ 2) at a cost above the smallest budget, tighter
 budgets must trade J for cost beyond eval noise, and the retries must
 measurably hurt the bystander. Run it after touching the builder's fault or
-capacity constants; the FAIL messages name the knob to turn.
+capacity constants; the FAIL messages name the knob to turn. Three of those
+criteria are stated against a no-retry baseline, so the grid must contain
+`max_attempts = 1` (the default `--max-attempts 1,2,3` does); a grid without it
+is rejected up front rather than after the sweep, and a budget below the
+cheapest action in the grid is reported as infeasible.
 
-#### Findings (multichain sweep, 30k timesteps, 10 eval seeds)
+#### Findings (multichain sweep, 100k timesteps, 10 eval seeds)
 
-Reference run of the commands above (defaults; sample output committed as
-`rl_constrained_comparison_multichain.csv`):
+Reference run of the commands above (`--timesteps 100000`, otherwise defaults;
+output committed as `rl_constrained_comparison_multichain.csv`). Produced
+2026-08-16 on the review-fixed code: the reward is the paired Lagrangian
+(`(r − b·n)/R`, default `--lambda-lr 0.5`), and the chunk loop now trains the
+timesteps it reports — the earlier reference's "30k" actually trained ~105k
+via the chunk-loop bug, so 100k is the honest match for its effective compute.
+(At an honest 30k the study is basin-dominated: arm B's outcome is insensitive
+to λ entirely, and the b=0.2 dual only starts binding after the last chunk.)
 
 | arm | budget | J | edge cost | violations | bystander | p95 |
 | --- | --- | --- | --- | --- | --- | --- |
-| unconstrained PPO | — | **6.74** | 0.318 | — | 0.797 | 242 ms |
-| constrained PPO | 0.05 | 6.25 | 0.000 | 0% | 0.865 | 135 ms |
-| retry_budget | 0.05 | 6.29 | 0.011 | 0% | 0.861 | 137 ms |
-| constrained PPO | 0.1 | 6.25 | 0.000 | 0% | 0.865 | 135 ms |
-| retry_budget | 0.1 | 6.30 | 0.016 | 0% | 0.861 | 135 ms |
-| constrained PPO | 0.2 | 6.55 | 0.251 | 70% | 0.818 | 262 ms |
-| retry_budget | 0.2 | 6.46 | 0.029 | 0% | 0.858 | 147 ms |
+| unconstrained PPO | — | **6.35** | 0.300 | — | 0.767 | 258 ms |
+| constrained PPO | 0.05 | 5.95 | 0.057 | 60% | 0.827 | 154 ms |
+| retry_budget | 0.05 | 5.88 | 0.027 | 0% | 0.836 | 144 ms |
+| constrained PPO | 0.1 | 5.90 | 0.005 | 0% | 0.840 | 142 ms |
+| retry_budget | 0.1 | 5.95 | 0.050 | 0% | 0.834 | 156 ms |
+| constrained PPO | 0.2 | 6.11 | 0.138 | 20% | 0.808 | 180 ms |
+| retry_budget | 0.2 | 6.07 | 0.094 | 0% | 0.818 | 178 ms |
 
 Three results worth keeping:
 
-1. **The trade-off is real and two-sided.** J rises monotonically with
-   amplification (6.25 → 6.55 → 6.74) and the bystander chain pays for it
-   symmetrically (0.865 → 0.818 → 0.797, ~7 p.p. at the unconstrained
+1. **The trade-off is real and two-sided.** J rises with allowed amplification
+   (≈5.9 at the tight budgets → 6.11 → 6.35) and the bystander chain pays for
+   it symmetrically (0.83–0.84 → 0.808 → 0.767, ~7 p.p. at the unconstrained
    optimum) — the externality production retry budgets exist to bound.
    Contrast with `chain`, where every arm sits at cost 0 and the same study
    shows nothing.
-2. **Dual ascent behaves as designed but only enforces the mean.** λ climbs
-   while eval cost exceeds the budget, decays under slack, and holds an
-   interior point at b=0.2 — yet that arm violates its budget on 7/10 eval
-   seeds (mean cost 0.251 vs 0.2), and the curve shows λ still rising at 30k
-   steps. Longer training tightens this; per-episode guarantees need more
-   than a Lagrangian.
-3. **The hand-coded token bucket is competitive where it matters.** At tight
-   budgets constrained PPO retreats to the zero-retry corner (it cannot see
-   the budget in its observation) and `RetryBudgetPolicy` edges it out while
-   never violating; constrained PPO only wins at the loose budget. RL earns
-   its keep in adaptivity, not in replacing the 30-line mechanism.
+2. **Dual ascent enforces the mean, not the episode.** λ climbs while eval
+   cost exceeds the budget, decays under slack, and holds interior points:
+   b=0.2 is satisfied in expectation with real slack used (0.138 vs 0.2,
+   2/10 seed violations) and b=0.05 sits at its budget (0.057, over by small
+   margins on 6/10 seeds). Per-episode guarantees need more than a Lagrangian
+   — report violation rates alongside the means.
+3. **The hand-coded token bucket is competitive where it matters.** It never
+   violates at any budget, and constrained PPO buys only near-equal J at the
+   cost of in-expectation enforcement. RL earns its keep in adaptivity, not
+   in replacing the 30-line mechanism.
 
 Calibration history (why the builder's constants look the way they do): at
 p_fail U(0.3, 0.6) and retrying relay edges, upstream layers recovered blips

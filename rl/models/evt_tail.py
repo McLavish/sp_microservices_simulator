@@ -7,13 +7,6 @@ from rl.models.lognormal import LogNormalModel
 from rl.models.utils import ensure_positive
 
 
-def _log_or_neg_inf(values: np.ndarray) -> np.ndarray:
-    """Elementwise log, with -inf where the value is non-positive."""
-    out = np.full_like(values, -math.inf, dtype=np.float64)
-    np.log(values, where=values > 0, out=out)
-    return out
-
-
 @dataclass
 class EVTTailModel:
     """Lognormal body with a Pareto tail above a quantile threshold.
@@ -25,6 +18,7 @@ class EVTTailModel:
 
     threshold_quantile: float = 0.95
     min_alpha: float = 0.1
+    max_alpha: float = 1e6
     body: LogNormalModel = field(default_factory=LogNormalModel)
     u: float = field(default=0.0, init=False)
     alpha: float = field(default=1.0, init=False)
@@ -42,7 +36,21 @@ class EVTTailModel:
             body_samples = data
             self.p_u = 0.0
 
-        self.body.fit(body_samples)
+        # `body_samples` is a right-TRUNCATED sample (everything above u was
+        # removed), so an ordinary MLE biases both parameters toward zero and
+        # every body quantile comes out low — the p_u/_body_cdf_u
+        # renormalization fixes the mass, not the shape. Treating the tail
+        # observations as right-censored at u recovers an unbiased body.
+        fit_censored = getattr(self.body, "fit_censored", None)
+        if callable(fit_censored) and tail_samples.size > 0:
+            # Right-censored AT u: the observation for an exceedance is the
+            # THRESHOLD ("we know only that it exceeded u"), not its actual
+            # value. Passing the actual values leaks tail information into the
+            # body fit (measured sigma 0.8384 vs 0.8004 against a true 0.8).
+            censored_at_u = np.where(data > self.u, self.u, data)
+            self.body = fit_censored(censored_at_u, data > self.u)
+        else:
+            self.body.fit(body_samples)
         self._body_cdf_u = float(self.body.cdf(np.array([self.u]))[0])
         if self._body_cdf_u <= 0:
             self._body_cdf_u = 1e-12
@@ -50,8 +58,15 @@ class EVTTailModel:
         if tail_samples.size > 0:
             ratios = tail_samples / self.u
             log_ratios = np.log(ratios)
-            alpha = tail_samples.size / np.sum(log_ratios)
-            self.alpha = max(float(alpha), self.min_alpha)
+            denom = float(np.sum(log_ratios))
+            # Samples clustered just above the threshold drive the Hill
+            # estimator arbitrarily high (observed alpha ~ 4e5) — a signal the
+            # tail is not power-law. The log-space density handles those values
+            # fine, so max_alpha is only a guard against inf/nan from a
+            # degenerate denominator, deliberately far above any plausible fit
+            # rather than a modelling constraint that would distort the tail.
+            alpha = tail_samples.size / denom if denom > 0 else self.max_alpha
+            self.alpha = float(min(max(alpha, self.min_alpha), self.max_alpha))
         else:
             self.alpha = 10.0
 
@@ -70,15 +85,34 @@ class EVTTailModel:
         tail_mask = ~body_mask
 
         if np.any(body_mask):
-            body_pdf = np.exp(self.body.logpdf(x_pos[body_mask]))
             scale = self.p_u / self._body_cdf_u if self.p_u > 0 else 0.0
-            out[idx[body_mask]] = _log_or_neg_inf(body_pdf * scale)
+            if scale <= 0.0:
+                out[idx[body_mask]] = -math.inf
+            else:
+                # Evaluate in LOG space, like the tail branch below. Going
+                # through the density underflows to 0.0 — and reports -inf —
+                # for any point whose body log-density is below ~-745, which a
+                # tight body fit reaches a few dozen sigmas out; a single such
+                # sample then wipes out the whole log-likelihood.
+                out[idx[body_mask]] = self.body.logpdf(x_pos[body_mask]) + math.log(scale)
 
         if np.any(tail_mask):
             x_tail = x_pos[tail_mask]
             scale = 1.0 - self.p_u
-            pdf = scale * self.alpha * (self.u**self.alpha) * (x_tail ** (-self.alpha - 1))
-            out[idx[tail_mask]] = _log_or_neg_inf(pdf)
+            if scale <= 0.0:
+                out[idx[tail_mask]] = -math.inf
+            else:
+                # Evaluate in LOG space. Done in probability space, u**alpha is a
+                # Python float power that RAISES OverflowError once alpha is
+                # large (tightly-clustered samples drive the Hill estimator up),
+                # and even below that it multiplies ~1e213 by ~1e-215 instead of
+                # computing the density.
+                out[idx[tail_mask]] = (
+                    math.log(scale)
+                    + math.log(self.alpha)
+                    + self.alpha * math.log(self.u)
+                    - (self.alpha + 1.0) * np.log(x_tail)
+                )
 
         return out
 

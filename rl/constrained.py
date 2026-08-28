@@ -8,6 +8,18 @@ between training chunks:
 
     lambda <- max(0, lambda + lr * (cost - budget))
 
+The primal is paired with that dual by handing the budget to the env
+(``EnvConfig.cost_budget = cfg.budget``): each window is then penalised by
+``(cost_retries - budget * cost_roots) / R`` — ``R`` the constant expected
+roots-per-window fixed at reset — whose episode sum is exactly
+``(sum(retries) - budget * sum(roots)) / R``: the same sign, and zero at the
+same point, as the ``cost - budget`` above. The constant ``R`` rescale keeps
+the term O(1), so lambda stays at the scale the default ``lambda_lr`` was
+tuned for; an unscaled count (hundreds of retries per window at the study's
+arrival rates) needs lambda and ``lambda_lr`` roughly ``R`` times smaller,
+and with only ``timesteps / chunk_timesteps`` dual updates per run the ascent
+then never reaches a binding multiplier.
+
 During constrained training the hand-tuned ``retries`` penalty is zeroed so
 the learned multiplier is the only retry pressure. Evaluation always reports
 the *base objective* J (reward with retry and cost penalties zeroed) plus the
@@ -27,16 +39,22 @@ import numpy as np
 
 from rl.env import EnvComponents, EnvConfig, MicroservicesEnv
 from rl.policies.sb3 import SB3Policy
+from rl.rollout import model_actor, run_episode
 from rl.sb3_support import import_sb3
 from rl.spec import ActionSpec, RewardWeights
 
-PPO, make_vec_env, _, SubprocVecEnv, _SB3_IMPORT_ERROR = import_sb3()
+_SB3 = import_sb3()
+PPO, make_vec_env, SubprocVecEnv = _SB3.ppo, _SB3.make_vec_env, _SB3.subproc_vec_env
+_SB3_IMPORT_ERROR = _SB3.import_error
 
 
 @dataclass
 class ConstrainedTrainConfig:
     build: Callable[[int | None], EnvComponents]
     action_spec: ActionSpec
+    # Retries per cost-client root allowed in expectation. Drives BOTH sides of
+    # the Lagrangian: the dual step below and the env's per-window cost term
+    # (via EnvConfig.cost_budget).
     budget: float = 0.1
     lambda_init: float = 0.0
     lambda_lr: float = 0.5
@@ -65,26 +83,13 @@ def dual_ascent_update(lam: float, cost: float, budget: float, lr: float) -> flo
     return max(0.0, lam + lr * (cost - budget))
 
 
-def objective_from_summary(summary: dict, weights: RewardWeights) -> float:
-    """Base objective J: the env reward with retry and cost penalties zeroed.
-
-    Used for evaluation of every arm so the comparison scale does not depend
-    on each arm's training weights.
-    """
-    return float(
-        summary["success_rate"] * weights.success
-        - summary["deadline_drop_rate"] * weights.deadline_drop
-        - summary["queue_drop_rate"] * weights.queue_drop
-        - summary["server_drop_rate"] * weights.server_drop
-        - summary["circuit_open_drop_rate"] * weights.circuit_open_drop
-        - summary["p95_latency_ms"] * weights.p95_latency_ms
-    )
-
-
 def evaluate_objective_and_cost(
     model, env: MicroservicesEnv, episodes: int, weights: RewardWeights
 ) -> tuple[float, float]:
-    """Mean episode objective J and mean per-window cost over `episodes`.
+    """Mean episode objective J and mean POOLED cost over `episodes`.
+
+    The cost is retries-per-root pooled over each episode's windows, not a mean
+    of per-window ratios — see the pooling note below.
 
     Resets unseeded so the env's (pre-seeded) RNG yields a reproducible
     scenario sequence.
@@ -92,18 +97,10 @@ def evaluate_objective_and_cost(
     objectives = []
     costs = []
     for _ in range(episodes):
-        obs, _ = env.reset()
-        terminated = truncated = False
-        episode_objective = 0.0
-        episode_costs = []
-        while not (terminated or truncated):
-            action, _ = model.predict(obs, deterministic=True)
-            obs, _reward, terminated, truncated, info = env.step(action)
-            summary = info["summary"]
-            episode_objective += objective_from_summary(summary, weights)
-            episode_costs.append(summary["cost"])
-        objectives.append(episode_objective)
-        costs.append(float(np.mean(episode_costs)) if episode_costs else 0.0)
+        # Unseeded: the env's pre-seeded RNG yields a reproducible sequence.
+        result = run_episode(env, model_actor(model))
+        objectives.append(result.objective(weights))
+        costs.append(result.pooled_cost)
     return float(np.mean(objectives)), float(np.mean(costs))
 
 
@@ -112,6 +109,17 @@ def train_constrained_ppo(cfg: ConstrainedTrainConfig) -> SB3Policy:
         raise ImportError(
             "stable-baselines3 is required for constrained training"
         ) from _SB3_IMPORT_ERROR
+
+    # Validate before allocating: `make_vec_env` below spawns `n_envs` worker
+    # interpreters, and a config error raised after that leaves them orphaned.
+    if cfg.chunk_timesteps <= 0:
+        # chunk=0 would call learn(0) forever: `trained` never advances.
+        raise ValueError(f"chunk_timesteps must be > 0, got {cfg.chunk_timesteps}")
+    if cfg.timesteps <= 0:
+        raise ValueError(f"timesteps must be > 0, got {cfg.timesteps}")
+    if cfg.budget < 0:
+        # The env rejects it too, but only once the workers are already up.
+        raise ValueError(f"budget must be >= 0, got {cfg.budget}")
 
     weights = replace(
         cfg.base_weights,
@@ -122,7 +130,10 @@ def train_constrained_ppo(cfg: ConstrainedTrainConfig) -> SB3Policy:
     def make_env() -> MicroservicesEnv:
         # Each env gets its own weights copy: lambda updates are broadcast via
         # env_method (works across SubprocVecEnv process boundaries, where a
-        # shared mutable object would not).
+        # shared mutable object would not). The budget, unlike lambda, is fixed
+        # for the whole arm, so it travels with the config at construction —
+        # and it must travel, or the primal penalises retries while the dual
+        # ascends on amplification.
         return MicroservicesEnv(
             EnvConfig(
                 build=cfg.build,
@@ -130,6 +141,7 @@ def train_constrained_ppo(cfg: ConstrainedTrainConfig) -> SB3Policy:
                 step_duration_s=cfg.step_duration_s,
                 episode_duration_s=cfg.episode_duration_s,
                 reward_weights=replace(weights),
+                cost_budget=cfg.budget,
             )
         )
 
@@ -156,20 +168,29 @@ def train_constrained_ppo(cfg: ConstrainedTrainConfig) -> SB3Policy:
     lam = cfg.lambda_init
     curve: list[tuple[int, float, float, float]] = []
     trained = 0
-    while trained < cfg.timesteps:
-        chunk = min(cfg.chunk_timesteps, cfg.timesteps - trained)
-        # SB3 semantics: with reset_num_timesteps=False, learn() trains
-        # `total_timesteps` ADDITIONAL steps (_setup_learn adds the current
-        # num_timesteps). Pass the per-chunk increment; the counter, schedules,
-        # and in-flight episodes still continue across chunks.
-        model.learn(total_timesteps=chunk, reset_num_timesteps=False)
-        trained = int(model.num_timesteps)  # true cumulative; curve rows stay honest
-        eval_objective, eval_cost = evaluate_objective_and_cost(
-            model, eval_env, cfg.eval_episodes, cfg.base_weights
-        )
-        lam = dual_ascent_update(lam, eval_cost, cfg.budget, cfg.lambda_lr)
-        vec_env.env_method("set_cost_weight", lam)
-        curve.append((trained, eval_objective, eval_cost, lam))
+    try:
+        while trained < cfg.timesteps:
+            chunk = min(cfg.chunk_timesteps, cfg.timesteps - trained)
+            # SB3 semantics: with reset_num_timesteps=False, learn() trains
+            # `total_timesteps` ADDITIONAL steps (_setup_learn adds the current
+            # num_timesteps). Pass the per-chunk increment; the counter,
+            # schedules, and in-flight episodes still continue across chunks.
+            model.learn(total_timesteps=chunk, reset_num_timesteps=False)
+            trained = int(model.num_timesteps)  # true cumulative; curve rows stay honest
+            eval_objective, eval_cost = evaluate_objective_and_cost(
+                model, eval_env, cfg.eval_episodes, cfg.base_weights
+            )
+            lam = dual_ascent_update(lam, eval_cost, cfg.budget, cfg.lambda_lr)
+            vec_env.env_method("set_cost_weight", lam)
+            curve.append((trained, eval_objective, eval_cost, lam))
+    finally:
+        # Nothing else closes it: SB3 defines no __del__ on VecEnv, and the
+        # returned policy keeps model -> model.env alive, so a caller training
+        # several arms in one process (rl.experiments.constrained_retry) would
+        # hold every arm's workers open until the process exits. Only
+        # `model.predict` is used afterwards, which never touches the env.
+        vec_env.close()
+        eval_env.close()
 
     if cfg.learning_curve_csv and curve:
         with open(cfg.learning_curve_csv, "w", newline="") as f:

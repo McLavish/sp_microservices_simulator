@@ -16,9 +16,7 @@ def main(csv_file, output_file, fault_events_file=None):
     plt.figure(figsize=(10, 6))
     plt.plot(t, q, label="Avg queue size (attempt end)", linewidth=2)
 
-    if fault_events_file:
-        fault_events = load_fault_events(fault_events_file)
-        plot_fault_events(fault_events)
+    plot_fault_events(load_fault_events(fault_events_file), ax=plt.gca())
 
     plt.xlabel("Time (s)")
     plt.ylabel("Avg Queue Size")

@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from rl.policies.action_space import ActionGrid
+from rl.policies.action_space import UNSPECIFIED, ActionGrid
 
 
 @dataclass
@@ -29,9 +29,17 @@ class AIMDPolicy:
     backoff_step: int = 1
     adjust_max_attempts: bool = False
     adjust_backoff: bool = False
-    ema_alpha: float = 0.2
-    success_target: float = 0.98
-    deadline_target: float = 0.01
+    # Defaults chosen so BOTH arms are reachable inside a default-length
+    # episode (10 windows at step_duration_s=1.0), measured across the shipped
+    # scenarios and eval seeds. The old values (alpha 0.2, success 0.98,
+    # deadline 0.01) made the decrease arm unreachable: alpha 0.2 gives the EMA
+    # a ~5-window memory, half the episode, and a 0.01 deadline target takes ~9
+    # clean windows to clear after a single faulty one -- so "AIMD" degenerated
+    # into a one-way ramp to the widest timeout. deadline_target is the dominant
+    # lever; see the reachability test in tests/test_rl_policies.py.
+    ema_alpha: float = 0.5
+    success_target: float = 0.95
+    deadline_target: float = 0.05
     min_completed: int = 1
     name: str = "aimd"
 
@@ -39,13 +47,21 @@ class AIMDPolicy:
         if not 0.0 < self.timeout_decrease_factor < 1.0:
             raise ValueError("timeout_decrease_factor must be in (0, 1)")
         self._has_global = self.grid.spec.global_timeout_ms is not None
-        self._ema_success = None
-        self._ema_deadline = None
-        self._init_state()
+        # Construction goes through reset() so the seeding rule below exists in
+        # ONE place: compare_policies re-resets per eval seed, so a
+        # recalibration applied to only one of the two copies would silently
+        # not reach the scored episodes.
+        self.reset()
 
     def reset(self, seed: int | None = None) -> None:
-        self._ema_success = None
-        self._ema_deadline = None
+        # Seed AT the targets, not at the first window's rates. Window 0 runs
+        # the env's initial action before any feedback exists; seeding from it
+        # started the controller deep in debt, and with the shipped ema_alpha
+        # the decrease arm could not clear the targets for ~21 windows against
+        # a 10-window episode - it was unreachable, so "AIMD" was a one-way ramp.
+        # No RNG here, so `seed` is accepted for protocol compatibility only.
+        self._ema_success = self.success_target
+        self._ema_deadline = self.deadline_target
         self._init_state()
 
     def _init_state(self) -> None:
@@ -133,7 +149,13 @@ class AIMDPolicy:
             backoff_ms = self.grid.spec.backoff_ms[0]
 
         return self.grid.nearest_indices(
-            timeout_ms, max_attempts, backoff_ms, self.initial_global_timeout_ms
+            timeout_ms,
+            max_attempts,
+            backoff_ms,
+            # None means "no opinion", not "the spec's None entry".
+            UNSPECIFIED
+            if self.initial_global_timeout_ms is None
+            else self.initial_global_timeout_ms,
         )
 
     def _build_action(self) -> tuple[int, ...]:

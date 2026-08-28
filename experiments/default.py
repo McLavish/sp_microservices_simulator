@@ -14,7 +14,7 @@ if __name__ == "__main__":
     # Create fault events tracker
     fault_tracker = FaultEventsTracker()
 
-    # Service: 20ms median, lognormal sigma 0.5, 16 workers, queue cap 200
+    # Service: 20ms median, lognormal sigma 0.5, 16 workers, queue cap 20
     svc_cfg = ServiceConfig(
         name="svc-A",
         latency_median=ms_to_ns(20),
@@ -49,7 +49,7 @@ if __name__ == "__main__":
     )
     client = ClientRuntime(cfg=cli_cfg, service=svc)
 
-    # Workload: 300 rps for 12s, with a 2x spike between [4s, 6s)
+    # Workload: 300 rps for 100s, with a 2x spike between [20s, 40s)
     wl = Workload(
         base_rps=300.0,
         duration_s=100,

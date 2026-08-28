@@ -1,3 +1,4 @@
+import math
 import random
 from collections import deque
 from dataclasses import dataclass, field
@@ -12,8 +13,6 @@ from core import TimeDuration, TimePoint
 class RetryContext:
     attempt: int  # attempt starts at 1 (the original request is attempt 1)
     now: TimePoint  # current simulation time; required (rate limiters need it)
-    # last_delay: TimeDuration
-    # total_delay: TimeDuration
     # last_result: Optional[bool] = None
 
 
@@ -28,6 +27,46 @@ class RetryPolicy:
 
     def next_delay(self, context: RetryContext) -> DelayDecision:
         raise NotImplementedError
+
+    def on_request_start(self, now: TimePoint) -> None:
+        """Called once per root request, when the client admits it.
+
+        Separate from ``add_result`` (once per *attempt*) so a policy can key
+        off request arrivals rather than attempt outcomes — which is what a
+        Finagle-style retry budget needs, since its ratio is retries per
+        *request*. Default is a no-op.
+        """
+        return
+
+    #: Whether `rollback` is safe to apply LATER than the `next_delay` it undoes.
+    #: FALSE by default, because that is the safe answer for every policy that
+    #: overrides `rollback`: they hold either single-slot undo state (the leaky
+    #: bucket rewinds whichever charge was most recent, not the one being undone)
+    #: or a CAPPED, refilling balance (a refund arriving after an intervening
+    #: refill or deposit clamps at the cap and thereby MINTS quota that was never
+    #: spent). A new side-effecting policy is therefore safe without remembering
+    #: anything; opt IN with True only for a rollback that is genuinely
+    #: order-independent. Skipping the inherited no-op rollback costs nothing, so
+    #: side-effect-free policies have no reason to opt in.
+    supports_deferred_rollback: bool = False
+
+    def rollback(self, context: RetryContext) -> None:
+        """Undo the side effects of the immediately preceding ``next_delay``.
+
+        ``next_delay`` is side-effecting for every throttling policy (a retry
+        budget withdraws tokens, a rate limiter spends one, a leaky bucket
+        reserves the next slot). The client may still decline to issue the retry
+        it just asked for — the global deadline can veto it — and without a
+        refund those never-issued retries are charged anyway.
+
+        The client calls this only when ``next_delay`` returned ``allow=True``
+        and the retry was then vetoed, and it recurses through
+        ``underlying_strategy`` so every layer that charged also refunds.
+        Default is a no-op, so side-effect-free policies need not implement it.
+        Cf. Finagle's ``RetryBudget.tryWithdraw()``, which avoids the problem by
+        only withdrawing when the caller commits to the retry.
+        """
+        return
 
 
 @dataclass
@@ -120,8 +159,53 @@ class CBState(Enum):
     HALF_OPEN = 2
 
 
+class _CircuitBreakerBase(RetryPolicy):
+    """The half of a breaker both implementations share.
+
+    Admission (`allow_request`), the OPEN -> HALF_OPEN transition and retry
+    delegation are identical for the count- and time-based windows; only what
+    counts as "the probe window" differs, so that is the one hook. Keeping the
+    transition in a single place matters because the missing probe cap
+    (see `CBState.HALF_OPEN`) has to be fixed here exactly once.
+
+    Not a dataclass: the fields below are declared by the concrete subclasses,
+    and bare annotations here would not join their field lists anyway.
+    """
+
+    half_open_delay: TimeDuration
+    underlying_strategy: RetryPolicy
+    _state: CBState
+    _opened_at: TimePoint | None
+
+    def _reset_probe_window(self) -> None:
+        """Drop the results accumulated before the probe stage."""
+        raise NotImplementedError
+
+    def get_state(self) -> CBState:
+        return self._state
+
+    def allow_request(self, now: TimePoint) -> bool:
+        # NOTE: half-open admits *every* request (no probe cap) — see CBState.HALF_OPEN.
+        if self._state != CBState.OPEN:
+            return True
+        if (
+            self._opened_at is None
+            or self.half_open_delay == 0
+            or now - self._opened_at >= self.half_open_delay
+        ):
+            self._state = CBState.HALF_OPEN
+            self._reset_probe_window()
+            return True
+        return False
+
+    def next_delay(self, context: RetryContext) -> DelayDecision:
+        if self._state != CBState.CLOSED:
+            return DelayDecision(False, 0)
+        return self.underlying_strategy.next_delay(context)
+
+
 @dataclass
-class CountBasedCircuitBreakerPolicy(RetryPolicy):
+class CountBasedCircuitBreakerPolicy(_CircuitBreakerBase):
     # e.g. if you have 5 failures out of 10 calls, the circuit opens
     failure_threshold_ratio: tuple[int, int]  # (failures, total)
     # e.g. if you have 3 successes out of 5 calls, the circuit closes
@@ -137,14 +221,24 @@ class CountBasedCircuitBreakerPolicy(RetryPolicy):
     def __post_init__(self):
         f, ftot = self.failure_threshold_ratio
         s, stot = self.success_threshold_ratio
-        assert 0 <= f <= ftot and ftot > 0
-        assert 0 <= s <= stot and stot > 0
+        if ftot < 1 or not 0 <= f <= ftot:
+            raise ValueError(
+                f"failure_threshold_ratio must be (failures, total) with "
+                f"0 <= failures <= total and total >= 1, got {self.failure_threshold_ratio}"
+            )
+        if stot < 1 or not 0 <= s <= stot:
+            raise ValueError(
+                f"success_threshold_ratio must be (successes, total) with "
+                f"0 <= successes <= total and total >= 1, got {self.success_threshold_ratio}"
+            )
+        if self.half_open_delay < 0:
+            raise ValueError(f"half_open_delay must be >= 0 ns, got {self.half_open_delay}")
         # Note: deques with maxlen will drop old entries when new ones are added
         self._closed_window = deque(maxlen=ftot)
         self._open_window = deque(maxlen=stot)
 
-    def get_state(self) -> CBState:
-        return self._state
+    def _reset_probe_window(self) -> None:
+        self._open_window.clear()
 
     def add_result(self, success: bool, now: TimePoint) -> None:
         if self._state == CBState.CLOSED:
@@ -170,39 +264,47 @@ class CountBasedCircuitBreakerPolicy(RetryPolicy):
                     self._open_window.clear()
                     self._opened_at = now
 
-    def allow_request(self, now: TimePoint) -> bool:
-        # NOTE: half-open admits *every* request (no probe cap) — see CBState.HALF_OPEN.
-        if self._state != CBState.OPEN:
-            return True
-        if (
-            self._opened_at is None
-            or self.half_open_delay == 0
-            or now - self._opened_at >= self.half_open_delay
-        ):
-            self._state = CBState.HALF_OPEN
-            self._open_window.clear()
-            return True
-        return False
-
-    def next_delay(self, context: RetryContext) -> DelayDecision:
-        if self._state != CBState.CLOSED:
-            return DelayDecision(False, 0)
-        return self.underlying_strategy.next_delay(context)
-
 
 @dataclass
-class TimeBasedCircuitBreakerPolicy(RetryPolicy):
+class TimeBasedCircuitBreakerPolicy(_CircuitBreakerBase):
     failure_threshold_rate: float  # percentage of failures to open the circuit
     success_threshold_rate: float  # percentage of successes to close the circuit
     min_requests: int  # Minimum requests in the window to evaluate
     window_duration: TimeDuration
     underlying_strategy: RetryPolicy
     half_open_delay: TimeDuration
+    # Probes needed to decide in HALF_OPEN. Deliberately smaller than
+    # min_requests: an open circuit suppresses traffic, so requiring the
+    # closed-state quorum can strand the breaker in HALF_OPEN forever.
+    half_open_min_requests: int = 1
 
     _window: deque[tuple[TimePoint, bool]] = field(default_factory=deque)  # (timestamp, success)
     _failures_in_window: int = field(default=0, init=False)
     _state: CBState = CBState.CLOSED
     _opened_at: TimePoint | None = None
+
+    def __post_init__(self):
+        if not 0 <= self.failure_threshold_rate <= 1:
+            raise ValueError(
+                f"failure_threshold_rate must be in [0, 1], got {self.failure_threshold_rate}"
+            )
+        if not 0 <= self.success_threshold_rate <= 1:
+            raise ValueError(
+                f"success_threshold_rate must be in [0, 1], got {self.success_threshold_rate}"
+            )
+        if self.min_requests < 1:
+            raise ValueError(f"min_requests must be >= 1, got {self.min_requests}")
+        if self.half_open_min_requests < 1:
+            raise ValueError(
+                f"half_open_min_requests must be >= 1, got {self.half_open_min_requests}"
+            )
+        # A negative window evicts every prior result on the next add_result
+        # (`now - t > window_duration` holds for t == now), so the window can
+        # never reach min_requests and the breaker silently never opens.
+        if self.window_duration <= 0:
+            raise ValueError(f"window_duration must be > 0 ns, got {self.window_duration}")
+        if self.half_open_delay < 0:
+            raise ValueError(f"half_open_delay must be >= 0 ns, got {self.half_open_delay}")
 
     def _evict_old(self, now: TimePoint) -> None:
         while self._window and (now - self._window[0][0]) > self.window_duration:
@@ -214,8 +316,8 @@ class TimeBasedCircuitBreakerPolicy(RetryPolicy):
         self._window.clear()
         self._failures_in_window = 0
 
-    def get_state(self) -> CBState:
-        return self._state
+    def _reset_probe_window(self) -> None:
+        self._clear_window()
 
     def add_result(self, success: bool, now: TimePoint) -> None:
         self._evict_old(now)
@@ -238,37 +340,23 @@ class TimeBasedCircuitBreakerPolicy(RetryPolicy):
         elif self._state == CBState.OPEN:
             return
         elif self._state == CBState.HALF_OPEN:
-            if total >= self.min_requests and rate < (1 - self.success_threshold_rate):
+            # Half-open needs its own, smaller quorum. Gating on the CLOSED
+            # window's min_requests means a service whose throughput has dropped
+            # below min_requests / window_duration -- which is exactly what an
+            # open circuit causes -- can never accumulate enough probes to
+            # decide, and stays HALF_OPEN indefinitely.
+            probes = max(1, min(self.min_requests, self.half_open_min_requests))
+            if total >= probes and rate < (1 - self.success_threshold_rate):
                 self._state = CBState.CLOSED
                 self._opened_at = None
                 # Fresh metrics after recovery (resilience4j resets the sliding
                 # window on transition to CLOSED); otherwise half-open probe
                 # results would seed the closed-state failure rate.
                 self._clear_window()
-            elif total >= self.min_requests:
+            elif total >= probes:
                 self._state = CBState.OPEN
                 self._opened_at = now
                 self._clear_window()
-
-    def allow_request(self, now: TimePoint) -> bool:
-        # NOTE: half-open admits *every* request (no probe cap) — see CBState.HALF_OPEN.
-        if self._state != CBState.OPEN:
-            return True
-        if (
-            self._opened_at is None
-            or self.half_open_delay == 0
-            or now - self._opened_at >= self.half_open_delay
-        ):
-            self._state = CBState.HALF_OPEN
-            self._clear_window()
-            return True
-        return False
-
-    def next_delay(self, context: RetryContext) -> DelayDecision:
-        if self._state != CBState.CLOSED:
-            return DelayDecision(False, 0)
-
-        return self.underlying_strategy.next_delay(context)
 
 
 # By leaky we mean the leaky bucket as a queue version.
@@ -278,14 +366,36 @@ class LeakyRateLimiterPolicy(RetryPolicy):
     max_attempts: int  # total attempts including the initial try
     period: TimeDuration
 
-    _next_at: TimePoint | None = field(default=None, init=False)
+    def __post_init__(self):
+        if self.max_requests < 1:
+            raise ValueError(f"max_requests must be >= 1, got {self.max_requests}")
+        if self.max_attempts < 1:
+            raise ValueError(f"max_attempts must be >= 1, got {self.max_attempts}")
+        if self.period <= 0:
+            raise ValueError(f"period must be > 0 ns, got {self.period}")
+        self._interval = Fraction(self.period, self.max_requests)
+
+    # Next free slot, kept as an EXACT rational instant in ns. Rounding it every
+    # step dropped the same remainder each time, so the achieved spacing was
+    # floor(period / max_requests) and the bucket ran permanently fast whenever
+    # the division is not exact (3 per 100 ns spaced 33 ns apart admits four in
+    # [0, 100)). The emitted delay is still an integer number of nanoseconds.
+    _next_at: Fraction | None = field(default=None, init=False)
+    # Previous _next_at, so a vetoed retry can release the slot it reserved.
+    _prev_next_at: Fraction | None = field(default=None, init=False)
+    _slot_reserved: bool = field(default=False, init=False)
+    _interval: Fraction = field(default=Fraction(0), init=False, repr=False)
 
     def add_request(self, now: TimePoint) -> TimeDuration:
-        start_at = max(now, self._next_at or now)
-        delay = max(0, start_at - now)
+        reserved = self._next_at
+        start_at = reserved if reserved is not None and reserved > now else Fraction(now)
 
-        self._next_at = round(start_at + self.period / self.max_requests)
-        return delay
+        self._prev_next_at = self._next_at
+        self._slot_reserved = True
+        self._next_at = start_at + self._interval
+        # Retries are issued on integer-ns events, so a slot lands on the first
+        # instant at or after it — never before, which would admit early.
+        return max(0, math.ceil(start_at) - now)
 
     def next_delay(self, context: RetryContext) -> DelayDecision:
         if context.attempt >= self.max_attempts:
@@ -293,38 +403,116 @@ class LeakyRateLimiterPolicy(RetryPolicy):
         delay = self.add_request(context.now)
         return DelayDecision(True, delay)
 
+    def rollback(self, context: RetryContext) -> None:
+        if not self._slot_reserved:
+            return
+        self._next_at = self._prev_next_at
+        self._prev_next_at = None
+        self._slot_reserved = False
+
+
+class _ThrottledRetryPolicy(RetryPolicy):
+    """A wrapping policy that spends one unit of quota per ISSUED retry.
+
+    The charge/refund contract `ClientRuntime._on_attempt_done` relies on lives
+    here, in one place, for every quota-carrying policy: charge only on the path
+    that returns `allow=True` (the client asks for a delay before it knows the
+    global deadline will veto the retry), and refund exactly one unit when it
+    then declines. Subclasses supply the quota mechanics.
+
+    Not a dataclass, so it contributes no fields to its dataclass subclasses.
+    """
+
+    underlying_strategy: RetryPolicy
+
+    def _throttle_allows(self, now: TimePoint) -> bool:
+        """Whether the throttle has quota for one more retry."""
+        raise NotImplementedError
+
+    def _charge(self) -> None:
+        """Spend one unit of quota."""
+        raise NotImplementedError
+
+    def _refund(self) -> None:
+        """Give one unit back, capped at this throttle's ceiling."""
+        raise NotImplementedError
+
+    def next_delay(self, context: RetryContext) -> DelayDecision:
+        if not self._throttle_allows(context.now):
+            return DelayDecision(False, 0)
+        can_retry, delay = self.underlying_strategy.next_delay(context)
+        if not can_retry:
+            return DelayDecision(False, 0)
+        self._charge()
+        return DelayDecision(True, delay)
+
+    def rollback(self, context: RetryContext) -> None:
+        # Refund a withdrawal for a retry the client then declined to issue.
+        self._refund()
+
 
 @dataclass
-class RetryBudgetPolicy(RetryPolicy):
-    budget_ratio: float  # retries can be at most this ratio of successes (e.g., 0.1 for 10%)
+class RetryBudgetPolicy(_ThrottledRetryPolicy):
+    """Finagle-style retry budget: retries capped at `budget_ratio` of REQUESTS.
+
+    One deposit per admitted root request (`on_request_start`), one withdrawal
+    per retry (`next_delay`), refunded if the client then declines to issue it
+    (`rollback`) — the same deposit/tryWithdraw shape as Finagle's `RetryBudget`.
+
+    Deliberate divergence from Finagle: deposits here never expire. Finagle
+    ages them out on a TTL (default 60 s) so a long-idle client cannot bank
+    unlimited retry credit; this implementation caps the balance at
+    `max_retries` worth of tokens instead, which bounds the burst but not the
+    staleness. Adequate for episode-length simulations; would need the TTL to
+    model a long-lived client faithfully.
+
+    Note the denominator is *requests*, not *successes*. Depositing only on
+    success would enforce `retries <= ratio x successes`, which is strictly
+    tighter during exactly the failure storms a budget exists to damp, and does
+    not match the retries-per-root constraint the RL cost measures.
+    """
+
+    budget_ratio: float  # retries can be at most this ratio of requests (e.g., 0.1 for 10%)
     max_retries: int  # maximum consecutive retries before throttling
     underlying_strategy: RetryPolicy
 
     # Integer token bucket in units of 1/denominator of the (rationalized)
-    # ratio: one retry costs `denominator` tokens, each success awards
+    # ratio: one retry costs `denominator` tokens, each request deposits
     # `numerator`. Exact arithmetic — no float drift (cf. Finagle's integer
-    # RetryBudget deposit/withdraw); limit_denominator(10_000) recovers
-    # intended ratios like 1/3 from their float representations.
+    # RetryBudget deposit/withdraw); limit_denominator recovers intended ratios
+    # like 1/3 from their float representations.
     _retry_cost: int = field(init=False)
-    _success_award: int = field(init=False)
+    _deposit: int = field(init=False)
     _max_tokens: int = field(init=False)
     _tokens: int = field(init=False)
+
+    #: Rationalization bound. Wide enough that every ratio a caller can
+    #: plausibly mean survives it: at 10_000 anything below ~1/20000 rounded to
+    #: 0/1, which silently turned the budget into a one-shot allowance of
+    #: `max_retries` retries for the whole run — the same policy for 1e-5, 1e-7
+    #: and 1e-9 — and ratios just above that floor were off by tens of percent.
+    _MAX_RATIO_DENOMINATOR = 1_000_000_000
 
     def __post_init__(self):
         if not 0 < self.budget_ratio <= 1:
             raise ValueError("budget_ratio must be in (0, 1]")
         if self.max_retries < 1:
             raise ValueError("max_retries must be >= 1")
-        ratio = Fraction(self.budget_ratio).limit_denominator(10_000)
+        ratio = Fraction(self.budget_ratio).limit_denominator(self._MAX_RATIO_DENOMINATOR)
+        if ratio.numerator == 0:
+            raise ValueError(
+                f"budget_ratio {self.budget_ratio!r} is below the representable floor "
+                f"1/{self._MAX_RATIO_DENOMINATOR}: it would rationalize to a zero deposit, "
+                "so the budget would never refill"
+            )
         self._retry_cost = ratio.denominator
-        self._success_award = ratio.numerator
+        self._deposit = ratio.numerator
         self._max_tokens = self._retry_cost * self.max_retries
         self._tokens = self._max_tokens  # start with full budget
 
-    def add_result(self, success: bool, now: TimePoint | None = None) -> None:
-        # Add tokens for a successful request
-        if success:
-            self._tokens = min(self._max_tokens, self._tokens + self._success_award)
+    def on_request_start(self, now: TimePoint) -> None:
+        # One deposit per admitted request, regardless of how it turns out.
+        self._tokens = min(self._max_tokens, self._tokens + self._deposit)
 
     def can_retry(self) -> bool:
         return self._tokens >= self._retry_cost
@@ -333,18 +521,21 @@ class RetryBudgetPolicy(RetryPolicy):
         # Backward-compatible scale: 100 tokens == one retry, as before.
         return self._tokens / self._retry_cost * 100.0
 
-    def next_delay(self, context: RetryContext) -> DelayDecision:
-        if self.can_retry():
-            can_retry, delay = self.underlying_strategy.next_delay(context)
-            if can_retry:
-                self._tokens -= self._retry_cost
-                return DelayDecision(True, delay)
-            return DelayDecision(False, 0)
-        return DelayDecision(False, 0)
+    def _throttle_allows(self, now: TimePoint) -> bool:
+        return self.can_retry()
+
+    def _charge(self) -> None:
+        self._tokens -= self._retry_cost
+
+    def _refund(self) -> None:
+        # Capped balance: a refund after an intervening deposit clamps at the
+        # cap and mints quota. Only the immediate (deadline-veto) refund is
+        # exact — see supports_deferred_rollback.
+        self._tokens = min(self._max_tokens, self._tokens + self._retry_cost)
 
 
 @dataclass
-class BurstyRateLimiterPolicy(RetryPolicy):
+class BurstyRateLimiterPolicy(_ThrottledRetryPolicy):
     max_requests: int  # maximum requests in the bucket
     refill_rate: float  # requests added per period
     period: TimeDuration  # time period for refill calculations
@@ -376,18 +567,19 @@ class BurstyRateLimiterPolicy(RetryPolicy):
         self._refill_tokens(now)
         return self._tokens >= 1.0
 
-    def next_delay(self, context: RetryContext) -> DelayDecision:
-        if self.can_retry(context.now):
-            can_retry, delay = self.underlying_strategy.next_delay(context)
-            if can_retry:
-                self._tokens -= 1
-                return DelayDecision(True, delay)
-            return DelayDecision(False, 0)
-        return DelayDecision(False, 0)
+    def _throttle_allows(self, now: TimePoint) -> bool:
+        return self.can_retry(now)
+
+    def _charge(self) -> None:
+        self._tokens -= 1
+
+    def _refund(self) -> None:
+        # Capped, continuously refilling balance: see supports_deferred_rollback.
+        self._tokens = min(float(self.max_requests), self._tokens + 1.0)
 
 
 @dataclass
-class FixedWindowBurstyLimiterPolicy(RetryPolicy):
+class FixedWindowBurstyLimiterPolicy(_ThrottledRetryPolicy):
     max_requests: int  # maximum executions per period
     period: TimeDuration
     underlying_strategy: RetryPolicy
@@ -396,6 +588,10 @@ class FixedWindowBurstyLimiterPolicy(RetryPolicy):
     _window_start: TimePoint | None = field(default=None, init=False)
 
     def __post_init__(self):
+        if self.max_requests < 1:
+            raise ValueError(f"max_requests must be >= 1, got {self.max_requests}")
+        if self.period <= 0:
+            raise ValueError(f"period must be > 0 ns, got {self.period}")
         self._tokens = self.max_requests  # start with full tokens
 
     def _get_current_window_start(self, now: TimePoint) -> TimePoint:
@@ -417,14 +613,17 @@ class FixedWindowBurstyLimiterPolicy(RetryPolicy):
         current_window_start = self._get_current_window_start(now)
         return current_window_start + self.period
 
-    def next_delay(self, context: RetryContext) -> DelayDecision:
-        if self.can_retry(context.now):
-            can_retry, delay = self.underlying_strategy.next_delay(context)
-            if can_retry:
-                self._tokens -= 1
-                return DelayDecision(True, delay)
-            return DelayDecision(False, 0)
-        return DelayDecision(False, 0)
+    def _throttle_allows(self, now: TimePoint) -> bool:
+        return self.can_retry(now)
+
+    def _charge(self) -> None:
+        self._tokens -= 1
+
+    def _refund(self) -> None:
+        # Refunds land in the window the charge was made in: the client vetoes
+        # at the same simulated instant, so no window rollover intervenes. A
+        # later one would not — see supports_deferred_rollback.
+        self._tokens = min(self.max_requests, self._tokens + 1)
 
 
 # class HedgePolicy:

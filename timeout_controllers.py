@@ -68,6 +68,29 @@ class AdaptiveTimeoutController(TimeoutController):
     _current_attempt_timeout: TimeDuration | None = field(default=None, init=False)
 
     def __post_init__(self):
+        # Reject a self-contradictory configuration instead of silently serving
+        # or silently clamping it. `initial_attempt_timeout` is handed out
+        # verbatim until enough SUCCESSFUL samples accumulate, so an initial
+        # outside the bounds escapes them for that whole window — while every
+        # adaptation path applies them. Clamping instead would override an
+        # operator's explicit setting, so this validates at construction, the
+        # way resilience4j checks its timeout config.
+        if self.min_timeout < 0:
+            raise ValueError(f"min_timeout must be >= 0 ns, got {self.min_timeout}")
+        if self.max_timeout is not None and self.max_timeout < self.min_timeout:
+            raise ValueError(
+                f"max_timeout ({self.max_timeout} ns) must be >= "
+                f"min_timeout ({self.min_timeout} ns)"
+            )
+        if self.initial_attempt_timeout is not None:
+            above_max = (
+                self.max_timeout is not None and self.initial_attempt_timeout > self.max_timeout
+            )
+            if self.initial_attempt_timeout < self.min_timeout or above_max:
+                raise ValueError(
+                    f"initial_attempt_timeout ({self.initial_attempt_timeout} ns) must lie within "
+                    f"[{self.min_timeout}, {self.max_timeout}] ns"
+                )
         self._latencies = deque(maxlen=self.window_size)
         self._successes = deque(maxlen=self.success_rate_window)
         self._current_global_timeout = self.initial_global_timeout
@@ -99,6 +122,28 @@ class AdaptiveTimeoutController(TimeoutController):
         """Update current timeout values based on collected metrics"""
         percentile_timeout = self._calculate_percentile_timeout()
         success_rate = self._get_success_rate()
+
+        if percentile_timeout is None:
+            # Not enough SUCCESSFUL samples to estimate a percentile. That is
+            # exactly the state a too-short timeout produces, and the old code
+            # returned here — so the timeout froze at its initial value and the
+            # controller could never escape. Inflate off the current value
+            # instead, which is the one signal available.
+            if (
+                success_rate < self.min_success_rate
+                and self._successes
+                and self.initial_attempt_timeout is not None
+            ):
+                # Inflate off the INITIAL timeout, never off the already-inflated
+                # current value: compounding turned 10 ms into 100 s in four
+                # windows, and max_timeout is unbounded by default. This is a
+                # bounded cold-start nudge (at most 10x, the success_rate floor),
+                # not a control loop.
+                inflated = int(self.initial_attempt_timeout / max(success_rate, 0.1))
+                if self.max_timeout is not None:
+                    inflated = min(inflated, self.max_timeout)
+                self._current_attempt_timeout = max(inflated, self.min_timeout)
+            return
 
         if percentile_timeout is not None:
             # If success rate is low, increase timeout

@@ -27,7 +27,6 @@ from scipy.stats import ttest_rel
 from rl.cli import parse_float_list, parse_int_list
 from rl.constrained import (
     ConstrainedTrainConfig,
-    objective_from_summary,
     train_constrained_ppo,
 )
 from rl.env import (
@@ -40,10 +39,20 @@ from rl.env import (
 )
 from rl.policies.action_space import ActionGrid
 from rl.policies.fixed import FixedPolicy
+from rl.rollout import mean_ignoring_nan, policy_actor, run_episode
 from rl.sb3_support import import_sb3
-from rl.spec import RewardWeights
+from rl.spec import (
+    DEFAULT_ATTEMPT_TIMEOUTS_MS,
+    DEFAULT_BACKOFF_MS,
+    DEFAULT_EVAL_SEEDS,
+    DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_TRAIN_SEEDS,
+    RewardWeights,
+)
 
-PPO, _, _, _, _SB3_IMPORT_ERROR = import_sb3()
+_SB3 = import_sb3()
+PPO = _SB3.ppo
+_SB3_IMPORT_ERROR = _SB3.import_error
 
 BASE_WEIGHTS = RewardWeights()
 
@@ -92,44 +101,34 @@ def _eval_arm(
     bystander_successes: list[float] = []
 
     for seed in seeds:
-        obs, info = env.reset(seed=seed)
         policy.reset(seed=seed)
-        terminated = truncated = False
-        episode_objective = 0.0
-        episode_costs: list[float] = []
-        while not (terminated or truncated):
-            action = policy.act(obs, info)
-            obs, _reward, terminated, truncated, info = env.step(action)
-            summary = info["summary"]
-            episode_objective += objective_from_summary(summary, BASE_WEIGHTS)
-            episode_costs.append(summary["cost"])
-        cost_mean = float(np.mean(episode_costs)) if episode_costs else 0.0
-        objectives.append(episode_objective)
+        result = run_episode(env, policy_actor(policy), seed=seed)
+        cost_mean = result.pooled_cost
+        objectives.append(result.objective(BASE_WEIGHTS))
         costs.append(cost_mean)
         if budget is not None:
             violations.append(1.0 if cost_mean > budget else 0.0)
-        metrics = env.metrics_summary()
-        if metrics:
-            successes.append(metrics.succeeded / metrics.total if metrics.total else 0.0)
-            p95s.append(metrics.p95)
-        horizon = env.in_horizon_summary()
-        if horizon:
-            successes_horizon.append(horizon.succeeded / horizon.total if horizon.total else 0.0)
-            p95s_horizon.append(horizon.p95)
-        bystander = env.bystander_metrics_summary()
+        if result.metrics:
+            successes.append(result.success_rate(in_horizon=False))
+            p95s.append(result.metrics.p95)
+        if result.in_horizon:
+            successes_horizon.append(result.success_rate(in_horizon=True))
+            p95s_horizon.append(result.in_horizon.p95)
+        bystander = result.bystander_success_rate()
         if bystander is not None:
-            bystander_successes.append(
-                bystander.succeeded / bystander.total if bystander.total else 0.0
-            )
+            bystander_successes.append(bystander)
 
     result: dict[str, object] = {
         "J_mean": float(np.mean(objectives)),
         "J_std": float(np.std(objectives)),
         "success_rate": float(np.mean(successes)) if successes else 0.0,
-        "p95_ms": float(np.mean(p95s)) if p95s else 0.0,
+        # Percentiles are nan for a seed whose episode had no successful root
+        # (Metrics.summary reports missing data as nan, not 0 ms); averaging
+        # them plainly would void the cell for every other seed as well.
+        "p95_ms": mean_ignoring_nan(p95s),
         # Full-population above (incl. drained roots); reward-visible below.
         "success_rate_in_horizon": float(np.mean(successes_horizon)) if successes_horizon else 0.0,
-        "p95_ms_in_horizon": float(np.mean(p95s_horizon)) if p95s_horizon else 0.0,
+        "p95_ms_in_horizon": mean_ignoring_nan(p95s_horizon),
         "cost_mean": float(np.mean(costs)),
         "violation_rate": float(np.mean(violations)) if violations else "",
         # Empty when the scenario has no bystander chain (CSV-shape convention
@@ -171,6 +170,14 @@ def _run_calibration(
     a bystander chain exists) the agent's retries must measurably hurt it.
     Returns True when every applicable criterion passes.
     """
+    # Check the grid up front, not after minutes of sweeping: criteria (a), (d)
+    # and (e) are all stated against a no-retry baseline, and ActionSpec happily
+    # accepts a max_attempts list that omits 1 (e.g. `--max-attempts 2,3`).
+    if not any(grid.values_for(idx).max_attempts == 1 for idx in grid.indices):
+        raise SystemExit(
+            "--calibrate needs a no-retry baseline: none of the actions in this "
+            "grid has max_attempts == 1. Add 1 to --max-attempts."
+        )
     print(f"[calibrate] sweeping {len(grid.indices)} fixed actions on seeds {list(oracle_seeds)}")
     sweep: list[tuple[tuple[int, ...], dict]] = []
     for action_idx in grid.indices:
@@ -203,8 +210,16 @@ def _run_calibration(
     # Feasible optimum per budget, selected on the sweep's cost (as arm C's
     # oracle would see it), re-evaluated on the eval seeds for tighter stats.
     feasible: dict[float, dict] = {}
+    cheapest = min(item[1]["cost_mean"] for item in sweep)
     for budget in sorted(budgets):
         candidates = [item for item in sweep if item[1]["cost_mean"] <= budget]
+        if not candidates:
+            # Unreachable for a non-negative budget once a no-retry action is in
+            # the grid (its cost is exactly 0), so this is a bad --budgets value.
+            raise SystemExit(
+                f"budget {budget} is infeasible: the cheapest action in this grid "
+                f"costs {cheapest:.3f}. Raise --budgets or widen --max-attempts."
+            )
         idx, _ = max(candidates, key=lambda item: item[1]["J_mean"])
         feasible[budget] = re_eval(idx)
 
@@ -282,7 +297,9 @@ def _run_calibration(
     return all_passed
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
+    """`argv` defaults to sys.argv; taking it explicitly makes the entry
+    point callable from a test without patching sys.argv."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", choices=sorted(SCENARIO_TO_BUILDER), default="chain")
     parser.add_argument("--budgets", type=parse_float_list, default=[0.05, 0.1, 0.2])
@@ -294,15 +311,15 @@ def main() -> None:
     parser.add_argument("--lambda-init", type=float, default=0.0)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--train-seed", type=int, default=123)
-    parser.add_argument("--oracle-seeds", type=parse_int_list, default="123,456,789")
+    # Same seed populations as rl.experiments.compare_policies: the two studies
+    # are only comparable when their arms are evaluated on the same seeds.
+    parser.add_argument("--oracle-seeds", type=parse_int_list, default=DEFAULT_TRAIN_SEEDS)
+    parser.add_argument("--eval-seeds", type=parse_int_list, default=DEFAULT_EVAL_SEEDS)
     parser.add_argument(
-        "--eval-seeds",
-        type=parse_int_list,
-        default="321,654,987,1320,1653,1986,2319,2652,2985,3318",
+        "--attempt-timeouts-ms", type=parse_int_list, default=list(DEFAULT_ATTEMPT_TIMEOUTS_MS)
     )
-    parser.add_argument("--attempt-timeouts-ms", type=parse_int_list, default=[10, 30, 50, 80])
-    parser.add_argument("--max-attempts", type=parse_int_list, default=[1, 2, 3])
-    parser.add_argument("--backoff-ms", type=parse_int_list, default=[0, 20, 50])
+    parser.add_argument("--max-attempts", type=parse_int_list, default=list(DEFAULT_MAX_ATTEMPTS))
+    parser.add_argument("--backoff-ms", type=parse_int_list, default=list(DEFAULT_BACKOFF_MS))
     parser.add_argument(
         "--output-csv",
         type=str,
@@ -318,7 +335,7 @@ def main() -> None:
         help="grid-sweep fixed policies and verify the scenario supports a "
         "binding retry budget, then exit without training",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     builder = SCENARIO_TO_BUILDER[args.scenario]
     output_csv = args.output_csv or f"rl_constrained_comparison_{args.scenario}.csv"
@@ -338,8 +355,10 @@ def main() -> None:
     plain_env = _make_env(plain_build, action_spec, args.episode_duration_s)
 
     if args.calibrate:
-        _run_calibration(plain_env, grid, args.oracle_seeds, args.eval_seeds, args.budgets)
-        return
+        # The gate's verdict is the point of the mode: propagate it as the exit
+        # status instead of always reporting success.
+        passed = _run_calibration(plain_env, grid, args.oracle_seeds, args.eval_seeds, args.budgets)
+        raise SystemExit(0 if passed else 1)
 
     if PPO is None:
         raise ImportError(

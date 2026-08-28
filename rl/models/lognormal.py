@@ -64,12 +64,6 @@ class LogNormalModel:
     def sample(self, rng: np.random.Generator, size: int) -> np.ndarray:
         return rng.lognormal(mean=self.mu, sigma=self.sigma, size=size)
 
-    def moments(self) -> tuple[float, float]:
-        s2 = self.sigma * self.sigma
-        mean = math.exp(self.mu + 0.5 * s2)
-        second = math.exp(2.0 * self.mu + 2.0 * s2)
-        return mean, second
-
     def params(self) -> dict[str, float]:
         return {"mu": self.mu, "sigma": self.sigma}
 

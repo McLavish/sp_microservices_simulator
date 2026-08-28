@@ -15,22 +15,60 @@ together. Always export both from the same run.
 
 ## `Metrics` (`metrics.py`)
 
-Construct via `client.metrics()` (it wraps `roots` + `attempts_total`).
+Construct via `client.metrics()` (it wraps `roots` plus the client's lifetime
+attempt counter, readable as `Metrics.client_attempts_total()`). That counter is
+a *different population* from `roots` — clients bump it at attempt **start**
+while roots are appended at **completion** — so no `Summary` field is derived
+from it.
 
-### `summary()` (`metrics.py:39`)
+### One outcome table (`core.py`)
 
-Returns a `Summary` (`core.py:79`): `total`, `succeeded`, `dropped_*` by reason,
+`classify_root(root)` (`core.py`) is the single classifier: it returns a
+`RootOutcome`, and `Metrics.summary`, `Metrics.export_csv` and the RL env's
+`_summarize_roots` all book roots by its answer rather than re-deriving the
+rules.
+
+`core.FAILURE_OUTCOMES` then maps each **non-success** outcome to where it is
+reported: the `Summary` field it increments, the `export_csv` column that books
+it, and the label `print_stats` prints. Every one of those lists is generated
+from that mapping, in its declaration order — which is what fixes the CSV
+header, so appending an outcome is safe and reordering rewrites it.
+
+Adding a `RootOutcome` member is therefore two edits, and both are forced:
+`core.py` raises at import if the new member has no `FAILURE_OUTCOMES` entry (or
+if an entry names a `Summary` field that does not exist), and `rl/env.py` raises
+at import if its `_OUTCOME_RATE_KEYS` table — the env needs rate keys, not CSV
+column names — has no key for it. Consumers outside `core` get that check by
+calling `core.require_outcome_coverage(table, owner=...)` next to their own
+table. `plotting/failures_over_time.py` derives its `REASON_COLUMNS` from the
+same table (it still tolerates a column missing from an older CSV), so a new
+outcome flows into the failure-mix figure without a manual edit.
+
+### `summary()` (`metrics.py`)
+
+Returns a `Summary` (`core.py`): `total`, `succeeded`, `dropped_*` by reason,
 latency percentiles `p50..p99_99`, `mean`, `max`, `retries_per_root`,
-`attempts_total`. Notes:
+`attempts_total`. Every field, `attempts_total` included, is computed over the
+roots being summarized (`Metrics.attempts_on_roots()`). Notes:
 
 - A root's **latency is wall-clock**: `max(attempt.end) - min(attempt.begin)`, i.e.
   including queueing and every retry, counted only for **successful** roots.
 - A failed root is attributed to its **last attempt's** `drop_reason`.
-- `retries_per_root = (attempts_total - total) / total`.
+- `retries_per_root = (attempts on the summarized roots - total) / total`.
+  Counted over the roots being summarized, not the client's lifetime attempt
+  counter — those disagree whenever work is still in flight (a mid-run export,
+  or the RL env's in-horizon population).
+- `dropped_cancelled` counts roots abandoned by an upstream cancellation. It is
+  deliberately its own bucket, NOT folded into the other `dropped_*` counts:
+  cancelled work did not fail, and charging it to a failure category would count
+  one root cause once where it failed and again at every sibling it cancelled.
+- `mean` / `max` are `nan` when no successful root completed, matching the
+  percentiles. They are not 0, which would make an empty window read as a
+  perfect one.
 
-`print_stats()` (`metrics.py:95`) dumps the summary to stdout.
+`print_stats()` (`metrics.py`) dumps the summary to stdout.
 
-### `export_csv(path, granularity_s=1.0)` (`metrics.py:113`)
+### `export_csv(path, granularity_s=1.0)` (`metrics.py`)
 
 Writes one row per time bucket (default 1 s). `granularity_s` must round to at
 least 1 ns (values below 5e-10 s raise `ValueError`); the `timepoint` column is
@@ -50,7 +88,8 @@ The subtlety is **which event time a column is bucketed by** — start vs. end:
 | `completed` | end | all attempts ending in the bucket |
 | `failure_root` | end | failed roots completing in the bucket |
 | `failure_retry` | end | failed *retry* attempts ending in the bucket |
-| `failure_queue_full` / `failure_deadline` / `failure_server` / `failure_circuit_open` | end | failed roots by final drop reason |
+| `failure_queue_full` / `failure_deadline` / `failure_server` / `failure_circuit_open` | end | failed roots by final drop reason (generated from `core.FAILURE_OUTCOMES`, in its order) |
+| `failure_cancelled` | end | roots abandoned by an upstream cancellation (see `propagate_cancellation`); abandoned, not failed |
 | `total_request` | start (cumulative) | running sum of started roots |
 | `total_failure` | end (cumulative) | running sum of failed roots |
 | `p50 p90 p95 p99 p99.9 p99.99 min max` | end | latency stats over **successful roots** completing in the bucket (ms) |
@@ -72,13 +111,23 @@ With `--fault-events`, the active fault windows are shaded/annotated over the se
 | `latencies_over_time` | `p50/p90/p95/p99/max` | latency percentile bands over time |
 | `qps_over_time` | `root_requests`, `retries`, `failure_root` | throughput, retries, failures over time |
 | `queue_size_over_time` | `queue_avg_at_attempt_end` | average queue depth over time |
-| `latency_distribution` | *(none — synthetic)* | lognormal PDF/CDF for `--median-ms` / `--sigma` |
+| `latency_distribution` | *(none — synthetic)* | lognormal PDF/CDF for `--median` (ms) / `--sigma` |
+| `rl_traces_over_time` | trace CSV from `compare_policies` | per-step knob + success-rate traces (`--seed`, `--policies`) |
+| `rl_pareto` | `rl_constrained_comparison*.csv` | goodput-vs-amplification Pareto (+ bystander panel) |
 
 Each script writes a PNG via `--output`/`-o` (defaults: `latencies_over_time.png`,
 `qps_over_time.png`, `queue_size_over_time.png`, `latency_distribution.png`, and
 `reasons_and_request_amplification.png` for `failures_over_time`).
-`latency_distribution` takes `--median-ms` and `--sigma` instead of a CSV.
+`latency_distribution` takes `--median` (in milliseconds) and `--sigma` instead of a
+CSV; both must be finite and positive — degenerate values used to render a blank
+figure and still report it as saved.
 `plot.sh` batch-renders the standard chain figures.
+
+Selectors and overlays fail loudly rather than rendering an empty-but-plausible
+figure: a missing `--fault-events` file, an unknown fault `event_type` in that JSON,
+and an unmatched `--seed`/`--policies` in `rl_traces_over_time` all exit with a
+message naming what *is* available. Buckets in which no root completed are drawn as
+a gap, never as a 0% failure rate.
 
 ### Example
 
@@ -94,3 +143,20 @@ python -m plotting.latencies_over_time output.csv --fault-events fault_events.js
   tracker that produces the overlay JSON.
 - [experiments](experiments.md) — what each scenario writes (filenames differ per
   experiment).
+
+## Mutation record
+
+Behaviours below were, at some point, changed in the source without any test
+failing. Each now has a guard; re-run these after a significant change to the
+event loop, the queue, or the metrics path. `tests/test_golden_and_invariants.py`
+is where they are pinned.
+
+| Mutation | Caught by |
+| --- | --- |
+| `service.py` `heapq.heappop(self.queue)` → LIFO pop | `test_service_is_fcfs`, both golden runs |
+| `service.py` `add += inj.add_latency` → `add += 0` | `test_additive_latency_applies_inside_its_window` |
+| `simulator.py` `seq=self._seq` → `seq=-self._seq` | `test_fanout_golden` (needs contention: with every request succeeding, tie order is unobservable) |
+
+The golden tests are brittle on purpose. A diff means the simulator's numbers
+moved, which invalidates figures produced with the old behaviour — establish
+why before updating the expected values.

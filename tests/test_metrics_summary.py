@@ -1,9 +1,22 @@
 import csv
 import tempfile
 import unittest
+from enum import Enum, auto
 from pathlib import Path
+from unittest import mock
 
-from core import DropReason, Request, RootRequest, TimeInterval, ms_to_ns, s_to_ns
+import core
+from core import (
+    FAILURE_OUTCOMES,
+    DropReason,
+    Request,
+    RootOutcome,
+    RootRequest,
+    TimeInterval,
+    ms_to_ns,
+    require_outcome_coverage,
+    s_to_ns,
+)
 from metrics import Metrics
 
 
@@ -84,6 +97,47 @@ class TestMetricsSummary(unittest.TestCase):
                 rows = list(csv.DictReader(f))
 
         self.assertEqual(rows[0]["timepoint"], "5.000")
+
+
+class TestSummaryPopulation(unittest.TestCase):
+    """Every Summary field is computed over the roots being summarized.
+
+    `attempts_total` used to be a pass-through of whatever the constructor was
+    handed, and the three construction sites hand it different populations: a
+    client's LIFETIME counter (bumped at attempt start, while roots are
+    appended at completion), the attempts on these roots, or a sum of lifetime
+    counters across clients. A consumer computing amplification as
+    `attempts_total / total` therefore got `retries_per_root + 1` from one site
+    and an in-flight-inflated number from another, while `print_stats` printed
+    the two side by side as if they agreed.
+    """
+
+    def _root(self, attempts: int) -> RootRequest:
+        return RootRequest(
+            attempts=[
+                Request(
+                    service="svc",
+                    interval=TimeInterval(begin=i * 10, end=i * 10 + 10),
+                    success=(i == attempts - 1),
+                    drop_reason=DropReason.NONE if i == attempts - 1 else DropReason.DEADLINE,
+                )
+                for i in range(attempts)
+            ]
+        )
+
+    def test_attempts_total_counts_the_summarized_roots_not_the_client_counter(self):
+        # 17 attempts started lifetime-wide; 2 recorded on the one root here.
+        metrics = Metrics(roots=[self._root(2)], attempts_total=17)
+        summary = metrics.summary()
+
+        self.assertEqual(summary.attempts_total, 2)
+        self.assertAlmostEqual(summary.retries_per_root, 1.0)
+
+    def test_both_populations_stay_readable_under_distinct_names(self):
+        metrics = Metrics(roots=[self._root(2)], attempts_total=17)
+
+        self.assertEqual(metrics.attempts_on_roots(), 2)
+        self.assertEqual(metrics.client_attempts_total(), 17)
 
 
 class TestTiedFinalAttempts(unittest.TestCase):
@@ -167,6 +221,77 @@ class TestExportGranularity(unittest.TestCase):
 
             df = pd.read_csv(path)
             self.assertEqual(df["timepoint"].nunique(), len(df))
+
+
+class _NewOutcome(Enum):
+    """A `RootOutcome` member no consumer table knows about yet."""
+
+    THROTTLED = auto()
+
+
+class _ExtendedRootOutcome:
+    """`core.RootOutcome` with one member added.
+
+    Python forbids subclassing an enum that already has members, and
+    `require_outcome_coverage` looks `RootOutcome` up as a module global on
+    every call — so patching this stand-in over it is what growing the enum
+    looks like from inside the guard.
+    """
+
+    SUCCESS = RootOutcome.SUCCESS
+
+    def __iter__(self):
+        yield from RootOutcome
+        yield _NewOutcome.THROTTLED
+
+
+class TestOutcomeCoverageGuard(unittest.TestCase):
+    """A consumer table missing a non-success outcome must fail loudly.
+
+    The guard is what turns "new RootOutcome silently booked as a server drop"
+    into an import-time error, so it must reject an incomplete mapping and not
+    compare a table against itself: `core.FAILURE_OUTCOMES` is one of its own
+    callers, so checking a mapping against that table instead of against the
+    enum would pass unconditionally — the silent no-op this guard exists to
+    prevent.
+    """
+
+    def test_complete_mapping_passes(self):
+        require_outcome_coverage(FAILURE_OUTCOMES, owner="test")
+
+    def test_missing_outcome_is_named(self):
+        incomplete = dict(FAILURE_OUTCOMES)
+        del incomplete[RootOutcome.CANCELLED]
+        with self.assertRaises(RuntimeError) as ctx:
+            require_outcome_coverage(incomplete, owner="tests.incomplete_table")
+        self.assertIn("CANCELLED", str(ctx.exception))
+        self.assertIn("tests.incomplete_table", str(ctx.exception))
+
+    def test_a_new_enum_member_fails_even_the_core_table(self):
+        # The whole point: adding an outcome must break the tables that predate
+        # it, FAILURE_OUTCOMES included. A guard comparing a mapping against
+        # itself (or against FAILURE_OUTCOMES) sees nothing here.
+        with (
+            mock.patch.object(core, "RootOutcome", _ExtendedRootOutcome()),
+            self.assertRaises(RuntimeError) as ctx,
+        ):
+            require_outcome_coverage(FAILURE_OUTCOMES, owner="core.FAILURE_OUTCOMES")
+        message = str(ctx.exception)
+        self.assertIn("THROTTLED", message)
+        self.assertNotIn("DEADLINE", message)
+
+    def test_success_entry_cannot_stand_in_for_a_missing_failure(self):
+        # SUCCESS needs no entry, and having one is harmless...
+        padded = dict(FAILURE_OUTCOMES)
+        padded[RootOutcome.SUCCESS] = FAILURE_OUTCOMES[RootOutcome.DEADLINE]
+        require_outcome_coverage(padded, owner="test")
+
+        # ... but it must not pay for a missing failure outcome: this table is
+        # the same SIZE as the complete one and still misses DEADLINE.
+        del padded[RootOutcome.DEADLINE]
+        with self.assertRaises(RuntimeError) as ctx:
+            require_outcome_coverage(padded, owner="tests.success_padded_table")
+        self.assertIn("DEADLINE", str(ctx.exception))
 
 
 if __name__ == "__main__":

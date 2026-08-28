@@ -2,14 +2,23 @@ from __future__ import annotations
 
 import argparse
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from rl.cli import parse_int_list, parse_optional_int_list
 from rl.env import SCENARIO_BUILDERS, ActionSpec, EnvConfig, MicroservicesEnv
 from rl.model_io import check_action_spec, save_action_spec
+from rl.rollout import model_actor, run_episode
 from rl.sb3_support import import_sb3
+from rl.spec import (
+    DEFAULT_ATTEMPT_TIMEOUTS_MS,
+    DEFAULT_BACKOFF_MS,
+    DEFAULT_MAX_ATTEMPTS,
+)
 
-PPO, make_vec_env, _, SubprocVecEnv, _SB3_IMPORT_ERROR = import_sb3()
+_SB3 = import_sb3()
+PPO, make_vec_env, SubprocVecEnv = _SB3.ppo, _SB3.make_vec_env, _SB3.subproc_vec_env
+_SB3_IMPORT_ERROR = _SB3.import_error
 
 
 @dataclass
@@ -63,21 +72,20 @@ def _evaluate(model, cfg: TrainConfig) -> None:
     total_rewards: list[float] = []
     for ep in range(cfg.eval_episodes):
         env = _make_env(cfg)
-        obs, _ = env.reset(seed=cfg.seed + 1000 + ep)
-        terminated = False
-        truncated = False
-        ep_reward = 0.0
-        last_info = {}
-        while not (terminated or truncated):
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
-            ep_reward += float(reward)
-            last_info = info
-
-        total_rewards.append(ep_reward)
-        summary = last_info.get("summary", {})
-        action = last_info.get("action", {})
-        print(f"[eval] episode={ep} reward={ep_reward:.4f} action={action} summary={summary}")
+        result = run_episode(env, model_actor(model), seed=cfg.seed + 1000 + ep)
+        total_rewards.append(result.total_reward)
+        # The per-window summary is NOT an episode aggregate — it is recomputed
+        # each step over that window's completions — so report the episode-level
+        # figures explicitly and label the window as a window.
+        last = result.windows[-1] if result.windows else None
+        episode_success = result.success_rate(in_horizon=True)
+        print(
+            f"[eval] episode={ep} reward={result.total_reward:.4f} "
+            f"success_rate_in_horizon={episode_success:.4f} "
+            f"cost_pooled={result.pooled_cost:.4f} "
+            f"action={last.action_values if last else {}} "
+            f"last_window_summary={last.summary if last else {}}"
+        )
 
     if total_rewards:
         avg = sum(total_rewards) / len(total_rewards)
@@ -101,7 +109,7 @@ def train(cfg: TrainConfig) -> None:
     )
 
     if cfg.load_path:
-        check_action_spec(cfg.load_path, _action_spec(cfg))
+        check_action_spec(cfg.load_path, _action_spec(cfg), cfg.step_duration_s)
         model = PPO.load(cfg.load_path, env=vec_env, device=cfg.device)
     else:
         model = PPO(
@@ -139,9 +147,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-envs", type=int, default=1)
     parser.add_argument("--step-duration-s", type=float, default=1.0)
     parser.add_argument("--episode-duration-s", type=float, default=10.0)
-    parser.add_argument("--attempt-timeouts-ms", type=parse_int_list, default=[10, 30, 50, 80])
-    parser.add_argument("--max-attempts", type=parse_int_list, default=[1, 2, 3])
-    parser.add_argument("--backoff-ms", type=parse_int_list, default=[0, 20, 50])
+    parser.add_argument(
+        "--attempt-timeouts-ms", type=parse_int_list, default=list(DEFAULT_ATTEMPT_TIMEOUTS_MS)
+    )
+    parser.add_argument("--max-attempts", type=parse_int_list, default=list(DEFAULT_MAX_ATTEMPTS))
+    parser.add_argument("--backoff-ms", type=parse_int_list, default=list(DEFAULT_BACKOFF_MS))
     parser.add_argument("--global-timeouts-ms", type=parse_optional_int_list, default=None)
     parser.add_argument("--n-steps", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -159,9 +169,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
+    """`argv` defaults to sys.argv; taking it explicitly makes the entry
+    point callable from a test without patching sys.argv."""
     parser = _build_arg_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     cfg = TrainConfig(
         timesteps=args.timesteps,

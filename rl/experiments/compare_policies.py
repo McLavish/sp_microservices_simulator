@@ -1,12 +1,12 @@
 import argparse
 import csv
+import os
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
 
-from core import Summary
 from rl.cli import parse_int_list, parse_optional_int_list
 from rl.constrained import ConstrainedTrainConfig, train_constrained_ppo
 from rl.env import (
@@ -23,9 +23,19 @@ from rl.policies.bayesian import BayesianPolicy
 from rl.policies.fixed import FixedPolicy, FixedValuePolicy
 from rl.policies.model_based import ModelBasedPolicy
 from rl.policies.sb3 import SB3Policy
+from rl.rollout import EpisodeResult, mean_ignoring_nan, policy_actor, run_episode
 from rl.sb3_support import import_sb3
+from rl.spec import (
+    DEFAULT_ATTEMPT_TIMEOUTS_MS,
+    DEFAULT_BACKOFF_MS,
+    DEFAULT_EVAL_SEEDS,
+    DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_TRAIN_SEEDS,
+)
 
-PPO, make_vec_env, _sb3_evaluate, _SubprocVecEnv, _ = import_sb3()
+_SB3 = import_sb3()
+PPO, make_vec_env = _SB3.ppo, _SB3.make_vec_env
+_SB3_IMPORT_ERROR = _SB3.import_error
 
 
 @dataclass
@@ -94,48 +104,43 @@ def _episode(
     policy,
     seed: int,
     trace_rows: list[dict] | None = None,
-) -> tuple[float, Summary | None, Summary | None, float]:
-    obs, info = env.reset(seed=seed)
+) -> EpisodeResult:
     policy.reset(seed=seed)
-    total_reward = 0.0
-    terminated = False
-    truncated = False
-    step_idx = 0
-    window_costs: list[float] = []
-    while not (terminated or truncated):
-        action = policy.act(obs, info)
-        obs, reward, terminated, truncated, info = env.step(action)
-        total_reward += float(reward)
-        summary = info["summary"]
-        window_costs.append(summary["cost"])
-        if trace_rows is not None:
-            applied = info["action"]
-            trace_rows.append(
-                {
-                    "policy": policy.name,
-                    "seed": seed,
-                    "step": step_idx,
-                    "step_duration_s": env.step_duration_s,
-                    "attempt_timeout_ms": applied["attempt_timeout_ms"],
-                    "max_attempts": applied["max_attempts"],
-                    "backoff_ms": applied["backoff_ms"],
-                    "global_timeout_ms": applied["global_timeout_ms"],
-                    "reward": float(reward),
-                    "completed": summary["completed"],
-                    "success_rate": summary["success_rate"],
-                    "deadline_drop_rate": summary["deadline_drop_rate"],
-                    "queue_drop_rate": summary["queue_drop_rate"],
-                    "server_drop_rate": summary["server_drop_rate"],
-                    "p95_latency_ms": summary["p95_latency_ms"],
-                    "retries_per_root": summary["retries_per_root"],
-                    "cost": summary["cost"],
-                }
-            )
-        step_idx += 1
-        policy.update(obs, reward, terminated or truncated, info)
-
-    cost_mean = float(np.mean(window_costs)) if window_costs else 0.0
-    return total_reward, env.metrics_summary(), env.in_horizon_summary(), cost_mean
+    result = run_episode(
+        env,
+        policy_actor(policy),
+        seed=seed,
+        on_step=lambda obs, reward, done, info: policy.update(obs, reward, done, info),
+    )
+    if trace_rows is not None:
+        # Trace rows are this caller's business; the loop and the aggregations
+        # that must agree across callers live in rl.rollout.
+        trace_rows.extend(
+            {
+                "policy": policy.name,
+                "seed": seed,
+                "step": window.step,
+                "step_duration_s": env.step_duration_s,
+                "attempt_timeout_ms": window.action_values["attempt_timeout_ms"],
+                "max_attempts": window.action_values["max_attempts"],
+                "backoff_ms": window.action_values["backoff_ms"],
+                "global_timeout_ms": window.action_values["global_timeout_ms"],
+                "reward": window.reward,
+                "completed": window.summary["completed"],
+                "success_rate": window.summary["success_rate"],
+                "deadline_drop_rate": window.summary["deadline_drop_rate"],
+                "queue_drop_rate": window.summary["queue_drop_rate"],
+                "server_drop_rate": window.summary["server_drop_rate"],
+                "p95_latency_ms": window.summary["p95_latency_ms"],
+                "retries_per_root": window.summary["retries_per_root"],
+                "cost": window.summary["cost"],
+            }
+            for window in result.windows
+        )
+    # Return the shared result itself: flattening it into a positional tuple is
+    # what forced this module to re-implement EpisodeResult.success_rate inline
+    # and put bystander_success_rate()/drained_summary out of reach.
+    return result
 
 
 def _evaluate(
@@ -153,32 +158,34 @@ def _evaluate(
     costs = []
 
     for seed in seeds:
-        total_reward, summary, horizon, cost_mean = _episode(
-            env, policy, seed, trace_rows=trace_rows
-        )
-        rewards.append(total_reward)
-        costs.append(cost_mean)
-        if summary:
-            successes.append(summary.succeeded / summary.total if summary.total else 0.0)
-            p95s.append(summary.p95)
-            retries.append(summary.retries_per_root)
-        if horizon:
-            successes_horizon.append(horizon.succeeded / horizon.total if horizon.total else 0.0)
-            p95s_horizon.append(horizon.p95)
+        result = _episode(env, policy, seed, trace_rows=trace_rows)
+        rewards.append(result.total_reward)
+        costs.append(result.pooled_cost)
+        if result.metrics:
+            # Through the shared accessor, so this path and _eval_arm cannot
+            # drift on what "success rate over a population" means.
+            successes.append(result.success_rate(in_horizon=False))
+            p95s.append(result.metrics.p95)
+            retries.append(result.metrics.retries_per_root)
+        if result.in_horizon:
+            successes_horizon.append(result.success_rate(in_horizon=True))
+            p95s_horizon.append(result.in_horizon.p95)
 
     def avg(values: list[float]) -> float:
         return float(np.mean(values)) if values else 0.0
 
     # success_rate / p95_ms keep their historical full-population meaning
     # (incl. drained roots); the *_in_horizon columns cover exactly the roots
-    # the reward saw.
+    # the reward saw. Percentiles go through mean_ignoring_nan: a seed with no
+    # successful root reports p95 as nan by design, and plain averaging would
+    # void the cell for every other seed too.
     return {
         "reward_mean": avg(rewards),
         "reward_std": float(np.std(rewards)) if rewards else 0.0,
         "success_rate": avg(successes),
-        "p95_ms": avg(p95s),
+        "p95_ms": mean_ignoring_nan(p95s),
         "success_rate_in_horizon": avg(successes_horizon),
-        "p95_ms_in_horizon": avg(p95s_horizon),
+        "p95_ms_in_horizon": mean_ignoring_nan(p95s_horizon),
         "retries_per_root": avg(retries),
         "cost_mean": avg(costs),
     }
@@ -186,7 +193,10 @@ def _evaluate(
 
 def _train_ppo(cfg: ExperimentConfig, learning_curve_csv: str | None = None) -> SB3Policy:
     if PPO is None or make_vec_env is None:
-        raise ImportError("stable-baselines3 is required for PPO baseline")
+        # Chained: import_sb3 catches bare Exception, so a broken torch/sb3
+        # install is otherwise indistinguishable from a missing one and the
+        # user is sent to reinstall a package they already have.
+        raise ImportError("stable-baselines3 is required for PPO baseline") from _SB3_IMPORT_ERROR
     from stable_baselines3.common.callbacks import (
         EvalCallback,
         StopTrainingOnNoModelImprovement,
@@ -215,17 +225,34 @@ def _train_ppo(cfg: ExperimentConfig, learning_curve_csv: str | None = None) -> 
     # EvalCallback only keeps its evaluation history when log_path is set; the
     # npz it writes there is discarded in favor of the CSV below.
     with tempfile.TemporaryDirectory() as npz_dir:
+        # min_evals keeps patience from firing in the opening evals of a long
+        # run. StopTrainingOnNoModelImprovement compares against a running max
+        # with min_evals=0 by default, so a budget raised without also raising
+        # the eval interval stopped after patience+1 evals - the documented
+        # 100k command trained 5000 steps, a 20x silent truncation.
+        expected_evals = max(1, cfg.ppo_timesteps // max(1, cfg.ppo_eval_interval))
+        min_evals = max(cfg.ppo_patience + 1, expected_evals // 4)
         eval_callback = EvalCallback(
             eval_env,
             n_eval_episodes=cfg.ppo_eval_episodes,
             eval_freq=cfg.ppo_eval_interval,
             log_path=npz_dir,
+            # Checkpoint the best model: without a save path SB3 only tracks
+            # best_mean_reward, so "early stopping" returned the LAST weights -
+            # by construction several non-improving evals past the best it saw.
+            best_model_save_path=npz_dir,
             callback_after_eval=StopTrainingOnNoModelImprovement(
-                max_no_improvement_evals=cfg.ppo_patience
+                max_no_improvement_evals=cfg.ppo_patience,
+                min_evals=min_evals,
             ),
             verbose=0,
         )
         model.learn(total_timesteps=cfg.ppo_timesteps, callback=eval_callback)
+
+        best_path = os.path.join(npz_dir, "best_model.zip")
+        if os.path.exists(best_path):
+            # Reload inside the tempdir, before it is cleaned up.
+            model = PPO.load(best_path, env=vec_env)
 
     if learning_curve_csv and len(eval_callback.evaluations_timesteps):
         with open(learning_curve_csv, "w", newline="") as f:
@@ -258,20 +285,20 @@ def _best_fixed_action(cfg: ExperimentConfig, grid: ActionGrid) -> tuple[int, ..
     return best_idx
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
+    """`argv` defaults to sys.argv; taking it explicitly makes the entry
+    point callable from a test without patching sys.argv."""
     parser = argparse.ArgumentParser(description="Compare policy baselines.")
-    parser.add_argument("--attempt-timeouts-ms", type=parse_int_list, default=[10, 30, 50, 80])
-    parser.add_argument("--max-attempts", type=parse_int_list, default=[1, 2, 3])
-    parser.add_argument("--backoff-ms", type=parse_int_list, default=[0, 20, 50])
+    parser.add_argument(
+        "--attempt-timeouts-ms", type=parse_int_list, default=list(DEFAULT_ATTEMPT_TIMEOUTS_MS)
+    )
+    parser.add_argument("--max-attempts", type=parse_int_list, default=list(DEFAULT_MAX_ATTEMPTS))
+    parser.add_argument("--backoff-ms", type=parse_int_list, default=list(DEFAULT_BACKOFF_MS))
     parser.add_argument("--global-timeouts-ms", type=parse_optional_int_list, default=None)
     parser.add_argument("--step-duration-s", type=float, default=1.0)
     parser.add_argument("--episode-duration-s", type=float, default=10.0)
-    parser.add_argument("--train-seeds", type=parse_int_list, default="123,456,789")
-    parser.add_argument(
-        "--eval-seeds",
-        type=parse_int_list,
-        default="321,654,987,1320,1653,1986,2319,2652,2985,3318",
-    )
+    parser.add_argument("--train-seeds", type=parse_int_list, default=DEFAULT_TRAIN_SEEDS)
+    parser.add_argument("--eval-seeds", type=parse_int_list, default=DEFAULT_EVAL_SEEDS)
     parser.add_argument(
         "--policies",
         type=str,
@@ -294,15 +321,15 @@ def main() -> None:
     parser.add_argument("--model-queue-workers", type=int, default=16)
     parser.add_argument("--model-queue-max-utilization", type=float, default=0.95)
     parser.add_argument("--bayes-buffer", type=int, default=2000)
-    parser.add_argument("--aimd-success-target", type=float, default=0.98)
-    parser.add_argument("--aimd-deadline-target", type=float, default=0.01)
+    parser.add_argument("--aimd-success-target", type=float, default=0.95)
+    parser.add_argument("--aimd-deadline-target", type=float, default=0.05)
     parser.add_argument("--aimd-timeout-increase-step", type=int, default=1)
     parser.add_argument("--aimd-timeout-decrease-factor", type=float, default=0.5)
     parser.add_argument("--aimd-max-attempts-step", type=int, default=1)
     parser.add_argument("--aimd-backoff-step", type=int, default=1)
     parser.add_argument("--aimd-adjust-max-attempts", action="store_true")
     parser.add_argument("--aimd-adjust-backoff", action="store_true")
-    parser.add_argument("--aimd-ema-alpha", type=float, default=0.2)
+    parser.add_argument("--aimd-ema-alpha", type=float, default=0.5)
     parser.add_argument("--aimd-min-completed", type=int, default=1)
     parser.add_argument("--fault-scenario", choices=sorted(SCENARIO_BUILDERS), default="none")
     parser.add_argument("--reward-success", type=float, default=1.0)
@@ -350,7 +377,7 @@ def main() -> None:
         default="rl_constrained_curve.csv",
         help="Constrained-PPO dual-ascent trajectory (timesteps, eval_J, eval_cost, lambda).",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     reward_weights = RewardWeights(
         success=args.reward_success,
@@ -407,6 +434,25 @@ def main() -> None:
     grid = ActionGrid(action_spec)
 
     policy_names = [p.strip() for p in args.policies.split(",") if p.strip()]
+    known = {
+        "fixed",
+        "aimd",
+        "model_based",
+        "model_based_queue",
+        "bayesian",
+        "ppo",
+        # "sb3" is deliberately absent: it was accepted here but only "ppo" was
+        # ever instantiated, so `--policies sb3` exited 0 with no rows.
+        "oracle_fixed",
+        "constrained_ppo",
+    }
+    unknown = [n for n in policy_names if n not in known]
+    if unknown:
+        # Silently dropping a typo produced a comparison table quietly missing
+        # the arm the caller asked for.
+        raise SystemExit(
+            f"unknown --policies entries: {', '.join(unknown)}. Known: {', '.join(sorted(known))}"
+        )
     policies = []
 
     if "fixed" in policy_names:
@@ -475,8 +521,10 @@ def main() -> None:
     if "ppo" in policy_names:
         if args.ppo_load_path:
             if PPO is None:
-                raise ImportError("stable-baselines3 is required for PPO baseline")
-            check_action_spec(args.ppo_load_path, action_spec)
+                raise ImportError(
+                    "stable-baselines3 is required for PPO baseline"
+                ) from _SB3_IMPORT_ERROR
+            check_action_spec(args.ppo_load_path, action_spec, cfg.step_duration_s)
             model = PPO.load(args.ppo_load_path)
             policies.append(SB3Policy(model=model, deterministic=True, name="ppo"))
         else:

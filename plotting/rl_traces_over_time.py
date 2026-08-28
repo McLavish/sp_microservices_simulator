@@ -20,28 +20,52 @@ def _step_seconds(df: pd.DataFrame) -> float:
     return 1.0
 
 
+def _select_seed(df: pd.DataFrame, seed):
+    """Rows for `seed`, or a message naming the seeds the CSV does carry.
+
+    `require_rows` runs before the filter, so it cannot catch a selector that
+    matched nothing: unguarded, a mistyped --seed either died with a raw pandas
+    IndexError in `_step_seconds` or wrote a blank figure and exited 0.
+    """
+    if seed is None:
+        seed = int(df["seed"].iloc[0])
+    selected = df[df["seed"] == seed]
+    if selected.empty:
+        available = ", ".join(str(s) for s in sorted(df["seed"].unique()))
+        raise SystemExit(f"no rows for --seed {seed} in the CSV (seeds present: {available})")
+    return seed, selected
+
+
+def _select_policies(df: pd.DataFrame, policies, seed):
+    available = sorted(df["policy"].unique())
+    if not policies:
+        return available
+    missing = [name for name in policies if name not in available]
+    if missing:
+        raise SystemExit(
+            f"no rows for --policies {', '.join(missing)} at seed {seed} "
+            f"(policies present: {', '.join(available)})"
+        )
+    return policies
+
+
 def main(csv_file, output_file, policies=None, seed=None, fault_events_file=None):
     df = pd.read_csv(csv_file)
     require_rows(df, csv_file)
-    if seed is None:
-        seed = int(df["seed"].iloc[0])
-    df = df[df["seed"] == seed]
+    seed, df = _select_seed(df, seed)
+    names = _select_policies(df, policies, seed)
     step_s = _step_seconds(df)
-    names = policies or sorted(df["policy"].unique())
 
     fig, (ax_top, ax_bottom) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
 
     for name in names:
         sub = df[df["policy"] == name].sort_values("step")
-        if sub.empty:
-            continue
         ax_top.step(sub["step"] * step_s, sub["attempt_timeout_ms"], where="post", label=name)
         ax_bottom.plot(sub["step"] * step_s, sub["success_rate"], label=name)
 
     ax_top.set_ylabel("Attempt timeout (ms)")
     ax_top.set_ylim(bottom=0)
     ax_top.grid(True)
-    ax_top.legend(loc="upper left", ncol=2, frameon=True)
     ax_top.set_title(f"Policy knob and success rate over time (seed {seed})")
 
     ax_bottom.set_xlabel("Time (s)")
@@ -49,11 +73,14 @@ def main(csv_file, output_file, policies=None, seed=None, fault_events_file=None
     ax_bottom.set_ylim(0, 1.05)
     ax_bottom.grid(True)
 
-    if fault_events_file:
-        fault_events = load_fault_events(fault_events_file)
-        for ax in (ax_top, ax_bottom):
-            plt.sca(ax)
-            plot_fault_events(fault_events)
+    # Overlay before the legend so the shaded windows are named in it. Only the
+    # top panel labels them: the bottom panel carries no legend of its own and
+    # the axes share an x scale, so one entry describes both.
+    fault_events = load_fault_events(fault_events_file)
+    plot_fault_events(fault_events, ax=ax_top)
+    plot_fault_events(fault_events, ax=ax_bottom, label=False)
+
+    ax_top.legend(loc="upper left", ncol=2, frameon=True)
 
     plt.tight_layout()
     plt.savefig(output_file)

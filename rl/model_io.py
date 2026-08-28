@@ -43,8 +43,16 @@ def save_action_spec(
     Path(sidecar_path(model_path)).write_text(json.dumps(payload, indent=2))
 
 
-def check_action_spec(model_path: str, spec: ActionSpec) -> None:
-    """Raise ValueError when the stored spec disagrees; warn when absent."""
+def check_action_spec(
+    model_path: str, spec: ActionSpec, step_duration_s: float | None = None
+) -> None:
+    """Raise ValueError when the stored spec disagrees; warn when absent.
+
+    When `step_duration_s` is given it is checked too: the sidecar records it
+    because a model trained on 1 s windows reads a different world from 0.1 s
+    windows (every rate and the episode-time feature rescale), so loading under
+    a different step duration silently reinterprets every observation.
+    """
     path = Path(sidecar_path(model_path))
     if not path.exists():
         warnings.warn(
@@ -53,7 +61,17 @@ def check_action_spec(model_path: str, spec: ActionSpec) -> None:
             stacklevel=2,
         )
         return
-    stored = json.loads(path.read_text())["action_spec"]
+    payload = json.loads(path.read_text())
+    if step_duration_s is not None:
+        stored_step = payload.get("step_duration_s")
+        if stored_step is not None and float(stored_step) != float(step_duration_s):
+            raise ValueError(
+                f"{model_path} was trained with step_duration_s={stored_step} but is "
+                f"being evaluated with {step_duration_s}; every observation rate and "
+                "the episode-time feature are scaled by it, so the model would be "
+                "reading a different world than it was trained on"
+            )
+    stored = payload["action_spec"]
     current = dataclasses.asdict(spec)
     if stored != current:
         raise ValueError(
