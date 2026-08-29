@@ -202,7 +202,8 @@ that:
 1. runs the node's **local** service time, then
 2. checks local deadline/failure (drops as `DEADLINE` / `SERVER_FAILURE`), then
 3. launches **all** downstream `client.start_request(...)` calls concurrently,
-   propagating the parent deadline via `override_global_deadline` — a
+   propagating the parent deadline via `override_global_deadline` (unless
+   `propagate_deadline` is off, see below) — a
    *synchronous* rejection (queue-full / circuit-open) on an early edge is
    remembered but does not skip later edges' launches, so downstream load never
    depends on edge order, and
@@ -232,6 +233,21 @@ worker: [local]                    worker: [local .... waiting on B,C ....]
   subtree, so capacity is consumed all the way down.
 
 `tests/test_chain_worker_model.py` asserts the in-flight counts for both modes.
+
+### Deadline propagation
+
+`propagate_deadline` (`chain.py`) is the third per-node switch, next to
+`hold_worker_during_fanout` and `propagate_cancellation`:
+
+| `propagate_deadline` | Behaviour | Models |
+| --- | --- | --- |
+| `True` (default) | The node passes its own attempt deadline down each edge as `override_global_deadline`, so a downstream call runs under `min(its own controller, that deadline)` and books a `DEADLINE` drop of its own when it expires. | A stack that plumbs the caller's deadline through the wire: Go contexts, gRPC's `grpc-timeout` header. |
+| `False` | The deadline stops here. Downstream calls run under their own controller timeouts only, so they keep running (and consuming downstream capacity) after this node's attempt was abandoned upstream. | A stack with no deadline propagation — the modelling-choice ablation "no propagated deadline". |
+
+The node still enforces its own deadline on itself either way, so the *caller's*
+outcome is unchanged by the switch; only the downstream's view of the deadline
+disappears. `tests/test_chain_scenarios.py::TestChainScenarios::test_propagate_deadline_switch`
+pins both branches.
 
 ### Example: a node fanning out to two services
 

@@ -104,6 +104,36 @@ def _run_fanout_scenario(seed: int, top_attempt_timeout_ms: int = 200):
     }
 
 
+def _run_two_hop_deadline_scenario(propagate_deadline: bool):
+    """A -> B, where B is far slower than the top client's attempt deadline.
+
+    Top client: 30 ms attempt timeout, no root deadline. A is instant, B's
+    client waits up to 500 ms, and B's service median is 100 ms. Returns the
+    (top client, A->B client) metrics summaries.
+    """
+    sim = Simulator(seed=20260829)
+
+    a_cfg = ServiceConfig("svc-A", ms_to_ns(1), 1e-6, workers=64, queue_capacity=200)
+    b_cfg = ServiceConfig("svc-B", ms_to_ns(100), 0.1, workers=64, queue_capacity=200)
+
+    a_node = ServiceNodeRuntime(
+        service=ServiceRuntime(cfg=a_cfg).bind(), propagate_deadline=propagate_deadline
+    )
+    b_node = ServiceNodeRuntime(service=ServiceRuntime(cfg=b_cfg).bind())
+
+    a_to_b = ClientRuntime(_client_cfg(500, 1, 10), service=b_node)
+    a_node.add_downstream(DownstreamEdge(client=a_to_b, target=b_node))
+
+    top_client = ClientRuntime(_client_cfg(30, 1, 10), service=a_node)
+
+    wl = Workload(base_rps=50.0, duration_s=2, load_spikes=[])
+    wl.drive(sim, lambda s: top_client.start_request(s))
+    sim.run(until=s_to_ns(wl.duration_s))
+    sim.run()
+
+    return top_client.metrics().summary(), a_to_b.metrics().summary()
+
+
 class TestChainScenarios(unittest.TestCase):
     def test_tandem_fanout_behavior(self):
         r = _run_fanout_scenario(seed=1234)
@@ -124,6 +154,35 @@ class TestChainScenarios(unittest.TestCase):
         r = _run_fanout_scenario(seed=4321, top_attempt_timeout_ms=30)
         self.assertGreater(r["A"].dropped_deadline, 0)
         self.assertGreater(r["B"].dropped_deadline, 0)
+
+    def test_propagate_deadline_switch(self):
+        """The A1 ablation: with propagation off, the child outlives the parent.
+
+        Two hops, A -> B. The top client's attempt deadline (30 ms) expires long
+        before B's service time (~100 ms) is done, and B's own client would
+        happily wait 500 ms for it. So the switch is the only thing that decides
+        whether B's call inherits the 30 ms: the root drops on DEADLINE either
+        way (A enforces its own attempt deadline on itself), but the downstream
+        client books a DEADLINE drop only when the deadline is propagated.
+        """
+        for propagate, expect_b_deadline_drops in ((True, True), (False, False)):
+            with self.subTest(propagate_deadline=propagate):
+                root, b = _run_two_hop_deadline_scenario(propagate_deadline=propagate)
+
+                # The root's own 30 ms attempt timeout is unaffected by the switch.
+                self.assertGreater(root.total, 0)
+                self.assertEqual(root.succeeded, 0)
+                self.assertEqual(root.dropped_deadline, root.total)
+
+                self.assertEqual(b.total, root.total)  # every root launched one call
+                if expect_b_deadline_drops:
+                    # Propagated: B's attempts are cut off at the root's 30 ms.
+                    self.assertEqual(b.dropped_deadline, b.total)
+                    self.assertEqual(b.succeeded, 0)
+                else:
+                    # Not propagated: they run to completion under their own 500 ms.
+                    self.assertEqual(b.dropped_deadline, 0)
+                    self.assertEqual(b.succeeded, b.total)
 
     def test_queue_pressure_drops(self):
         sim = Simulator(seed=7)

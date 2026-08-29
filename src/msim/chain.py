@@ -183,7 +183,9 @@ class _FanOutAttempt:
                 edge.client.start_request(
                     self.sim,
                     on_done=self._on_downstream_done,
-                    override_global_deadline=self.deadline,
+                    override_global_deadline=(
+                        self.deadline if self.node.propagate_deadline else None
+                    ),
                 )
             )
         self._launching = False
@@ -261,6 +263,21 @@ class ServiceNodeRuntime:
     #     descendants that also set the flag). Those roots are recorded with
     #     DropReason.CANCELLED.
     propagate_cancellation: bool = False
+    # Deadline model for the fan-out, the modelling-choice ablation "no
+    # propagated deadline":
+    #   True (default) -> this node passes its own attempt deadline down each
+    #     edge, so a downstream call can never outlive the caller's attempt:
+    #     the downstream client runs under min(its own controller, that
+    #     deadline) and books a DEADLINE drop of its own when it expires.
+    #     Models a stack that plumbs the caller's deadline through the wire
+    #     (Go contexts, gRPC's grpc-timeout header) — the current behaviour.
+    #   False -> the deadline stops here. Downstream calls run under their own
+    #     controller timeouts only, so they keep running (and consuming
+    #     downstream capacity) after this node's attempt has already been
+    #     abandoned upstream. Models a stack with no deadline propagation.
+    #     This node still enforces its own deadline on itself, so the caller's
+    #     drop is unchanged; only the downstream's view of it disappears.
+    propagate_deadline: bool = True
 
     @property
     def cfg(self) -> ServiceConfig:
