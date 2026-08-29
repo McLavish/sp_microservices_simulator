@@ -24,9 +24,10 @@ retry policies, PPO training) lives on the `rl-layer` branch, not here.
 - Python >= 3.10
 - [uv](https://docs.astral.sh/uv/) for environment and dependency management
 
-This is **not** an installable package (`pyproject.toml` sets `package = false`).
-Run everything as `python -m <module>` from the repo root; imports are flat
-(`from core import ...`).
+The simulator library is the `msim` package under `src/`; `make install` (`uv sync`)
+installs it editable, so `from msim.core import ...` works from any directory. The
+`experiments/` and `plotting/` scripts are not part of the package — run them as
+`python -m <module>` from the repo root.
 
 ## Install
 

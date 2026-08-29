@@ -56,10 +56,10 @@ what happens next:
 ### Example: client with fixed-backoff retries
 
 ```python
-from caller import ClientConfig, ClientRuntime
-from core import ms_to_ns
-from retry_policies import FixedBackoffRetryPolicy
-from timeout_controllers import StaticTimeoutController
+from msim.caller import ClientConfig, ClientRuntime
+from msim.core import ms_to_ns
+from msim.retry_policies import FixedBackoffRetryPolicy
+from msim.timeout_controllers import StaticTimeoutController
 
 cfg = ClientConfig(
     retry=FixedBackoffRetryPolicy(max_attempts=2, delay=ms_to_ns(100)),  # 1 retry
@@ -163,8 +163,8 @@ uncapped half-open probe admission noted above is one code path, not two.
 ### Example: a circuit breaker around no-retry
 
 ```python
-from core import s_to_ns
-from retry_policies import CountBasedCircuitBreakerPolicy, NoRetryPolicy
+from msim.core import s_to_ns
+from msim.retry_policies import CountBasedCircuitBreakerPolicy, NoRetryPolicy
 
 breaker = CountBasedCircuitBreakerPolicy(
     failure_threshold_ratio=(5, 10),   # open at 5 failures / 10 calls
@@ -236,7 +236,7 @@ worker: [local]                    worker: [local .... waiting on B,C ....]
 ### Example: a node fanning out to two services
 
 ```python
-from chain import DownstreamEdge, ServiceNodeRuntime
+from msim.chain import DownstreamEdge, ServiceNodeRuntime
 
 a = ServiceNodeRuntime(service=svc_a)            # ServiceRuntimes built earlier
 a.add_downstream(DownstreamEdge(client=a_to_b, target=ServiceNodeRuntime(service=svc_b)))
@@ -252,10 +252,10 @@ round trip between a client and the service it calls. It is a `ServiceLike`
 drives it exactly like the thing it wraps.
 
 ```python
-from caller import ClientRuntime
-from chain import DownstreamEdge
-from core import ms_to_ns
-from transport import TransportDelay, TransportLink
+from msim.caller import ClientRuntime
+from msim.chain import DownstreamEdge
+from msim.core import ms_to_ns
+from msim.transport import TransportDelay, TransportLink
 
 delay = TransportDelay(median=ms_to_ns(2), sigma=0.4)
 a_to_b = ClientRuntime(cfg=edge_cfg, service=TransportLink(node_b, delay))

@@ -92,9 +92,9 @@ reasoning about where load is shed:
 ### Example: a faulty service
 
 ```python
-from core import TimeInterval, ms_to_ns, s_to_ns
-from faults import LatencyInjection, PartialFailure
-from service import ServiceConfig, ServiceRuntime
+from msim.core import TimeInterval, ms_to_ns, s_to_ns
+from msim.faults import LatencyInjection, PartialFailure
+from msim.service import ServiceConfig, ServiceRuntime
 
 cfg = ServiceConfig(
     name="svc-A",
@@ -147,9 +147,9 @@ deterministically at t=0).
 ### Example: workload with a spike
 
 ```python
-from core import TimeInterval, s_to_ns
-from faults import LoadSpike
-from workload import Workload
+from msim.core import TimeInterval, s_to_ns
+from msim.faults import LoadSpike
+from msim.workload import Workload
 
 wl = Workload(
     base_rps=300.0,
@@ -197,7 +197,7 @@ something was wrong.
 empty:
 
 ```python
-from fault_events import FaultEventsTracker
+from msim.fault_events import FaultEventsTracker
 
 tracker = FaultEventsTracker()
 cfg.register_fault_events(tracker)   # service faults

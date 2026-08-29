@@ -130,21 +130,22 @@ experiments, so comparisons are apples-to-apples. See
 ## Module map
 
 ```
-core            time types, Request/RootRequest, DropReason, Summary   (no deps)
- |
-simulator       event heap + clock
-faults          LoadSpike / LatencyInjection / PartialFailure  --> fault_events (JSON overlay)
-service         M/G/c/K queue            <- faults, fault_events, simulator
-workload        Poisson arrivals         <- faults, fault_events, simulator
-retry_policies  retry / circuit-breaker / rate-limit / budget
-timeout_controllers  static / adaptive timeouts
-caller          client + retry loop      <- retry_policies, timeout_controllers, service, metrics
-transport       per-link delay decorator <- caller, service, simulator
-chain           fan-out nodes            <- caller, service, simulator
-metrics         aggregation + CSV export
+src/msim/       the installable library package (import as `msim.<module>`)
+  core            time types, Request/RootRequest, DropReason, Summary   (no deps)
+   |
+  simulator       event heap + clock
+  faults          LoadSpike / LatencyInjection / PartialFailure  --> fault_events (JSON overlay)
+  service         M/G/c/K queue            <- faults, fault_events, simulator
+  workload        Poisson arrivals         <- faults, fault_events, simulator
+  retry_policies  retry / circuit-breaker / rate-limit / budget
+  timeout_controllers  static / adaptive timeouts
+  caller          client + retry loop      <- retry_policies, timeout_controllers, service, metrics
+  transport       per-link delay decorator <- caller, service, simulator
+  chain           fan-out nodes            <- caller, service, simulator
+  metrics         aggregation + CSV export
 
-experiments/    runnable scenarios (entry points)   --> CSV + fault JSON
-plotting/       render CSV + fault JSON to PNG
+experiments/    runnable scenarios (entry points, not in the package)   --> CSV + fault JSON
+plotting/       render CSV + fault JSON to PNG (not in the package)
 ```
 
 ## Minimal example
@@ -152,8 +153,8 @@ plotting/       render CSV + fault JSON to PNG
 The engine on its own, with no services:
 
 ```python
-from simulator import Simulator
-from core import s_to_ns
+from msim.simulator import Simulator
+from msim.core import s_to_ns
 
 sim = Simulator(seed=1)
 sim.schedule(s_to_ns(2), lambda: print("B at", sim.timestep))
