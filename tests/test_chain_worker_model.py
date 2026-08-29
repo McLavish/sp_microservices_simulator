@@ -2,11 +2,11 @@ import os
 import random
 import unittest
 
-from caller import ClientConfig, ClientRuntime
-from chain import DownstreamEdge, ServiceNodeRuntime, _FanOutAttempt
-from core import DropReason, RootRequest, TimeInterval, ms_to_ns, s_to_ns
-from faults import PartialFailure
-from retry_policies import (
+from msim.caller import ClientConfig, ClientRuntime
+from msim.chain import DownstreamEdge, ServiceNodeRuntime, _FanOutAttempt
+from msim.core import DropReason, RootRequest, TimeInterval, ms_to_ns, s_to_ns
+from msim.faults import PartialFailure
+from msim.retry_policies import (
     CBState,
     CountBasedCircuitBreakerPolicy,
     FixedBackoffRetryPolicy,
@@ -14,10 +14,10 @@ from retry_policies import (
     NoRetryPolicy,
     RetryBudgetPolicy,
 )
-from service import ServiceConfig, ServiceRuntime
-from simulator import Simulator
-from timeout_controllers import StaticTimeoutController
-from workload import Workload
+from msim.service import ServiceConfig, ServiceRuntime
+from msim.simulator import Simulator
+from msim.timeout_controllers import StaticTimeoutController
+from msim.workload import Workload
 
 
 def _build_fanout(hold_worker: bool):

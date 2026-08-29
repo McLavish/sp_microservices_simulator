@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from metrics import Metrics  # noqa: E402
+from msim.metrics import Metrics  # noqa: E402
 from plotting.qps_over_time import _bucket_width_s  # noqa: E402
 
 

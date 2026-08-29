@@ -17,16 +17,16 @@ import unittest
 
 import pandas as pd
 
-from caller import ClientConfig, ClientRuntime
-from chain import DownstreamEdge, ServiceNodeRuntime
-from core import DropReason, TimeInterval, ms_to_ns, s_to_ns
-from faults import LatencyInjection, PartialFailure
-from metrics import Metrics
-from retry_policies import FixedBackoffRetryPolicy, NoRetryPolicy
-from service import MIN_LOGNORM_SIGMA, ServiceConfig, ServiceRuntime
-from simulator import Simulator
-from timeout_controllers import StaticTimeoutController
-from workload import Workload
+from msim.caller import ClientConfig, ClientRuntime
+from msim.chain import DownstreamEdge, ServiceNodeRuntime
+from msim.core import DropReason, TimeInterval, ms_to_ns, s_to_ns
+from msim.faults import LatencyInjection, PartialFailure
+from msim.metrics import Metrics
+from msim.retry_policies import FixedBackoffRetryPolicy, NoRetryPolicy
+from msim.service import MIN_LOGNORM_SIGMA, ServiceConfig, ServiceRuntime
+from msim.simulator import Simulator
+from msim.timeout_controllers import StaticTimeoutController
+from msim.workload import Workload
 
 
 def _single_service_run(seed=1234, duration_s=10.0):
@@ -575,7 +575,7 @@ class TestRootClassificationAgreement(unittest.TestCase):
 
     def _population(self):
         """One root of every shape the classifier must distinguish."""
-        from core import Request, RootRequest
+        from msim.core import Request, RootRequest
 
         def root(reason, *, success=False, cancelled=False, attempts=1, completed_at=None):
             r = RootRequest(cancelled=cancelled, completed_at=completed_at)
@@ -644,7 +644,7 @@ class TestRootClassificationAgreement(unittest.TestCase):
         in particular that `cancelled` beats the final attempt's drop reason,
         which is the ordering that drifted before it was centralised.
         """
-        from core import Request, RootOutcome, RootRequest, classify_root
+        from msim.core import Request, RootOutcome, RootRequest, classify_root
 
         def root(reason, *, success=False, cancelled=False):
             r = RootRequest(cancelled=cancelled)

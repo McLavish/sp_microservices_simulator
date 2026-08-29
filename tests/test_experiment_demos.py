@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from core import ns_to_s
+from msim.core import ns_to_s
 
 
 def _run_demo(module: str, cwd: Path) -> dict:

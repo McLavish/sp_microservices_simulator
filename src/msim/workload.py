@@ -3,10 +3,10 @@ import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from core import TimePoint, ns_to_s, s_to_ns
-from fault_events import FaultEventsTracker
-from faults import LoadSpike
-from simulator import Event, Simulator
+from msim.core import TimePoint, ns_to_s, s_to_ns
+from msim.fault_events import FaultEventsTracker
+from msim.faults import LoadSpike
+from msim.simulator import Event, Simulator
 
 # Domain separation between the arrival process and every other RNG in the
 # simulation. Callers routinely pass the SAME integer to `Simulator(seed=...)`

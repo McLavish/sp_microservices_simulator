@@ -4,10 +4,10 @@ from collections.abc import Callable
 from dataclasses import MISSING, dataclass, field, fields
 from functools import partial
 
-from core import DropReason, TimeDuration, TimePoint
-from fault_events import FaultEventsTracker
-from faults import LatencyInjection, PartialFailure
-from simulator import Simulator
+from msim.core import DropReason, TimeDuration, TimePoint
+from msim.fault_events import FaultEventsTracker
+from msim.faults import LatencyInjection, PartialFailure
+from msim.simulator import Simulator
 
 # Floor applied to the lognormal shape parameter. Load-bearing, not defensive:
 # the sampler has floored sigma here since the first commit, so every pinned

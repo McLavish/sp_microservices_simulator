@@ -1,12 +1,12 @@
 import unittest
 from dataclasses import fields
 
-from caller import ClientConfig, ClientRuntime
-from core import DropReason, ms_to_ns
-from retry_policies import FixedBackoffRetryPolicy
-from service import ServiceConfig, ServiceRuntime
-from simulator import Simulator
-from timeout_controllers import StaticTimeoutController
+from msim.caller import ClientConfig, ClientRuntime
+from msim.core import DropReason, ms_to_ns
+from msim.retry_policies import FixedBackoffRetryPolicy
+from msim.service import ServiceConfig, ServiceRuntime
+from msim.simulator import Simulator
+from msim.timeout_controllers import StaticTimeoutController
 
 
 class TestServiceDeadline(unittest.TestCase):

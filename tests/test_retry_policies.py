@@ -1,10 +1,10 @@
 import random
 import unittest
 
-from caller import ClientConfig, ClientRuntime
-from core import DropReason, TimeInterval, s_to_ns
-from faults import PartialFailure
-from retry_policies import (
+from msim.caller import ClientConfig, ClientRuntime
+from msim.core import DropReason, TimeInterval, s_to_ns
+from msim.faults import PartialFailure
+from msim.retry_policies import (
     BurstyRateLimiterPolicy,
     CBState,
     CountBasedCircuitBreakerPolicy,
@@ -21,9 +21,9 @@ from retry_policies import (
     RetryPolicy,
     TimeBasedCircuitBreakerPolicy,
 )
-from service import ServiceConfig, ServiceRuntime
-from simulator import Simulator
-from timeout_controllers import StaticTimeoutController
+from msim.service import ServiceConfig, ServiceRuntime
+from msim.simulator import Simulator
+from msim.timeout_controllers import StaticTimeoutController
 
 
 class TestRetryPolicies(unittest.TestCase):
@@ -722,7 +722,7 @@ class TestVetoedRetriesAreRefunded(unittest.TestCase):
     """
 
     def _run(self, policy, attempt_timeout_ms=30, global_timeout_ms=30):
-        from core import ms_to_ns
+        from msim.core import ms_to_ns
 
         sim = Simulator(seed=1)
         svc = ServiceRuntime(
@@ -752,7 +752,7 @@ class TestVetoedRetriesAreRefunded(unittest.TestCase):
         return len(root.attempts) - 1  # retries actually issued
 
     def test_retry_budget_charges_only_issued_retries(self):
-        from core import ms_to_ns
+        from msim.core import ms_to_ns
 
         policy = RetryBudgetPolicy(
             budget_ratio=0.1,
@@ -769,7 +769,7 @@ class TestVetoedRetriesAreRefunded(unittest.TestCase):
         self.assertEqual(policy._tokens, before)
 
     def test_token_bucket_limiters_charge_only_issued_retries(self):
-        from core import ms_to_ns
+        from msim.core import ms_to_ns
 
         for policy in (
             BurstyRateLimiterPolicy(
@@ -801,7 +801,7 @@ class TestVetoedRetriesAreRefunded(unittest.TestCase):
         self.assertIsNone(policy._next_at)
 
     def test_rollback_reaches_wrapped_layers(self):
-        from core import ms_to_ns
+        from msim.core import ms_to_ns
 
         inner = FixedWindowBurstyLimiterPolicy(
             max_requests=5,

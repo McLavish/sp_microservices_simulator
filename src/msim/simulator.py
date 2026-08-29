@@ -3,7 +3,7 @@ import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from core import TimePoint
+from msim.core import TimePoint
 
 
 @dataclass(order=True)

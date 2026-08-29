@@ -4,7 +4,6 @@ import json
 
 import pytest
 
-from core import ms_to_ns
 from experiments.hotel_matched import (
     _DEFAULT_BASE_RPS,
     _DEFAULT_DURATION_S,
@@ -27,7 +26,8 @@ from experiments.hotel_matched import (
     config_from_args,
     run_hotel_matched,
 )
-from retry_policies import ExponentialBackoffWithJitterRetryPolicy, JitterMode, NoRetryPolicy
+from msim.core import ms_to_ns
+from msim.retry_policies import ExponentialBackoffWithJitterRetryPolicy, JitterMode, NoRetryPolicy
 
 
 def test_config_from_args_accepts_calibration_fault_and_load_spike(tmp_path):

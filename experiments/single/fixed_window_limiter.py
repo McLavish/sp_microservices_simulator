@@ -1,15 +1,15 @@
-from caller import ClientConfig, ClientRuntime
-from core import TimeInterval, ms_to_ns, s_to_ns
-from fault_events import FaultEventsTracker
-from faults import LatencyInjection, LoadSpike, PartialFailure
-from retry_policies import (
+from msim.caller import ClientConfig, ClientRuntime
+from msim.core import TimeInterval, ms_to_ns, s_to_ns
+from msim.fault_events import FaultEventsTracker
+from msim.faults import LatencyInjection, LoadSpike, PartialFailure
+from msim.retry_policies import (
     ExponentialBackoffRetryPolicy,
     FixedWindowBurstyLimiterPolicy,
 )
-from service import ServiceConfig, ServiceRuntime
-from simulator import Simulator
-from timeout_controllers import StaticTimeoutController
-from workload import Workload
+from msim.service import ServiceConfig, ServiceRuntime
+from msim.simulator import Simulator
+from msim.timeout_controllers import StaticTimeoutController
+from msim.workload import Workload
 
 if __name__ == "__main__":
     sim = Simulator(seed=88990)

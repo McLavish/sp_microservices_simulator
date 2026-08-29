@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from core import TimeDuration
+from msim.core import TimeDuration
 
 
 class TimeoutController(ABC):

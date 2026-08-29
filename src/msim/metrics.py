@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from core import (
+from msim.core import (
     FAILURE_OUTCOMES,
     MS_TO_NS,
     S_TO_NS,

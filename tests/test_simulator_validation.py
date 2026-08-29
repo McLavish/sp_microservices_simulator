@@ -1,7 +1,7 @@
 import unittest
 
-from core import s_to_ns
-from simulator import Simulator
+from msim.core import s_to_ns
+from msim.simulator import Simulator
 
 
 class TestSimulatorTimeValidation(unittest.TestCase):

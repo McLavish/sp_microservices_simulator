@@ -11,20 +11,20 @@ but the root is still abandoned, and must not start a fresh attempt afterwards.
 
 import unittest
 
-from caller import ClientConfig, ClientRuntime
-from chain import DownstreamEdge, ServiceNodeRuntime
-from core import DropReason, TimeInterval, ms_to_ns, s_to_ns
-from faults import PartialFailure
-from retry_policies import (
+from msim.caller import ClientConfig, ClientRuntime
+from msim.chain import DownstreamEdge, ServiceNodeRuntime
+from msim.core import DropReason, TimeInterval, ms_to_ns, s_to_ns
+from msim.faults import PartialFailure
+from msim.retry_policies import (
     CBState,
     CountBasedCircuitBreakerPolicy,
     FixedBackoffRetryPolicy,
     NoRetryPolicy,
     RetryPolicy,
 )
-from service import ServiceConfig, ServiceRuntime
-from simulator import Simulator
-from timeout_controllers import StaticTimeoutController
+from msim.service import ServiceConfig, ServiceRuntime
+from msim.simulator import Simulator
+from msim.timeout_controllers import StaticTimeoutController
 
 
 def _node(name: str, median_ms: float, workers: int = 1, p_fail: float = 0.0):

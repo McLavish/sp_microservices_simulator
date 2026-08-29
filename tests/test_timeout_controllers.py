@@ -1,14 +1,14 @@
 import unittest
 from functools import partial
 
-from caller import ClientConfig, ClientRuntime
-from core import TimeInterval, ms_to_ns, s_to_ns
-from faults import LatencyInjection
-from retry_policies import FixedBackoffRetryPolicy
-from service import ServiceConfig, ServiceRuntime
-from simulator import Simulator
-from timeout_controllers import AdaptiveTimeoutController
-from workload import Workload
+from msim.caller import ClientConfig, ClientRuntime
+from msim.core import TimeInterval, ms_to_ns, s_to_ns
+from msim.faults import LatencyInjection
+from msim.retry_policies import FixedBackoffRetryPolicy
+from msim.service import ServiceConfig, ServiceRuntime
+from msim.simulator import Simulator
+from msim.timeout_controllers import AdaptiveTimeoutController
+from msim.workload import Workload
 
 
 def _feed(ctrl: AdaptiveTimeoutController, latency: int, n: int, success: bool = True):

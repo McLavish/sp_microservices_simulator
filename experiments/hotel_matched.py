@@ -21,17 +21,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from caller import ClientConfig, ClientRuntime
-from chain import DownstreamEdge, ServiceNodeRuntime
-from core import TimeInterval, ms_to_ns, s_to_ns
-from fault_events import FaultEventsTracker
-from faults import LatencyInjection, LoadSpike, PartialFailure
-from metrics import Metrics
-from retry_policies import ExponentialBackoffWithJitterRetryPolicy, JitterMode, NoRetryPolicy
-from service import ServiceConfig, ServiceRuntime
-from simulator import Simulator
-from timeout_controllers import StaticTimeoutController
-from workload import Workload
+from msim.caller import ClientConfig, ClientRuntime
+from msim.chain import DownstreamEdge, ServiceNodeRuntime
+from msim.core import TimeInterval, ms_to_ns, s_to_ns
+from msim.fault_events import FaultEventsTracker
+from msim.faults import LatencyInjection, LoadSpike, PartialFailure
+from msim.metrics import Metrics
+from msim.retry_policies import ExponentialBackoffWithJitterRetryPolicy, JitterMode, NoRetryPolicy
+from msim.service import ServiceConfig, ServiceRuntime
+from msim.simulator import Simulator
+from msim.timeout_controllers import StaticTimeoutController
+from msim.workload import Workload
 
 DEFAULT_SERVICE_PARAMS = {
     "hotels-root": {"median_ms": 0.2, "sigma": 0.2, "workers": 128, "queue_capacity": 4096},

@@ -1,13 +1,13 @@
 import unittest
 
-from caller import ClientConfig, ClientRuntime
-from chain import DownstreamEdge, ServiceNodeRuntime
-from core import DropReason, TimeInterval, s_to_ns
-from faults import PartialFailure
-from retry_policies import NoRetryPolicy
-from service import ServiceConfig, ServiceRuntime
-from simulator import Simulator
-from timeout_controllers import StaticTimeoutController
+from msim.caller import ClientConfig, ClientRuntime
+from msim.chain import DownstreamEdge, ServiceNodeRuntime
+from msim.core import DropReason, TimeInterval, s_to_ns
+from msim.faults import PartialFailure
+from msim.retry_policies import NoRetryPolicy
+from msim.service import ServiceConfig, ServiceRuntime
+from msim.simulator import Simulator
+from msim.timeout_controllers import StaticTimeoutController
 
 
 class TestChainFailureReason(unittest.TestCase):

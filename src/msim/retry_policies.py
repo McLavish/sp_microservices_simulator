@@ -6,7 +6,7 @@ from enum import Enum
 from fractions import Fraction
 from typing import NamedTuple
 
-from core import TimeDuration, TimePoint
+from msim.core import TimeDuration, TimePoint
 
 
 @dataclass

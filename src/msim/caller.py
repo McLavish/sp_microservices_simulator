@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Protocol, runtime_checkable
 
-from core import (
+from msim.core import (
     DropReason,
     Request,
     RootRequest,
@@ -11,11 +11,11 @@ from core import (
     TimeInterval,
     TimePoint,
 )
-from metrics import Metrics
-from retry_policies import RetryContext, RetryPolicy
-from service import AttemptControl, AttemptDoneCallback, ServiceConfig
-from simulator import Event, Simulator
-from timeout_controllers import TimeoutController
+from msim.metrics import Metrics
+from msim.retry_policies import RetryContext, RetryPolicy
+from msim.service import AttemptControl, AttemptDoneCallback, ServiceConfig
+from msim.simulator import Event, Simulator
+from msim.timeout_controllers import TimeoutController
 
 
 @runtime_checkable

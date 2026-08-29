@@ -1,10 +1,10 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from caller import ClientRuntime
-from core import DropReason, RootRequest, TimeDuration, TimePoint
-from service import AttemptControl, AttemptDoneCallback, ServiceConfig, ServiceRuntime
-from simulator import Event, Simulator
+from msim.caller import ClientRuntime
+from msim.core import DropReason, RootRequest, TimeDuration, TimePoint
+from msim.service import AttemptControl, AttemptDoneCallback, ServiceConfig, ServiceRuntime
+from msim.simulator import Event, Simulator
 
 
 @dataclass

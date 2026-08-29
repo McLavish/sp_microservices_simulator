@@ -5,8 +5,8 @@ from enum import Enum, auto
 from pathlib import Path
 from unittest import mock
 
-import core
-from core import (
+from msim import core
+from msim.core import (
     FAILURE_OUTCOMES,
     DropReason,
     Request,
@@ -17,7 +17,7 @@ from core import (
     require_outcome_coverage,
     s_to_ns,
 )
-from metrics import Metrics
+from msim.metrics import Metrics
 
 
 class TestMetricsSummary(unittest.TestCase):

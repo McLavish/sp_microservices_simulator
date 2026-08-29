@@ -19,8 +19,12 @@ dev = [
     "pandas",
 ]
 
-[tool.uv]
-package = false
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "msim"
 
 [tool.ruff]
 line-length = 100
@@ -49,18 +53,7 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-first-party = [
-    "core",
-    "caller",
-    "chain",
-    "transport",
-    "service",
-    "simulator",
-    "workload",
-    "metrics",
-    "fault_events",
-    "faults",
-    "retry_policies",
-    "timeout_controllers",
+    "msim",
     "experiments",
     "plotting",
 ]
@@ -70,7 +63,7 @@ quote-style = "double"
 indent-style = "space"
 
 [tool.ty.environment]
-root = ["."]
+root = ["./src", "."]
 
 [tool.ty.rules]
 # Enforced via pre-commit. Lenient on missing annotations for now,
@@ -89,18 +82,7 @@ addopts = [
 
 [tool.coverage.run]
 source = [
-    "core",
-    "caller",
-    "chain",
-    "transport",
-    "service",
-    "simulator",
-    "workload",
-    "metrics",
-    "fault_events",
-    "faults",
-    "retry_policies",
-    "timeout_controllers",
+    "msim",
     "experiments",
     "plotting",
 ]

@@ -1,9 +1,9 @@
 import unittest
 
-from core import TimeInterval, ns_to_s, s_to_ns
-from faults import LoadSpike
-from simulator import Simulator
-from workload import Workload
+from msim.core import TimeInterval, ns_to_s, s_to_ns
+from msim.faults import LoadSpike
+from msim.simulator import Simulator
+from msim.workload import Workload
 
 
 class TestWorkload(unittest.TestCase):

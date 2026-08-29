@@ -1,7 +1,7 @@
 import math
 from dataclasses import dataclass
 
-from core import TimeDuration, TimeInterval, TimePoint
+from msim.core import TimeDuration, TimeInterval, TimePoint
 
 
 def _require_finite(name: str, value: float) -> None:

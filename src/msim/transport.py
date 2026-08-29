@@ -36,10 +36,10 @@ import math
 from dataclasses import dataclass
 from enum import Enum, auto
 
-from caller import ServiceLike
-from core import DropReason, TimeDuration, TimePoint
-from service import AttemptControl, AttemptDoneCallback, ServiceConfig
-from simulator import Event, Simulator
+from msim.caller import ServiceLike
+from msim.core import DropReason, TimeDuration, TimePoint
+from msim.service import AttemptControl, AttemptDoneCallback, ServiceConfig
+from msim.simulator import Event, Simulator
 
 
 @dataclass(frozen=True)

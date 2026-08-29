@@ -21,9 +21,9 @@ import unittest
 from collections.abc import Callable
 from typing import cast
 
-from caller import ClientConfig, ClientRuntime
-from chain import DownstreamEdge, ServiceNodeRuntime
-from core import (
+from msim.caller import ClientConfig, ClientRuntime
+from msim.chain import DownstreamEdge, ServiceNodeRuntime
+from msim.core import (
     DropReason,
     RootOutcome,
     TimeDuration,
@@ -34,12 +34,12 @@ from core import (
     root_latency,
     s_to_ns,
 )
-from faults import PartialFailure
-from retry_policies import FixedBackoffRetryPolicy, NoRetryPolicy, RetryPolicy
-from service import AttemptControl, AttemptDoneCallback, ServiceConfig, ServiceRuntime
-from simulator import Simulator
-from timeout_controllers import StaticTimeoutController
-from transport import TransportDelay, TransportLink
+from msim.faults import PartialFailure
+from msim.retry_policies import FixedBackoffRetryPolicy, NoRetryPolicy, RetryPolicy
+from msim.service import AttemptControl, AttemptDoneCallback, ServiceConfig, ServiceRuntime
+from msim.simulator import Simulator
+from msim.timeout_controllers import StaticTimeoutController
+from msim.transport import TransportDelay, TransportLink
 
 
 def _svc(

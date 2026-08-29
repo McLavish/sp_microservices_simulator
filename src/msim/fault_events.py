@@ -2,7 +2,7 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from core import TimeInterval, ns_to_ms, ns_to_s
+from msim.core import TimeInterval, ns_to_ms, ns_to_s
 
 
 @dataclass
