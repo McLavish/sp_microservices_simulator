@@ -15,7 +15,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from msim.metrics import Metrics  # noqa: E402
-from plotting.qps_over_time import _bucket_width_s  # noqa: E402
+from msim.plotting.qps_over_time import _bucket_width_s  # noqa: E402
 
 
 class TestQpsBucketWidth(unittest.TestCase):
@@ -40,7 +40,7 @@ class TestLoadMetricsTrim(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "t.csv")
             df.to_csv(path, index=False)
-            from plotting.utils.io import load_metrics
+            from msim.plotting.utils.io import load_metrics
 
             out = load_metrics(path)
         # The idle bucket at t=2 is trimmed; the completion-only bucket at t=1
@@ -52,7 +52,7 @@ class TestLoadMetricsTrim(unittest.TestCase):
         backing off completes AFTER its last attempt ended, so its bucket has
         `completed == 0` and only a root-completion column set — the row
         metrics.py widened its bucket range to preserve."""
-        from plotting.utils.io import load_metrics
+        from msim.plotting.utils.io import load_metrics
 
         for column in ("success_root", "failure_root"):
             with self.subTest(column=column):
@@ -80,7 +80,7 @@ class TestHeaderOnlyCsv(unittest.TestCase):
         return path
 
     def test_require_rows_raises_system_exit(self):
-        from plotting.utils.io import load_metrics, require_rows
+        from msim.plotting.utils.io import load_metrics, require_rows
 
         with tempfile.TemporaryDirectory() as tmp:
             path = self._header_only_csv(tmp)
@@ -89,7 +89,7 @@ class TestHeaderOnlyCsv(unittest.TestCase):
                 require_rows(df, path)
 
     def test_failures_over_time_exits_cleanly_not_typeerror(self):
-        import plotting.failures_over_time as failures_over_time
+        import msim.plotting.failures_over_time as failures_over_time
 
         with tempfile.TemporaryDirectory() as tmp:
             path = self._header_only_csv(tmp)
@@ -120,7 +120,7 @@ def _stall_frame() -> pd.DataFrame:
 
 class TestFailureReasonPercentages(unittest.TestCase):
     def test_zero_completion_bucket_stays_nan(self):
-        from plotting.failures_over_time import failure_reason_percentages
+        from msim.plotting.failures_over_time import failure_reason_percentages
 
         cols, pct = failure_reason_percentages(_stall_frame())
         self.assertEqual(cols, ["failure_deadline", "failure_server"])
@@ -133,7 +133,7 @@ class TestFailureReasonPercentages(unittest.TestCase):
         self.assertAlmostEqual(pct["failure_deadline"].iloc[2], 0.0)
 
     def test_missing_reason_column_is_skipped(self):
-        from plotting.failures_over_time import failure_reason_percentages
+        from msim.plotting.failures_over_time import failure_reason_percentages
 
         df = _stall_frame().drop(columns=["failure_server"])
         cols, pct = failure_reason_percentages(df)
@@ -141,7 +141,7 @@ class TestFailureReasonPercentages(unittest.TestCase):
         self.assertEqual(list(pct.columns), ["failure_deadline"])
 
     def _render(self, df, tmp):
-        import plotting.failures_over_time as failures_over_time
+        import msim.plotting.failures_over_time as failures_over_time
 
         csv_path = os.path.join(tmp, "metrics.csv")
         df.to_csv(csv_path, index=False)
@@ -184,14 +184,14 @@ class TestFaultEventOverlay(unittest.TestCase):
         plt.close("all")
 
     def test_unknown_event_type_raises(self):
-        from plotting.utils.fault_events import plot_fault_events
+        from msim.plotting.utils.fault_events import plot_fault_events
 
         with self.assertRaises(SystemExit) as caught:
             plot_fault_events([_fault_event("thread_pool_exhaustion", {})], ax=self.ax)
         self.assertIn("thread_pool_exhaustion", str(caught.exception))
 
     def test_renamed_parameter_key_raises(self):
-        from plotting.utils.fault_events import plot_fault_events
+        from msim.plotting.utils.fault_events import plot_fault_events
 
         # Producer-side rename of failure_rate: used to render "Partial Failure (0%)".
         with self.assertRaises(SystemExit) as caught:
@@ -199,7 +199,7 @@ class TestFaultEventOverlay(unittest.TestCase):
         self.assertIn("failure_rate", str(caught.exception))
 
     def test_identical_events_share_one_legend_entry(self):
-        from plotting.utils.fault_events import plot_fault_events
+        from msim.plotting.utils.fault_events import plot_fault_events
 
         events = [
             _fault_event("load_spike", {"rps_multiplier": 3.0}, 1.0, 2.0),
@@ -213,7 +213,7 @@ class TestFaultEventOverlay(unittest.TestCase):
         self.assertEqual(len(self.ax.patches), 3)  # every window is still drawn
 
     def test_label_false_draws_the_span_without_a_legend_entry(self):
-        from plotting.utils.fault_events import plot_fault_events
+        from msim.plotting.utils.fault_events import plot_fault_events
 
         self.ax.plot([0, 1], [0, 1], label="series")
         plot_fault_events(
@@ -224,7 +224,7 @@ class TestFaultEventOverlay(unittest.TestCase):
         self.assertEqual(len(self.ax.patches), 1)
 
     def test_failures_plot_names_the_window_in_both_legends(self):
-        import plotting.failures_over_time as failures_over_time
+        import msim.plotting.failures_over_time as failures_over_time
 
         with tempfile.TemporaryDirectory() as tmp:
             csv_path = os.path.join(tmp, "stall.csv")
@@ -246,7 +246,7 @@ class TestLatencyDistributionArguments(unittest.TestCase):
         plt.close("all")
 
     def test_non_positive_median_exits(self):
-        from plotting.latency_distribution import plot_lognormal_latency
+        from msim.plotting.latency_distribution import plot_lognormal_latency
 
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "out.png")
@@ -256,7 +256,7 @@ class TestLatencyDistributionArguments(unittest.TestCase):
             self.assertFalse(os.path.exists(out))
 
     def test_non_positive_sigma_exits(self):
-        from plotting.latency_distribution import plot_lognormal_latency
+        from msim.plotting.latency_distribution import plot_lognormal_latency
 
         # sigma=0 is the silent variant: scipy returns nan without a warning.
         with tempfile.TemporaryDirectory() as tmp:
@@ -266,7 +266,7 @@ class TestLatencyDistributionArguments(unittest.TestCase):
             self.assertFalse(os.path.exists(out))
 
     def test_scale_is_the_median(self):
-        from plotting.latency_distribution import plot_lognormal_latency
+        from msim.plotting.latency_distribution import plot_lognormal_latency
 
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "out.png")

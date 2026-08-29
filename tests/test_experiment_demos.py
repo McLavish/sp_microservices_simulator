@@ -1,4 +1,4 @@
-"""Coverage for the runnable demos under `experiments/`.
+"""Coverage for the runnable demos under `examples/`.
 
 The demos are `python -m` scripts whose whole point is the CSV they export, so
 they are exercised the way a reader runs them: execute the module in a scratch
@@ -46,13 +46,13 @@ def _spill_bound(globs, client_cfg_name: str) -> float:
 @pytest.fixture(scope="module")
 def chain_fanout(tmp_path_factory):
     cwd = tmp_path_factory.mktemp("chain_fanout")
-    return cwd, _run_demo("experiments.chain_fanout", cwd)
+    return cwd, _run_demo("examples.chain_fanout", cwd)
 
 
 @pytest.fixture(scope="module")
 def rate_limiter_leaky(tmp_path_factory):
     cwd = tmp_path_factory.mktemp("rate_limiter_leaky")
-    return cwd, _run_demo("experiments.single.rate_limiter_leaky", cwd)
+    return cwd, _run_demo("examples.single.rate_limiter_leaky", cwd)
 
 
 def test_chain_fanout_demo_reports_traffic_for_its_whole_run(chain_fanout):

@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 
-from plotting.utils.fault_events import load_fault_events, plot_fault_events
-from plotting.utils.io import build_plot_parser, load_metrics, require_rows
+from msim.plotting.utils.fault_events import load_fault_events, plot_fault_events
+from msim.plotting.utils.io import build_plot_parser, load_metrics, require_rows
 
 
 def _bucket_width_s(df) -> float:

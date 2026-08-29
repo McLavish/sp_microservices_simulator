@@ -3,8 +3,8 @@ import numpy as np
 from matplotlib.ticker import PercentFormatter
 
 from msim.core import FAILURE_OUTCOMES
-from plotting.utils.fault_events import load_fault_events, plot_fault_events
-from plotting.utils.io import build_plot_parser, load_metrics, require_rows
+from msim.plotting.utils.fault_events import load_fault_events, plot_fault_events
+from msim.plotting.utils.io import build_plot_parser, load_metrics, require_rows
 
 # Derived from the authoritative outcome table so a new RootOutcome shows up
 # here (stack + legend follow the CSV column order) without a manual edit.

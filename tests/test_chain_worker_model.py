@@ -334,7 +334,7 @@ class TestSettleIsTheOnlyTeardownPath(unittest.TestCase):
     (quorum: succeed when k of n downstreams return) reaching for it would
     leave the outstanding siblings running, consuming shared downstream
     capacity and recording outcomes of their own — precisely the cross-chain
-    retry externality `experiments/multichain_retry_storm.py` exhibits.
+    retry externality `examples/multichain_retry_storm.py` exhibits.
     """
 
     def _attempt(self):

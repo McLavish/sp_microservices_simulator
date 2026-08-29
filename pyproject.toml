@@ -7,6 +7,13 @@ dependencies = [
     "numpy",
 ]
 
+[project.optional-dependencies]
+plot = [
+    "matplotlib",
+    "pandas",
+    "scipy",
+]
+
 [dependency-groups]
 dev = [
     "ruff",
@@ -54,8 +61,7 @@ ignore = [
 [tool.ruff.lint.isort]
 known-first-party = [
     "msim",
-    "experiments",
-    "plotting",
+    "examples",
 ]
 
 [tool.ruff.format]
@@ -83,8 +89,6 @@ addopts = [
 [tool.coverage.run]
 source = [
     "msim",
-    "experiments",
-    "plotting",
 ]
 omit = [
     "*/tests/*",

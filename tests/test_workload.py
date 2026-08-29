@@ -160,7 +160,7 @@ class TestWorkloadSeeding(unittest.TestCase):
     def test_default_seed_is_zero_and_deterministic(self):
         # Documented: rng_seed=None falls back to 0 — two unseeded workloads
         # emit identical streams, which is why concurrent workloads must pass
-        # explicit distinct seeds (see experiments/multichain_retry_storm.py).
+        # explicit distinct seeds (see examples/multichain_retry_storm.py).
         self.assertEqual(self._arrivals(None), self._arrivals(0))
 
 
