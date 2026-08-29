@@ -24,10 +24,12 @@ retry policies, PPO training) lives on the `rl-layer` branch, not here.
 - Python >= 3.10
 - [uv](https://docs.astral.sh/uv/) for environment and dependency management
 
-The simulator library is the `msim` package under `src/`; `make install` (`uv sync`)
-installs it editable, so `from msim.core import ...` works from any directory. The
-`experiments/` and `plotting/` scripts are not part of the package — run them as
-`python -m <module>` from the repo root.
+The simulator library is the `msim` package under `src/` (including `msim.plotting`);
+`make install` (`uv sync`) installs it editable, so `from msim.core import ...` works
+from any directory. Consumers depend on `microservices-simulator[plot]` — the `plot`
+extra carries `matplotlib` / `pandas` / `scipy`, and `pandas` is also needed for CSV
+export. The `examples/` demo scenarios are not part of the package — run them as
+`python -m examples.<name>` from the repo root.
 
 ## Install
 
@@ -35,16 +37,17 @@ installs it editable, so `from msim.core import ...` works from any directory. T
 make install        # uv sync --group dev + install the git pre-commit hook
 ```
 
-The simulator core depends only on `numpy`. The dev group adds `ruff`, `ty`,
-`pytest`, and the `scipy` / `matplotlib` / `pandas` used by plotting and CSV export.
+The simulator core depends only on `numpy`; the `plot` extra adds the `scipy` /
+`matplotlib` / `pandas` used by plotting and CSV export. The dev group adds `ruff`,
+`ty`, `pytest` and those same libraries.
 
 ## Quickstart
 
 Run a scenario, then plot it:
 
 ```bash
-python -m experiments.default        # writes output.csv + fault_events.json
-python -m plotting.failures_over_time output.csv --fault-events fault_events.json
+python -m examples.default           # writes output.csv + fault_events.json
+python -m msim.plotting.failures_over_time output.csv --fault-events fault_events.json
 ```
 
 ## Development
@@ -72,4 +75,4 @@ Full technical docs live in [`docs/`](docs/README.md):
 | [services-and-workload](docs/services-and-workload.md) | Service queue, service times, arrivals, fault injection. |
 | [request-handling](docs/request-handling.md) | Clients, retry policies, timeouts, chains/fan-out. |
 | [observability](docs/observability.md) | Metrics, CSV schema, plotting. |
-| [experiments](docs/experiments.md) | Runnable scenarios and their outputs. |
+| [examples](docs/examples.md) | Runnable example scenarios and their outputs. |

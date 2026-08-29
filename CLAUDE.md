@@ -6,9 +6,9 @@ This file provides guidance to the Agent when working with code in this reposito
 
 Discrete-event simulator of microservice request flows: queues, retries, timeouts, partial failures, latency injections, load spikes. Simulates single services, chains, and fan-outs, exports per-bucket CSV metrics + fault-event JSON for plotting. (A reinforcement-learning layer — Gymnasium env, learned/model-based retry policies, PPO training — used to live in `rl/`; it was split out to the `rl-layer` branch on 2026-08-28 and is not part of this branch.)
 
-The project is uv-managed. The simulator library is the `msim` package in `src/msim/`, built by the `uv_build` backend: `uv sync` installs it editable into the in-tree `.venv`, so `from msim.core import ...`, `from msim.service import ...`, `from msim.transport import ...` work from any cwd. `experiments/` and `plotting/` are *not* part of the package — run them as `python -m experiments.<name>` / `python -m plotting.<name>` from the repo root (pytest's `pythonpath = ["."]` exists for them). The simulator core depends only on `numpy` + stdlib; `scipy`, `matplotlib`, `pandas` are dev deps pulled in only by plotting and `Metrics.export_csv` (which imports `pandas` lazily at export time).
+The project is uv-managed. The simulator library is the `msim` package in `src/msim/`, built by the `uv_build` backend: `uv sync` installs it editable into the in-tree `.venv`, so `from msim.core import ...`, `from msim.service import ...`, `from msim.transport import ...` work from any cwd. `msim.plotting` ships in the package; its heavy deps (`matplotlib`, `pandas`, `scipy`) are the `plot` extra — `pandas` is also what `Metrics.export_csv` needs (imported lazily at export time), so a consumer that exports CSVs installs `microservices-simulator[plot]`. The core depends only on `numpy` + stdlib. `examples/` (runnable demo scenarios) is *not* part of the package: run them as `python -m examples.<name>` from the repo root (pytest's `pythonpath = ["."]` exists for them).
 
-Deeper reference docs live in `docs/` — start with `docs/architecture.md`, then the subsystem you're touching (`services-and-workload`, `request-handling`, `observability`, `experiments`). Keep them in sync when changing the behavior they describe. `AGENTS.md` is a symlink to this file — edit `CLAUDE.md`, never create a separate agents file.
+Deeper reference docs live in `docs/` — start with `docs/architecture.md`, then the subsystem you're touching (`services-and-workload`, `request-handling`, `observability`, `examples`). Keep them in sync when changing the behavior they describe. `AGENTS.md` is a symlink to this file — edit `CLAUDE.md`, never create a separate agents file.
 
 ## Architecture
 
@@ -72,32 +72,31 @@ uv run pytest tests/test_transport.py     # single module
 uv run pytest -k chain_worker             # by keyword
 ```
 
-Single-service / chain experiments (write CSVs + JSON to repo root):
+Example scenarios (write CSVs + JSON to the cwd):
 ```bash
-python -m experiments.default
-python -m experiments.chain_fanout
-python -m experiments.multichain_retry_storm
-python -m experiments.hotel_matched   # DeathStarBench hotelReservation approximation -> hotel_matched_results/
+python -m examples.default
+python -m examples.chain_fanout
+python -m examples.multichain_retry_storm
 ```
-`experiments/hotel_matched.py` maps the hotel read workload onto two chains sharing `profile`; `--calibration-json` takes the calibration JSON emitted by the external `valharness` project (`orchestrator.record_real`) and falls back to built-in defaults without it. Calibration fault semantics: an *absent* `fault_scenario` key falls back to the default profile fault, but an explicit empty (or profile-free) scenario means genuinely no profile faults. CLI bounds and JSON finiteness are validated (NaN/Infinity rejected).
 The tandem vs hold-worker fan-out behaviour is covered by
 `tests/test_chain_worker_model.py`; broader chain scenarios (fan-out
 monotonicity, deadline propagation, queue pressure) live in
 `tests/test_chain_scenarios.py`.
-`experiments/single/` holds focused single-service demos (circuit breakers, backoff variants, rate limiters, retry budget).
+`examples/single/` holds focused single-service demos (circuit breakers, backoff variants, rate limiters, retry budget).
+The DeathStarBench hotelReservation model (`hotel_matched`) is no longer here: it is the `hotel-sim` project in `microservices-system/benchmarks/hotelreservation/sim`, which depends on this package from git.
 
 Plotting (consumes a CSV + matching fault-events JSON; the time axis is shared):
 ```bash
-python -m plotting.failures_over_time chain_output.csv --fault-events chain_fault_events.json
-python -m plotting.latencies_over_time chain_output.csv --fault-events chain_fault_events.json
-python -m plotting.queue_size_over_time chain_output.csv --fault-events chain_fault_events.json
-python -m plotting.qps_over_time chain_output.csv --fault-events chain_fault_events.json
+python -m msim.plotting.failures_over_time chain_output.csv --fault-events chain_fault_events.json
+python -m msim.plotting.latencies_over_time chain_output.csv --fault-events chain_fault_events.json
+python -m msim.plotting.queue_size_over_time chain_output.csv --fault-events chain_fault_events.json
+python -m msim.plotting.qps_over_time chain_output.csv --fault-events chain_fault_events.json
 ./plot.sh   # batch-render the standard chain figures
 ```
 
 ## Conventions when extending
 
-- New library modules go in `src/msim/` and are imported absolutely (`from msim.<module> import ...`, never relative). `known-first-party` and the coverage `source` list cover the whole package, so nothing in `pyproject.toml` needs editing per module. Scripts and demos stay in `experiments/` / `plotting/`.
+- New library modules go in `src/msim/` and are imported absolutely (`from msim.<module> import ...`, never relative). `known-first-party` and the coverage `source` list cover the whole package, so nothing in `pyproject.toml` needs editing per module. Plotting scripts live in `src/msim/plotting/` (heavy deps go in the `plot` extra); runnable demos stay in `examples/`. Benchmark-specific scenarios belong with the benchmark (e.g. `hotel-sim` in `microservices-system`), not here.
 - New retry policies that wrap another should expose `underlying_strategy` so `_update_policy_results`, `_rollback_policy` *and* `_notify_request_start` reach them. New stateful policies should implement `add_result(success, now)` (once per attempt) and/or `on_request_start(now)` (once per admitted root request — that's the hook `RetryBudgetPolicy` deposits on, since its ratio is retries per *request*).
 - If a policy's `next_delay` has **side effects** (withdrawing budget, spending a rate-limiter token, reserving a leaky-bucket slot), it must also implement `rollback(context)` to undo exactly one such charge. The client asks for a delay before it knows the global deadline will veto the retry; without a refund, retries that are never issued are still charged. `RetryPolicy.rollback` defaults to a no-op, so side-effect-free policies need nothing.
 - Custom service behaviors must call `finalize` exactly once and `release_worker` at most once (both raise on repeats). Completion callbacks must not submit work synchronously if FCFS matters to your experiment — schedule through the event heap instead.

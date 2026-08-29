@@ -103,7 +103,7 @@ windows, request lifespans, and bucket ranges all use this convention.
 so events scheduled for the same instant fire in insertion order — this keeps runs
 deterministic even under ties.
 
-The usual driver pattern (see any file in `experiments/`) is:
+The usual driver pattern (see any file in `examples/`) is:
 
 ```python
 sim.run(until=s_to_ns(workload.duration_s))  # run the measured window
@@ -143,9 +143,9 @@ src/msim/       the installable library package (import as `msim.<module>`)
   transport       per-link delay decorator <- caller, service, simulator
   chain           fan-out nodes            <- caller, service, simulator
   metrics         aggregation + CSV export
+  plotting/       render CSV + fault JSON to PNG   (deps: the `plot` extra)
 
-experiments/    runnable scenarios (entry points, not in the package)   --> CSV + fault JSON
-plotting/       render CSV + fault JSON to PNG (not in the package)
+examples/       runnable demo scenarios (not in the package)   --> CSV + fault JSON
 ```
 
 ## Minimal example
@@ -170,4 +170,4 @@ sim.run()
   arrivals, and fault injection.
 - [request-handling](request-handling.md) — clients, retries, timeouts, and chains.
 - [observability](observability.md) — metrics, CSV export, and plotting.
-- [experiments](experiments.md) — runnable scenarios.
+- [examples](examples.md) — runnable example scenarios.

@@ -363,7 +363,7 @@ attempt is booked under the service that handled it, never under the link.
 
 - [services-and-workload](services-and-workload.md) — the `submit_attempt` / `behavior`
   contract these build on.
-- [experiments](experiments.md) — `single/` demos for each policy, plus the chain
+- [examples](examples.md) — `single/` demos for each policy, plus the chain
   scenarios.
 - [observability](observability.md) — how attempts become metrics.
 - [architecture](architecture.md) — the module map, the half-open time convention

@@ -1,13 +1,13 @@
 # Observability: metrics, CSV export & plotting
 
 How a run becomes numbers and pictures. `Metrics` aggregates completed
-`RootRequest`s into a summary and a per-bucket CSV; the `plotting/` scripts render
+`RootRequest`s into a summary and a per-bucket CSV; the `msim.plotting` scripts render
 that CSV (optionally overlaid with the fault-event JSON).
 
 ```
 ClientRuntime.roots --> Metrics.summary()      --> console stats
                     \-> Metrics.export_csv()    --> <name>_output.csv  --\
-FaultEventsTracker  ---> export_json()          --> <name>_fault.json  --+--> plotting/*.py --> PNG
+FaultEventsTracker  ---> export_json()          --> <name>_fault.json  --+--> msim.plotting.* --> PNG
 ```
 
 The CSV and the fault JSON share a **seconds** time axis, so they align when plotted
@@ -38,7 +38,7 @@ at import if the new member has no `FAILURE_OUTCOMES` entry (or if an entry name
 a `Summary` field that does not exist). Any consumer outside `core` that keeps its
 own per-outcome table gets the same check by calling
 `core.require_outcome_coverage(table, owner=...)` next to it, and
-`plotting/failures_over_time.py` derives its `REASON_COLUMNS` from the same table
+`msim.plotting.failures_over_time` derives its `REASON_COLUMNS` from the same table
 (it still tolerates a column missing from an older CSV), so a new outcome flows
 into the failure-mix figure without a manual edit.
 
@@ -72,7 +72,7 @@ Writes one row per time bucket (default 1 s). `granularity_s` must round to at
 least 1 ns (values below 5e-10 s raise `ValueError`); the `timepoint` column is
 serialized with granularity-aware precision so sub-millisecond buckets never
 collapse under the fixed `%.3f` used for latency columns. Count columns are raw
-per-bucket counts — `plotting.qps_over_time` divides them by the bucket width
+per-bucket counts — `msim.plotting.qps_over_time` divides them by the bucket width
 (inferred from consecutive timepoints) before labeling the axis "QPS".
 
 The subtlety is **which event time a column is bucketed by** — start vs. end:
@@ -97,11 +97,12 @@ Latency/queue cells are `nan` for buckets with no qualifying data. Because roots
 bucket by start but completions/latency by end, a spike of starts and the resulting
 completions can land in different rows — expected, not a bug.
 
-## Plotting (`plotting/`)
+## Plotting (`msim.plotting`)
 
-Each script is `python -m plotting.<name> <csv> [--fault-events JSON] [--output PNG]`.
-With `--fault-events`, the active fault windows are shaded/annotated over the series
-(via `plotting/utils/fault_events.py`).
+Each script is `python -m msim.plotting.<name> <csv> [--fault-events JSON] [--output PNG]`.
+The scripts ship in the package; their dependencies are the `plot` extra
+(`microservices-simulator[plot]`). With `--fault-events`, the active fault windows are
+shaded/annotated over the series (via `msim.plotting.utils.fault_events`).
 
 | Script | Reads (CSV columns) | Renders |
 | --- | --- | --- |
@@ -127,17 +128,17 @@ completed are drawn as a gap, never as a 0% failure rate.
 ### Example
 
 ```bash
-python -m experiments.default        # writes output.csv + fault_events.json
-python -m plotting.failures_over_time output.csv --fault-events fault_events.json
-python -m plotting.latencies_over_time output.csv --fault-events fault_events.json -o lat.png
+python -m examples.default           # writes output.csv + fault_events.json
+python -m msim.plotting.failures_over_time output.csv --fault-events fault_events.json
+python -m msim.plotting.latencies_over_time output.csv --fault-events fault_events.json -o lat.png
 ```
 
 ## See also
 
 - [services-and-workload](services-and-workload.md) — registering faults into the
   tracker that produces the overlay JSON.
-- [experiments](experiments.md) — what each scenario writes (filenames differ per
-  experiment).
+- [examples](examples.md) — what each example scenario writes (filenames differ per
+  scenario).
 
 ## Mutation record
 
