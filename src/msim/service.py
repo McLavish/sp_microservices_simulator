@@ -7,7 +7,7 @@ from functools import partial
 from msim.core import DropReason, TimeDuration, TimePoint
 from msim.fault_events import FaultEventsTracker
 from msim.faults import LatencyInjection, PartialFailure
-from msim.simulator import Simulator
+from msim.simulator import Event, Simulator
 
 # Floor applied to the lognormal shape parameter. Load-bearing, not defensive:
 # the sampler has floored sigma here since the first commit, so every pinned
@@ -152,6 +152,11 @@ class QItem:
     # Flagged rather than removed, because removing from the middle of a heap
     # would cost O(n) and break the FCFS invariant the heap order encodes.
     cancelled: bool = field(default=False, compare=False)
+    # The caller's deadline passed while this entry was still waiting for a
+    # worker. The caller was told at the deadline (its own clock fired); the
+    # entry keeps its queue slot until the server reaches it, and is then
+    # discarded without a second report.
+    expired: bool = field(default=False, compare=False)
 
 
 @dataclass
@@ -160,10 +165,13 @@ class ServiceRuntime:
     in_flight: int = 0
     queue: list[QItem] = field(default_factory=list)
     _seq: int = 0
-    # Live (non-tombstoned) queue occupancy. `queue` still holds cancelled
-    # entries until they surface at the heap head, so its raw length overstates
-    # occupancy: using it for the capacity check would let a cancelled entry go
-    # on shedding load, and using it for telemetry would inflate queue depth.
+    # Queue occupancy: every entry holding a slot, i.e. the heap minus the
+    # cancelled tombstones. `queue` still holds those until they surface at the
+    # heap head, so its raw length overstates occupancy: using it for the
+    # capacity check would let a cancelled entry go on shedding load, and using
+    # it for telemetry would inflate queue depth. Expired entries (the caller
+    # timed out while waiting) DO count: the server has not looked at them yet,
+    # so they still occupy the backlog and still shed load.
     _queued: int = 0
     # Attempts ARRIVING at this queue, from every client feeding it. This is
     # lambda for a queueing model, so it must be counted at submission, not at
@@ -227,6 +235,11 @@ class ServiceRuntime:
             if item.cancelled:
                 continue  # already discounted at cancel time; never took a worker
             self._queued -= 1
+            if item.expired:
+                # The caller timed out while this waited and was told at its
+                # deadline; the server discovers that now and drops the entry
+                # without taking a worker or reporting again.
+                continue
             item.start()
 
     def submit_attempt(
@@ -239,6 +252,13 @@ class ServiceRuntime:
         """
         Enqueue an attempt for this service.
         Execution is FCFS with 'workers' concurrency.
+
+        Deadline contract: `attempt_deadline` is the CALLER's clock. An attempt
+        still waiting for a worker when it passes is reported as a DEADLINE drop
+        at exactly that instant, not when the server next dequeues; the entry
+        keeps its queue slot until then (a server does not scan its backlog) and
+        is discarded silently when it surfaces. An attempt in service is cut at
+        the deadline and its worker freed there.
 
         Callback contract: `on_done` runs after the worker is freed but BEFORE
         queued work resumes — a callback that synchronously submits new work can
@@ -293,18 +313,47 @@ class ServiceRuntime:
             settled_on_done(False, 0, DropReason.QUEUE_FULL, self.queue_len(), False)
             return control
 
-        # Enqueue the request
-        item = QItem(
-            enqueued_at=sim.timestep,
-            seq=seq,
-            start=start_cb,
-        )
+        # Enqueue the request. The caller's deadline is armed as its own event:
+        # a client whose attempt is still waiting for a worker times out at its
+        # deadline regardless of when the server next looks at the queue.
+        # Reporting only at dequeue (the old behaviour) made the client learn of
+        # the timeout whenever a worker happened to free — in the retry-storm
+        # example half the deadline drops at the bottleneck were reported up to
+        # 50 ms late on a 60 ms timeout, and every retry fired that much late.
+        deadline_ev: Event | None = None
+
+        def start() -> None:
+            # Dequeued in time: the caller's clock no longer applies here. The
+            # in-service path enforces the deadline from now on (it cuts the
+            # service at the deadline, and _begin_service still catches a
+            # worker that frees at exactly the deadline instant).
+            if deadline_ev is not None:
+                deadline_ev.cancelled = True
+            start_cb()
+
+        item = QItem(enqueued_at=sim.timestep, seq=seq, start=start)
         heapq.heappush(self.queue, item)
         self._queued += 1
+
+        if attempt_deadline is not None:
+
+            def expire_in_queue() -> None:
+                # Still queued (start() and cancel_queued() both disarm this
+                # event). Tell the caller now; the entry stays in the heap,
+                # holding its slot, until the server reaches and discards it.
+                item.expired = True
+                # Depth EXCLUDING this attempt, as every other completion path
+                # reports it (an entry in service or one that never joined is
+                # not part of the queue it observes).
+                settled_on_done(False, 0, DropReason.DEADLINE, self.queue_len() - 1, False)
+
+            deadline_ev = sim.schedule(attempt_deadline, expire_in_queue)
 
         def cancel_queued() -> None:
             # Never entered service, so no worker to release and no _start_next.
             # Free the slot now, not when the tombstone reaches the heap head.
+            if deadline_ev is not None:
+                deadline_ev.cancelled = True
             item.cancelled = True
             self._queued -= 1
             on_done(False, 0, DropReason.CANCELLED, self.queue_len(), False)
@@ -329,8 +378,11 @@ class ServiceRuntime:
         if control is not None:
             control._clear()
 
-        # If the attempt expired while waiting in the queue, drop immediately without
-        # consuming a worker. We make sure we are not scheduling an event in the past.
+        # A worker that frees at EXACTLY the deadline instant can dequeue this
+        # attempt before its own deadline event fires (same `at`, earlier seq):
+        # drop it here, at the deadline, without consuming a worker. Strictly
+        # later dequeues never reach this point — the expiry event has already
+        # reported and _start_next discards the entry.
         if attempt_deadline is not None and sim.timestep >= attempt_deadline:
             on_done(False, 0, DropReason.DEADLINE, self.queue_len(), False)
             return

@@ -224,7 +224,7 @@ class Request:
     # downstream wait happens after the worker is handed back. With
     # hold_worker_during_fanout=True it covers the whole subtree, because the
     # worker really is held throughout. End-to-end node latency is `interval`.
-    # None when service never began (queue-full / deadline-at-dequeue drops).
+    # None when service never began (queue-full / deadline-while-queued drops).
     service_time_ns: TimeDuration | None = None
     # True when the occupancy above is a LOWER BOUND: the worker was still held
     # when a deadline or cancellation cut the attempt short. False when the

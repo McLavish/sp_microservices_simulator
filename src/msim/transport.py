@@ -167,9 +167,10 @@ class _TransitAttempt:
         if self.deadline is not None and arrive_at >= self.deadline:
             # Expired in transit: never call the target. Expired work is shed
             # before it consumes anything anywhere else in the model
-            # (`ServiceRuntime` drops at submit and at dequeue without taking a
-            # worker), and `admitted_total` counts arrivals AT THE QUEUE — a
-            # packet that died on the wire never arrived.
+            # (`ServiceRuntime` drops at submit, and a queued attempt at its
+            # deadline, without taking a worker), and `admitted_total` counts
+            # arrivals AT THE QUEUE — a packet that died on the wire never
+            # arrived.
             #
             # The client's clock fires at its deadline, not when the packet
             # would have landed. `max` only guards `Simulator.schedule`'s
@@ -264,7 +265,9 @@ class _TransitAttempt:
             # done, only the response was late.
             #
             # `max` matters when the target itself reported at or after the
-            # deadline (a deadline drop at dequeue happens strictly after it):
+            # deadline. A stock `ServiceRuntime` never reports after it (its
+            # queued and in-service deadline paths both fire AT the deadline),
+            # so this is for a target that ignores the deadline it is given:
             # the past cannot be scheduled, so delivery is now.
             deliver_at = max(self.deadline, self.sim.timestep)
             success = False

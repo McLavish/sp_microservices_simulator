@@ -496,37 +496,32 @@ class TestDeadlineSemantics(unittest.TestCase):
     def test_a_report_that_arrives_after_the_deadline_is_delivered_at_once(self):
         """The clamp is `max(deadline, now)`, and the `max` is a live path.
 
-        A `ServiceRuntime` deadline drop at dequeue fires whenever a worker
-        frees *after* the deadline, so the link is genuinely handed reports from
-        the past-the-deadline side. Clamping to the deadline itself would then
-        mean scheduling into the past, which `Simulator.schedule` refuses with a
-        `ValueError` — the run would abort rather than mis-report.
+        A stock `ServiceRuntime` reports every deadline drop AT or before the
+        deadline (a queued attempt's caller-clock event fires at it, an attempt
+        in service is cut there), so with stock targets the link is never handed
+        a report from the past-the-deadline side. A third-party `ServiceLike`
+        that ignores the deadline it is given still can, and clamping to the
+        deadline itself would then mean scheduling into the past, which
+        `Simulator.schedule` refuses with a `ValueError` — the run would abort
+        rather than mis-report.
 
-        Here one attempt holds the single worker until 20 ms while a second
-        crosses a 1 ms link with a 5 ms deadline: it queues at 1 ms and is shed
-        at dequeue at 20 ms, long past its deadline.
+        Here the stub target ignores its 5 ms deadline and reports a success at
+        21 ms (1 ms forward leg + 20 ms of service). The link books a DEADLINE
+        delivered now, not retroactively at 5 ms, keeping the occupancy the
+        target reported.
         """
         sim = Simulator(seed=1)
-        svc = _svc("svc", 20, workers=1)
-        hog = _Recorder(sim)
-        svc.submit_attempt(sim, hog)  # holds the only worker until ~20 ms
-
-        link = TransportLink(svc, TransportDelay(median=ms_to_ns(1)))
+        target = _StubTarget(service_ns=ms_to_ns(20))
+        link = TransportLink(target, TransportDelay(median=ms_to_ns(1)))
         rec = _Recorder(sim)
         link.submit_attempt(sim, rec, attempt_deadline=ms_to_ns(5))
 
         sim.run()
-        self.assertEqual(len(rec.calls), 1)
-        success, occupancy, drop, qsize, censored = rec.calls[0]
-        self.assertFalse(success)
-        self.assertEqual(drop, DropReason.DEADLINE)
-        self.assertEqual(occupancy, 0)  # never entered service
-        self.assertEqual(qsize, 0)
-        self.assertFalse(censored)
-        # Delivered when the drop was reported, NOT retroactively at 5 ms.
-        self.assertGreater(rec.times[0], ms_to_ns(5))
-        self.assertLess(abs(rec.times[0] - ms_to_ns(20)), ms_to_ns(0.01))
-        self.assertEqual(svc.admitted_total, 2)  # it did reach the queue
+        self.assertEqual(target.arrivals, [ms_to_ns(1)])  # 1 ms < 5 ms: it was forwarded
+        self.assertEqual(target.reports, [ms_to_ns(21)])
+        self.assertEqual(rec.calls, [(False, ms_to_ns(20), DropReason.DEADLINE, 0, False)])
+        # Delivered when the report arrived, NOT retroactively at 5 ms.
+        self.assertEqual(rec.times, [ms_to_ns(21)])
 
     def test_return_leg_expiry_is_booked_at_the_deadline_with_full_occupancy(self):
         """The work was really done; only the response was late.

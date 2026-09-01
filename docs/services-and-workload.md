@@ -77,17 +77,32 @@ window doubles the draw and adds 10 ms.
 probability at time `t` is the **max** `p_fail` over active partial failures; the
 attempt fails if `rng.random() < p_fail`.
 
-### The four drop points
+### The drop points
 
-A `DropReason` can be assigned at four distinct moments — worth knowing when
+A `DropReason` can be assigned at these distinct moments — worth knowing when
 reasoning about where load is shed:
 
 | When | Reason | Code |
 | --- | --- | --- |
 | At submit, queue already full | `QUEUE_FULL` | `service.py` |
-| At submit / at dequeue, already past deadline | `DEADLINE` | `service.py`, `service.py` |
+| At submit, already past deadline | `DEADLINE` | `service.py` |
+| While queued, the deadline passes | `DEADLINE`, reported **at the deadline** | `service.py` |
 | At finish, now past deadline | `DEADLINE` | `service.py` |
 | At finish, failure roll lost | `SERVER_FAILURE` | `service.py` |
+
+**The attempt deadline is the caller's clock.** A client whose attempt is still
+waiting for a worker times out at its deadline regardless of when the server
+next looks at the queue, so a queued attempt is reported at exactly that instant
+(`service.py`). The server side is deliberately not deadline-aware until it
+dequeues: the expired entry keeps its queue slot — still shedding `QUEUE_FULL`
+on later arrivals — until the server reaches it, and is then discarded without
+a second report. The dequeue path itself reports a `DEADLINE` only on the exact
+tie where a worker frees at the deadline instant. (Reporting only at dequeue,
+the old behaviour, made the client learn of a timeout whenever a worker happened
+to free: in `examples.multichain_retry_storm` half the deadline drops at the
+bottleneck were reported up to 50 ms late on a 60 ms timeout, and every retry
+fired that late.) An attempt already **in service** is cut at the deadline and
+its worker freed there; the occupancy it reports is censored.
 
 ### Example: a faulty service
 

@@ -152,6 +152,7 @@ is where they are pinned.
 | `service.py` `heapq.heappop(self.queue)` → LIFO pop | `test_service_is_fcfs`, both golden runs |
 | `service.py` `add += inj.add_latency` → `add += 0` | `test_additive_latency_applies_inside_its_window` |
 | `simulator.py` `seq=self._seq` → `seq=-self._seq` | `test_fanout_golden` (needs contention: with every request succeeding, tie order is unobservable) |
+| `service.py` report a queued attempt's deadline only at dequeue (drop the caller-clock event) | `test_service_deadline.py::TestQueuedAttemptDeadline`. Not by the goldens: their queues drain before the deadline, whereas in `examples.multichain_retry_storm` half the bottleneck's deadline drops were reported up to 50 ms late |
 
 The golden tests are brittle on purpose. A diff means the simulator's numbers
 moved, which invalidates figures produced with the old behaviour — establish

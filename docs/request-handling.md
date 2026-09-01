@@ -37,7 +37,10 @@ what happens next:
 - **Half-open deadline (strict).** `within_deadline = end_time < req.deadline`
   (`caller.py`). An attempt that *finishes exactly at* its deadline is converted
   to a `DEADLINE` drop, not a success. Effective success requires
-  `success AND within_deadline AND drop_reason == NONE`.
+  `success AND within_deadline AND drop_reason == NONE`. The deadline is the
+  caller's clock: an attempt still queued at the service when it passes is
+  reported at the deadline itself, not when a worker next frees (see
+  [services-and-workload](services-and-workload.md#the-drop-points)).
 - **Policy result fan-out.** `_update_policy_results` (`caller.py`) walks the
   policy via its `underlying_strategy` chain and calls `add_result(success, now)` on
   every layer that supports it. This is the *only* way circuit breakers and retry
@@ -320,8 +323,10 @@ scheduled (`Simulator.schedule` raises on it). The `max` only bites when the
 clock is already past the deadline: at submit on the forward row (a deadline
 handed down that has already elapsed — the analogue of `ServiceRuntime`'s
 already-expired drop), or on the return row when the target itself reports
-*after* the deadline — a `ServiceRuntime` deadline drop at dequeue fires whenever
-a worker frees late (`service.py`). Delivery is then immediate instead of
+*after* the deadline. A stock `ServiceRuntime` never does — a queued attempt's
+caller-clock event fires *at* the deadline and an attempt in service is cut
+there — so that branch is reached only by a third-party `ServiceLike` that
+ignores the deadline it is given. Delivery is then immediate instead of
 retroactive; everywhere else `now` is still short of the deadline and the clamp
 lands on the deadline itself.
 

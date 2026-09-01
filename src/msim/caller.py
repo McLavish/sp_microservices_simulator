@@ -306,7 +306,7 @@ class ClientRuntime:
         ctx.req.drop_reason = drop_reason
         ctx.req.queue_size_at_end = queue_size
         # svc_time == 0 marks paths where service never began (queue-full,
-        # deadline-at-dequeue); real service times are floored at 100 us.
+        # deadline while queued); real service times are floored at 100 us.
         ctx.req.service_time_ns = svc_time if svc_time > 0 else None
         ctx.req.service_time_censored = occupancy_censored
 
