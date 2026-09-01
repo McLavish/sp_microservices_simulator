@@ -346,7 +346,14 @@ class TimeBasedCircuitBreakerPolicy(_CircuitBreakerBase):
             # open circuit causes -- can never accumulate enough probes to
             # decide, and stays HALF_OPEN indefinitely.
             probes = max(1, min(self.min_requests, self.half_open_min_requests))
-            if total >= probes and rate < (1 - self.success_threshold_rate):
+            # Close when the probes' SUCCESS rate reaches the threshold — the
+            # same `>=` the count-based breaker applies to its success ratio.
+            # Compared on the success side rather than as `rate < 1 - thr`: the
+            # strict form could never be met at thr=1.0 (a breaker asked to
+            # close only on all-successful probes re-opened on two successes),
+            # and the float `1 - 0.8` is not 0.2, so 4 of 5 probes missed it too.
+            success_rate = (total - failures) / total if total > 0 else 0.0
+            if total >= probes and success_rate >= self.success_threshold_rate:
                 self._state = CBState.CLOSED
                 self._opened_at = None
                 # Fresh metrics after recovery (resilience4j resets the sliding

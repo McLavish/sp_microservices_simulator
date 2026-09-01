@@ -127,7 +127,7 @@ only partially implemented.)
 | Policy | Opens when | Closes when |
 | --- | --- | --- |
 | `CountBasedCircuitBreakerPolicy` (`retry_policies.py`) | `failure_threshold_ratio` e.g. `(5,10)` = 5 failures in last 10 | `success_threshold_ratio` successes among half-open probes |
-| `TimeBasedCircuitBreakerPolicy` (`retry_policies.py`) | failure **rate** > `failure_threshold_rate` over `window_duration` (needs `min_requests`) | failure rate falls below `1 - success_threshold_rate` |
+| `TimeBasedCircuitBreakerPolicy` (`retry_policies.py`) | failure **rate** > `failure_threshold_rate` over `window_duration` (needs `min_requests`) | success rate among the half-open probes (at least `half_open_min_requests`) reaches `success_threshold_rate` (`>=`, so `1.0` means "all probes succeed") |
 
 Both validate their configuration in `__post_init__` and raise `ValueError`:
 thresholds within range, `min_requests >= 1`, `window_duration > 0`,

@@ -461,6 +461,52 @@ class TestRetryPolicies(unittest.TestCase):
             sim.run()
 
 
+class TestTimeBasedBreakerCloseBoundary(unittest.TestCase):
+    """HALF_OPEN closes when the probes' success rate REACHES the threshold.
+
+    The rule used to be `failure_rate < 1 - success_threshold_rate`, strict and
+    computed on the failure side. At `success_threshold_rate=1.0` that is
+    `0 < 0`, never true, so a breaker configured to close only on all-successful
+    probes re-opened after two successes; and `1 - 0.8` is `0.19999...` in
+    floating point, so 4 successful probes out of 5 missed an 80% threshold.
+    """
+
+    def _half_open(self, success_threshold_rate: float, probes: int):
+        policy = TimeBasedCircuitBreakerPolicy(
+            failure_threshold_rate=0.5,
+            success_threshold_rate=success_threshold_rate,
+            min_requests=2,
+            window_duration=s_to_ns(10),
+            underlying_strategy=NoRetryPolicy(),
+            half_open_delay=1,
+            half_open_min_requests=probes,
+        )
+        policy.add_result(False, now=0)
+        policy.add_result(False, now=1)
+        self.assertEqual(policy.get_state(), CBState.OPEN)
+        self.assertTrue(policy.allow_request(now=10))
+        self.assertEqual(policy.get_state(), CBState.HALF_OPEN)
+        return policy
+
+    def test_all_successful_probes_close_a_breaker_that_demands_all(self):
+        policy = self._half_open(success_threshold_rate=1.0, probes=2)
+        policy.add_result(True, now=11)
+        policy.add_result(True, now=12)
+        self.assertEqual(policy.get_state(), CBState.CLOSED)
+
+    def test_exactly_the_threshold_closes(self):
+        policy = self._half_open(success_threshold_rate=0.8, probes=5)
+        for i, ok in enumerate((True, True, True, True, False)):
+            policy.add_result(ok, now=11 + i)
+        self.assertEqual(policy.get_state(), CBState.CLOSED)
+
+    def test_one_below_the_threshold_reopens(self):
+        policy = self._half_open(success_threshold_rate=0.8, probes=5)
+        for i, ok in enumerate((True, True, True, False, False)):
+            policy.add_result(ok, now=11 + i)
+        self.assertEqual(policy.get_state(), CBState.OPEN)
+
+
 class TestTimeBasedBreakerCounters(unittest.TestCase):
     def test_incremental_counters_match_full_rescan(self):
         rng = random.Random(7)
