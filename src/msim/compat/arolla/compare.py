@@ -19,7 +19,16 @@ Measures, per group (the replicas of one client entry together):
   the group calls, when it has one.
 
 Each run uses its seed for the simulator AND for the arrival streams, on both
-sides, so the samples are independent of each other and of the other engine's.
+sides, so the samples are independent of each other and of the other engine's,
+and each sweep point takes its own block of seeds, so the points of a file are
+independent of each other too.
+
+One known difference is in the arrival process itself: Arolla's workload sends
+every client's first request at exactly t = 0, where msim's Poisson process
+draws the first arrival like every other. With many clients that is a burst at
+the start and one request more per client, which shows in cells whose standard
+error is tiny. `--reference-start poisson` replaces, in memory, the reference's
+first arrival by a drawn one, to compare everything else.
 
 The reference simulator is imported from the checkout given with `--arolla`
 (its `simulator/src`), and needs what that code needs (pydantic, numpy, pandas,
@@ -142,8 +151,29 @@ def run_msim(config: dict[str, Any], seed: int, duration_s: float | None) -> Mea
     return {name: group.measures() for name, group in groups.items()}
 
 
+def _draw_first_arrival(workload_class: Any, s_to_ns: Any) -> None:
+    """Make the reference's workload draw its first arrival instead of forcing it to t = 0."""
+
+    def drive(self: Any, sim: Any, on_arrival: Any) -> None:
+        end_at = s_to_ns(self.duration_s)
+
+        def tick() -> None:
+            if sim.timestep >= end_at:
+                return
+            on_arrival(sim)
+            sim.schedule(sim.timestep + max(1, self._sample_interarrival(sim.timestep)), tick)
+
+        sim.schedule(max(1, self._sample_interarrival(0)), tick)
+
+    workload_class.drive = drive
+
+
 def run_arolla(
-    config: dict[str, Any], seed: int, duration_s: float | None, checkout: str
+    config: dict[str, Any],
+    seed: int,
+    duration_s: float | None,
+    checkout: str,
+    start: str = "as-is",
 ) -> Measures:
     """The same scenario on the reference simulator.
 
@@ -158,6 +188,12 @@ def run_arolla(
             sys.path.insert(0, source)
         from simulator.config.loader import ConfigLoader  # ty: ignore[unresolved-import]
         from simulator.config.schema import ExperimentConfig  # ty: ignore[unresolved-import]
+
+        if start == "poisson":
+            from simulator.runtime.workload import Workload  # ty: ignore[unresolved-import]
+            from simulator.utils import time as their_time  # ty: ignore[unresolved-import]
+
+            _draw_first_arrival(Workload, their_time.s_to_ns)
 
         cfg = copy.deepcopy(config)
         cfg["seed"] = seed
@@ -206,11 +242,13 @@ def run_arolla(
     return result["measures"]
 
 
-def _job(job: tuple[str, dict[str, Any], int, float | None, str]) -> tuple[str, int, Measures]:
-    engine, config, seed, duration_s, checkout = job
+def _job(
+    job: tuple[str, dict[str, Any], int, float | None, str, str],
+) -> tuple[str, int, Measures]:
+    engine, config, seed, duration_s, checkout, start = job
     if engine == "msim":
         return engine, seed, run_msim(config, seed, duration_s)
-    return engine, seed, run_arolla(config, seed, duration_s, checkout)
+    return engine, seed, run_arolla(config, seed, duration_s, checkout, start)
 
 
 def _mean_se(values: list[float]) -> tuple[float, float, int]:
@@ -262,9 +300,10 @@ def compare_point(
     first_seed: int,
     jobs: int,
     duration_s: float | None = None,
+    reference_start: str = "as-is",
 ) -> list[dict[str, Any]]:
     todo = [
-        (engine, config, first_seed + index, duration_s, checkout)
+        (engine, config, first_seed + index, duration_s, checkout, reference_start)
         for index in range(seeds)
         for engine in ("arolla", "msim")
     ]
@@ -310,12 +349,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--point", type=int, default=None, help="one sweep point (0-based)")
     parser.add_argument("--duration-s", type=float, default=None, help="cut every workload short")
     parser.add_argument("--threshold", type=float, default=3.0, help="gap in SE that is marked")
+    parser.add_argument(
+        "--reference-start",
+        choices=("as-is", "poisson"),
+        default="as-is",
+        help="the reference's first arrival: at t = 0 as it ships, or drawn like the others",
+    )
     parser.add_argument("--json", default=None, help="also write the rows to this file")
     args = parser.parse_args(argv)
 
     points = read(args.scenario)
     if args.point is not None:
         points = [points[args.point]]
+    if args.reference_start == "poisson":
+        print("reference: first arrival of every client drawn, not forced to t = 0")
     saved = []
     worst_overall = 0.0
     for point in points:
@@ -330,9 +377,11 @@ def main(argv: list[str] | None = None) -> int:
             point.config,
             checkout=args.arolla,
             seeds=args.seeds,
-            first_seed=args.first_seed,
+            # A block of seeds per sweep point: the points share no randomness.
+            first_seed=args.first_seed + point.index * args.seeds,
             jobs=args.jobs,
             duration_s=args.duration_s,
+            reference_start=args.reference_start,
         )
         worst = print_rows(rows, args.threshold)
         worst_overall = max(worst_overall, worst)
@@ -343,7 +392,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         with open(args.json, "w", encoding="utf-8") as handle:
             json.dump(
-                {"seeds": args.seeds, "first_seed": args.first_seed, "points": saved},
+                {
+                    "seeds": args.seeds,
+                    "first_seed": args.first_seed,
+                    "reference_start": args.reference_start,
+                    "points": saved,
+                },
                 handle,
                 indent=1,
             )

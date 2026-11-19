@@ -133,7 +133,15 @@ that started in each fault window, attempts per request, median latency of
 successes, retries asked and admitted at the server) the two means and their
 difference in standard errors, marking a difference beyond `--threshold` (3).
 `--point i` runs one sweep point, `--duration-s` cuts the workloads short for a
-scenario too large to run whole, `--json` saves the rows.
+scenario too large to run whole, `--json` saves the rows. Each sweep point takes
+its own block of seeds, so the points of a file share no randomness.
+
+One difference is in the arrival process and is deliberate (the table above):
+their workload sends every client's first request at exactly t = 0. With many
+clients that is a burst at the start and one request more per client, enough to
+show in cells whose standard error is tiny. `--reference-start poisson`
+replaces, in memory, the reference's first arrival by a drawn one, so that
+everything else can be compared.
 
 The reference is imported from the checkout given with `--arolla` and needs what
 that code needs (pydantic, numpy, pandas, PyYAML); it should be a checkout whose
