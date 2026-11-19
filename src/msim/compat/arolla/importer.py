@@ -28,6 +28,20 @@ each its own tenant. There are two kinds, as in their runner:
   It is built as a client that carries the service's policy and tells the
   server its deadline.
 
+**Dependencies.** A service with `dependencies` is a chain node that holds its
+worker from the start, makes its calls first and does its own work last
+(`local_work="last"`): `sequential` dependencies are one call wave each,
+`parallel` ones share a wave that the service waits out (`wave_join="wait_all"`),
+and an `optional` dependency is an optional edge. What a service calls is the
+dependency's own retry LOOP -- a client that carries the dependency's retry
+policy and attempt timeout, one per service, shared by all its callers -- so the
+caller gets one answer per call, when the dependency has finished retrying.
+
+**Two loops on one hop.** A client with a retry policy in front of a service
+that retries too, or that has an attempt timeout of its own, calls that same
+loop through a `RetryLayer`: the client's policy and timer on the outside, the
+service's on the inside.
+
 **Arrivals.** Every client has its own arrival stream, derived from the
 workload's `rng_seed`, the position of its entry among the entries that target
 the same service, and its replica index, so arms laid out on separate services
@@ -48,7 +62,8 @@ from msim.admission import (
     SuccessFundedBudget,
     TokenBucketBudget,
 )
-from msim.caller import ClientConfig, ClientRuntime, ServiceLike
+from msim.caller import ClientConfig, ClientRuntime, RetryLayer, ServiceLike
+from msim.chain import DownstreamEdge, ServiceNodeRuntime
 from msim.compat.arolla import schema
 from msim.compat.arolla.policies import (
     FirstAttemptFundedBudget,
@@ -102,6 +117,11 @@ class Scenario:
     gates: dict[str, AdmissionGate] = field(default_factory=dict)
     #: Each service's limiter as a controller, for the services that have one.
     controllers: dict[str, AdmissionController] = field(default_factory=dict)
+    #: The chain node of every service that calls others or is called by one.
+    nodes: dict[str, ServiceNodeRuntime] = field(default_factory=dict)
+    #: A service's own retry loop as the client that runs it, where something
+    #: calls the service through it (another service, or a client that retries).
+    loops: dict[str, ClientRuntime] = field(default_factory=dict)
 
     @property
     def name(self) -> str:
@@ -285,24 +305,7 @@ def build(
     which is how one scenario is run many times. `duration_s` cuts every
     workload short, for a scenario too large to run whole.
     """
-    for service in experiment.services:
-        if service.dependencies:
-            raise UnsupportedScenario(
-                f"service {service.name!r} has dependencies, which are not mapped yet"
-            )
-
-    sim = Simulator(seed=experiment.seed if seed is None else seed)
-    stations = {service.name: _station(service) for service in experiment.services}
-    controllers = {}
-    for service in experiment.services:
-        controller = _controller(service)
-        if controller is not None:
-            controllers[service.name] = controller
-    # What a caller with retries of its own submits to: the gate, where there is one.
-    gates = {
-        name: AdmissionGate(stations[name], [controller])
-        for name, controller in controllers.items()
-    }
+    builder = _Builder(experiment, Simulator(seed=experiment.seed if seed is None else seed))
 
     if experiment.clients:
         entries = list(experiment.clients)
@@ -310,7 +313,6 @@ def build(
         assert experiment.workload is not None
         entries = [schema.Client(name=IMPLICIT_CLIENT, workload=experiment.workload)]
 
-    banks: dict[str, RetryBank] = {}
     position_on: dict[str, int] = {}
     clients: list[ImportedClient] = []
     for entry in entries:
@@ -321,7 +323,7 @@ def build(
             raise UnsupportedScenario(f"client {entry.name!r}: e2e_retry_budget is not mapped yet")
         for replica in range(entry.replicas):
             name = entry.name if entry.replicas <= 1 else f"{entry.name}.{replica}"
-            runtime = _client(entry, name, service, sim, stations, gates, controllers, banks)
+            runtime = builder.client(entry, name, service)
             spec = entry.workload
             base_seed = spec.rng_seed if arrivals is None else arrivals
             workload = Workload(
@@ -349,90 +351,187 @@ def build(
             )
     return Scenario(
         experiment=experiment,
-        sim=sim,
+        sim=builder.sim,
         clients=clients,
-        stations=stations,
-        gates=gates,
-        controllers=controllers,
+        stations=builder.stations,
+        gates=builder.gates,
+        controllers=builder.controllers,
+        nodes=builder.nodes,
+        loops=builder.loops,
     )
 
 
-def _client(
-    entry: schema.Client,
-    name: str,
-    service: schema.Service,
-    sim: Simulator,
-    stations: dict[str, ServiceRuntime],
-    gates: dict[str, AdmissionGate],
-    controllers: dict[str, AdmissionController],
-    banks: dict[str, RetryBank],
-) -> ClientRuntime:
-    service_timeout = service.timeout or schema.Timeout()
-    if entry.retry is None:
-        # A relay: the service's own retry loop and timeouts are the client's.
-        # Its attempts ARE the service's attempts, so they go straight to the
-        # station; the limiter gates them from inside the loop.
-        if entry.timeout is not None and entry.timeout.attempt_ms is not None:
-            raise UnsupportedScenario(
-                f"client {entry.name!r}: an attempt timeout on a client without a retry "
-                "policy (a second timeout around the service's own) is not mapped yet"
+class _Builder:
+    """The services of one scenario, built once and shared by everything that calls them."""
+
+    def __init__(self, experiment: schema.Experiment, sim: Simulator) -> None:
+        self.experiment = experiment
+        self.sim = sim
+        self.stations = {service.name: _station(service) for service in experiment.services}
+        self.controllers: dict[str, AdmissionController] = {}
+        for service in experiment.services:
+            controller = _controller(service)
+            if controller is not None:
+                self.controllers[service.name] = controller
+        #: What a client with retries of its own submits to, where the service
+        #: has a limiter: the gate that turns its retries away.
+        self.gates = {
+            name: AdmissionGate(self.stations[name], [controller])
+            for name, controller in self.controllers.items()
+        }
+        self.banks: dict[str, RetryBank] = {}
+        #: A service's own retry loop, as the client that runs it. One per
+        #: service, shared by every caller: the loop is the service's.
+        self.loops: dict[str, ClientRuntime] = {}
+        self.layers: dict[str, RetryLayer] = {}
+        #: The chain node of every service that calls others or is called by one.
+        self.nodes: dict[str, ServiceNodeRuntime] = {}
+        self._graph()
+
+    def _graph(self) -> None:
+        """Build a node for every service in a call graph, callees before callers."""
+        services = {service.name: service for service in self.experiment.services}
+        called = {d.service for service in services.values() for d in service.dependencies}
+        pending = {name for name, service in services.items() if service.dependencies} | called
+        for name in sorted(pending):
+            if name in self.controllers:
+                raise UnsupportedScenario(
+                    f"service {name!r} has a limiter and calls or is called by another service: "
+                    "admission between services is not mapped yet"
+                )
+        while pending:
+            ready = sorted(
+                name
+                for name in pending
+                if all(d.service in self.nodes for d in services[name].dependencies)
             )
-        policy = _backoff(service.retry, sim)
-        controller = controllers.get(service.name)
+            for name in ready:
+                service = services[name]
+                if not service.dependencies:
+                    self.nodes[name] = ServiceNodeRuntime(service=self.stations[name])
+                    continue
+                # Their dependency model: the worker is held from the start, the
+                # dependencies are called first -- one after the other, or all
+                # together with the service waiting for every answer -- and the
+                # service's own work comes last.
+                parallel = service.dependency_call_pattern == "parallel"
+                node = ServiceNodeRuntime(
+                    service=self.stations[name],
+                    hold_worker_during_fanout=True,
+                    local_work="last",
+                    wave_join="wait_all" if parallel else "short_circuit",
+                )
+                for index, dependency in enumerate(service.dependencies):
+                    node.add_downstream(
+                        DownstreamEdge(
+                            client=self.loop(services[dependency.service]),
+                            target=self.nodes[dependency.service],
+                            wave=0 if parallel else index,
+                            optional=dependency.optional,
+                        )
+                    )
+                self.nodes[name] = node
+            pending -= set(ready)
+
+    def target(self, service: schema.Service) -> ServiceLike:
+        """What one attempt AT the service is submitted to: its node, or its station."""
+        return self.nodes.get(service.name, self.stations[service.name])
+
+    def loop_policy(self, service: schema.Service) -> RetryPolicy:
+        """The service's own retry policy, gated by its limiter from inside."""
+        policy = _backoff(service.retry, self.sim)
+        controller = self.controllers.get(service.name)
         if controller is not None:
             policy = ControlledRetryPolicy([controller], policy)
+        return policy
+
+    def loop(self, service: schema.Service) -> ClientRuntime:
+        """The service's own retry loop: what another service, or a layer, calls."""
+        loop = self.loops.get(service.name)
+        if loop is None:
+            timeout = service.timeout or schema.Timeout()
+            loop = self.loops[service.name] = ClientRuntime(
+                cfg=ClientConfig(
+                    retry=self.loop_policy(service),
+                    # The caller's deadline is the loop's global deadline; the
+                    # service's attempt timeout bounds each attempt, enforced there.
+                    timeout_controller=StaticTimeoutController(
+                        global_timeout=None, attempt_timeout=_ms(timeout.attempt_ms)
+                    ),
+                ),
+                service=self.target(service),
+            )
+        return loop
+
+    def layer(self, service: schema.Service) -> RetryLayer:
+        layer = self.layers.get(service.name)
+        if layer is None:
+            layer = self.layers[service.name] = RetryLayer(self.loop(service))
+        return layer
+
+    def client(self, entry: schema.Client, name: str, service: schema.Service) -> ClientRuntime:
+        service_timeout = service.timeout or schema.Timeout()
+        if entry.retry is None:
+            # A relay: the service's own retry loop and timeouts are the client's.
+            # Its attempts ARE the service's attempts, so they go straight to the
+            # service; the limiter gates them from inside the loop.
+            if entry.timeout is not None and entry.timeout.attempt_ms is not None:
+                raise UnsupportedScenario(
+                    f"client {entry.name!r}: an attempt timeout on a client without a retry "
+                    "policy (a second timeout around the service's own) is not mapped yet"
+                )
+            global_ms = (
+                entry.timeout.global_ms if entry.timeout is not None else service_timeout.global_ms
+            )
+            return ClientRuntime(
+                cfg=ClientConfig(
+                    retry=self.loop_policy(service),
+                    timeout_controller=StaticTimeoutController(
+                        global_timeout=_ms(global_ms),
+                        attempt_timeout=_ms(service_timeout.attempt_ms),
+                    ),
+                    tenant=name,
+                ),
+                service=self.target(service),
+            )
+
+        # A client with a policy of its own.
+        policy = _client_policy(entry, self.sim, self.banks)
+        own_attempt_ms = entry.timeout.attempt_ms if entry.timeout is not None else None
         global_ms = (
             entry.timeout.global_ms if entry.timeout is not None else service_timeout.global_ms
         )
-        target: ServiceLike = stations[service.name]
+        service_retries = service.retry is not None and service.retry.type != "none"
+        if service_retries or (
+            own_attempt_ms is not None and service_timeout.attempt_ms is not None
+        ):
+            # Two retry loops, or two attempt timeouts, on one hop: the client
+            # calls the service's own loop, which keeps its policy and its
+            # timeout, and sees one answer per call.
+            if service.name in self.controllers:
+                raise UnsupportedScenario(
+                    f"client {entry.name!r} retries, and the service it calls ({service.name!r}) "
+                    "has a limiter and a retry loop of its own: not mapped yet"
+                )
+            target: ServiceLike = self.layer(service)
+            attempt_ms = own_attempt_ms
+        else:
+            target = self.gates.get(service.name, self.target(service))
+            # Without a timer of its own, the service's attempt timeout bounds
+            # each call, and the server enforces it.
+            attempt_ms = (
+                own_attempt_ms if own_attempt_ms is not None else service_timeout.attempt_ms
+            )
         return ClientRuntime(
             cfg=ClientConfig(
                 retry=policy,
                 timeout_controller=StaticTimeoutController(
-                    global_timeout=_ms(global_ms), attempt_timeout=_ms(service_timeout.attempt_ms)
+                    global_timeout=_ms(global_ms), attempt_timeout=_ms(attempt_ms)
                 ),
                 tenant=name,
+                # The client's own timer is the client's: the server hears of
+                # the global deadline only.
+                server_deadline="attempt" if own_attempt_ms is None else "global",
             ),
             service=target,
         )
-
-    # A client with a policy of its own.
-    if service.retry is not None and service.retry.type != "none":
-        raise UnsupportedScenario(
-            f"client {entry.name!r} has a retry policy and so has the service it calls "
-            f"({service.name!r}): two retry loops on one hop are not mapped yet"
-        )
-    target = gates.get(service.name, stations[service.name])
-    policy = _client_policy(entry, sim, banks)
-    if entry.timeout is None:
-        # No timeout of its own: the request's global timeout is the service's,
-        # and the service's attempt timeout bounds each call, enforced there.
-        timeouts = StaticTimeoutController(
-            global_timeout=_ms(service_timeout.global_ms),
-            attempt_timeout=_ms(service_timeout.attempt_ms),
-        )
-        mode = "attempt"
-    elif entry.timeout.attempt_ms is None:
-        timeouts = StaticTimeoutController(
-            global_timeout=_ms(entry.timeout.global_ms),
-            attempt_timeout=_ms(service_timeout.attempt_ms),
-        )
-        mode = "attempt"
-    else:
-        if service_timeout.attempt_ms is not None:
-            raise UnsupportedScenario(
-                f"client {entry.name!r} and service {service.name!r} both set an attempt "
-                "timeout: two timeouts on one hop are not mapped yet"
-            )
-        # The client's own timer: the server is told the global deadline only.
-        timeouts = StaticTimeoutController(
-            global_timeout=_ms(entry.timeout.global_ms),
-            attempt_timeout=_ms(entry.timeout.attempt_ms),
-        )
-        mode = "global"
-    return ClientRuntime(
-        cfg=ClientConfig(
-            retry=policy, timeout_controller=timeouts, tenant=name, server_deadline=mode
-        ),
-        service=target,
-    )

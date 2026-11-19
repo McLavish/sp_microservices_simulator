@@ -64,6 +64,9 @@ where theirs lets a mistake through:
 | ... its `timeout.attempt_ms` | a timer of the client's own: `server_deadline="global"`, so the attempts it gives up on live on at the server |
 | ... no `timeout` at all | the service's `timeout` applies: its `global_ms` to the request, its `attempt_ms` to each call, enforced by the server |
 | a client **without** a `retry` policy, and the single client of a top-level `workload` | a relay: a client that carries the SERVICE's retry policy and timeouts, tells the server its deadline, and submits straight to the station. The service's limiter gates those retries from inside the loop |
+| a service with `dependencies` | a chain node that holds its worker, makes its calls first and works last (`local_work="last"`): `sequential` dependencies are a call wave each, `parallel` ones share a wave the service waits out (`wave_join="wait_all"`), an `optional` one is an optional edge |
+| a call from one service to another | a call to the dependency's own retry **loop**: a client carrying the dependency's `retry` policy and `timeout.attempt_ms`, one per service and shared by its callers. The caller gets one answer per call, when the dependency has finished retrying |
+| a client with a `retry` policy in front of a service that retries too, or that has an `attempt_ms` of its own | two loops on one hop: the client calls the service's loop through a `RetryLayer`, its policy and timer outside, the service's inside |
 | `workload` | a `Workload` with its own arrival stream per client |
 
 **Arrival streams.** Each client's stream is derived from the workload's
@@ -84,6 +87,8 @@ something else, the intent is kept here. The same defects are fixed on a branch
 of their repository, which is what msim is compared against (below).
 | Their code | Here |
 | --- | --- |
+| a dependency call completes on the dependency's first attempt, and again on each later one | once, when the dependency has finished retrying |
+| a client with its own policy takes the service's first attempt as the call's result | the result of the call: the service's last attempt |
 | the answer to an attempt the client timed out is processed as a new result | ignored (an orphan's answer goes nowhere) |
 | all replicas of an entry, and all entries sharing a workload block, arrive at the same instants | one arrival stream per client |
 | a retry-budget deposit is cut to whole hundredths of a retry | exact |
@@ -99,11 +104,13 @@ above zero.
 
 ## Not mapped yet
 
-`build` raises `UnsupportedScenario`, naming the feature, for a scenario that
-uses service `dependencies`, a client `e2e_retry_budget`, a retry policy on both
-a client and the service it calls, an attempt timeout on both, or a
-`count_based` breaker / `rate_limiter` on a service. Of the 44 scenario files
-Arolla ships, 42 are built today; the two with dependencies are not.
+All 44 scenario files Arolla ships are built. `build` raises
+`UnsupportedScenario`, naming the feature, for the corners of their schema no
+shipped file uses and this reader does not map yet: a client `e2e_retry_budget`;
+a `count_based` breaker or a `rate_limiter` on a service; a limiter on a service
+that calls, or is called by, another service; a limiter on a service that also
+retries itself when its client retries too; an attempt timeout on a client that
+has no retry policy.
 
 ## Comparing the two simulators
 

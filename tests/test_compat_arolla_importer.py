@@ -16,6 +16,7 @@ from msim.admission import (
     SuccessFundedBudget,
     TokenBucketBudget,
 )
+from msim.caller import RetryLayer
 from msim.compat.arolla import Scenario, UnsupportedScenario, arrival_seed, build, parse
 from msim.compat.arolla.policies import (
     BreakerState,
@@ -476,6 +477,167 @@ class TestRunControls(unittest.TestCase):
         self.assertLess(scenario.sim.timestep, 2 * S)
 
 
+GRAPH = """
+name: graph
+seed: 3
+services:
+  - name: db
+    latency: {median_ms: 10, lognorm_sigma: 0}
+    workers: 4
+    partial_failures: [{start_s: 0, end_s: 0.025, p_fail: 1}]
+  - name: cache
+    latency: {median_ms: 5, lognorm_sigma: 0}
+    workers: 4
+    partial_failures: [{start_s: 0, end_s: 10, p_fail: 1}]
+  - name: app
+    latency: {median_ms: 10, lognorm_sigma: 0}
+    workers: 2
+    timeout: {attempt_ms: 400}
+    retry: {type: fixed, max_attempts: 3, delay_ms: 0}
+    dependencies:
+      - {service: cache, optional: true}
+      - {service: db}
+  - name: search
+    latency: {median_ms: 10, lognorm_sigma: 0}
+    workers: 2
+    dependencies: [{service: db}]
+  - name: gateway
+    latency: {median_ms: 10, lognorm_sigma: 0}
+    workers: 2
+    dependencies: [{service: app}, {service: search}]
+    dependency_call_pattern: parallel
+    retry: {type: fixed, max_attempts: 2, delay_ms: 0}
+clients:
+  - name: user
+    target_service: gateway
+    retry: {type: fixed, max_attempts: 2, delay_ms: 0}
+    timeout: {attempt_ms: 300, global_ms: 1000}
+    workload: {base_rps: 1, duration_s: 1}
+"""
+
+
+class TestDependencies(unittest.TestCase):
+    def setUp(self):
+        self.scenario = _build(GRAPH)
+
+    def test_a_service_in_a_call_graph_is_a_node_that_works_after_its_calls(self):
+        nodes = self.scenario.nodes
+        self.assertEqual(set(nodes), {"db", "cache", "app", "search", "gateway"})
+        for name in ("app", "search", "gateway"):
+            node = nodes[name]
+            self.assertIs(node.service, self.scenario.stations[name])
+            self.assertEqual((node.local_work, node.hold_worker_during_fanout), ("last", True))
+        # A service that only gets called is a plain node.
+        self.assertEqual(nodes["db"].downstreams, [])
+        self.assertEqual(nodes["db"].local_work, "first")
+
+    def test_sequential_dependencies_are_a_wave_each_and_parallel_ones_share_one(self):
+        nodes = self.scenario.nodes
+        app = nodes["app"]
+        self.assertEqual(
+            [(e.target.cfg.name, e.wave, e.optional) for e in app.downstreams],
+            [("cache", 0, True), ("db", 1, False)],
+        )
+        self.assertEqual(app.wave_join, "short_circuit")
+        gateway = nodes["gateway"]
+        self.assertEqual(
+            [(e.target.cfg.name, e.wave, e.optional) for e in gateway.downstreams],
+            [("app", 0, False), ("search", 0, False)],
+        )
+        self.assertEqual(gateway.wave_join, "wait_all")  # it waits for every answer
+
+    def test_what_a_service_calls_is_the_dependencys_own_retry_loop(self):
+        loops = self.scenario.loops
+        app_loop = loops["app"]
+        self.assertIs(self.scenario.nodes["gateway"].downstreams[0].client, app_loop)
+        self.assertEqual(app_loop.cfg.retry, FixedBackoffRetryPolicy(max_attempts=3, delay=0))
+        self.assertEqual(app_loop.cfg.timeout_controller.get_attempt_timeout(), 400 * MS)
+        self.assertIsNone(app_loop.cfg.timeout_controller.get_global_timeout())
+        self.assertEqual(app_loop.cfg.server_deadline, "attempt")
+        self.assertIs(app_loop.service, self.scenario.nodes["app"])
+        self.assertIsInstance(loops["db"].cfg.retry, NoRetryPolicy)
+        # One loop per service, whoever calls it.
+        self.assertIs(self.scenario.nodes["app"].downstreams[1].client, loops["db"])
+        self.assertIs(self.scenario.nodes["search"].downstreams[0].client, loops["db"])
+
+    def test_a_caller_gets_one_answer_when_the_dependency_has_finished_retrying(self):
+        """One request at t = 0. The db fails until 25 ms and the cache always.
+
+        gateway calls app and search together. app: cache fails at 5 ms (optional,
+        so on to the db), db fails at 15 ms, app retries: cache 15-20, db 20-30,
+        own work 30-40. search: db fails at 10 ms, search fails, and gateway --
+        which waits for app before it looks -- fails at 40 ms and retries:
+        app 40-65 (cache 5, db 10, work 10), search 40-60, own work 65-75.
+        """
+        scenario = self.scenario
+        (user,) = scenario.clients
+        user.runtime.start_request(scenario.sim)
+        scenario.sim.run()
+
+        def spans(client) -> list[tuple[int, int, bool]]:
+            return [
+                (round(a.interval.begin / MS), round(a.interval.end / MS), a.success)
+                for root in client.roots
+                for a in root.attempts
+            ]
+
+        self.assertEqual(
+            spans(scenario.loops["app"]), [(0, 15, False), (15, 40, True), (40, 65, True)]
+        )
+        self.assertEqual(spans(scenario.loops["search"]), [(0, 10, False), (40, 60, True)])
+        self.assertEqual(spans(scenario.loops["gateway"]), [(0, 40, False), (40, 75, True)])
+        # The user made one call and saw one answer: the gateway's own retry is its business.
+        self.assertEqual(spans(user.runtime), [(0, 75, True)])
+        self.assertEqual(user.runtime.roots[0].attempts[0].service, "gateway.retries")
+        for station in scenario.stations.values():
+            self.assertEqual((station.in_flight, station.queue_len()), (0, 0))
+
+
+class TestTwoLoopsOnOneHop(unittest.TestCase):
+    def _user(self, text: str):
+        scenario = _build(text)
+        (user,) = scenario.clients
+        return scenario, user.runtime
+
+    def test_a_retrying_client_calls_a_retrying_service_through_its_loop(self):
+        scenario, user = self._user(GRAPH)
+        layer = user.service
+        self.assertIsInstance(layer, RetryLayer)
+        self.assertIs(layer.client, scenario.loops["gateway"])
+        self.assertEqual(layer.cfg.name, "gateway.retries")
+        # The client keeps its own policy and its own timer.
+        self.assertEqual(user.cfg.retry, FixedBackoffRetryPolicy(max_attempts=2, delay=0))
+        self.assertEqual(user.cfg.timeout_controller.get_attempt_timeout(), 300 * MS)
+        self.assertEqual(user.cfg.timeout_controller.get_global_timeout(), 1000 * MS)
+        self.assertEqual(user.cfg.server_deadline, "global")
+        self.assertEqual(scenario.loops["gateway"].cfg.retry, FixedBackoffRetryPolicy(2, 0))
+
+    def test_two_attempt_timeouts_are_two_loops_too(self):
+        text = TENANTS.replace(
+            "    retry: {type: fixed, max_attempts: 2, delay_ms: 1}",
+            "    retry: {type: fixed, max_attempts: 2, delay_ms: 1}\n    timeout: {attempt_ms: 50}",
+        )
+        scenario = _build(text)
+        breaker = scenario.group("breaker")[0].runtime
+        assert isinstance(breaker.service, RetryLayer)
+        inner = breaker.service.client
+        self.assertIsInstance(inner.cfg.retry, NoRetryPolicy)  # the service does not retry ...
+        self.assertEqual(
+            inner.cfg.timeout_controller.get_attempt_timeout(), 90 * MS
+        )  # ... but times out
+        self.assertEqual(breaker.cfg.timeout_controller.get_attempt_timeout(), 50 * MS)
+        self.assertEqual(breaker.cfg.server_deadline, "global")
+        # The client brings its own timeouts, so the service's global one is not read.
+        self.assertIsNone(breaker.cfg.timeout_controller.get_global_timeout())
+
+    def test_a_client_without_a_timer_tells_the_loop_its_global_deadline(self):
+        text = GRAPH.replace("    timeout: {attempt_ms: 300, global_ms: 1000}\n", "")
+        _, user = self._user(text)
+        self.assertIsInstance(user.service, RetryLayer)
+        self.assertIsNone(user.cfg.timeout_controller.get_attempt_timeout())
+        self.assertEqual(user.cfg.server_deadline, "attempt")
+
+
 class TestWhatIsNotMappedYet(unittest.TestCase):
     def _unsupported(self, text: str) -> str:
         with self.assertRaises(UnsupportedScenario) as raised:
@@ -483,16 +645,6 @@ class TestWhatIsNotMappedYet(unittest.TestCase):
         return str(raised.exception)
 
     def test_each_is_named(self):
-        both_retry = TENANTS.replace(
-            "    timeout: {attempt_ms: 90, global_ms: 300}",
-            "    timeout: {attempt_ms: 90, global_ms: 300}\n    retry: {type: fixed, max_attempts: 2, delay_ms: 0}",
-        )
-        self.assertIn("two retry loops on one hop", self._unsupported(both_retry))
-        two_timeouts = TENANTS.replace(
-            "    retry: {type: fixed, max_attempts: 2, delay_ms: 1}",
-            "    retry: {type: fixed, max_attempts: 2, delay_ms: 1}\n    timeout: {attempt_ms: 50}",
-        )
-        self.assertIn("two timeouts on one hop", self._unsupported(two_timeouts))
         budget = TENANTS.replace("    timeout: {attempt_ms: 60}", "    e2e_retry_budget: 2")
         self.assertIn("e2e_retry_budget", self._unsupported(budget))
         limiter = TENANTS.replace(
@@ -500,11 +652,26 @@ class TestWhatIsNotMappedYet(unittest.TestCase):
             "rate_limiter: {type: bursty, max_requests: 5, period_ms: 1000}",
         )
         self.assertIn("rate_limiter on a service", self._unsupported(limiter))
-        dependencies = TENANTS.replace(
-            "    arolla_retry_budget: {alpha: 0.2, beta_up: 0.15}",
-            "    dependencies: [{service: plain}]",
+        between = GRAPH.replace(
+            "    timeout: {attempt_ms: 400}", "    global_retry_budget: {target_rps: 10}"
         )
-        self.assertIn("has dependencies", self._unsupported(dependencies))
+        self.assertIn("admission between services", self._unsupported(between))
+        both = TENANTS.replace(
+            "    arolla_retry_budget: {alpha: 0.2, beta_up: 0.15}",
+            "    arolla_retry_budget: {alpha: 0.2, beta_up: 0.15}\n"
+            "    retry: {type: fixed, max_attempts: 2, delay_ms: 0}",
+        )
+        self.assertIn("a limiter and a retry loop of its own", self._unsupported(both))
+        relay_timer = RELAY.replace(
+            "workload:\n  base_rps: 100",
+            "clients:\n  - name: c\n    timeout: {attempt_ms: 50}\n    workload:\n      base_rps: 100",
+        ).replace(
+            "  duration_s: 3\n  rng_seed: 9\n  load_spikes: [{start_s: 2, end_s: 3, rps_multiplier: 2}]\n",
+            "      duration_s: 3\n",
+        )
+        self.assertIn(
+            "an attempt timeout on a client without a retry", self._unsupported(relay_timer)
+        )
 
 
 class TestSmallThings(unittest.TestCase):
@@ -526,16 +693,10 @@ class TestSmallThings(unittest.TestCase):
 #: A checkout of https://github.com/eth-easl/Arolla, to run the test below.
 AROLLA_CHECKOUT = os.environ.get("AROLLA_CHECKOUT")
 
-#: Shipped scenario files that use something not mapped yet.
-NOT_BUILT = {
-    "dependency/diamond.yaml",
-    "post_mortem_simulation/s04__internal_retry_rogue.yaml",
-}
-
 
 @unittest.skipUnless(AROLLA_CHECKOUT, "set AROLLA_CHECKOUT to a checkout of Arolla to run this")
 class TestTheScenariosArollaShips(unittest.TestCase):
-    def test_every_file_is_read_and_all_but_two_are_built(self):
+    def test_every_file_is_read_and_built(self):
         from msim.compat.arolla import read
 
         assert AROLLA_CHECKOUT is not None
@@ -543,17 +704,11 @@ class TestTheScenariosArollaShips(unittest.TestCase):
         files = sorted(root.rglob("*.yaml"))
         self.assertEqual(len(files), 44)
         points = 0
-        not_built = set()
         for path in files:
             for point in read(path):
                 points += 1
-                experiment = parse(point.config)  # every point of every file is valid
-                try:
-                    build(experiment)
-                except UnsupportedScenario:
-                    not_built.add(str(path.relative_to(root)))
+                build(parse(point.config))
         self.assertEqual(points, 183)
-        self.assertEqual(not_built, NOT_BUILT)
 
 
 if __name__ == "__main__":
