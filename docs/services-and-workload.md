@@ -170,6 +170,20 @@ bottleneck were reported up to 50 ms late on a 60 ms timeout, and every retry
 fired that late.) An attempt already **in service** is cut at the deadline and
 its worker freed there; the occupancy it reports is censored.
 
+Two things decided **outside** the service change what reaches these points:
+
+- The deadline a service enforces is the one it is **told**. By default that is
+  the attempt's own deadline. A client built with `server_deadline="global"` or
+  `"none"` keeps its attempt timeout to itself: none of the `DEADLINE` rows
+  above fires for that timeout, the client books the drop from a timer of its
+  own, and the attempt stays here as an orphan, holding its worker or its queue
+  slot until it is served
+  ([request-handling](request-handling.md#what-the-server-learns-about-the-deadline)).
+- An `admission.AdmissionGate` in front of the service can turn an attempt away
+  before it is submitted here at all. That attempt is `REJECTED`: it takes no
+  queue slot, no worker, and does not count in `admitted_total`
+  ([request-handling](request-handling.md#admission-control-admissionpy)).
+
 ### Example: a faulty service
 
 ```python
