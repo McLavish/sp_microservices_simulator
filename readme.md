@@ -16,6 +16,10 @@ retry policies, PPO training) lives on the `rl-layer` branch, not here.
   and static or adaptive timeout control.
 - **Chains** — multi-hop fan-out with AND semantics, concurrent or sequential
   downstream calls (call waves), and tandem vs. hold-worker capacity models.
+- **Admission control** — a gate in front of a service that refuses retries by a
+  server-side rule (token bucket, AIMD, success-funded and goodput-coupled
+  budgets, a failure-rate gate, a share of what is in flight), per tenant where
+  the rule is.
 - **Faults** — latency injection, partial failures, and load spikes scoped to time
   windows.
 - **Outputs** — per-bucket CSV metrics + seconds-based fault JSON, plus plotting

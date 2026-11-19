@@ -78,7 +78,7 @@ windows, request lifespans, and bucket ranges all use this convention.
   carries one of these. `CANCELLED` means *abandoned, not failed* (an upstream
   fan-out short-circuited); it is counted separately and kept out of the failure
   buckets. `REJECTED` means refused by admission control in front of the
-  service; no stock component produces it.
+  service (`admission.AdmissionGate`).
 - **`Request`** (`core.py`) — a single attempt: the handling `service` name, its
   `interval` (lifespan), the `deadline` it ran under, `success`, `drop_reason`,
   `queue_size_at_end` (queue length when the attempt finished, `None` if it never
@@ -150,6 +150,7 @@ src/msim/       the installable library package (import as `msim.<module>`)
   timeout_controllers  static / adaptive timeouts
   caller          client + retry loop      <- retry_policies, timeout_controllers, service, metrics
   transport       per-link delay decorator <- caller, service, simulator
+  admission       admission gate decorator + controllers <- caller, retry_policies, service
   chain           fan-out nodes            <- caller, service, simulator
   metrics         aggregation + CSV export
   plotting/       render CSV + fault JSON to PNG   (deps: the `plot` extra)

@@ -51,8 +51,8 @@ per-reason table).
 
 An outcome can be **optional** (`OutcomeReporting.optional`): one that most
 scenarios cannot produce. `RootOutcome.REJECTED` is the only one — the request's
-final attempt ended with `DropReason.REJECTED`, refused by admission control in
-front of the service before it joined a queue, which no stock component does. An
+final attempt ended with `DropReason.REJECTED`, refused by an
+`admission.AdmissionGate` in front of the service before it joined a queue. An
 optional outcome is counted like any other, but it is kept out of the fixed
 output: its CSV column is written after every fixed column and only when the
 outcome occurred (below), and `print_stats` prints no line for it while it is

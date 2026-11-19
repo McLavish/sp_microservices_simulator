@@ -59,9 +59,9 @@ class DropReason(Enum):
     # Refused, not served: admission control in front of the service turned the
     # attempt away before it joined the queue. Not QUEUE_FULL (the server's own
     # backlog shed it) and not CIRCUIT_OPEN (the CLIENT's breaker shed it): the
-    # refusal is a server-side policy decision about this one attempt. No stock
-    # component produces it, so it occurs only in a scenario that builds one
-    # that does.
+    # refusal is a server-side policy decision about this one attempt. Produced
+    # by `admission.AdmissionGate` only, so it occurs only in a scenario that
+    # builds one.
     REJECTED = auto()
 
 
@@ -393,7 +393,7 @@ class Summary:
     dropped_cancelled: int = 0
     # Refused by admission control in front of the service (DropReason.REJECTED):
     # the request's final attempt was turned away before it joined a queue. Zero
-    # in every scenario that builds no admission control.
+    # in every scenario without an `admission.AdmissionGate`.
     dropped_rejected: int = 0
 
 

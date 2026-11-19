@@ -600,6 +600,82 @@ exactly the way reporting a tandem node's downstream wait as occupancy would.
 `Request.service` stays the *target's* `cfg.name`: the link forwards `cfg`, so an
 attempt is booked under the service that handled it, never under the link.
 
+## Admission control (`admission.py`)
+
+Everything above that sheds load does it for a reason of its own: a station
+refuses an attempt when its queue is full, a client's breaker stops sending.
+**Admission control** is a policy decision taken on the server's side about one
+attempt as it arrives: let it in, or turn it away before it costs a queue slot.
+The attempts it is about are retries -- a server cannot stop its callers from
+retrying, but it can decline the retries it is sent, and it sees all its callers
+at once.
+
+`AdmissionGate(target, controllers, retry_scope="hop")` is a `ServiceLike`
+decorator, like `TransportLink`: a client (or a link, or an edge's client)
+submits to the gate, and attempts stay booked under the target's name.
+
+```python
+from msim.admission import AdmissionGate, TokenBucketBudget
+
+gated = AdmissionGate(service, [TokenBucketBudget(rate=30, burst=10)])
+client = ClientRuntime(cfg=ClientConfig(..., tenant="a"), service=gated)
+```
+
+For each attempt:
+
+1. Every controller is asked `check(request)`. Only if **all** agree is each told
+   to `commit(request)` -- two phases, so a refusal by a later controller costs an
+   earlier one none of its quota.
+2. A refused attempt is reported **at once** as `DropReason.REJECTED`, with no
+   queue size, on a handle that is already settled. The target never hears of it:
+   no queue slot, no worker, no `admitted_total`. The client treats it as any
+   failed attempt (feedback, retry decision), and a request whose final attempt
+   was refused is booked rejected ([observability](observability.md)).
+3. An admitted attempt is forwarded with the gate watching: when the target
+   reports, every controller is told (`observe(outcome)`), then the caller. That
+   includes the answer to an attempt whose caller has stopped waiting
+   ([orphans](#what-the-server-learns-about-the-deadline)). A cancelled attempt is
+   not observed -- abandoned work says nothing about the server.
+
+The gate decides by the attempt's [request context](#request-context-what-travels-with-a-request),
+so the requests that reach it must carry one (it raises otherwise: give the
+client that starts them a `ClientConfig.tenant`). `retry_scope` says which
+attempts are retries here: `"hop"`, a retry of the caller in front of the gate
+(`attempt > 1`), or `"request"`, anything a retry anywhere above caused
+(`is_retry`).
+
+The gate keeps its own account of what it let in and has not seen end
+(`outstanding`, `outstanding_retries`) and per-tenant `counts` (`attempts`,
+`rejected`, `retries_asked`, `retries_admitted`). It does not read the target's
+`in_flight`: that excludes what waits in the queue, includes work for callers
+that have left, and a tandem chain node holds no worker while it waits.
+
+| Controller | A retry is admitted ... | State |
+| --- | --- | --- |
+| `TokenBucketBudget(rate, burst)` | while a bucket refilled at `rate` per second has a token | global |
+| `AimdBudget(min_rate, max_rate, initial_rate, ...)` | like the bucket, with a rate that is halved (`decrease_factor`) after a window in which more than `failure_threshold` of the attempts failed, and raised by `additive_step` otherwise | global |
+| `SuccessFundedBudget(ratio, max_retries)` | while the bank holds a retry; every **success** deposits `ratio` of one | global |
+| `FailureRateGate(failure_threshold, min_requests, window, open_delay)` | unless more than the threshold of the last window's outcomes failed; closes again when the success rate is back and `open_delay` has passed | global |
+| `GoodputCoupledBudget(alpha, beta_down, beta_up, window, ...)` | while the tenant has fewer than `alpha x goodput` retries in the window, its goodput being its smoothed rate of successes here (quick to fall, slow to recover) | **per tenant** |
+| `ConcurrencyRetryBudget(budget_percent, min_retry_concurrency)` | while the retries in flight are less than a share of all attempts in flight (Envoy's retry budget) | the gate's account |
+
+All of them only ever refuse retries (`RetryController`): a first attempt passes
+untouched and uncharged. Balances are exact (integer token units, rational
+thresholds), so a budget does not depend on how often it is consulted.
+`GoodputCoupledBudget` is the admission rule of [Arolla](https://github.com/eth-easl/Arolla)
+(ETH EASL), ported; its count of retries is compared with a fractional allowance,
+so a tenant always gets the first retry of a window while its allowance is above
+zero -- one retry per tenant per window as a floor.
+
+**On the caller's side.** `ControlledRetryPolicy(controllers, underlying_strategy)`
+is the same rules as a layer of a client's own retry policy: it is told every
+attempt's outcome (`record_attempt`), a retry needs every controller's agreement
+and the wrapped policy's, the controllers are charged only for a retry that is
+granted and refunded (`refund`) if the deadline then vetoes it. It sees one
+client's attempts only: clients share a budget by sharing the controller object,
+and `ConcurrencyRetryBudget`, which needs the server's load, refuses to work
+there.
+
 ## See also
 
 - [services-and-workload](services-and-workload.md) — the `submit_attempt` / `behavior`

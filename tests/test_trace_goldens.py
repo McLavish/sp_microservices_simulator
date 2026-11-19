@@ -33,6 +33,7 @@ from pathlib import Path
 
 import pytest
 
+from msim.admission import AdmissionGate, GoodputCoupledBudget, TokenBucketBudget
 from msim.caller import ClientConfig, ClientRuntime
 from msim.chain import DownstreamEdge, ServiceNodeRuntime
 from msim.core import DropReason, TimeInterval, ms_to_ns, s_to_ns
@@ -605,6 +606,59 @@ def _queue_order(
     return sim, [drivers, direct, to_back, to_side], [relay.service, back.service, side.service]
 
 
+def _admission(seed: int = 6161):
+    """Three tenants behind one admission gate with two controllers.
+
+    The station is too small for its three tenants and fails for a second on
+    top. The gate holds a server-wide token bucket AND Arolla's per-tenant
+    goodput budget, so both phases of admission run and each refuses in turn.
+    One tenant keeps its attempt timeout to itself, so the gate also observes
+    answers nobody is waiting for; one is behind a link, so a refusal travels
+    back over the wire.
+    """
+    sim = Simulator(seed=seed)
+    station = ServiceRuntime(
+        cfg=ServiceConfig(
+            name="svc",
+            latency_median=ms_to_ns(8),
+            latency_lognorm_sigma=0.5,
+            workers=3,
+            queue_capacity=6,
+            partial_failures=[PartialFailure(TimeInterval(s_to_ns(1), s_to_ns(2)), p_fail=0.6)],
+        )
+    ).bind()
+    gate = AdmissionGate(
+        station,
+        [TokenBucketBudget(rate=40, burst=6), GoodputCoupledBudget(alpha=0.2, beta_up=0.15)],
+    )
+    clients = []
+    for index, (tenant, mode, linked) in enumerate(
+        (("steady", "attempt", False), ("hasty", "global", False), ("remote", "attempt", True))
+    ):
+        target = (
+            TransportLink(gate, TransportDelay(median=ms_to_ns(1), sigma=0.2)) if linked else gate
+        )
+        client = ClientRuntime(
+            cfg=ClientConfig(
+                retry=_fixed(4, 2),
+                timeout_controller=_static(40),
+                tenant=tenant,
+                server_deadline=mode,
+            ),
+            service=target,
+        )
+        Workload(base_rps=150.0, duration_s=3.0, load_spikes=[], rng_seed=seed + index).drive(
+            sim, client.start_request
+        )
+        clients.append(client)
+    sim.run()
+    counts = sorted(
+        (tenant, c.attempts, c.rejected, c.retries_asked, c.retries_admitted)
+        for tenant, c in gate.counts.items()
+    )
+    return sim, clients, [station], [counts, gate.outstanding, gate.outstanding_retries]
+
+
 def _retry_by_cause(seed: int = 909):
     """Two clients that retry by the cause of the failure, on one small station.
 
@@ -818,6 +872,13 @@ _QUEUE_ORDER: dict[str, Trace] = {
 }
 
 
+_ADMISSION: Trace = (
+    "6f0d27073db90d58bd2fab0bc1394de8cce17779cb6c74920dad69a831a518d6",
+    7501,
+    "25279339ffb61af8812524331fe3b4e6d15c056142b22b5d8e4e3ff3faae7fe3",
+)
+
+
 # `_queue_order(QueueDiscipline.FCFS, server_deadline=...)`: the attempt timeout
 # stays with the client, and the stations serve the orphans it leaves behind.
 _ORPHANS: dict[str, Trace] = {
@@ -902,6 +963,22 @@ class TestTraceGoldens(unittest.TestCase):
                 trace = _trace(sim, clients, services)
                 self.assertEqual(trace, expected)
                 self.assertNotEqual(trace[0], told[0])
+
+    def test_admission_trace(self):
+        sim, clients, services, gate_state = _admission()
+        reasons = _reasons(clients)
+        for reason in ("NONE", "QUEUE_FULL", "DEADLINE", "SERVER_FAILURE", "REJECTED"):
+            self.assertGreater(reasons[reason], 0, reason)
+        counts, outstanding, outstanding_retries = gate_state
+        # Every tenant was refused retries and granted some, and the gate's
+        # account is back to zero.
+        for _tenant, attempts, rejected, asked, admitted in counts:
+            self.assertGreater(rejected, 0)
+            self.assertGreater(admitted, 0)
+            self.assertEqual(asked, admitted + rejected)
+            self.assertGreater(attempts, asked)
+        self.assertEqual((outstanding, outstanding_retries), (0, 0))
+        self.assertEqual(_trace(sim, clients, services, extra=gate_state), _ADMISSION)
 
     def test_retry_by_cause_trace(self):
         sim, clients, services, policy_state = _retry_by_cause()
