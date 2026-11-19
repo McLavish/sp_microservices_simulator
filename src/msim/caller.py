@@ -499,3 +499,136 @@ class ClientRuntime:
 
     def metrics(self) -> Metrics:
         return Metrics(roots=self.roots, attempts_total=self.attempts_total)
+
+
+class _LayerControl(AttemptControl):
+    """Cancellation handle for an attempt a `RetryLayer` is serving.
+
+    Like `transport._LinkControl`: what cancelling means depends on where the
+    inner request is, so `cancel()` asks the attempt instead of running a bound
+    teardown.
+    """
+
+    __slots__ = ("_attempt",)
+
+    def __init__(self, attempt: "_LayerAttempt") -> None:
+        super().__init__()
+        self._attempt = attempt
+
+    def cancel(self) -> bool:
+        if self._settled:
+            return False
+        return self._attempt.cancel()
+
+
+class _LayerAttempt:
+    """One attempt of the caller in front of a `RetryLayer`: one inner REQUEST."""
+
+    def __init__(self, on_done: AttemptDoneCallback) -> None:
+        self._on_done = on_done
+        self.control = _LayerControl(self)
+        #: The inner request. None until `start_request` has returned, by which
+        #: time it may already be over.
+        self.root: RootRequest | None = None
+        #: A cancellation took effect: the inner request ends as CANCELLED.
+        self._cancelled = False
+
+    def finished(self, root: RootRequest) -> None:
+        """The inner client's `on_done`: report the request as one attempt."""
+        self.control._settle()
+        last = root.attempts[-1]
+        if last.success:
+            drop = DropReason.NONE
+        elif self._cancelled:
+            drop = DropReason.CANCELLED
+        else:
+            # The reason the request itself ended with. An inner root can carry
+            # the `cancelled` flag here without a cancellation having taken
+            # effect (the attempt had already committed when it was asked to
+            # stop): its outcome is genuine and is reported as itself.
+            drop = last.drop_reason
+            if drop in (DropReason.NONE, DropReason.CANCELLED):
+                drop = DropReason.SERVER_FAILURE
+        self._on_done(
+            last.success,
+            last.service_time_ns or 0,
+            drop,
+            last.queue_size_at_end,
+            last.service_time_censored,
+        )
+
+    def cancel(self) -> bool:
+        root = self.root
+        if root is None or root.done or root.cancel is None:
+            return False
+        self._cancelled = True
+        root.cancel()
+        if root.done:
+            # Torn down: a pending retry was dropped or the attempt in flight
+            # was abandoned, and `finished` has already reported CANCELLED.
+            return True
+        # Nothing was cancellable: the attempt in flight has committed to an
+        # outcome. The inner client will issue no further attempt, and that
+        # outcome arrives through `finished` as what it is.
+        self._cancelled = False
+        return False
+
+
+@dataclass
+class RetryLayer:
+    """A retry loop as a target: a `ClientRuntime` that another client calls.
+
+    For two retry loops on one hop, each with its own policy and its own
+    timeouts: a caller that retries, in front of a service (or a sidecar, or a
+    gateway) that retries the same call itself.
+
+        inner = ClientRuntime(cfg=service_side_cfg, service=service)
+        outer = ClientRuntime(cfg=caller_cfg, service=RetryLayer(inner))
+
+    One attempt of the caller is one whole REQUEST of the inner client, which
+    makes as many attempts at its own target as its policy allows. The caller
+    sees one answer -- the outcome of the inner request's last attempt, with
+    that attempt's occupancy, queue size and censoring -- when the inner client
+    has finished, and the caller's attempt deadline is the inner request's
+    global deadline (tightened by the inner client's own, if it has one).
+
+    The two loops keep separate books. The inner client's records are attempts
+    at the real target, under the target's name; the caller's records are
+    booked under the LAYER's name (`name`, by default `<target>.retries`), so a
+    consumer that counts attempts per service does not count a call twice.
+
+    Cancelling an attempt of the layer cancels the inner request: a pending
+    retry is dropped, an attempt in flight is abandoned, and `cancel()` returns
+    True with `CANCELLED` already reported. If the attempt in flight has
+    committed to an outcome, `cancel()` returns False, the inner client stops
+    retrying, and that outcome is reported as itself.
+    """
+
+    client: ClientRuntime
+    name: str | None = None
+    cfg: ServiceConfig = field(init=False)
+
+    def __post_init__(self) -> None:
+        target = self.client.service.cfg
+        self.cfg = replace(target, name=self.name or f"{target.name}.retries")
+
+    def submit_attempt(
+        self,
+        sim: Simulator,
+        on_done: AttemptDoneCallback,
+        attempt_deadline: TimePoint | None = None,
+        *,
+        ctx: RequestContext | None = None,
+    ) -> AttemptControl:
+        # The handle exists BEFORE the inner request starts: the request can be
+        # over, and reported, by the time `start_request` returns.
+        attempt = _LayerAttempt(on_done)
+        if ctx is None:
+            attempt.root = self.client.start_request(
+                sim, on_done=attempt.finished, override_global_deadline=attempt_deadline
+            )
+        else:
+            attempt.root = self.client.start_request(
+                sim, on_done=attempt.finished, override_global_deadline=attempt_deadline, ctx=ctx
+            )
+        return attempt.control

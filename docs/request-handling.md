@@ -652,6 +652,40 @@ exactly the way reporting a tandem node's downstream wait as occupancy would.
 `Request.service` stays the *target's* `cfg.name`: the link forwards `cfg`, so an
 attempt is booked under the service that handled it, never under the link.
 
+## Two retry loops on one hop (`RetryLayer`)
+
+A caller that retries is often in front of something that retries the same call
+itself: a service whose handler has its own retry loop, a sidecar, a gateway.
+`caller.RetryLayer(client, name=None)` makes a `ClientRuntime` usable as a
+target, so the two loops stack, each with its own policy and its own timeouts:
+
+```python
+inner = ClientRuntime(cfg=service_side_cfg, service=service)   # 3 attempts, 100 ms each
+outer = ClientRuntime(cfg=caller_cfg, service=RetryLayer(inner))  # 2 attempts, 1 s each
+```
+
+- One attempt of the caller is one whole **request** of the inner client, which
+  makes as many attempts at the real target as its policy allows.
+- The caller sees **one** answer, when the inner client has finished: the outcome
+  of the inner request's last attempt, with that attempt's occupancy, queue size
+  and censoring. Its policy is told once per call, not once per inner attempt.
+- The caller's attempt deadline is the inner request's global deadline
+  (tightened by the inner client's own, if it has one).
+- The two keep separate books: the inner client's records are attempts at the
+  real target, under its name; the caller's are booked under the layer's own
+  name (`name`, by default `<target>.retries`), so counting attempts per service
+  does not count a call twice.
+- A request context passes through; the inner client numbers its own attempts.
+- A caller that keeps its timeout to itself (`server_deadline="global"`) and
+  leaves does not stop the inner loop: it goes on retrying for nobody.
+
+Cancelling the caller's attempt cancels the inner request. A pending retry is
+dropped, an attempt in flight is abandoned, `cancel()` returns `True`, and
+`CANCELLED` has been reported. If the attempt in flight has already committed
+to an outcome, `cancel()` returns `False`, the inner client issues no further
+attempt, and that outcome is reported as itself -- so a genuine failure still
+reaches the caller's breaker ([below](#cancelling-an-attempt-that-has-already-committed)).
+
 ## Admission control (`admission.py`)
 
 Everything above that sheds load does it for a reason of its own: a station
