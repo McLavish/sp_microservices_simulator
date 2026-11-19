@@ -60,6 +60,42 @@ class ServiceConfig:
             tracker.add_partial_failure(partial_failure.duration, partial_failure.p_fail)
 
 
+@dataclass(frozen=True)
+class ServiceTime:
+    """A lognormal service-time distribution on its own: `median` ns, shape `sigma`.
+
+    What `ServiceConfig.latency_median` / `latency_lognorm_sigma` are for a whole
+    station, as a value that can be attached to ONE handler node of it
+    (`chain.ServiceNodeRuntime.service_time`), so that two methods of a service
+    with very different local work share the station's workers and queue without
+    sharing one distribution.
+
+    Validated like `ServiceConfig`, and floored the same way: a sigma below
+    `MIN_LOGNORM_SIGMA` becomes the floor, and a draw is ALWAYS taken. That is
+    the opposite of `transport.TransportDelay`, where `sigma == 0` means "no
+    draw" -- a node with an override must consume exactly the RNG draws the
+    station's own distribution would have, or switching one on would shift every
+    later draw of the run.
+    """
+
+    median: TimeDuration  # nanoseconds
+    sigma: float  # sigma of the underlying lognormal (shape)
+
+    def __post_init__(self) -> None:
+        # Finiteness first: NaN passes every ordering guard below (`nan < 1` is
+        # False) and would only surface inside a scheduled event.
+        if not math.isfinite(self.median):
+            raise ValueError(f"service-time median must be finite, got {self.median}")
+        if not math.isfinite(self.sigma):
+            raise ValueError(f"service-time sigma must be finite, got {self.sigma}")
+        if self.median < 1:
+            raise ValueError(f"service-time median must be >= 1 ns, got {self.median}")
+        if self.sigma < 0:
+            raise ValueError(f"service-time sigma must be >= 0, got {self.sigma}")
+        if self.sigma < MIN_LOGNORM_SIGMA:
+            object.__setattr__(self, "sigma", MIN_LOGNORM_SIGMA)
+
+
 #: The service -> client completion callback: (success, occupancy, drop reason,
 #: queue size, occupancy_censored). Spelled out rather than `Callable[..., None]`
 #: because the last argument carries statistical semantics — it marks the
@@ -212,12 +248,27 @@ class ServiceRuntime:
                 add += inj.add_latency
         return max(0, base * mult + add)
 
-    def _sample_service_time(self, t: TimePoint, sim: Simulator) -> TimeDuration:
+    def _sample_service_time(
+        self, t: TimePoint, sim: Simulator, service_time: ServiceTime | None = None
+    ) -> TimeDuration:
+        """One service-time draw at `t`: lognormal, then injections, then the floor.
+
+        `service_time` replaces the DISTRIBUTION only (a chain node's own
+        handler, `ServiceNodeRuntime.service_time`). Everything else stays the
+        station's: its latency injections and the 100 us floor still apply, and
+        it is still exactly one `lognormvariate` draw, so a node with an
+        override consumes the RNG stream the way it would without one.
+        """
         rng = sim.rng()
         # Both ranges are owned by ServiceConfig.__post_init__ on a frozen
-        # dataclass: median >= 1 ns is validated there, sigma is floored there.
-        mu = math.log(self.cfg.latency_median)  # since median = exp(mu)
-        raw = rng.lognormvariate(mu, self.cfg.latency_lognorm_sigma)
+        # dataclass (and by ServiceTime.__post_init__ for an override): median
+        # >= 1 ns is validated there, sigma is floored there.
+        if service_time is None:
+            median, sigma = self.cfg.latency_median, self.cfg.latency_lognorm_sigma
+        else:
+            median, sigma = service_time.median, service_time.sigma
+        mu = math.log(median)  # since median = exp(mu)
+        raw = rng.lognormvariate(mu, sigma)
         adj = self._adjust_latency(t, int(raw))
         return max(100_000, adj)  # put 1_000_000 to fix 1ms
 

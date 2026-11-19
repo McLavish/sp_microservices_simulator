@@ -48,7 +48,7 @@ from msim.retry_policies import (
     RetryBudgetPolicy,
     TimeBasedCircuitBreakerPolicy,
 )
-from msim.service import ServiceConfig, ServiceRuntime
+from msim.service import ServiceConfig, ServiceRuntime, ServiceTime
 from msim.simulator import Simulator
 from msim.timeout_controllers import AdaptiveTimeoutController, StaticTimeoutController
 from msim.transport import TransportDelay, TransportLink
@@ -440,6 +440,60 @@ def _call_waves(seed: int = 2024):
     return sim, clients, [n.service for n in (a, b, c, d, e, f)]
 
 
+def _method_service_times(seed: int = 606):
+    """Two handlers of one service with their own service times.
+
+    `read` and `write` are two nodes over ONE station (`ServiceNodeRuntime.
+    service_time`): they share its workers, its queue and its faults, and draw
+    their local work from different lognormals. A front node calls both.
+    """
+    sim = Simulator(seed=seed)
+    store = ServiceRuntime(
+        cfg=ServiceConfig(
+            name="store",
+            latency_median=ms_to_ns(4),
+            latency_lognorm_sigma=0.8,
+            workers=3,
+            queue_capacity=8,
+            latency_injections=[
+                LatencyInjection(TimeInterval(s_to_ns(3), s_to_ns(4)), add_latency=ms_to_ns(15))
+            ],
+            partial_failures=[PartialFailure(TimeInterval(s_to_ns(1), s_to_ns(2)), p_fail=0.4)],
+        )
+    ).bind()
+    read = ServiceNodeRuntime(service=store, service_time=ServiceTime(ms_to_ns(2), 0.3))
+    write = ServiceNodeRuntime(service=store, service_time=ServiceTime(ms_to_ns(6), 0.4))
+    front = ServiceNodeRuntime(
+        service=ServiceRuntime(
+            cfg=ServiceConfig(
+                name="front",
+                latency_median=ms_to_ns(1),
+                latency_lognorm_sigma=0.3,
+                workers=16,
+                queue_capacity=50,
+            )
+        ).bind()
+    )
+    front_to_write = ClientRuntime(
+        cfg=ClientConfig(retry=_fixed(3, 4), timeout_controller=_static(40)), service=write
+    )
+    front.add_downstream(DownstreamEdge(client=front_to_write, target=write))
+    writers = ClientRuntime(
+        cfg=ClientConfig(retry=_fixed(2, 10), timeout_controller=_static(120)), service=front
+    )
+    readers = ClientRuntime(
+        cfg=ClientConfig(retry=_fixed(2, 5), timeout_controller=_static(30)), service=read
+    )
+    Workload(base_rps=160.0, duration_s=6.0, load_spikes=[], rng_seed=seed).drive(
+        sim, writers.start_request
+    )
+    Workload(base_rps=220.0, duration_s=6.0, load_spikes=[], rng_seed=seed + 1).drive(
+        sim, readers.start_request
+    )
+    sim.run()
+    return sim, [writers, readers, front_to_write], [front.service, store]
+
+
 def _wrapped_policies(seed: int = 4321):
     """Two clients with deep policy stacks on one faulted service.
 
@@ -566,6 +620,12 @@ _CALL_WAVES: Trace = (
     "ced390460ed52428bd31da7f0e1cd51d157421913c49c6b95cfe32ff9d9898a7",
 )
 
+_METHOD_SERVICE_TIMES: Trace = (
+    "450289e2739b3be09cd120fe57eb6bd614e201a8345af9575397bc975ecc6855",
+    8836,
+    "b7c7eccf3b516ecbfea631ac958aea0ec5aff2923204ce82f50e50ae2982e03b",
+)
+
 
 class TestTraceGoldens(unittest.TestCase):
     """If one of these fails, a seeded run no longer unfolds the way it did."""
@@ -576,6 +636,13 @@ class TestTraceGoldens(unittest.TestCase):
         for reason in ("NONE", "QUEUE_FULL", "DEADLINE", "SERVER_FAILURE"):
             self.assertGreater(reasons[reason], 0, reason)
         self.assertEqual(_trace(sim, clients, services), _CALL_WAVES)
+
+    def test_method_service_times_trace(self):
+        sim, clients, services = _method_service_times()
+        reasons = _reasons(clients)
+        for reason in ("NONE", "QUEUE_FULL", "DEADLINE", "SERVER_FAILURE"):
+            self.assertGreater(reasons[reason], 0, reason)
+        self.assertEqual(_trace(sim, clients, services), _METHOD_SERVICE_TIMES)
 
     def test_single_service_trace(self):
         sim, clients, services = _single_service()

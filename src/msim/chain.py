@@ -3,7 +3,13 @@ from dataclasses import dataclass, field
 
 from msim.caller import ClientRuntime
 from msim.core import DropReason, RootRequest, TimeDuration, TimePoint
-from msim.service import AttemptControl, AttemptDoneCallback, ServiceConfig, ServiceRuntime
+from msim.service import (
+    AttemptControl,
+    AttemptDoneCallback,
+    ServiceConfig,
+    ServiceRuntime,
+    ServiceTime,
+)
 from msim.simulator import Event, Simulator
 
 
@@ -97,7 +103,7 @@ class _FanOutAttempt:
         reach the fan-out block at all.
         """
         self._register_cancel(self.cancel)
-        base_time = self.svc._sample_service_time(self.begin_at, self.sim)
+        base_time = self.svc._sample_service_time(self.begin_at, self.sim, self.node.service_time)
         end_local = (
             min(self.begin_at + base_time, self.deadline)
             if self.deadline is not None
@@ -342,10 +348,37 @@ class ServiceNodeRuntime:
     #     This node still enforces its own deadline on itself, so the caller's
     #     drop is unchanged; only the downstream's view of it disappears.
     propagate_deadline: bool = True
+    # Service time of THIS node's local stage, when it differs from the
+    # station's:
+    #   None (default) -> the local stage draws from the station's own
+    #     distribution (`service.cfg.latency_median` / `latency_lognorm_sigma`),
+    #     as every node always did.
+    #   a ServiceTime -> it draws from that instead. Several nodes can share one
+    #     `ServiceRuntime` -- one per handler of a service, the way a caller
+    #     reaches different methods of it -- and each can then have the local
+    #     work its own method does, while workers, queue, latency injections,
+    #     partial failures and the 100 us floor stay the station's. Still one
+    #     draw per attempt.
+    # Appended last so positional construction keeps its meaning.
+    service_time: ServiceTime | None = None
 
     @property
     def cfg(self) -> ServiceConfig:
         return self.service.cfg
+
+    @property
+    def local_service_time(self) -> ServiceTime:
+        """The distribution this node's local stage actually draws from.
+
+        `cfg` is the STATION's config, shared by every node over it, so
+        `cfg.latency_median` is not this node's service time once an override is
+        set. Read the effective pair here when estimating E[S] per handler.
+        """
+        if self.service_time is not None:
+            return self.service_time
+        return ServiceTime(
+            median=self.service.cfg.latency_median, sigma=self.service.cfg.latency_lognorm_sigma
+        )
 
     def add_downstream(self, edge: DownstreamEdge) -> None:
         self.downstreams.append(edge)

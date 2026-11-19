@@ -266,6 +266,39 @@ on every attempt, and N calls are N edges. Once the node has settled (deadline,
 failure, cancellation) its remaining waves are skipped whatever the
 `propagate_*` flags say — those describe calls already in flight.
 
+### Service time per handler node
+
+A real service runs different code for different methods: a `Read` can take a
+third of a millisecond where a `Write` on the same service takes six. One
+`ServiceConfig` has one lognormal, so modelling the service as one node gives
+both methods the same — wrong for each, and with an inflated spread.
+
+Build one `ServiceNodeRuntime` per handler **over the same `ServiceRuntime`**
+and give each its own `service_time`:
+
+```python
+from msim.service import ServiceTime
+
+store = ServiceRuntime(cfg=store_cfg).bind()          # ONE station: workers, queue, faults
+read = ServiceNodeRuntime(service=store, service_time=ServiceTime(ms_to_ns(0.3), 0.3))
+write = ServiceNodeRuntime(service=store, service_time=ServiceTime(ms_to_ns(6), 0.4))
+# a caller of Read targets `read`, a caller of Write targets `write`
+```
+
+| | Comes from |
+| --- | --- |
+| the lognormal the local stage draws from | the node's `service_time`, else the station's config |
+| workers, queue, `QUEUE_FULL` shedding | the shared station |
+| latency injections, partial failures, the 100 µs floor | the shared station |
+| the name attempts are booked under (`Request.service`) | the shared station (`node.cfg.name`) |
+
+`service_time=None` (the default) is the station's own distribution, exactly as
+before, and an override takes the same single draw — `ServiceTime` floors a zero
+sigma like `ServiceConfig` does rather than skipping the draw, so switching one
+on never shifts the RNG stream of the rest of the run. Because `node.cfg` is the
+*station's* config, read `node.local_service_time` for the distribution a given
+handler actually draws from. `tests/test_node_service_time.py` pins the split.
+
 ### Worker occupancy: tandem vs hold-worker
 
 `hold_worker_during_fanout` (`chain.py`) controls whether the node's worker is

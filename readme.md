@@ -8,8 +8,8 @@ metrics and fault-event JSON for plotting.
 A reinforcement-learning layer that built on the simulator (Gymnasium env, learned
 retry policies, PPO training) lives on the `rl-layer` branch, not here.
 
-- **Services** — M/G/c/K queues with lognormal service times, bounded queues, and
-  configurable workers.
+- **Services** — M/G/c/K queues with lognormal service times (one per service, or
+  one per handler over a shared station), bounded queues, and configurable workers.
 - **Clients** — retry policies (fixed/exponential/jittered backoff, circuit
   breakers, rate limiters, retry budgets) and static or adaptive timeout control.
 - **Chains** — multi-hop fan-out with AND semantics, concurrent or sequential

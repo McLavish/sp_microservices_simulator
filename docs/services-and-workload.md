@@ -68,6 +68,14 @@ latency injections, and floors the result at **100 µs** (`max(100_000, ...)`).
 1 ns and floors sigma at `MIN_LOGNORM_SIGMA` (1e-6), so a config asking for a
 near-deterministic service reports back the sigma that will actually be sampled.
 
+The `(median, sigma)` pair of the config is the station's default. A chain node
+can carry its own (`ServiceNodeRuntime.service_time`, a `ServiceTime(median,
+sigma)` validated and floored the same way): several nodes over one
+`ServiceRuntime` — one per handler of a service — then share its workers, queue
+and faults while each draws its local work from its own lognormal. It is still
+one draw per attempt, through the same injections and the same 100 µs floor —
+see [request-handling](request-handling.md#service-time-per-handler-node).
+
 **Latency injection math** (`_adjust_latency`, `service.py`): across all *active*
 injections, multipliers multiply and additive terms sum, applied as
 `base * mult + add` (then clamped at 0). So a `multiplier=2, add_latency=ms_to_ns(10)`
