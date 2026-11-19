@@ -28,6 +28,7 @@ for point in read("experiments/yaml/snowflake/policy-arolla.yaml"):
 | `schema` | their schema as dataclasses, read strictly (`parse`) |
 | `importer` | the mapping to stations, clients, gates and policies (`build`, `Scenario`) |
 | `policies` | their client-side retry controls as msim policy layers |
+| `compare` | one scenario on both simulators over many seeds, side by side |
 
 ## Reading a file
 
@@ -79,7 +80,8 @@ drain.
 ## Intended behaviour, not their bugs
 
 The mapping reproduces what their simulator is meant to do. Where its code does
-something else, the intent is kept here. 
+something else, the intent is kept here. The same defects are fixed on a branch
+of their repository, which is what msim is compared against (below).
 | Their code | Here |
 | --- | --- |
 | the answer to an attempt the client timed out is processed as a new result | ignored (an orphan's answer goes nowhere) |
@@ -102,3 +104,23 @@ uses service `dependencies`, a client `e2e_retry_budget`, a retry policy on both
 a client and the service it calls, an attempt timeout on both, or a
 `count_based` breaker / `rate_limiter` on a service. Of the 44 scenario files
 Arolla ships, 42 are built today; the two with dependencies are not.
+
+## Comparing the two simulators
+
+```bash
+python -m msim.compat.arolla.compare SCENARIO.yaml --arolla ~/checkouts/Arolla --seeds 200 --jobs 32
+```
+
+runs every sweep point of the file on both simulators, `--seeds` times each with
+a different seed for the simulator and for the arrival streams, and prints per
+client group and per measure (success over the whole run and for the requests
+that started in each fault window, attempts per request, median latency of
+successes, retries asked and admitted at the server) the two means and their
+difference in standard errors, marking a difference beyond `--threshold` (3).
+`--point i` runs one sweep point, `--duration-s` cuts the workloads short for a
+scenario too large to run whole, `--json` saves the rows.
+
+The reference is imported from the checkout given with `--arolla` and needs what
+that code needs (pydantic, numpy, pandas, PyYAML); it should be a checkout whose
+known defects are fixed, or the comparison measures those. The tool is not part
+of the test suite.

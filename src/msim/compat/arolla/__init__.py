@@ -17,6 +17,7 @@ reads those files and builds the msim objects that mean the same thing:
   keys their runner ignores are warnings);
 * `importer`: the mapping to stations, clients, admission gates and policies;
 * `policies`: their client-side retry controls as msim policy layers;
+* `compare`: one scenario on both simulators over many seeds, side by side.
 
 Reading a file needs PyYAML: install `microservices-simulator[arolla]`. The
 mechanisms the mapping relies on (client-side timeouts, admission control,
