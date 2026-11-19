@@ -659,6 +659,95 @@ def _admission(seed: int = 6161):
     return sim, clients, [station], [counts, gate.outstanding, gate.outstanding_retries]
 
 
+def _dependencies(seed: int = 2718):
+    """A handler that gathers before it works: calls first, local work last.
+
+    `front` holds its worker, calls `auth` (required) and `cache` (optional)
+    together and waits for both, then `store`, and only then does its own work.
+    `store` is itself such a node over two replicas it waits for. Small queues,
+    a failing `cache`, a slow and failing `store` and a tight deadline, so every
+    way out of each stage is taken: an optional failure, a required failure
+    after the wave has drained, a deadline during the calls and during the
+    local work, and a cancellation from above.
+    """
+    sim = Simulator(seed=seed)
+
+    def station(name: str, median_ms: float, workers: int, capacity: int, **faults):
+        return ServiceRuntime(
+            cfg=ServiceConfig(
+                name=name,
+                latency_median=ms_to_ns(median_ms),
+                latency_lognorm_sigma=0.5,
+                workers=workers,
+                queue_capacity=capacity,
+                **faults,
+            )
+        ).bind()
+
+    def client(target, attempts: int, timeout_ms: float) -> ClientRuntime:
+        return ClientRuntime(
+            cfg=ClientConfig(retry=_fixed(attempts, 2), timeout_controller=_static(timeout_ms)),
+            service=target,
+        )
+
+    outage = TimeInterval(s_to_ns(2), s_to_ns(3))
+    auth = ServiceNodeRuntime(service=station("auth", 3, 6, 20))
+    cache = ServiceNodeRuntime(
+        service=station("cache", 2, 2, 3, partial_failures=[PartialFailure(outage, p_fail=0.7)])
+    )
+    replicas = [
+        ServiceNodeRuntime(
+            service=station(
+                f"replica-{index}",
+                5,
+                3,
+                6,
+                partial_failures=[PartialFailure(outage, p_fail=0.25)],
+                latency_injections=[
+                    LatencyInjection(TimeInterval(s_to_ns(4), s_to_ns(5)), add_latency=ms_to_ns(25))
+                ],
+            )
+        )
+        for index in range(2)
+    ]
+    store = ServiceNodeRuntime(
+        service=station("store", 2, 5, 12),
+        hold_worker_during_fanout=True,
+        local_work="last",
+        wave_join="wait_all",
+    )
+    front = ServiceNodeRuntime(
+        service=station("front", 4, 8, 30),
+        hold_worker_during_fanout=True,
+        propagate_cancellation=True,
+        local_work="last",
+        wave_join="wait_all",
+    )
+    edges = []
+    for replica in replicas:
+        edge = client(replica, 2, 30)
+        store.add_downstream(DownstreamEdge(client=edge, target=replica))
+        edges.append(edge)
+    for target, wave, optional, attempts, timeout_ms in (
+        (auth, 0, False, 2, 40),
+        (cache, 0, True, 1, 15),
+        (store, 1, False, 2, 60),
+    ):
+        edge = client(target, attempts, timeout_ms)
+        front.add_downstream(
+            DownstreamEdge(client=edge, target=target, wave=wave, optional=optional)
+        )
+        edges.append(edge)
+    top = client(front, 2, 90)
+    spike = LoadSpike(TimeInterval(s_to_ns(1), s_to_ns(2)), rps_multiplier=2.5)
+    Workload(base_rps=160.0, duration_s=6.0, load_spikes=[spike], rng_seed=seed).drive(
+        sim, top.start_request
+    )
+    sim.run()
+    services = [front.service, auth.service, cache.service, store.service]
+    return sim, [top, *edges], [*services, *(replica.service for replica in replicas)]
+
+
 def _retry_by_cause(seed: int = 909):
     """Two clients that retry by the cause of the failure, on one small station.
 
@@ -872,6 +961,13 @@ _QUEUE_ORDER: dict[str, Trace] = {
 }
 
 
+_DEPENDENCIES: Trace = (
+    "b6b6a510d07b13a97a6c547f2ca71b99301527fb30dd7af39166ec532b867b8e",
+    18297,
+    "d0bc9a2daaafabb8ff7f1b4448cf093f46b811b294d46ada2d81407370ffad3c",
+)
+
+
 _ADMISSION: Trace = (
     "6f0d27073db90d58bd2fab0bc1394de8cce17779cb6c74920dad69a831a518d6",
     7501,
@@ -963,6 +1059,20 @@ class TestTraceGoldens(unittest.TestCase):
                 trace = _trace(sim, clients, services)
                 self.assertEqual(trace, expected)
                 self.assertNotEqual(trace[0], told[0])
+
+    def test_dependencies_trace(self):
+        sim, clients, services = _dependencies()
+        reasons = _reasons(clients)
+        for reason in ("NONE", "QUEUE_FULL", "DEADLINE", "SERVER_FAILURE", "CANCELLED"):
+            self.assertGreater(reasons[reason], 0, reason)
+        top, _to_replica_0, _to_replica_1, _to_auth, to_cache, _to_store = clients
+        # The optional call fails often, and the requests whose cache call
+        # failed still succeed.
+        self.assertGreater(_reasons([to_cache])["SERVER_FAILURE"], 20)
+        self.assertGreater(_reasons([top])["NONE"], 200)
+        for service in services:
+            self.assertEqual((service.in_flight, service.queue_len()), (0, 0), service.cfg.name)
+        self.assertEqual(_trace(sim, clients, services), _DEPENDENCIES)
 
     def test_admission_trace(self):
         sim, clients, services, gate_state = _admission()

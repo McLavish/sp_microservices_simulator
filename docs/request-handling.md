@@ -403,6 +403,58 @@ on every attempt, and N calls are N edges. Once the node has settled (deadline,
 failure, cancellation) its remaining waves are skipped whatever the
 `propagate_*` flags say — those describe calls already in flight.
 
+### Local work last, optional calls, waiting for a wave
+
+Three choices change how a node treats its calls. Each is off by default, and a
+node that sets none of them is the node described above, event for event.
+
+**`ServiceNodeRuntime.local_work = "last"`** puts the node's own work AFTER its
+calls instead of before them: a handler that gathers what it needs and then
+works on it.
+
+| | `"first"` (default) | `"last"` |
+| --- | --- | --- |
+| order | local service time, failure roll, then the waves | the waves, then local service time and failure roll |
+| service time drawn | when the worker is taken | when the last wave has ended (a latency injection active *then* applies) |
+| a call fails | the local work was already done | no local work is done |
+| deadline guard armed | before the first wave | at the start of the attempt |
+| worker | released after the first wave, unless held | held throughout: needs `hold_worker_during_fanout=True` |
+
+A tandem node hands its worker back before it waits on its calls and so has
+none left to do work on afterwards: `local_work="last"` on a node that does not
+hold its worker raises. The first wave is started through the event heap (the
+attempt may begin inside another attempt's completion, where a call submitted
+synchronously could overtake queued work), and the local stage that follows is
+cut by the same deadline guard. A node with no downstreams is a plain service
+either way.
+
+**`DownstreamEdge.optional = True`** marks a call the node can do without. The
+node still makes it and still waits for it -- its wave is not complete until the
+call has ended -- but a failed optional call fails nothing: the wave counts it as
+done and the node carries on to the next wave, or to its own work, or settles.
+A required call in the same wave fails the node as usual.
+
+**`ServiceNodeRuntime.wave_join = "wait_all"`** makes a wave a barrier. By
+default (`"short_circuit"`) the first required call that fails settles the node
+at once and the calls still in flight are abandoned. With `"wait_all"` the node
+waits until every call of the wave has ended and then fails with the **first**
+required failure; no later wave starts. A caller that collects all its answers
+before it looks at any. The deadline guard does not wait: it settles the node
+at its deadline in both modes.
+
+```python
+# A gateway that fetches three things, the third only if it can, then renders.
+gateway = ServiceNodeRuntime(
+    service=...,
+    hold_worker_during_fanout=True,
+    local_work="last",
+    wave_join="wait_all",
+)
+gateway.add_downstream(DownstreamEdge(client=to_users, target=users))
+gateway.add_downstream(DownstreamEdge(client=to_cart, target=cart))
+gateway.add_downstream(DownstreamEdge(client=to_ads, target=ads, optional=True))
+```
+
 ### Service time per handler node
 
 A real service runs different code for different methods: a `Read` can take a

@@ -26,11 +26,24 @@ class DownstreamEdge:
     # carries the same value -- the default -- the node behaves exactly as it
     # did before waves existed: one concurrent wave.
     wave: int = 0
+    # An optional call is one the node can do without. The node still makes it
+    # and still WAITS for it -- its wave is not complete until the call has
+    # ended -- but a failed optional call fails nothing: the wave counts it as
+    # done and the node carries on. False (the default): the call is required,
+    # as every call always was.
+    optional: bool = False
 
     def __post_init__(self) -> None:
         # bool is an int: `wave=True` would silently mean "wave 1".
         if isinstance(self.wave, bool) or not isinstance(self.wave, int) or self.wave < 0:
             raise ValueError(f"wave must be an int >= 0, got {self.wave!r}")
+        if not isinstance(self.optional, bool):
+            raise ValueError(f"optional must be a bool, got {self.optional!r}")
+
+
+#: The values of `ServiceNodeRuntime.local_work` and `ServiceNodeRuntime.wave_join`.
+LOCAL_WORK_MODES = ("first", "last")
+WAVE_JOIN_MODES = ("short_circuit", "wait_all")
 
 
 class _FanOutAttempt:
@@ -48,6 +61,12 @@ class _FanOutAttempt:
       that had not started are never launched;
     * the deadline guard fires;
     * an upstream cancels this node.
+
+    Three per-node choices bend that default, each off unless set:
+    `local_work="last"` puts the local stage AFTER the last wave instead of
+    before the first; an `optional` edge is waited for and cannot fail the
+    node; `wave_join="wait_all"` lets a wave run to its end before a required
+    failure in it settles the node.
 
     This was a nest of seven closures over eight mutable locals, where the
     lifetime rules were implicit in definition order — and every bug found in it
@@ -96,6 +115,9 @@ class _FanOutAttempt:
         self._launching = False
         self._sync_failure: RootRequest | None = None
         self._launched: list[RootRequest] = []
+        #: `wave_join="wait_all"` only: the first required call of the current
+        #: wave that failed, kept until the wave has drained.
+        self._wave_failure: RootRequest | None = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -107,11 +129,24 @@ class _FanOutAttempt:
         reach the fan-out block at all.
         """
         self._register_cancel(self.cancel)
-        base_time = self.svc._sample_service_time(self.begin_at, self.sim, self.node.service_time)
+        if self.node.local_work == "last" and self.node.downstreams:
+            # Calls first. The guard is armed NOW, before anything else this
+            # attempt schedules, so it wins a tie at the deadline instant
+            # against a wave or a local stage that ends there. The first wave
+            # goes through the event heap like every later one: this may be
+            # running inside another attempt's completion (a dequeue), where a
+            # call submitted synchronously could overtake work queued first.
+            self._group_waves()
+            self._arm_deadline_guard()
+            self._wave_event = self.sim.schedule(self.sim.timestep, self._on_next_wave)
+            return
+        self._start_local(self.begin_at)
+
+    def _start_local(self, at: TimePoint) -> None:
+        """Draw the local service time at `at` and schedule the end of the stage."""
+        base_time = self.svc._sample_service_time(at, self.sim, self.node.service_time)
         end_local = (
-            min(self.begin_at + base_time, self.deadline)
-            if self.deadline is not None
-            else self.begin_at + base_time
+            min(at + base_time, self.deadline) if self.deadline is not None else at + base_time
         )
         self._local_event = self.sim.schedule(end_local, self._on_local_done)
 
@@ -195,15 +230,17 @@ class _FanOutAttempt:
             self._settle(False, DropReason.SERVER_FAILURE)
             return
 
-        if not self.node.downstreams:
-            self._settle(True, DropReason.NONE)  # leaf: behave like a plain finish
+        if not self.node.downstreams or self.node.local_work == "last":
+            # A leaf behaves like a plain finish; with the local work last, the
+            # calls have all been made and this was the final stage.
+            self._settle(True, DropReason.NONE)
             return
 
         self._launch_fanout()
 
     # -- stage 2: fan out ----------------------------------------------------
 
-    def _launch_fanout(self) -> None:
+    def _group_waves(self) -> None:
         # Grouped per attempt, from a snapshot: `downstreams` is a public,
         # mutable list and an edge's `wave` can be reassigned. A dict keeps the
         # list order inside each wave, so a node whose edges share one wave
@@ -214,12 +251,18 @@ class _FanOutAttempt:
         self._waves = [waves[wave] for wave in sorted(waves)]
         self._wave_index = 0
 
+    def _arm_deadline_guard(self) -> None:
+        if self.deadline is not None:
+            self._deadline_event = self.sim.schedule(int(self.deadline), self._on_deadline)
+
+    def _launch_fanout(self) -> None:
+        self._group_waves()
+
         # Guard before launching, so a downstream that completes synchronously
         # cannot outlive the deadline unnoticed. Armed ONCE, for all the waves:
         # being scheduled before any wave event exists is also what lets it win
         # the tie when a wave completes at the deadline instant.
-        if self.deadline is not None:
-            self._deadline_event = self.sim.schedule(int(self.deadline), self._on_deadline)
+        self._arm_deadline_guard()
 
         self._launch_wave()
 
@@ -238,12 +281,16 @@ class _FanOutAttempt:
         # The same absolute deadline for every wave: a later wave simply has
         # less of it left.
         deadline = self.deadline if self.node.propagate_deadline else None
+        self._wave_failure = None
         self._launching = True
         for edge in edges:
+            # An optional call reports to its own hook: it ends its part of the
+            # wave whatever it did.
+            on_done = self._on_optional_done if edge.optional else self._on_downstream_done
             if self.ctx is None:
                 root = edge.client.start_request(
                     self.sim,
-                    on_done=self._on_downstream_done,
+                    on_done=on_done,
                     override_global_deadline=deadline,
                 )
             else:
@@ -252,7 +299,7 @@ class _FanOutAttempt:
                 # attempts (`ClientRuntime._start_attempt`).
                 root = edge.client.start_request(
                     self.sim,
-                    on_done=self._on_downstream_done,
+                    on_done=on_done,
                     override_global_deadline=deadline,
                     ctx=self.ctx,
                 )
@@ -274,20 +321,15 @@ class _FanOutAttempt:
         if self.settled:
             return
         if any(attempt.success for attempt in root.attempts):
-            self._remaining -= 1
-            if self._remaining == 0:
-                if self._wave_index + 1 == len(self._waves):
-                    self._settle(True, DropReason.NONE)
-                    return
-                # The wave is complete and another follows. Start it through
-                # the event heap, at this same instant, rather than from inside
-                # this completion callback: the callee that just reported has
-                # freed its worker but not yet resumed its queue, so a call
-                # submitted synchronously here would start ahead of work that
-                # was queued first (the callback contract in
-                # `ServiceRuntime.submit_attempt`). Retries take the same hop.
-                self._wave_index += 1
-                self._wave_event = self.sim.schedule(self.sim.timestep, self._on_next_wave)
+            self._call_ended()
+            return
+        if self.node.wave_join == "wait_all":
+            # A required call failed, and the wave is to run to its end: note
+            # the FIRST such failure and count the call as ended. The node
+            # settles on it when the wave has drained (`_wave_done`).
+            if self._wave_failure is None:
+                self._wave_failure = root
+            self._call_ended()
             return
         if self._launching:
             # Defer: launching the remaining edges first keeps downstream load
@@ -296,6 +338,40 @@ class _FanOutAttempt:
                 self._sync_failure = root
             return
         self._fail_from(root)  # AND semantics: first failure short-circuits
+
+    def _on_optional_done(self, root: RootRequest) -> None:
+        """An optional call ended. Success or not, its part of the wave is over."""
+        if self.settled:
+            return
+        self._call_ended()
+
+    def _call_ended(self) -> None:
+        self._remaining -= 1
+        if self._remaining == 0:
+            self._wave_done()
+
+    def _wave_done(self) -> None:
+        """Every call of the current wave has ended, none in a way that settled the node."""
+        if self._wave_failure is not None:
+            # wait_all: the wave has drained; a required call in it failed. No
+            # further wave is started.
+            self._fail_from(self._wave_failure)
+            return
+        if self._wave_index + 1 == len(self._waves):
+            if self.node.local_work == "last":
+                # The calls are done: now the node's own work, drawn here.
+                self._start_local(self.sim.timestep)
+                return
+            self._settle(True, DropReason.NONE)
+            return
+        # The wave is complete and another follows. Start it through the event
+        # heap, at this same instant, rather than from inside this completion
+        # callback: the callee that just reported has freed its worker but not
+        # yet resumed its queue, so a call submitted synchronously here would
+        # start ahead of work that was queued first (the callback contract in
+        # `ServiceRuntime.submit_attempt`). Retries take the same hop.
+        self._wave_index += 1
+        self._wave_event = self.sim.schedule(self.sim.timestep, self._on_next_wave)
 
     def _fail_from(self, root: RootRequest) -> None:
         # `_settle` latches `settled` first, so the sibling teardown it runs
@@ -374,6 +450,45 @@ class ServiceNodeRuntime:
     #     draw per attempt.
     # Appended last so positional construction keeps its meaning.
     service_time: ServiceTime | None = None
+    # When the node does its own work relative to its downstream calls:
+    #   "first" (default) -> local service time, failure roll, THEN the calls:
+    #     a handler that computes and then fans out. Everything above describes
+    #     this order.
+    #   "last" -> the calls first, wave by wave, and the local service time and
+    #     failure roll once the last wave has ended: a handler that gathers
+    #     what it needs and then does its work on it. The service time is drawn
+    #     when the calls are done (a latency injection active THEN applies), and
+    #     the worker is held from the start, so this order needs
+    #     `hold_worker_during_fanout=True`: a tandem node has no worker left to
+    #     do the work on.
+    local_work: str = "first"
+    # What a required call that fails does to the wave it is in:
+    #   "short_circuit" (default) -> the node fails at once (the calls still in
+    #     flight are abandoned, or cancelled with `propagate_cancellation`).
+    #   "wait_all" -> the node waits for every call of the wave to end, then
+    #     fails with the FIRST required failure. A barrier join: the caller
+    #     collects all its answers before it looks at any. No later wave starts.
+    # The deadline guard settles the node at its deadline either way.
+    wave_join: str = "short_circuit"
+
+    def __post_init__(self) -> None:
+        self._check_modes()
+
+    def _check_modes(self) -> None:
+        if self.local_work not in LOCAL_WORK_MODES:
+            raise ValueError(
+                f"local_work must be one of {', '.join(LOCAL_WORK_MODES)}; got {self.local_work!r}"
+            )
+        if self.wave_join not in WAVE_JOIN_MODES:
+            raise ValueError(
+                f"wave_join must be one of {', '.join(WAVE_JOIN_MODES)}; got {self.wave_join!r}"
+            )
+        if self.local_work == "last" and not self.hold_worker_during_fanout:
+            raise ValueError(
+                f"node {self.service.cfg.name!r}: local_work='last' needs "
+                "hold_worker_during_fanout=True. A tandem node hands its worker back "
+                "before it waits on its calls, so there is none left to do the work on"
+            )
 
     @property
     def cfg(self) -> ServiceConfig:
@@ -417,6 +532,9 @@ class ServiceNodeRuntime:
         `ctx`, the attempt's request context, is handed to every downstream
         call this attempt makes; the node itself does not read it.
         """
+        if self.local_work != "first" or self.wave_join != "short_circuit":
+            # The fields are plain attributes and can be set after construction.
+            self._check_modes()
 
         def behavior(
             svc: ServiceRuntime,
