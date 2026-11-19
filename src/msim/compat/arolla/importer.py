@@ -42,6 +42,20 @@ that retries too, or that has an attempt timeout of its own, calls that same
 loop through a `RetryLayer`: the client's policy and timer on the outside, the
 service's on the inside.
 
+**Admission.** A service's limiter refuses the RETRIES it is sent: a call whose
+caller is on its second or later attempt. For a client that retries and calls a
+plain service, that is an `AdmissionGate` in front of the station. Where the
+service runs a loop of its own (it retries, has its own attempt timeout, or is
+called by another service) the call is put to the limiter as it arrives at the
+loop (`AdmittingLoop`), and the loop reports every attempt it makes to the same
+controller.
+
+**The rest.** A `count_based` breaker, a `retry_circuit_breaker` and a rate
+limiter on a service gate that service's OWN retries only (`policies.py`). A
+client's `e2e_retry_budget` is a retry allowance on its requests
+(`ClientConfig.retry_allowance`) that every service's loop draws on; the client
+itself, as in their runner, does not.
+
 **Arrivals.** Every client has its own arrival stream, derived from the
 workload's `rng_seed`, the position of its entry among the entries that target
 the same service, and its replica index, so arms laid out on separate services
@@ -49,12 +63,15 @@ see the same arrivals (`arrival_seed`).
 """
 
 import hashlib
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 from msim import faults
 from msim.admission import (
     AdmissionController,
+    AdmissionCounts,
     AdmissionGate,
+    AdmissionRequest,
     AimdBudget,
     ControlledRetryPolicy,
     FailureRateGate,
@@ -66,18 +83,32 @@ from msim.caller import ClientConfig, ClientRuntime, RetryLayer, ServiceLike
 from msim.chain import DownstreamEdge, ServiceNodeRuntime
 from msim.compat.arolla import schema
 from msim.compat.arolla.policies import (
+    CountRetryBreaker,
     FirstAttemptFundedBudget,
+    LeakyRetryGate,
     RetryBank,
     ThreeStateRetryBreaker,
     WindowRetryGate,
 )
-from msim.core import TimeInterval, ms_to_ns, s_to_ns
+from msim.core import (
+    DropReason,
+    Request,
+    RequestContext,
+    RootRequest,
+    TimeInterval,
+    TimePoint,
+    ms_to_ns,
+    s_to_ns,
+)
 from msim.retry_policies import (
+    BurstyRateLimiterPolicy,
     ExponentialBackoffRetryPolicy,
     ExponentialBackoffWithJitterRetryPolicy,
     FixedBackoffRetryPolicy,
+    FixedWindowBurstyLimiterPolicy,
     JitterMode,
     NoRetryPolicy,
+    RetryAllowancePolicy,
     RetryPolicy,
 )
 from msim.service import ServiceConfig, ServiceRuntime
@@ -215,11 +246,114 @@ def _controller(service: schema.Service) -> AdmissionController | None:
             window=ms_to_ns(cfg.window_duration_ms),
             open_delay=ms_to_ns(cfg.half_open_delay_ms),
         )
-    what = f"circuit_breaker of type {cfg.type}" if key == "circuit_breaker" else key
-    raise UnsupportedScenario(
-        f"service {service.name!r}: a {what} on a service is not mapped yet "
-        "(their runner applies it to the service's own retries only)"
-    )
+    # A count_based breaker, a retry_circuit_breaker and the rate limiters gate
+    # the service's own retries only: `_own_retry_gate`.
+    return None
+
+
+def _own_retry_gate(service: schema.Service, policy: RetryPolicy) -> RetryPolicy:
+    """`policy` inside the service's retry-only limiter, when it has one."""
+    limiter = service.limiter
+    if limiter is None:
+        return policy
+    key, cfg = limiter
+    if key == "rate_limiter":
+        period = ms_to_ns(cfg.period_ms)
+        if cfg.type == "leaky":
+            return LeakyRetryGate(
+                underlying_strategy=policy,
+                max_requests=cfg.max_requests,
+                max_attempts=cfg.max_attempts or cfg.max_requests,
+                period=period,
+            )
+        if cfg.type == "bursty":
+            return BurstyRateLimiterPolicy(
+                max_requests=cfg.max_requests,
+                refill_rate=cfg.refill_rate or 1,
+                period=period,
+                underlying_strategy=policy,
+            )
+        return FixedWindowBurstyLimiterPolicy(
+            max_requests=cfg.max_requests, period=period, underlying_strategy=policy
+        )
+    if key == "circuit_breaker" and cfg.type == "count_based":
+        return CountRetryBreaker(
+            underlying_strategy=policy,
+            failure_threshold=cfg.failure_threshold,
+            failure_window=cfg.failure_window_size,
+            success_threshold=cfg.success_threshold,
+            success_window=cfg.success_window_size,
+            open_delay=ms_to_ns(cfg.half_open_delay_ms),
+        )
+    if key == "circuit_breaker" and cfg.type == "retry_circuit_breaker":
+        return WindowRetryGate(
+            underlying_strategy=policy,
+            failure_threshold=cfg.failure_threshold,
+            window=ms_to_ns(cfg.window_duration_ms),
+            min_window_size=cfg.min_requests or 100,
+        )
+    return policy
+
+
+@dataclass
+class AdmittingLoop(ClientRuntime):
+    """A service's retry loop that puts each CALL to the service's limiter first.
+
+    Arolla's services check their limiter when a call arrives, before the
+    service's own retry loop starts, and only for a call that is itself a retry
+    of its caller. A refused call never reaches the loop: the caller gets one
+    failed attempt, `REJECTED`. `AdmissionGate` does this in front of a plain
+    service; this is the same decision in front of a LOOP, where the thing that
+    arrives is a request and not an attempt. The loop reports its attempts to
+    the same controllers from inside (`ControlledRetryPolicy`), so nothing is
+    observed here.
+    """
+
+    controllers: Sequence[AdmissionController] = ()
+    #: Per tenant: the calls that arrived as retries, and how many were let in.
+    counts: dict[str | None, AdmissionCounts] = field(default_factory=dict)
+
+    def start_request(
+        self,
+        sim: Simulator,
+        on_done: Callable[[RootRequest], None] | None = None,
+        override_global_deadline: TimePoint | None = None,
+        *,
+        ctx: RequestContext | None = None,
+    ):
+        if ctx is None:
+            return super().start_request(sim, on_done, override_global_deadline)
+        counts = self.counts.get(ctx.tenant)
+        if counts is None:
+            counts = self.counts[ctx.tenant] = AdmissionCounts()
+        counts.attempts += 1
+        if ctx.attempt > 1:  # the caller's own attempt is a retry
+            counts.retries_asked += 1
+            request = AdmissionRequest(
+                now=sim.timestep, tenant=ctx.tenant, attempt=ctx.attempt, is_retry=True
+            )
+            if not all(controller.check(request) for controller in self.controllers):
+                counts.rejected += 1
+                # Refused on arrival: one attempt that never reached anything, as
+                # a client books a request its own breaker sheds.
+                root = RootRequest(global_deadline=override_global_deadline, on_done=on_done)
+                self.attempts_total += 1
+                root.add_attempt(
+                    Request(
+                        service=self.service.cfg.name,
+                        interval=TimeInterval(begin=sim.timestep, end=sim.timestep),
+                        deadline=override_global_deadline,
+                        success=False,
+                        drop_reason=DropReason.REJECTED,
+                        queue_size_at_end=None,
+                    )
+                )
+                self._complete_root(root, sim.timestep)
+                return root
+            for controller in self.controllers:
+                controller.commit(request)
+            counts.retries_admitted += 1
+        return super().start_request(sim, on_done, override_global_deadline, ctx=ctx)
 
 
 def _client_policy(
@@ -319,8 +453,6 @@ def build(
         service = experiment.service(entry.target_service or experiment.entry.name)
         position = position_on.get(service.name, 0)
         position_on[service.name] = position + 1
-        if entry.e2e_retry_budget is not None:
-            raise UnsupportedScenario(f"client {entry.name!r}: e2e_retry_budget is not mapped yet")
         for replica in range(entry.replicas):
             name = entry.name if entry.replicas <= 1 else f"{entry.name}.{replica}"
             runtime = builder.client(entry, name, service)
@@ -373,12 +505,9 @@ class _Builder:
             controller = _controller(service)
             if controller is not None:
                 self.controllers[service.name] = controller
-        #: What a client with retries of its own submits to, where the service
-        #: has a limiter: the gate that turns its retries away.
-        self.gates = {
-            name: AdmissionGate(self.stations[name], [controller])
-            for name, controller in self.controllers.items()
-        }
+        #: Whether requests carry a retry allowance for the services' loops to
+        #: draw on (some client sets `e2e_retry_budget`).
+        self.allowance = any(c.e2e_retry_budget is not None for c in experiment.clients)
         self.banks: dict[str, RetryBank] = {}
         #: A service's own retry loop, as the client that runs it. One per
         #: service, shared by every caller: the loop is the service's.
@@ -387,18 +516,19 @@ class _Builder:
         #: The chain node of every service that calls others or is called by one.
         self.nodes: dict[str, ServiceNodeRuntime] = {}
         self._graph()
+        #: What a client with retries of its own submits to, where the service
+        #: has a limiter and no loop of its own: the gate that turns its retries away.
+        self.gates = {
+            service.name: AdmissionGate(self.target(service), [self.controllers[service.name]])
+            for service in experiment.services
+            if service.name in self.controllers
+        }
 
     def _graph(self) -> None:
         """Build a node for every service in a call graph, callees before callers."""
         services = {service.name: service for service in self.experiment.services}
         called = {d.service for service in services.values() for d in service.dependencies}
         pending = {name for name, service in services.items() if service.dependencies} | called
-        for name in sorted(pending):
-            if name in self.controllers:
-                raise UnsupportedScenario(
-                    f"service {name!r} has a limiter and calls or is called by another service: "
-                    "admission between services is not mapped yet"
-                )
         while pending:
             ready = sorted(
                 name
@@ -443,6 +573,14 @@ class _Builder:
         controller = self.controllers.get(service.name)
         if controller is not None:
             policy = ControlledRetryPolicy([controller], policy)
+        elif service.retry is not None and service.retry.type != "none":
+            # A limiter that gates only the service's own retries: nothing to
+            # gate on a service that does not retry (the schema says so).
+            policy = _own_retry_gate(service, policy)
+        if self.allowance:
+            # Their end-to-end budget: every retry a service issues takes a unit
+            # of the request's allowance, and none is issued without one.
+            policy = RetryAllowancePolicy(policy)
         return policy
 
     def loop(self, service: schema.Service) -> ClientRuntime:
@@ -450,17 +588,22 @@ class _Builder:
         loop = self.loops.get(service.name)
         if loop is None:
             timeout = service.timeout or schema.Timeout()
-            loop = self.loops[service.name] = ClientRuntime(
-                cfg=ClientConfig(
-                    retry=self.loop_policy(service),
-                    # The caller's deadline is the loop's global deadline; the
-                    # service's attempt timeout bounds each attempt, enforced there.
-                    timeout_controller=StaticTimeoutController(
-                        global_timeout=None, attempt_timeout=_ms(timeout.attempt_ms)
-                    ),
+            cfg = ClientConfig(
+                retry=self.loop_policy(service),
+                # The caller's deadline is the loop's global deadline; the
+                # service's attempt timeout bounds each attempt, enforced there.
+                timeout_controller=StaticTimeoutController(
+                    global_timeout=None, attempt_timeout=_ms(timeout.attempt_ms)
                 ),
-                service=self.target(service),
             )
+            controller = self.controllers.get(service.name)
+            if controller is None:
+                loop = ClientRuntime(cfg=cfg, service=self.target(service))
+            else:
+                loop = AdmittingLoop(
+                    cfg=cfg, service=self.target(service), controllers=[controller]
+                )
+            self.loops[service.name] = loop
         return loop
 
     def layer(self, service: schema.Service) -> RetryLayer:
@@ -471,15 +614,11 @@ class _Builder:
 
     def client(self, entry: schema.Client, name: str, service: schema.Service) -> ClientRuntime:
         service_timeout = service.timeout or schema.Timeout()
-        if entry.retry is None:
+        own_attempt_ms = entry.timeout.attempt_ms if entry.timeout is not None else None
+        if entry.retry is None and own_attempt_ms is None:
             # A relay: the service's own retry loop and timeouts are the client's.
             # Its attempts ARE the service's attempts, so they go straight to the
             # service; the limiter gates them from inside the loop.
-            if entry.timeout is not None and entry.timeout.attempt_ms is not None:
-                raise UnsupportedScenario(
-                    f"client {entry.name!r}: an attempt timeout on a client without a retry "
-                    "policy (a second timeout around the service's own) is not mapped yet"
-                )
             global_ms = (
                 entry.timeout.global_ms if entry.timeout is not None else service_timeout.global_ms
             )
@@ -491,13 +630,14 @@ class _Builder:
                         attempt_timeout=_ms(service_timeout.attempt_ms),
                     ),
                     tenant=name,
+                    retry_allowance=entry.e2e_retry_budget,
                 ),
                 service=self.target(service),
             )
 
-        # A client with a policy of its own.
+        # A client with a policy of its own (or a timer of its own and no
+        # policy, which is a client that does not retry: the schema says so).
         policy = _client_policy(entry, self.sim, self.banks)
-        own_attempt_ms = entry.timeout.attempt_ms if entry.timeout is not None else None
         global_ms = (
             entry.timeout.global_ms if entry.timeout is not None else service_timeout.global_ms
         )
@@ -507,12 +647,7 @@ class _Builder:
         ):
             # Two retry loops, or two attempt timeouts, on one hop: the client
             # calls the service's own loop, which keeps its policy and its
-            # timeout, and sees one answer per call.
-            if service.name in self.controllers:
-                raise UnsupportedScenario(
-                    f"client {entry.name!r} retries, and the service it calls ({service.name!r}) "
-                    "has a limiter and a retry loop of its own: not mapped yet"
-                )
+            # timeout (and its limiter, at the door), and sees one answer per call.
             target: ServiceLike = self.layer(service)
             attempt_ms = own_attempt_ms
         else:
@@ -532,6 +667,7 @@ class _Builder:
                 # The client's own timer is the client's: the server hears of
                 # the global deadline only.
                 server_deadline="attempt" if own_attempt_ms is None else "global",
+                retry_allowance=entry.e2e_retry_budget,
             ),
             service=target,
         )

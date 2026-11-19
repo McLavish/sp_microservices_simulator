@@ -22,7 +22,12 @@ from enum import Enum
 from fractions import Fraction
 
 from msim.core import S_TO_NS, TimeDuration, TimePoint
-from msim.retry_policies import DelayDecision, RetryContext, RetryPolicy
+from msim.retry_policies import (
+    DelayDecision,
+    LeakyRateLimiterPolicy,
+    RetryContext,
+    RetryPolicy,
+)
 
 _MAX_DENOMINATOR = 1_000_000_000
 
@@ -292,3 +297,114 @@ class ThreeStateRetryBreaker(RetryPolicy):
                 return DelayDecision(False, 0)
             self._become(BreakerState.CLOSED, now)
         return self.underlying_strategy.next_delay(context)
+
+
+@dataclass
+class CountRetryBreaker(RetryPolicy):
+    """Arolla's `count_based` breaker on a service: open and closed, on retries only.
+
+    It gates the service's OWN retries and nothing else. Closed, it looks at
+    the last `failure_window` outcomes and opens once that window is full and
+    `failure_threshold` or more of it failed. Open, it refuses every retry,
+    looks at the last `success_window` outcomes, and closes once `open_delay`
+    has passed and that window is full with `success_threshold` or more
+    successes. There is no half-open stage: attempts keep flowing while it is
+    open, only retries stop.
+
+    Their builder turns each threshold into a count by cutting
+    `threshold x window` down to a whole number (so 0.29 of 100 is 28). Here
+    the ratio is compared as it is: 29 of 100.
+    """
+
+    underlying_strategy: RetryPolicy
+    failure_threshold: float
+    failure_window: int
+    success_threshold: float
+    success_window: int
+    open_delay: TimeDuration
+
+    _fail: Fraction = field(init=False, repr=False)
+    _ok: Fraction = field(init=False, repr=False)
+    _closed: deque[bool] = field(init=False, repr=False)
+    _open: deque[bool] = field(init=False, repr=False)
+    _opened_at: TimePoint | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._fail = _ratio(self.failure_threshold, "failure_threshold")
+        self._ok = _ratio(self.success_threshold, "success_threshold")
+        for name in ("failure_window", "success_window"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be >= 1, got {value!r}")
+        if self.open_delay < 0:
+            raise ValueError(f"open_delay must be >= 0 ns, got {self.open_delay!r}")
+        self._closed = deque(maxlen=self.failure_window)
+        self._open = deque(maxlen=self.success_window)
+
+    @property
+    def is_open(self) -> bool:
+        return self._opened_at is not None
+
+    def record_attempt(self, context: RetryContext, success: bool) -> None:
+        if self._opened_at is None:
+            self._closed.append(success)
+            total = len(self._closed)
+            failures = total - sum(self._closed)
+            full = total == self._closed.maxlen
+            if full and failures * self._fail.denominator >= self._fail.numerator * total:
+                self._opened_at = context.now
+                self._open.clear()
+            return
+        self._open.append(success)
+        total = len(self._open)
+        if (
+            context.now - self._opened_at >= self.open_delay
+            and total == self._open.maxlen
+            and sum(self._open) * self._ok.denominator >= self._ok.numerator * total
+        ):
+            self._opened_at = None
+            self._closed.clear()
+
+    def next_delay(self, context: RetryContext) -> DelayDecision:
+        if self._opened_at is not None:
+            return DelayDecision(False, 0)
+        return self.underlying_strategy.next_delay(context)
+
+
+@dataclass
+class LeakyRetryGate(RetryPolicy):
+    """Arolla's `leaky` rate limiter on a service: spaces the service's own retries.
+
+    The service's retries leave `period / max_requests` apart: a retry the
+    wrapped policy grants waits for the next free slot, if that is later than
+    the backoff it was given. `max_attempts` also bounds the attempts of one
+    request, the first try included, whatever the wrapped policy allows.
+
+    The slots are msim's exact leaky bucket (`LeakyRateLimiterPolicy`), so the
+    spacing does not drift, and a retry that is then not issued gives its slot
+    back.
+    """
+
+    underlying_strategy: RetryPolicy
+    max_requests: int
+    max_attempts: int
+    period: TimeDuration
+
+    _bucket: LeakyRateLimiterPolicy = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._bucket = LeakyRateLimiterPolicy(
+            max_requests=self.max_requests, max_attempts=self.max_attempts, period=self.period
+        )
+
+    def next_delay(self, context: RetryContext) -> DelayDecision:
+        if context.attempt >= self.max_attempts:
+            return DelayDecision(False, 0)
+        decision = self.underlying_strategy.next_delay(context)
+        if not decision.allow:
+            return DelayDecision(False, 0)
+        slot = self._bucket.next_delay(context)
+        return DelayDecision(True, max(decision.delay, slot.delay))
+
+    def rollback(self, context: RetryContext) -> None:
+        self._bucket.rollback(context)

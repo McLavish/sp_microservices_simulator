@@ -658,6 +658,15 @@ def _service(reader: _Reader) -> Service:
     )
     reader.done(_SERVICE_KEYS)
     limiters = [key for key in LIMITER_KEYS if getattr(service, key) is not None]
+    retry_only = service.rate_limiter is not None or (
+        service.circuit_breaker is not None and service.circuit_breaker.type != "time_based"
+    )
+    if retry_only and (service.retry is None or service.retry.type == "none"):
+        reader.warnings.append(
+            f"{reader.path(limiters[0])}: this limiter gates the service's own retries and "
+            f"nothing else, and service {name!r} has no retry policy: it does nothing, "
+            "here as in Arolla's runner"
+        )
     if len(limiters) > 1:
         raise SchemaError(
             f"{reader.path(limiters[1])}: service {name!r} has more than one limiter "
@@ -705,6 +714,17 @@ def _client(reader: _Reader) -> Client:
         replicas=reader.integer("replicas", 1, ge=1),
     )
     reader.done(_CLIENT_KEYS)
+    if (
+        client.retry is None
+        and client.timeout is not None
+        and client.timeout.attempt_ms is not None
+    ):
+        reader.warnings.append(
+            f"{reader.path('timeout')}: an attempt timeout on a client without a `retry` "
+            "policy is read as a client that does not retry (`retry: {type: none}`): it "
+            "makes one call and sees one result. Arolla's runner arms the timer for the "
+            "service's first attempt only and lets later ones complete the request"
+        )
     if client.retry is None:
         # Without a policy of its own the client only relays the service's
         # attempts, and their builder never looks at these two.

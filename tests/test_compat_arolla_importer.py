@@ -9,6 +9,7 @@ import yaml
 
 from msim.admission import (
     AdmissionGate,
+    AdmissionRequest,
     AimdBudget,
     ControlledRetryPolicy,
     FailureRateGate,
@@ -17,20 +18,27 @@ from msim.admission import (
     TokenBucketBudget,
 )
 from msim.caller import RetryLayer
-from msim.compat.arolla import Scenario, UnsupportedScenario, arrival_seed, build, parse
+from msim.compat.arolla import Scenario, arrival_seed, build, parse
+from msim.compat.arolla.importer import AdmittingLoop
 from msim.compat.arolla.policies import (
     BreakerState,
+    CountRetryBreaker,
     FirstAttemptFundedBudget,
+    LeakyRetryGate,
     RetryBank,
     ThreeStateRetryBreaker,
     WindowRetryGate,
 )
 from msim.core import DropReason, ms_to_ns, s_to_ns
 from msim.retry_policies import (
+    BurstyRateLimiterPolicy,
+    ExponentialBackoffRetryPolicy,
     ExponentialBackoffWithJitterRetryPolicy,
     FixedBackoffRetryPolicy,
+    FixedWindowBurstyLimiterPolicy,
     JitterMode,
     NoRetryPolicy,
+    RetryAllowancePolicy,
     RetryContext,
     policy_layers,
 )
@@ -638,39 +646,375 @@ class TestTwoLoopsOnOneHop(unittest.TestCase):
         self.assertEqual(user.cfg.server_deadline, "attempt")
 
 
-class TestWhatIsNotMappedYet(unittest.TestCase):
-    def _unsupported(self, text: str) -> str:
-        with self.assertRaises(UnsupportedScenario) as raised:
-            _build(text)
-        return str(raised.exception)
+STACK = """
+name: stack
+seed: 3
+services:
+  - name: db
+    latency: {median_ms: 1, lognorm_sigma: 0}
+    workers: 8
+    partial_failures: [{start_s: 0, end_s: 100, p_fail: 1}]
+  - name: app
+    latency: {median_ms: 1, lognorm_sigma: 0}
+    workers: 8
+    retry: {type: fixed, max_attempts: 5, delay_ms: 0}
+    dependencies: [{service: db}]
+  - name: gateway
+    latency: {median_ms: 1, lognorm_sigma: 0}
+    workers: 8
+    retry: {type: fixed, max_attempts: 5, delay_ms: 0}
+    dependencies: [{service: app}]
+clients:
+  - name: user
+    target_service: gateway
+    retry: {type: fixed, max_attempts: 2, delay_ms: 0}
+    workload: {base_rps: 1, duration_s: 1}
+"""
 
-    def test_each_is_named(self):
-        budget = TENANTS.replace("    timeout: {attempt_ms: 60}", "    e2e_retry_budget: 2")
-        self.assertIn("e2e_retry_budget", self._unsupported(budget))
-        limiter = TENANTS.replace(
-            "arolla_retry_budget: {alpha: 0.2, beta_up: 0.15}",
-            "rate_limiter: {type: bursty, max_requests: 5, period_ms: 1000}",
+
+def _one_request(scenario: Scenario):
+    (user,) = scenario.clients
+    user.runtime.start_request(scenario.sim)
+    scenario.sim.run()
+    return user.runtime
+
+
+class TestEndToEndRetryBudget(unittest.TestCase):
+    def test_without_one_the_layers_multiply(self):
+        scenario = _build(STACK)
+        _one_request(scenario)
+        self.assertEqual(scenario.stations["db"].admitted_total, 2 * 5 * 5)
+
+    def test_it_is_an_allowance_the_services_draw_on(self):
+        scenario = _build(
+            STACK.replace(
+                "    target_service: gateway\n",
+                "    target_service: gateway\n    e2e_retry_budget: 4\n",
+            )
         )
-        self.assertIn("rate_limiter on a service", self._unsupported(limiter))
-        between = GRAPH.replace(
-            "    timeout: {attempt_ms: 400}", "    global_retry_budget: {target_rps: 10}"
+        user = _one_request(scenario)
+        self.assertEqual(user.cfg.retry_allowance, 4)
+        for name in ("db", "app", "gateway"):
+            self.assertIsInstance(scenario.loops[name].cfg.retry, RetryAllowancePolicy, name)
+        # The client's own retries are not charged, as in their runner: its
+        # second call finds the allowance spent and every service tries once.
+        self.assertIsInstance(user.cfg.retry, FixedBackoffRetryPolicy)
+        self.assertEqual(len(user.roots[0].attempts), 2)
+        # First call: 1 + 4 retries at the bottom-most loop that retries. Second call: 1.
+        self.assertEqual(scenario.stations["db"].admitted_total, 5 + 1)
+
+    def test_each_request_has_its_own(self):
+        scenario = _build(
+            STACK.replace(
+                "    target_service: gateway\n",
+                "    target_service: gateway\n    e2e_retry_budget: 4\n",
+            )
         )
-        self.assertIn("admission between services", self._unsupported(between))
-        both = TENANTS.replace(
+        (user,) = scenario.clients
+        for _ in range(3):
+            user.runtime.start_request(scenario.sim)
+            scenario.sim.run()
+        self.assertEqual(scenario.stations["db"].admitted_total, 3 * 6)
+
+    def test_the_relay_client_draws_on_it_as_the_service_it_is(self):
+        text = STACK.replace(
+            "    retry: {type: fixed, max_attempts: 2, delay_ms: 0}\n    workload",
+            "    e2e_retry_budget: 3\n    workload",
+        )
+        scenario = _build(text)
+        user = _one_request(scenario)
+        self.assertEqual(user.cfg.retry_allowance, 3)
+        self.assertIsInstance(user.cfg.retry, RetryAllowancePolicy)
+        self.assertEqual(scenario.stations["db"].admitted_total, 1 + 3)
+
+
+LIMITED = """
+name: limited
+seed: 3
+services:
+  - name: svc
+    latency: {median_ms: 1, lognorm_sigma: 0}
+    workers: 8
+    retry: {type: fixed, max_attempts: 6, delay_ms: 0}
+    LIMITER
+    partial_failures: [{start_s: 0, end_s: 100, p_fail: 1}]
+workload: {base_rps: 1, duration_s: 1}
+"""
+
+
+class TestLimitersThatGateOnlyTheServicesOwnRetries(unittest.TestCase):
+    def _relay(self, limiter: str):
+        scenario = _build(LIMITED.replace("LIMITER", limiter))
+        client = _one_request(scenario)
+        return scenario, client, list(policy_layers(client.cfg.retry))
+
+    def test_a_bursty_rate_limiter(self):
+        scenario, client, layers = self._relay(
+            "rate_limiter: {type: bursty, max_requests: 2, period_ms: 1000, refill_rate: 1}"
+        )
+        self.assertIsInstance(layers[0], BurstyRateLimiterPolicy)
+        self.assertEqual(
+            (layers[0].max_requests, layers[0].refill_rate, layers[0].period), (2, 1, S)
+        )
+        self.assertEqual(len(client.roots[0].attempts), 3)  # two tokens, two retries
+        self.assertEqual(scenario.gates, {})  # nothing is refused on arrival
+
+    def test_a_fixed_window_rate_limiter(self):
+        _, client, layers = self._relay(
+            "rate_limiter: {type: fixed_window, max_requests: 3, period_ms: 1000}"
+        )
+        self.assertIsInstance(layers[0], FixedWindowBurstyLimiterPolicy)
+        self.assertEqual(len(client.roots[0].attempts), 4)
+
+    def test_a_leaky_rate_limiter_spaces_the_retries(self):
+        _, client, layers = self._relay(
+            "rate_limiter: {type: leaky, max_requests: 100, period_ms: 1000, max_attempts: 4}"
+        )
+        self.assertIsInstance(layers[0], LeakyRetryGate)
+        attempts = client.roots[0].attempts
+        self.assertEqual(len(attempts), 4)  # max_attempts, below the policy's six
+        begins = [round(a.interval.begin / MS) for a in attempts]
+        # 1 ms of service, then the next free slot: 10 ms apart from the second retry on.
+        self.assertEqual(begins, [0, 1, 11, 21])
+
+    def test_a_count_based_breaker(self):
+        _, client, layers = self._relay(
+            "circuit_breaker: {type: count_based, failure_threshold: 0.5, success_threshold: 0.5, "
+            "half_open_delay_ms: 1000, failure_window_size: 4, success_window_size: 2}"
+        )
+        breaker = layers[0]
+        assert isinstance(breaker, CountRetryBreaker)
+        self.assertEqual(
+            (breaker.failure_window, breaker.success_window, breaker.open_delay), (4, 2, S)
+        )
+        # Four failures fill the window and open it: no fifth attempt.
+        self.assertEqual(len(client.roots[0].attempts), 4)
+        self.assertTrue(breaker.is_open)
+
+    def test_a_retry_circuit_breaker(self):
+        _, client, layers = self._relay(
+            "circuit_breaker: {type: retry_circuit_breaker, failure_threshold: 0.5, "
+            "half_open_delay_ms: 0, window_duration_ms: 1000, min_requests: 3}"
+        )
+        self.assertIsInstance(layers[0], WindowRetryGate)
+        self.assertEqual(len(client.roots[0].attempts), 3)
+
+    def test_on_a_service_that_does_not_retry_it_is_named_as_doing_nothing(self):
+        text = LIMITED.replace(
+            "    retry: {type: fixed, max_attempts: 6, delay_ms: 0}\n", ""
+        ).replace("LIMITER", "rate_limiter: {type: bursty, max_requests: 2, period_ms: 1000}")
+        experiment = parse(yaml.safe_load(text))
+        (warning,) = experiment.warnings
+        self.assertIn("gates the service's own retries and nothing else", warning)
+        (policy,) = _layers(build(experiment), "client")
+        self.assertIsInstance(policy, NoRetryPolicy)
+
+
+class TestCountRetryBreaker(unittest.TestCase):
+    def _breaker(self) -> CountRetryBreaker:
+        return CountRetryBreaker(
+            underlying_strategy=FixedBackoffRetryPolicy(max_attempts=99, delay=0),
+            failure_threshold=0.5,
+            failure_window=4,
+            success_threshold=0.5,
+            success_window=2,
+            open_delay=500 * MS,
+        )
+
+    def _feed(self, breaker, start: int, results: list[bool]) -> None:
+        for index, ok in enumerate(results):
+            breaker.record_attempt(_context(1, start + index * MS), ok)
+
+    def test_it_opens_on_a_full_window_at_the_threshold(self):
+        breaker = self._breaker()
+        self._feed(breaker, 0, [False, False, True])
+        self.assertFalse(breaker.is_open)  # the window is not full yet
+        self._feed(breaker, 10 * MS, [True])  # 2 of 4
+        self.assertTrue(breaker.is_open)
+        self.assertFalse(breaker.next_delay(_context(1, 20 * MS)).allow)
+
+    def test_it_closes_after_the_delay_on_enough_recent_successes(self):
+        breaker = self._breaker()
+        self._feed(breaker, 0, [False] * 4)
+        self._feed(breaker, 100 * MS, [True, True])
+        self.assertTrue(breaker.is_open)  # two successes, but the delay has not passed
+        self._feed(breaker, 200 * MS, [False, False])
+        self._feed(breaker, 600 * MS, [False])
+        self.assertTrue(breaker.is_open)  # the delay has passed; the last two both failed
+        self._feed(breaker, 610 * MS, [True])
+        self.assertFalse(breaker.is_open)  # the last two: one of two, at the threshold
+        self.assertTrue(breaker.next_delay(_context(1, 620 * MS)).allow)
+
+    def test_a_ratio_is_not_cut_to_a_whole_count(self):
+        breaker = CountRetryBreaker(
+            underlying_strategy=FixedBackoffRetryPolicy(max_attempts=99, delay=0),
+            failure_threshold=0.29,
+            failure_window=100,
+            success_threshold=1.0,
+            success_window=1,
+            open_delay=0,
+        )
+        self._feed(breaker, 0, [False] * 28 + [True] * 72)
+        self.assertFalse(breaker.is_open)  # 28 % is below 29 %
+
+
+BETWEEN = """
+name: between
+seed: 3
+services:
+  - name: db
+    latency: {median_ms: 1, lognorm_sigma: 0}
+    workers: 8
+    global_retry_budget: {target_rps: 1, max_burst: 1}
+    partial_failures: [{start_s: 0, end_s: 100, p_fail: 1}]
+  - name: app
+    latency: {median_ms: 1, lognorm_sigma: 0}
+    workers: 8
+    retry: {type: fixed, max_attempts: 4, delay_ms: 0}
+    dependencies: [{service: db}]
+clients:
+  - name: user
+    target_service: app
+    workload: {base_rps: 1, duration_s: 1}
+"""
+
+
+class TestAdmissionWhereTheServiceRunsALoop(unittest.TestCase):
+    def test_a_service_refuses_the_retries_of_the_service_that_calls_it(self):
+        scenario = _build(BETWEEN)
+        client = _one_request(scenario)
+        loop = scenario.loops["db"]
+        assert isinstance(loop, AdmittingLoop)
+        self.assertIs(loop.controllers[0], scenario.controllers["db"])
+        # app's four attempts: the first is a first try, the second takes the one
+        # token, the third and fourth are refused on arrival.
+        self.assertEqual(scenario.stations["db"].admitted_total, 2)
+        self.assertEqual(
+            [root.attempts[-1].drop_reason for root in loop.roots],
+            [
+                DropReason.SERVER_FAILURE,
+                DropReason.SERVER_FAILURE,
+                DropReason.REJECTED,
+                DropReason.REJECTED,
+            ],
+        )
+        (counts,) = loop.counts.values()
+        self.assertEqual(
+            (counts.attempts, counts.retries_asked, counts.retries_admitted, counts.rejected),
+            (4, 3, 1, 2),
+        )
+        self.assertEqual(
+            [a.drop_reason for a in client.roots[0].attempts],
+            [
+                DropReason.SERVER_FAILURE,
+                DropReason.SERVER_FAILURE,
+                DropReason.REJECTED,
+                DropReason.REJECTED,
+            ],
+        )
+
+    def test_the_loop_tells_the_limiter_of_every_attempt_once(self):
+        text = BETWEEN.replace(
+            "global_retry_budget: {target_rps: 1, max_burst: 1}",
+            "retry_budget: {budget_ratio: 1, max_retries: 1}",
+        ).replace("start_s: 0, end_s: 100, p_fail: 1", "start_s: 50, end_s: 100, p_fail: 1")
+        scenario = _build(text)
+        controller = scenario.controllers["db"]
+        assert isinstance(controller, SuccessFundedBudget)
+        request = AdmissionRequest(now=0, tenant=None, attempt=2, is_retry=True)
+        controller.commit(request)  # empty the bank
+        self.assertEqual(controller.balance, 0.0)
+        _one_request(scenario)  # one successful call of db
+        self.assertEqual(controller.balance, 1.0)  # one deposit, not two
+
+    def test_a_retrying_client_in_front_of_a_service_with_a_limiter_and_a_loop(self):
+        text = TENANTS.replace(
             "    arolla_retry_budget: {alpha: 0.2, beta_up: 0.15}",
-            "    arolla_retry_budget: {alpha: 0.2, beta_up: 0.15}\n"
+            "    global_retry_budget: {target_rps: 1, max_burst: 1}\n"
             "    retry: {type: fixed, max_attempts: 2, delay_ms: 0}",
+        ).replace("start_s: 1, end_s: 2, p_fail: 0.5", "start_s: 0, end_s: 100, p_fail: 1")
+        scenario = _build(text)
+        (timer,) = scenario.group("timer")
+        layer = timer.runtime.service
+        assert isinstance(layer, RetryLayer)
+        self.assertIsInstance(layer.client, AdmittingLoop)
+        timer.runtime.start_request(scenario.sim)
+        scenario.sim.run()
+        # Inside the client's first call the service retried once itself, which
+        # took the one token: the client's three retries are refused at the door.
+        self.assertEqual(
+            [a.drop_reason for a in timer.runtime.roots[0].attempts],
+            [
+                DropReason.SERVER_FAILURE,
+                DropReason.REJECTED,
+                DropReason.REJECTED,
+                DropReason.REJECTED,
+            ],
         )
-        self.assertIn("a limiter and a retry loop of its own", self._unsupported(both))
-        relay_timer = RELAY.replace(
-            "workload:\n  base_rps: 100",
-            "clients:\n  - name: c\n    timeout: {attempt_ms: 50}\n    workload:\n      base_rps: 100",
-        ).replace(
-            "  duration_s: 3\n  rng_seed: 9\n  load_spikes: [{start_s: 2, end_s: 3, rps_multiplier: 2}]\n",
-            "      duration_s: 3\n",
+        self.assertEqual(scenario.stations["shared"].admitted_total, 2)
+        loop = layer.client
+        assert isinstance(loop, AdmittingLoop)
+        self.assertEqual(
+            (loop.counts["timer"].retries_asked, loop.counts["timer"].rejected), (3, 3)
         )
-        self.assertIn(
-            "an attempt timeout on a client without a retry", self._unsupported(relay_timer)
+
+
+class TestAClientWithATimerAndNoPolicy(unittest.TestCase):
+    TEXT = RELAY.replace(
+        "workload:\n  base_rps: 100\n  duration_s: 3\n  rng_seed: 9\n"
+        "  load_spikes: [{start_s: 2, end_s: 3, rps_multiplier: 2}]\n",
+        "clients:\n  - name: c\n    timeout: {attempt_ms: 50}\n    workload: {base_rps: 100, duration_s: 3}\n",
+    )
+
+    def test_it_is_read_as_a_client_that_does_not_retry(self):
+        experiment = parse(yaml.safe_load(self.TEXT))
+        self.assertIn("is read as a client that does not retry", experiment.warnings[0])
+        scenario = build(experiment)
+        (client,) = scenario.clients
+        self.assertIsInstance(client.runtime.cfg.retry, NoRetryPolicy)
+        self.assertEqual(client.runtime.cfg.server_deadline, "global")
+        self.assertEqual(client.runtime.cfg.timeout_controller.get_attempt_timeout(), 50 * MS)
+        # The service keeps its own retry loop and timeout, behind it.
+        assert isinstance(client.runtime.service, RetryLayer)
+        self.assertIs(client.runtime.service.client, scenario.loops["svc"])
+
+
+class TestTheRestOfTheSchema(unittest.TestCase):
+    def test_the_goodput_gate_and_cap(self):
+        text = TENANTS.replace(
+            "arolla_retry_budget: {alpha: 0.2, beta_up: 0.15}",
+            "arolla_retry_budget: {alpha: 0.2, success_rate_threshold: 0.4, success_rate_beta: 0.2, max_retry_ratio: 0.05}",
+        )
+        controller = _build(text).controllers["shared"]
+        assert isinstance(controller, GoodputCoupledBudget)
+        self.assertEqual(
+            (
+                controller.success_rate_threshold,
+                controller.success_rate_beta,
+                controller.max_retry_ratio,
+            ),
+            (0.4, 0.2, 0.05),
+        )
+
+    def test_a_latency_injection(self):
+        text = RELAY.replace(
+            "    partial_failures: [{start_s: 1, end_s: 2, p_fail: 0.5}]",
+            "    latency_injections: [{start_s: 1, end_s: 2, add_latency_ms: 30, multiplier: 2}]",
+        )
+        scenario = _build(text)
+        (injection,) = scenario.stations["svc"].cfg.latency_injections
+        self.assertEqual((injection.add_latency, injection.multiplier), (30 * MS, 2))
+        self.assertEqual((injection.duration.begin, injection.duration.end), (S, 2 * S))
+
+    def test_an_exponential_backoff(self):
+        text = RELAY.replace(
+            "retry: {type: fixed, max_attempts: 3, delay_ms: 5}",
+            "retry: {type: exponential, max_attempts: 4, initial_delay_ms: 5, max_delay_ms: 40}",
+        )
+        *_, backoff = _layers(_build(text), "client")
+        self.assertEqual(
+            backoff,
+            ExponentialBackoffRetryPolicy(max_attempts=4, initial_delay=5 * MS, max_delay=40 * MS),
         )
 
 
