@@ -9,9 +9,11 @@ A reinforcement-learning layer that built on the simulator (Gymnasium env, learn
 retry policies, PPO training) lives on the `rl-layer` branch, not here.
 
 - **Services** — M/G/c/K queues with lognormal service times (one per service, or
-  one per handler over a shared station), bounded queues, and configurable workers.
+  one per handler over a shared station), bounded queues served first-come, newest-first
+  or at random, and configurable workers.
 - **Clients** — retry policies (fixed/exponential/jittered backoff, circuit
-  breakers, rate limiters, retry budgets) and static or adaptive timeout control.
+  breakers, rate limiters, retry budgets, retries chosen by the cause of the failure)
+  and static or adaptive timeout control.
 - **Chains** — multi-hop fan-out with AND semantics, concurrent or sequential
   downstream calls (call waves), and tandem vs. hold-worker capacity models.
 - **Faults** — latency injection, partial failures, and load spikes scoped to time
