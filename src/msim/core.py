@@ -255,6 +255,59 @@ def root_latency(root: "RootRequest") -> "TimeDuration":
 
 
 @dataclass
+class RetryAllowance:
+    """How many more retries ONE request may issue, over every hop it crosses.
+
+    One object per root request, handed down by reference inside the
+    `RequestContext` of every attempt the request causes anywhere in the call
+    tree, so a retry issued three hops down and one issued by the root client
+    draw on the same number. Mutable on purpose: the context is frozen, and this
+    is the one thing in it that the request's own progress changes.
+    """
+
+    remaining: int
+
+    def __post_init__(self) -> None:
+        # bool is an int: `remaining=True` would silently mean one retry.
+        if isinstance(self.remaining, bool) or not isinstance(self.remaining, int):
+            raise ValueError(f"remaining must be an int, got {self.remaining!r}")
+        if self.remaining < 0:
+            raise ValueError(f"remaining must be >= 0, got {self.remaining}")
+
+
+@dataclass(frozen=True)
+class RequestContext:
+    """What a request carries from hop to hop, as one attempt of it sees it.
+
+    Only a request that was given a context has one: a client with a
+    `ClientConfig.tenant` creates one for every request it starts, and a caller
+    may pass its own to `ClientRuntime.start_request`. From there it travels
+    with every attempt the request causes, down every edge of the call tree.
+    Two fields are relative to a hop, and the client that issues an attempt sets
+    them for that attempt:
+
+    * `attempt`: the number of the attempt AT THE HOP THAT ISSUED IT (1 is that
+      client's first try). A downstream call made on behalf of an upstream retry
+      is still attempt 1 of its own client.
+    * `is_retry`: sticky. True when this attempt is a retry, or was caused by one
+      anywhere above it in the tree. `attempt > 1` asks the same of this hop
+      alone.
+
+    The other two belong to the request as a whole and are handed on untouched:
+    the same `tenant`, and the SAME `retry_allowance` object, at every hop.
+    """
+
+    tenant: str | None = None
+    attempt: int = 1
+    is_retry: bool = False
+    retry_allowance: RetryAllowance | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.attempt, bool) or not isinstance(self.attempt, int) or self.attempt < 1:
+            raise ValueError(f"attempt must be an int >= 1, got {self.attempt!r}")
+
+
+@dataclass
 class Request:
     service: str  # name of the service that handled the request
     interval: TimeInterval  # indicates the lifespan of the request

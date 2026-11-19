@@ -7,7 +7,7 @@ from enum import Enum
 from fractions import Fraction
 from typing import NamedTuple, Protocol, runtime_checkable
 
-from msim.core import DropReason, TimeDuration, TimePoint
+from msim.core import DropReason, RequestContext, TimeDuration, TimePoint
 
 
 @dataclass
@@ -18,6 +18,10 @@ class RetryContext:
     # policy that decides by cause (`RetryByCausePolicy`); every other policy
     # ignores it. None when the caller of `next_delay` does not say.
     drop_reason: DropReason | None = None
+    # The request context of the attempt that just ended (its tenant, the sticky
+    # retry flag, the request's shared retry allowance), when the request
+    # carries one. None for a request without a context.
+    request: RequestContext | None = None
 
 
 class DelayDecision(NamedTuple):

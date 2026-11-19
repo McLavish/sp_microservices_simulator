@@ -5,7 +5,7 @@ from dataclasses import MISSING, dataclass, field, fields
 from enum import Enum
 from functools import partial
 
-from msim.core import DropReason, TimeDuration, TimePoint
+from msim.core import DropReason, RequestContext, TimeDuration, TimePoint
 from msim.fault_events import FaultEventsTracker
 from msim.faults import LatencyInjection, PartialFailure
 from msim.simulator import Event, Simulator
@@ -398,6 +398,8 @@ class ServiceRuntime:
         on_done: AttemptDoneCallback,
         attempt_deadline: TimePoint | None = None,
         behavior: Behavior | None = None,
+        *,
+        ctx: RequestContext | None = None,
     ):
         """
         Enqueue an attempt for this service.
@@ -421,6 +423,11 @@ class ServiceRuntime:
 
         Returns an `AttemptControl` whose `cancel()` abandons the attempt if it
         is still outstanding (queued or in service) and is a no-op afterwards.
+
+        `ctx`, the attempt's request context, is accepted and NOT used: a
+        station serves every attempt alike, whoever it belongs to. The context
+        is for what sits in front of a station or behind it (a chain node hands
+        it to its downstream calls).
         """
 
         self._seq += 1

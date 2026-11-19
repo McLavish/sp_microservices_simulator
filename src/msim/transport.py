@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 
 from msim.caller import ServiceLike
-from msim.core import DropReason, TimeDuration, TimePoint
+from msim.core import DropReason, RequestContext, TimeDuration, TimePoint
 from msim.service import AttemptControl, AttemptDoneCallback, ServiceConfig
 from msim.simulator import Event, Simulator
 
@@ -135,11 +135,14 @@ class _TransitAttempt:
         sim: Simulator,
         on_done: AttemptDoneCallback,
         deadline: TimePoint | None,
+        ctx: RequestContext | None = None,
     ) -> None:
         self.target = target
         self.delay = delay
         self.sim = sim
         self.deadline = deadline
+        #: The attempt's request context: the wire carries it to the target as is.
+        self.ctx = ctx
         self._on_done = on_done
 
         self.phase = _Phase.FORWARD
@@ -218,9 +221,14 @@ class _TransitAttempt:
     def _on_arrival(self) -> None:
         self._event = None
         self.phase = _Phase.AT_SERVICE
-        inner = self.target.submit_attempt(
-            self.sim, self._on_target_done, attempt_deadline=self.deadline
-        )
+        if self.ctx is None:
+            inner = self.target.submit_attempt(
+                self.sim, self._on_target_done, attempt_deadline=self.deadline
+            )
+        else:
+            inner = self.target.submit_attempt(
+                self.sim, self._on_target_done, attempt_deadline=self.deadline, ctx=self.ctx
+            )
         # The target may report from INSIDE submit_attempt (queue-full, already
         # expired), i.e. before this assignment: by then the attempt has already
         # moved on to RETURN or DONE and this control is a stale handle on
@@ -366,6 +374,8 @@ class TransportLink:
         sim: Simulator,
         on_done: AttemptDoneCallback,
         attempt_deadline: TimePoint | None = None,
+        *,
+        ctx: RequestContext | None = None,
     ) -> AttemptControl:
         """Send one attempt over the link; see the module docstring for semantics."""
         return _TransitAttempt(
@@ -374,4 +384,5 @@ class TransportLink:
             sim=sim,
             on_done=on_done,
             deadline=attempt_deadline,
+            ctx=ctx,
         ).start()

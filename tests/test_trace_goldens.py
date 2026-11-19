@@ -220,7 +220,7 @@ def _fanout(seed: int = 1234):
     return sim, [top, *edges], [a.service, *leaves]
 
 
-def _chain_switches(seed: int = 77):
+def _chain_switches(seed: int = 77, tenant: str | None = None):
     """Every per-node switch at its non-default value, plus a transport link.
 
     A holds its worker through the fan-out and cancels abandoned siblings; B
@@ -288,7 +288,11 @@ def _chain_switches(seed: int = 77):
     a.add_downstream(DownstreamEdge(client=a_to_c, target=c))
     b.add_downstream(DownstreamEdge(client=b_to_d, target=d))
     top = ClientRuntime(
-        cfg=ClientConfig(retry=_fixed(2, 10), timeout_controller=_static(120, global_ms=400)),
+        cfg=ClientConfig(
+            retry=_fixed(2, 10),
+            timeout_controller=_static(120, global_ms=400),
+            tenant=tenant,
+        ),
         service=a,
     )
     spike = LoadSpike(TimeInterval(s_to_ns(1), s_to_ns(2)), rps_multiplier=3.0)
@@ -893,6 +897,13 @@ class TestTraceGoldens(unittest.TestCase):
         reasons = _reasons(clients)
         for reason in ("NONE", "QUEUE_FULL", "DEADLINE", "SERVER_FAILURE", "CANCELLED"):
             self.assertGreater(reasons[reason], 0, reason)
+        self.assertEqual(_trace(sim, clients, services), _CHAIN_SWITCHES)
+
+    def test_a_request_context_changes_no_trace(self):
+        """The same run with a tenant on the root client: a context then travels
+        with every attempt, through nodes, a link, retries and cancellations, and
+        nothing reads it -- so the pinned trace is reproduced exactly."""
+        sim, clients, services = _chain_switches(tenant="tenant-a")
         self.assertEqual(_trace(sim, clients, services), _CHAIN_SWITCHES)
 
     def test_retry_storm_trace(self):

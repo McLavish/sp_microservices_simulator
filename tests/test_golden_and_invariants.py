@@ -363,7 +363,7 @@ class _FinalizeAtOffsetService:
         self.cfg = service.cfg
         self.offset_ns = offset_ns
 
-    def submit_attempt(self, sim, on_done, attempt_deadline=None):
+    def submit_attempt(self, sim, on_done, attempt_deadline=None, *, ctx=None):
         def behavior(service, sim_, deadline, finalize, begin_at, release_worker, register_cancel):
             if deadline is None:
                 raise AssertionError("this fixture needs an attempt deadline")

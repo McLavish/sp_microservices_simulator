@@ -1,11 +1,12 @@
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Protocol, runtime_checkable
 
 from msim.core import (
     DropReason,
     Request,
+    RequestContext,
     RootRequest,
     TimeDuration,
     TimeInterval,
@@ -28,6 +29,10 @@ class ServiceLike(Protocol):
 
     Implemented by `ServiceRuntime` (single service) and `ServiceNodeRuntime`
     (a chain node that fans out downstream).
+
+    `ctx` is the request context of the attempt (`core.RequestContext`). A client
+    passes it ONLY for a request that carries one, so a target that never serves
+    such requests is called with the three arguments it always was.
     """
 
     cfg: ServiceConfig
@@ -37,6 +42,8 @@ class ServiceLike(Protocol):
         sim: Simulator,
         on_done: AttemptDoneCallback,
         attempt_deadline: TimePoint | None = None,
+        *,
+        ctx: RequestContext | None = None,
     ) -> AttemptControl: ...
 
 
@@ -44,6 +51,12 @@ class ServiceLike(Protocol):
 class ClientConfig:
     retry: RetryPolicy
     timeout_controller: TimeoutController
+    # Who this client's requests belong to. A client with a tenant gives every
+    # request it STARTS a `core.RequestContext`, which then travels with every
+    # attempt that request causes, down the whole call tree. None (the default):
+    # no context is created and nothing downstream is handed one. It is the ROOT
+    # client's tenant that counts: a request that arrives with a context keeps it.
+    tenant: str | None = None
 
 
 @dataclass
@@ -66,6 +79,10 @@ class AttemptCtx:
     # that outcome as CANCELLED: this one leaves the attempt alone and only
     # forbids further ones. Survives the `cancelling` reset in `_cancel_root`.
     abandoned: bool = False
+    # The request context of the attempt in flight (of the last one issued, while
+    # backing off): the request's context with `attempt` and `is_retry` set for
+    # this client's attempt. None for a request that carries no context.
+    request_ctx: RequestContext | None = None
 
 
 @dataclass
@@ -192,7 +209,16 @@ class ClientRuntime:
         sim: Simulator,
         on_done: Callable[[RootRequest], None] | None = None,
         override_global_deadline: TimePoint | None = None,
+        *,
+        ctx: RequestContext | None = None,
     ):
+        """Start one request; `ctx` is the context it arrives with, if any.
+
+        A request that arrives with a context keeps it (a chain node hands its
+        own attempt's context to every downstream call). One that arrives with
+        none gets a fresh context when this client has a `tenant`, and none
+        otherwise.
+        """
         root_req = RootRequest()
 
         # Compute global deadline: min(override, controller)
@@ -237,7 +263,9 @@ class ClientRuntime:
             interval=TimeInterval(begin=sim.timestep, end=sim.timestep),
             deadline=None,
         )
-        initial_ctx = AttemptCtx(root=root_req, req=dummy_req)
+        if ctx is None and self.cfg.tenant is not None:
+            ctx = RequestContext(tenant=self.cfg.tenant)
+        initial_ctx = AttemptCtx(root=root_req, req=dummy_req, request_ctx=ctx)
         root_req.cancel = partial(self._cancel_root, initial_ctx, sim)
         self._start_attempt(sim, initial_ctx)
         return root_req
@@ -264,7 +292,21 @@ class ClientRuntime:
         ctx.retry_event = None
         ctx.pending_retry_context = None
         on_done = partial(self._on_attempt_done, ctx, sim)
-        ctx.control = self.service.submit_attempt(sim, on_done, attempt_deadline=req_deadline)
+        if ctx.request_ctx is None:
+            # No request context: the call every target has always received.
+            ctx.control = self.service.submit_attempt(sim, on_done, attempt_deadline=req_deadline)
+            return
+        # The two hop-relative fields, for THIS attempt of THIS client. Attempts
+        # are recorded on the root as they end and never overlap, so the next
+        # one's number is the count so far plus one. The flag is sticky: once
+        # True -- here or at a hop above -- it stays True.
+        number = ctx.root.attempt_count() + 1
+        ctx.request_ctx = replace(
+            ctx.request_ctx, attempt=number, is_retry=ctx.request_ctx.is_retry or number > 1
+        )
+        ctx.control = self.service.submit_attempt(
+            sim, on_done, attempt_deadline=req_deadline, ctx=ctx.request_ctx
+        )
 
     def _on_attempt_done(
         self,
@@ -342,6 +384,7 @@ class ClientRuntime:
             # The cause as booked above: DEADLINE for an attempt that ran out of
             # time, whatever the service reported.
             drop_reason=drop_reason,
+            request=ctx.request_ctx,
         )
 
         decision = self.cfg.retry.next_delay(retry_context)

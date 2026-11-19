@@ -2,7 +2,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from msim.caller import ClientRuntime
-from msim.core import DropReason, RootRequest, TimeDuration, TimePoint
+from msim.core import DropReason, RequestContext, RootRequest, TimeDuration, TimePoint
 from msim.service import (
     AttemptControl,
     AttemptDoneCallback,
@@ -65,12 +65,16 @@ class _FanOutAttempt:
         begin_at: TimePoint,
         release_worker: Callable[[], None],
         register_cancel: Callable[[Callable[[], None] | None], None],
+        ctx: RequestContext | None = None,
     ) -> None:
         self.node = node
         self.svc = svc
         self.sim = sim
         self.deadline = deadline
         self.begin_at = begin_at
+        #: The request context this attempt arrived with, handed on to every
+        #: downstream call it makes. None for a request that carries none.
+        self.ctx = ctx
         self._finalize = finalize
         self._release_worker = release_worker
         self._register_cancel = register_cancel
@@ -231,19 +235,28 @@ class _FanOutAttempt:
         edges = self._waves[self._wave_index]
         self._remaining = len(edges)
 
+        # The same absolute deadline for every wave: a later wave simply has
+        # less of it left.
+        deadline = self.deadline if self.node.propagate_deadline else None
         self._launching = True
         for edge in edges:
-            self._launched.append(
-                edge.client.start_request(
+            if self.ctx is None:
+                root = edge.client.start_request(
                     self.sim,
                     on_done=self._on_downstream_done,
-                    # The same absolute deadline for every wave: a later wave
-                    # simply has less of it left.
-                    override_global_deadline=(
-                        self.deadline if self.node.propagate_deadline else None
-                    ),
+                    override_global_deadline=deadline,
                 )
-            )
+            else:
+                # The request's context goes down as this attempt received it;
+                # the edge's client sets the hop-relative fields for its own
+                # attempts (`ClientRuntime._start_attempt`).
+                root = edge.client.start_request(
+                    self.sim,
+                    on_done=self._on_downstream_done,
+                    override_global_deadline=deadline,
+                    ctx=self.ctx,
+                )
+            self._launched.append(root)
         self._launching = False
 
         # A synchronous rejection during the loop was deferred so that every
@@ -388,6 +401,8 @@ class ServiceNodeRuntime:
         sim: Simulator,
         on_done: AttemptDoneCallback,
         attempt_deadline: TimePoint | None = None,
+        *,
+        ctx: RequestContext | None = None,
     ) -> AttemptControl:
         """Submit a logical attempt to this node.
 
@@ -398,6 +413,9 @@ class ServiceNodeRuntime:
         The local worker is released after the local stage unless
         ``hold_worker_during_fanout`` is set, in which case it is held for the
         whole subtree (synchronous thread-per-request model).
+
+        `ctx`, the attempt's request context, is handed to every downstream
+        call this attempt makes; the node itself does not read it.
         """
 
         def behavior(
@@ -418,6 +436,7 @@ class ServiceNodeRuntime:
                 begin_at=begin_at,
                 release_worker=release_worker,
                 register_cancel=register_cancel,
+                ctx=ctx,
             ).start()
 
         # Propagate the cancellation handle up: without it the caller holds no

@@ -182,6 +182,8 @@ class _StubTarget:
         sim: Simulator,
         on_done: AttemptDoneCallback,
         attempt_deadline: TimePoint | None = None,
+        *,
+        ctx: object = None,
     ) -> AttemptControl:
         self.arrivals.append(sim.timestep)
         arrived_at = sim.timestep

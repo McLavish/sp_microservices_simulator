@@ -16,7 +16,9 @@ timeout_controller)` and a `service` (anything matching `ServiceLike` — a plai
 
 1. Build a `RootRequest` and compute its **global deadline** as
    `min(now + controller.global_timeout, override_global_deadline)` — whichever
-   bounds are present (`caller.py`).
+   bounds are present (`caller.py`). The request keeps the context it arrives
+   with (`ctx=`), or gets a fresh one when the client has a `tenant`
+   ([below](#request-context-what-travels-with-a-request)).
 2. Ask the policy stack whether the request is allowed (`_allow_policy_request`). If
    a circuit breaker is open, record a single `CIRCUIT_OPEN` attempt and complete
    the root immediately.
@@ -65,6 +67,43 @@ what happens next:
 > `sub_policies(context=None)` instead: every branch without a context, and only
 > the branch that made the decision with one (`policy_layers` then refunds a
 > vetoed retry in that branch alone).
+
+### Request context: what travels with a request
+
+By default a request carries nothing from hop to hop but its deadline. A
+**request context** (`core.RequestContext`) adds what a component may need to
+know about the request an attempt belongs to:
+
+| Field | Meaning | Set by |
+| --- | --- | --- |
+| `tenant` | who the request belongs to | the client that starts the request (`ClientConfig.tenant`); unchanged down the tree |
+| `attempt` | the number of this attempt **at the hop that issued it** (1 = that client's first try) | each client, for its own attempts |
+| `is_retry` | **sticky**: this attempt is a retry, or was caused by one anywhere above it | each client: `incoming.is_retry or attempt > 1` |
+| `retry_allowance` | a `core.RetryAllowance`, one mutable object shared by the whole request: retries it may still issue over every hop | whoever creates the context; handed on by reference |
+
+A context exists only for a request that was given one. A client whose
+`ClientConfig.tenant` is set creates one for every request it **starts**; a
+caller can pass its own as `start_request(sim, ctx=...)`; and a request that
+arrives with a context keeps it, so in a call tree the root client's tenant is
+the tenant at every hop (an edge client's own `tenant` only matters when nothing
+arrives). From there:
+
+- the client passes the attempt's context to its target as
+  `submit_attempt(..., ctx=...)` -- **only when there is one**, so a target that
+  never serves such requests is called with the three arguments it always was;
+- a `ServiceNodeRuntime` hands the context of the attempt it is serving to every
+  downstream call that attempt makes, a `TransportLink` carries it over the wire,
+  and a plain `ServiceRuntime` accepts and ignores it;
+- the retry policy is asked with it: `RetryContext.request` is the context of
+  the attempt that just ended (`None` without one).
+
+`attempt` and `is_retry` answer two different questions. Under an upstream
+retry, a downstream client's first call is `attempt=1, is_retry=True`: not a
+retry *of that hop*, but load that exists only because something above retried.
+
+Nothing in a scenario without a tenant creates a context, and a context that
+nothing reads changes no event and no random draw (a seeded run with a tenant on
+its root client reproduces its pinned trace).
 
 ### Example: client with fixed-backoff retries
 

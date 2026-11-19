@@ -74,9 +74,11 @@ windows, request lifespans, and bucket ranges all use this convention.
 ## Core data types (`core.py`)
 
 - **`DropReason`** (`core.py`) — `NONE`, `QUEUE_FULL`, `DEADLINE`,
-  `SERVER_FAILURE`, `CIRCUIT_OPEN`, `CANCELLED`. Every non-success carries one of
-  these. `CANCELLED` means *abandoned, not failed* (an upstream fan-out
-  short-circuited); it is counted separately and kept out of the failure buckets.
+  `SERVER_FAILURE`, `CIRCUIT_OPEN`, `CANCELLED`, `REJECTED`. Every non-success
+  carries one of these. `CANCELLED` means *abandoned, not failed* (an upstream
+  fan-out short-circuited); it is counted separately and kept out of the failure
+  buckets. `REJECTED` means refused by admission control in front of the
+  service; no stock component produces it.
 - **`Request`** (`core.py`) — a single attempt: the handling `service` name, its
   `interval` (lifespan), the `deadline` it ran under, `success`, `drop_reason`,
   `queue_size_at_end` (queue length when the attempt finished, `None` if it never
@@ -86,6 +88,10 @@ windows, request lifespans, and bucket ranges all use this convention.
   `on_done` callback fired once on completion, a `cancelled` flag, a `cancel()`
   handle, and `completed_at` (prefer it over the last attempt's end: a root
   cancelled while backing off finishes later than any attempt it made).
+- **`RequestContext`** (`core.py`) — what a request carries from hop to hop when
+  it was given one: `tenant`, the hop-relative `attempt` number and sticky
+  `is_retry` flag, and a shared `RetryAllowance`. Off by default; see
+  [request-handling](request-handling.md#request-context-what-travels-with-a-request).
 - **`Summary`** (`core.py`) — the aggregate returned by `Metrics.summary()`
   (counts by outcome, latency percentiles, retries per root). See
   [observability](observability.md).
