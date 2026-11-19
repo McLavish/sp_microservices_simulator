@@ -57,12 +57,21 @@ class ServiceConfig:
     partial_failures: list[PartialFailure] = field(default_factory=list)
     # Which waiting attempt a freed worker takes (`QueueDiscipline`).
     queue_discipline: QueueDiscipline = QueueDiscipline.FCFS
+    # Whether a waiting attempt gives its queue slot back the moment its caller's
+    # deadline passes. False (the default, and every pinned result): the server
+    # does not scan its backlog, so a dead entry holds its slot -- and sheds load
+    # -- until a worker reaches it. True: a server that drops a waiting request as
+    # soon as its caller has gone. Either way the caller is told at its deadline
+    # and the entry never takes a worker.
+    evict_expired: bool = False
 
     def __post_init__(self):
         if not isinstance(self.queue_discipline, QueueDiscipline):
             raise ValueError(
                 f"queue_discipline must be a QueueDiscipline, got {self.queue_discipline!r}"
             )
+        if not isinstance(self.evict_expired, bool):
+            raise ValueError(f"evict_expired must be a bool, got {self.evict_expired!r}")
         if self.workers < 1:
             raise ValueError(
                 f"workers must be >= 1, got {self.workers}; with no workers "
@@ -225,6 +234,14 @@ class QItem:
     # entry keeps its queue slot until the server reaches it, and is then
     # discarded without a second report.
     expired: bool = field(default=False, compare=False)
+    # Expired AND already discounted (`ServiceConfig.evict_expired`): the slot was
+    # given back at the deadline, so like a cancelled entry this is a tombstone.
+    evicted: bool = field(default=False, compare=False)
+
+
+#: A LIFO stack is rebuilt without its tombstones once they outnumber the live
+#: entries, and never for fewer than this many (a rebuild is O(n)).
+_COMPACT_MIN_DEAD = 64
 
 
 @dataclass
@@ -249,6 +266,9 @@ class ServiceRuntime:
     # Excludes work rejected before it ever joined the queue (queue-full,
     # already-expired), which genuinely never arrived at the server.
     admitted_total: int = 0
+    # Tombstones still sitting in `queue`: cancelled or evicted entries, which
+    # hold no slot. Only a LIFO stack needs the count (`_note_dead`).
+    _dead: int = 0
 
     def bind(self):
         """Reset the live queue state back to a freshly-constructed runtime.
@@ -339,11 +359,31 @@ class ServiceRuntime:
         self.queue.pop()
         return item
 
+    def _note_dead(self) -> None:
+        """An entry still in `queue` stopped holding a slot (cancelled or evicted).
+
+        A heap brings its tombstones to the head as time passes, and RANDOM draws
+        them like any other entry. A stack does neither: under sustained load its
+        bottom never surfaces, so tombstones there would pile up for the whole
+        run. Rebuild the stack without them once they are most of it. Skipping a
+        tombstone and never having held it are the same thing to `_start_next`,
+        so this changes memory, not behaviour.
+        """
+        self._dead += 1
+        if (
+            self.cfg.queue_discipline is QueueDiscipline.LIFO
+            and self._dead >= _COMPACT_MIN_DEAD
+            and 2 * self._dead > len(self.queue)
+        ):
+            self.queue = [item for item in self.queue if not (item.cancelled or item.evicted)]
+            self._dead = 0
+
     def _start_next(self, sim: Simulator):
         while self.in_flight < self.cfg.workers and self.queue:
             item = self._dequeue(sim)
-            if item.cancelled:
-                continue  # already discounted at cancel time; never took a worker
+            if item.cancelled or item.evicted:
+                self._dead -= 1
+                continue  # already discounted (at cancel or eviction); never took a worker
             self._queued -= 1
             if item.expired:
                 # The caller timed out while this waited and was told at its
@@ -451,12 +491,19 @@ class ServiceRuntime:
             def expire_in_queue() -> None:
                 # Still queued (start() and cancel_queued() both disarm this
                 # event). Tell the caller now; the entry stays in the heap,
-                # holding its slot, until the server reaches and discards it.
+                # holding its slot, until the server reaches and discards it --
+                # unless the station evicts, in which case the slot is free from
+                # this instant and only a tombstone stays behind.
                 item.expired = True
                 # Depth EXCLUDING this attempt, as every other completion path
                 # reports it (an entry in service or one that never joined is
                 # not part of the queue it observes).
-                settled_on_done(False, 0, DropReason.DEADLINE, self.queue_len() - 1, False)
+                depth = self.queue_len() - 1
+                if self.cfg.evict_expired:
+                    item.evicted = True
+                    self._queued -= 1
+                    self._note_dead()
+                settled_on_done(False, 0, DropReason.DEADLINE, depth, False)
 
             deadline_ev = sim.schedule(attempt_deadline, expire_in_queue)
 
@@ -467,6 +514,7 @@ class ServiceRuntime:
                 deadline_ev.cancelled = True
             item.cancelled = True
             self._queued -= 1
+            self._note_dead()
             on_done(False, 0, DropReason.CANCELLED, self.queue_len(), False)
 
         control._bind(cancel_queued)

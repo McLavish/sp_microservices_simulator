@@ -7,8 +7,10 @@ can be -- waiting, cancelled, expired -- is handled the same way in all three.
 """
 
 import unittest
+import unittest.mock
 from collections import Counter
 
+from msim import service as service_module
 from msim.caller import ClientConfig, ClientRuntime
 from msim.core import DropReason, ms_to_ns
 from msim.retry_policies import NoRetryPolicy
@@ -27,6 +29,7 @@ def _service(
     queue_capacity: int | None = None,
     median_ms: float = 10.0,
     sigma: float = 0.0,
+    evict_expired: bool = False,
 ) -> ServiceRuntime:
     return ServiceRuntime(
         cfg=ServiceConfig(
@@ -36,6 +39,7 @@ def _service(
             workers=workers,
             queue_capacity=queue_capacity,
             queue_discipline=discipline,
+            evict_expired=evict_expired,
         )
     ).bind()
 
@@ -207,6 +211,134 @@ class TestEveryKindOfEntry(unittest.TestCase):
             self.assertEqual(("d", "QUEUE_FULL") in order, sheds_d, (discipline, order))
 
 
+class TestEviction(unittest.TestCase):
+    """`evict_expired`: a waiting attempt gives its slot back when its caller gives up."""
+
+    def test_it_is_off_by_default(self):
+        config = ServiceConfig(name="svc", latency_median=1, latency_lognorm_sigma=0.1, workers=1)
+        self.assertIs(config.evict_expired, False)
+
+    def _full_queue_after_an_expiry(self, discipline: QueueDiscipline, evict: bool) -> list:
+        sim = Simulator(seed=3)
+        service = _service(discipline, queue_capacity=1, evict_expired=evict)
+        order: list = []
+        _submit(service, sim, "head", order)  # holds the one worker until 10 ms
+        _submit(service, sim, "old", order, deadline=ms_to_ns(5))  # the one queue slot
+        # After `old` has expired, and before a worker has reached it:
+        sim.schedule(ms_to_ns(6), lambda: _submit(service, sim, "new", order))
+        sim.run()
+        self.assertEqual((service.queue_len(), service.in_flight, service._dead), (0, 0, 0))
+        return order
+
+    def test_without_it_the_dead_entry_sheds_the_next_arrival(self):
+        for discipline in QueueDiscipline:
+            self.assertEqual(
+                self._full_queue_after_an_expiry(discipline, evict=False),
+                [("old", "DEADLINE"), ("new", "QUEUE_FULL"), ("head", "NONE")],
+                discipline,
+            )
+
+    def test_with_it_the_slot_is_free_at_the_deadline(self):
+        for discipline in QueueDiscipline:
+            self.assertEqual(
+                self._full_queue_after_an_expiry(discipline, evict=True),
+                [("old", "DEADLINE"), ("head", "NONE"), ("new", "NONE")],
+                discipline,
+            )
+
+    def test_the_caller_is_told_once_at_its_deadline_with_the_same_depth_either_way(self):
+        def reports(evict: bool) -> list:
+            sim = Simulator(seed=3)
+            service = _service(FCFS, evict_expired=evict)
+            seen: list = []
+            _submit(service, sim, "head", [])
+            service.submit_attempt(
+                sim,
+                lambda ok, t, drop, depth, censored: seen.append((sim.timestep, drop.name, depth)),
+                attempt_deadline=ms_to_ns(5),
+            )
+            _submit(service, sim, "b", [])
+            sim.run()
+            return seen
+
+        # One report, at the deadline, with the depth it observed: `b`, not itself.
+        for evict in (False, True):
+            self.assertEqual(reports(evict), [(ms_to_ns(5), "DEADLINE", 1)], evict)
+
+    def test_occupancy_drops_at_the_deadline_only_when_evicting(self):
+        for evict, depth_after_expiry in ((False, 2), (True, 1)):
+            sim = Simulator(seed=3)
+            service = _service(FCFS, evict_expired=evict)
+            _submit(service, sim, "head", [])
+            _submit(service, sim, "old", [], deadline=ms_to_ns(5))
+            _submit(service, sim, "b", [])
+            depths: list[int] = []
+            sim.schedule(ms_to_ns(6), lambda s=service, d=depths: d.append(s.queue_len()))
+            sim.run()
+            self.assertEqual(depths, [depth_after_expiry], evict)
+
+    def test_under_lifo_a_dead_entry_at_the_bottom_no_longer_sheds_load(self):
+        """The case `test_an_expired_entry_holds_its_slot_until_the_server_reaches_it` pins
+        without eviction: `d` was shed by an entry whose caller had long gone."""
+        sim = Simulator(seed=3)
+        service = _service(LIFO, queue_capacity=2, evict_expired=True)
+        order: list = []
+        _submit(service, sim, "head", order)
+        _submit(service, sim, "old", order, deadline=ms_to_ns(5))
+        _submit(service, sim, "b", order)
+        sim.schedule(ms_to_ns(12), lambda: _submit(service, sim, "c", order))
+        sim.schedule(ms_to_ns(13), lambda: _submit(service, sim, "d", order))
+        sim.run()
+        self.assertNotIn(("d", "QUEUE_FULL"), order)
+        self.assertEqual(_served(order), ["head", "b", "d", "c"])
+
+
+class TestLifoCompaction(unittest.TestCase):
+    """A stack never reaches its bottom under load, so its tombstones are swept."""
+
+    def _run(self, discipline: QueueDiscipline, waiting: int = 400):
+        sim = Simulator(seed=5)
+        service = _service(discipline, evict_expired=True, median_ms=1000.0)
+        order: list = []
+        _submit(service, sim, "head", order)  # holds the worker for a second
+        for index in range(waiting):
+            _submit(service, sim, f"w{index}", order, deadline=ms_to_ns(1 + index % 7))
+        lengths: list[int] = []
+        sim.schedule(ms_to_ns(50), lambda: lengths.append(len(service.queue)))
+        sim.run()
+        return order, lengths[0], service
+
+    def test_a_stack_of_tombstones_is_swept_and_a_heap_is_not(self):
+        _, heap_length, _ = self._run(FCFS)
+        _, stack_length, service = self._run(LIFO)
+
+        self.assertEqual(heap_length, 400)  # every tombstone still there at 50 ms
+        self.assertLess(stack_length, service_module._COMPACT_MIN_DEAD)
+        self.assertEqual((service.queue_len(), service._dead, service.queue), (0, 0, []))
+
+    def test_sweeping_changes_nothing_that_is_observed(self):
+        swept, _, _ = self._run(LIFO)
+        with unittest.mock.patch.object(service_module, "_COMPACT_MIN_DEAD", 10**9):  # never sweep
+            unswept, length, _ = self._run(LIFO)
+        self.assertEqual(length, 400)
+        self.assertEqual(swept, unswept)
+
+    def test_cancelled_entries_are_swept_too(self):
+        sim = Simulator(seed=5)
+        service = _service(LIFO, median_ms=1000.0)
+        order: list = []
+        _submit(service, sim, "head", order)
+        controls = [_submit(service, sim, f"w{index}", order) for index in range(300)]
+        for control in controls[:250]:
+            self.assertTrue(control.cancel())
+        self.assertEqual(service.queue_len(), 50)
+        self.assertLess(len(service.queue), 50 + service_module._COMPACT_MIN_DEAD)
+        sim.run()
+        # The fifty survivors, newest first.
+        self.assertEqual(_served(order), ["head", *(f"w{index}" for index in range(299, 249, -1))])
+        self.assertEqual((service.queue_len(), service._dead, service.queue), (0, 0, []))
+
+
 class TestUnderOverload(unittest.TestCase):
     """What the order is FOR: with callers that give up, LIFO works on live requests."""
 
@@ -252,6 +384,16 @@ class TestConfiguration(unittest.TestCase):
             )
         self.assertEqual([d.value for d in QueueDiscipline], ["fcfs", "lifo", "random"])
         self.assertIs(QueueDiscipline("lifo"), LIFO)
+
+    def test_evict_expired_must_be_a_bool(self):
+        with self.assertRaisesRegex(ValueError, "evict_expired must be a bool"):
+            ServiceConfig(
+                name="svc",
+                latency_median=1,
+                latency_lognorm_sigma=0.1,
+                workers=1,
+                evict_expired=1,  # ty: ignore[invalid-argument-type]
+            )
 
 
 if __name__ == "__main__":

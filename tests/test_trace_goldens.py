@@ -495,12 +495,25 @@ def _method_service_times(seed: int = 606):
     return sim, [writers, readers, front_to_write], [front.service, store]
 
 
-def _queue_order(discipline: QueueDiscipline, seed: int = 515):
+def _queue_order(
+    discipline: QueueDiscipline,
+    seed: int = 515,
+    evict_expired: bool = False,
+    direct_timeout_ms: float = 60,
+):
     """An overloaded station behind a relay, served in `discipline` order.
 
     Callers give up after 60 ms and retry, so queued entries expire while they
     wait, and the relay cancels what it abandons: every kind of queue entry
-    meets the order in which the station takes them.
+    meets the order in which the station takes them. With `evict_expired` an
+    expired entry gives its slot back at its deadline.
+
+    `direct_timeout_ms` is the patience of the callers that reach the station
+    directly. At the default every caller has the same, and FCFS then never lets
+    an entry expire while it waits: the oldest entry is also the first to
+    expire, and it is taken just before it does (and cut in service). A shorter
+    one puts impatient entries BEHIND patient ones, which is where an FCFS
+    queue holds dead entries.
     """
     sim = Simulator(seed=seed)
     back = ServiceNodeRuntime(
@@ -513,6 +526,7 @@ def _queue_order(discipline: QueueDiscipline, seed: int = 515):
                 queue_capacity=30,
                 partial_failures=[PartialFailure(TimeInterval(s_to_ns(2), s_to_ns(3)), p_fail=0.3)],
                 queue_discipline=discipline,
+                evict_expired=evict_expired,
             )
         ).bind()
     )
@@ -525,6 +539,7 @@ def _queue_order(discipline: QueueDiscipline, seed: int = 515):
                 workers=8,
                 queue_capacity=40,
                 queue_discipline=discipline,
+                evict_expired=evict_expired,
             )
         ).bind()
     )
@@ -537,6 +552,7 @@ def _queue_order(discipline: QueueDiscipline, seed: int = 515):
                 workers=32,
                 queue_capacity=100,
                 queue_discipline=discipline,
+                evict_expired=evict_expired,
             )
         ).bind(),
         propagate_cancellation=True,
@@ -553,7 +569,8 @@ def _queue_order(discipline: QueueDiscipline, seed: int = 515):
         cfg=ClientConfig(retry=_fixed(2, 10), timeout_controller=_static(90, 400)), service=relay
     )
     direct = ClientRuntime(
-        cfg=ClientConfig(retry=_fixed(3, 5), timeout_controller=_static(60)), service=back
+        cfg=ClientConfig(retry=_fixed(3, 5), timeout_controller=_static(direct_timeout_ms)),
+        service=back,
     )
     spike = [LoadSpike(TimeInterval(s_to_ns(4), s_to_ns(5)), rps_multiplier=2.5)]
     Workload(base_rps=150.0, duration_s=7.0, load_spikes=spike, rng_seed=seed).drive(
@@ -779,6 +796,26 @@ _QUEUE_ORDER: dict[str, Trace] = {
 }
 
 
+# `_queue_order(..., evict_expired=True, direct_timeout_ms=25)`.
+_EVICTING: dict[str, Trace] = {
+    "fcfs": (
+        "c69b38fad1be637743bd9bd286ebd81f7eee1a5e8ffbe86f55c13dcee60e1e29",
+        15291,
+        "557ae06f94f2e108998def95924606699d60a3dd599b2e67593bd8e6f9c6740d",
+    ),
+    "lifo": (
+        "f69e966436688dc129e48537e2b2414c8040380b70be9a88de0b8d8c88b5464b",
+        16433,
+        "d056187cd5fb7d4d43cc5bcd8652e751f10c8ec3a38cfd2925616ebbcaaaf88f",
+    ),
+    "random": (
+        "9ae54e0ee40c4875924038a13b76f8dfe1f0953d9ff3d95239d1fbbb29448267",
+        16396,
+        "986ee003d820f074047a9ed7ed86fdb91c2c797ef5fda5502079d21b9a4462c0",
+    ),
+}
+
+
 class TestTraceGoldens(unittest.TestCase):
     """If one of these fails, a seeded run no longer unfolds the way it did."""
 
@@ -795,6 +832,21 @@ class TestTraceGoldens(unittest.TestCase):
         for name, expected in _QUEUE_ORDER.items():
             with self.subTest(discipline=name):
                 self.assertEqual(traces[name], expected)
+
+    def test_evicting_queue_traces(self):
+        for discipline in QueueDiscipline:
+            with self.subTest(discipline=discipline.value):
+                sim, clients, services = _queue_order(
+                    discipline, evict_expired=True, direct_timeout_ms=25
+                )
+                reasons = _reasons(clients)
+                for reason in ("NONE", "QUEUE_FULL", "DEADLINE", "SERVER_FAILURE", "CANCELLED"):
+                    self.assertGreater(reasons[reason], 0, reason)
+                evicting = _trace(sim, clients, services)
+                self.assertEqual(evicting, _EVICTING[discipline.value])
+                # The scenario is only worth pinning while eviction changes the run.
+                sim, clients, services = _queue_order(discipline, direct_timeout_ms=25)
+                self.assertNotEqual(_trace(sim, clients, services)[0], evicting[0])
 
     def test_retry_by_cause_trace(self):
         sim, clients, services, policy_state = _retry_by_cause()

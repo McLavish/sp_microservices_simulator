@@ -30,6 +30,7 @@ arrivals --> [ queue (FCFS*, cap = queue_capacity) ] --> [ c workers ] --> done
 | `latency_injections` | list of `LatencyInjection` windows (see below) |
 | `partial_failures` | list of `PartialFailure` windows |
 | `queue_discipline` | which waiting attempt a freed worker takes: `QueueDiscipline.FCFS` (default), `LIFO` or `RANDOM` (see below) |
+| `evict_expired` | `False` (default): a waiting attempt whose caller gave up keeps its queue slot until a worker reaches it; `True`: it gives the slot back at its deadline (see below) |
 
 `register_fault_events(tracker)` (`service.py`) pushes this service's latency
 injections and partial failures into a `FaultEventsTracker` for plotting.
@@ -61,6 +62,32 @@ on shedding load for as long as newer work keeps arriving.
 be a fixed priority, a different discipline -- and from the simulator's own
 generator, so the run is still reproducible from the seed. A single waiter is no
 choice and takes no draw.
+
+### Evicting expired entries
+
+By default a server does not scan its backlog: an attempt whose caller's deadline
+passes while it waits is reported `DEADLINE` to the caller at that instant, but
+the entry keeps its queue slot -- and so keeps shedding new arrivals at a full
+queue -- until a worker reaches it and discards it. `evict_expired=True` models a
+server that drops a waiting request as soon as its caller has gone: the slot is
+free from the deadline on. The caller is told at the same instant with the same
+queue depth either way, and the entry never takes a worker either way; only the
+occupancy (`queue_len()`, hence the capacity check and the reported depths that
+follow) differs.
+
+When it matters depends on the order. Under FCFS with callers of ONE patience
+it hardly does: the oldest entry is also the first to expire, and a saturated
+queue settles where entries are taken just before they would (and are then cut
+in service), so nothing expires while waiting. It matters as soon as impatient
+entries sit behind patient ones, and most under LIFO, where a dead entry at the
+bottom of the stack would otherwise hold its slot indefinitely.
+
+Entries that hold no slot any more (cancelled, or evicted) stay in `queue` as
+tombstones until taken. A heap brings them to its head and `RANDOM` draws them
+like any other entry; a LIFO stack never reaches its bottom under load, so it is
+rebuilt without its tombstones once they outnumber the live entries. That is
+bookkeeping only -- skipping a tombstone and never having held it are the same
+to the dequeue loop.
 
 ### `ServiceRuntime` (`service.py`)
 
