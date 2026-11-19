@@ -44,8 +44,10 @@ ClientRuntime._on_attempt_done
 ```
 
 The same `submit_attempt` path is reused by **chains**: a `ServiceNodeRuntime`
-wraps a `ServiceRuntime` and injects a custom *behavior* that fans out to
-downstream nodes before finalizing. A `TransportLink` (`transport.py`) can sit
+wraps a `ServiceRuntime` and injects a custom *behavior* that calls its
+downstream nodes before finalizing — all at once by default, or in ordered
+*call waves* (`DownstreamEdge.wave`) for a handler whose calls are sequential.
+A `TransportLink` (`transport.py`) can sit
 between a client and its service — a `ServiceLike` decorator that adds a
 lognormal network delay to each leg of every attempt's round trip. See
 [request-handling](request-handling.md).

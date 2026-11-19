@@ -181,9 +181,9 @@ breaker = CountBasedCircuitBreakerPolicy(
 ## Chains & fan-out (`chain.py`)
 
 A `ServiceNodeRuntime` (`chain.py`) is a service node that may call downstream
-services. It wraps a `ServiceRuntime` and a list of `DownstreamEdge(client, target)`
-(`chain.py`), and it satisfies `ServiceLike`, so a `ClientRuntime` drives it
-exactly like a plain service.
+services. It wraps a `ServiceRuntime` and a list of
+`DownstreamEdge(client, target, wave=0)` (`chain.py`), and it satisfies
+`ServiceLike`, so a `ClientRuntime` drives it exactly like a plain service.
 
 ```
             ClientRuntime
@@ -204,17 +204,67 @@ that:
 
 1. runs the node's **local** service time, then
 2. checks local deadline/failure (drops as `DEADLINE` / `SERVER_FAILURE`), then
-3. launches **all** downstream `client.start_request(...)` calls concurrently,
-   propagating the parent deadline via `override_global_deadline` (unless
-   `propagate_deadline` is off, see below) — a
-   *synchronous* rejection (queue-full / circuit-open) on an early edge is
-   remembered but does not skip later edges' launches, so downstream load never
-   depends on edge order, and
+3. launches the downstream `client.start_request(...)` calls **wave by wave**
+   (one wave, i.e. all of them concurrently, unless the edges say otherwise —
+   see [Call waves](#call-waves-sequential-and-staged-calls)), propagating the
+   parent deadline via `override_global_deadline` (unless `propagate_deadline`
+   is off, see below) — a *synchronous* rejection (queue-full / circuit-open)
+   on an early edge is remembered but does not skip the later launches of its
+   wave, so downstream load never depends on edge order, and
 4. finalizes with success only when *all* downstreams succeed; the **first**
    downstream failure short-circuits the parent (AND semantics), applied after
    the launch loop for synchronous rejections. A deadline guard event finalizes
    as `DEADLINE` if time runs out first, and is cancelled on success
    (`chain.py`).
+
+### Call waves: sequential and staged calls
+
+`DownstreamEdge.wave` (an `int >= 0`, default `0`) orders a node's calls. Edges
+with the **same** wave are launched together; waves run in **ascending** order,
+and a wave starts only when every call of the previous one has succeeded.
+
+| Handler in the real system | Edges |
+| --- | --- |
+| calls B and C concurrently (the default) | B and C on wave 0 |
+| calls B, then C, then D | B on wave 0, C on wave 1, D on wave 2 |
+| four concurrent calls, then three more | four edges on wave 0, three on wave 1 |
+
+```python
+a.add_downstream(DownstreamEdge(client=a_to_b, target=b))            # wave 0
+a.add_downstream(DownstreamEdge(client=a_to_c, target=c, wave=1))    # after B succeeded
+```
+
+Rules, all pinned by `tests/test_chain_waves.py`:
+
+- **Only the order of the values matters** (gaps are fine), and a node whose
+  edges all carry one value is the single concurrent fan-out it always was —
+  the same events and the same RNG draws, so every earlier seeded result stands.
+- **A "call" is the edge client's whole root request**, retries included: a wave
+  is complete when each of its calls has succeeded, and end-to-end latency over
+  sequential waves is the **sum** of the waves, each wave costing its slowest
+  call.
+- **A failure ends the node.** The first failed call fails the node (after the
+  rest of its wave was launched); waves that had not started are never
+  launched, so a failing early call sheds the load of the later ones.
+- **The next wave goes through the event heap**, at the same instant, never
+  from inside the completion callback. The callee that just answered has freed
+  its worker but not yet resumed its queue, so a second call to the same callee
+  made synchronously would overtake work that was queued first. Retries take
+  the same hop.
+- **One deadline for all the waves.** The deadline guard is armed once, before
+  the first wave, and every wave is given the same absolute deadline, so a
+  later wave has less of it left. A wave that completes at the deadline instant
+  loses the tie: the node is a `DEADLINE` drop and the next wave never starts.
+- **Worker occupancy** follows `hold_worker_during_fanout` as before: released
+  once the first wave has been launched (tandem), or held across every wave.
+
+What a wave does **not** model: there is one local service-time draw and one
+failure roll, both *before* the first wave — no local work between or after
+waves, and in tandem mode the continuation between two waves needs no worker.
+There are no conditional or optional calls and no quorum: every edge is called
+on every attempt, and N calls are N edges. Once the node has settled (deadline,
+failure, cancellation) its remaining waves are skipped whatever the
+`propagate_*` flags say — those describe calls already in flight.
 
 ### Worker occupancy: tandem vs hold-worker
 
@@ -233,7 +283,7 @@ worker: [local]                    worker: [local .... waiting on B,C ....]
   the node's capacity is freed during the downstream wait. Capacity is **not**
   consumed down the tree — this is the model the multichain experiments rely on.
 - **`True` (synchronous thread-per-request):** the worker is held for the whole
-  subtree, so capacity is consumed all the way down.
+  subtree — every call wave included — so capacity is consumed all the way down.
 
 `tests/test_chain_worker_model.py` asserts the in-flight counts for both modes.
 
@@ -285,7 +335,7 @@ The link wraps the target *as the edge's client sees it*: `node_b`'s own
 `ServiceNodeRuntime.service` stays a `ServiceRuntime`, and `DownstreamEdge` is
 unchanged. The delay lives on the caller's side of the edge, not inside the node.
 
-> **Why a decorator and not a change to `chain.py`.** `_launch_fanout`
+> **Why a decorator and not a change to `chain.py`.** `_launch_wave`
 > (`chain.py`) runs once per downstream *root request*, but retries are issued
 > from `ClientRuntime._start_attempt` (`caller.py`) and never pass through
 > `chain.py` at all. A delay added to the fan-out loop would therefore be charged

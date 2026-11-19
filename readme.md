@@ -12,8 +12,8 @@ retry policies, PPO training) lives on the `rl-layer` branch, not here.
   configurable workers.
 - **Clients** — retry policies (fixed/exponential/jittered backoff, circuit
   breakers, rate limiters, retry budgets) and static or adaptive timeout control.
-- **Chains** — multi-hop fan-out with AND semantics and tandem vs. hold-worker
-  capacity models.
+- **Chains** — multi-hop fan-out with AND semantics, concurrent or sequential
+  downstream calls (call waves), and tandem vs. hold-worker capacity models.
 - **Faults** — latency injection, partial failures, and load spikes scoped to time
   windows.
 - **Outputs** — per-bucket CSV metrics + seconds-based fault JSON, plus plotting

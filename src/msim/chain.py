@@ -11,20 +11,35 @@ from msim.simulator import Event, Simulator
 class DownstreamEdge:
     client: ClientRuntime
     target: "ServiceNodeRuntime"
+    # Call wave. A node's edges with the SAME wave are launched together (the
+    # concurrent fan-out); waves run in ascending order, and a wave starts only
+    # once every call of the previous one has succeeded. So a handler that calls
+    # B, then C, then D is three edges on waves 0, 1, 2, and one that makes four
+    # concurrent calls followed by three more is waves 0 and 1. Only the order
+    # of the values matters (gaps are fine), and when every edge of a node
+    # carries the same value -- the default -- the node behaves exactly as it
+    # did before waves existed: one concurrent wave.
+    wave: int = 0
+
+    def __post_init__(self) -> None:
+        # bool is an int: `wave=True` would silently mean "wave 1".
+        if isinstance(self.wave, bool) or not isinstance(self.wave, int) or self.wave < 0:
+            raise ValueError(f"wave must be an int >= 0, got {self.wave!r}")
 
 
 class _FanOutAttempt:
     """One logical attempt at a `ServiceNodeRuntime`, as an explicit state machine.
 
-    The lifecycle is: local service stage -> (optionally) fan out to every
-    downstream edge -> settle. It settles exactly once, through `_settle`, on
-    whichever of these happens first:
+    The lifecycle is: local service stage -> (optionally) fan out to the
+    downstream edges, one call wave after the other -> settle. It settles
+    exactly once, through `_settle`, on whichever of these happens first:
 
     * the local stage expires against the deadline, or the local service fails;
     * the node has no downstreams and the local stage succeeds;
-    * every downstream succeeds (AND semantics);
-    * any downstream fails (short-circuit, but only after every edge is launched
-      so downstream load does not depend on edge order);
+    * every downstream of the last wave succeeds (AND semantics);
+    * any downstream fails (short-circuit, but only after every edge of its wave
+      is launched so downstream load does not depend on edge order); the waves
+      that had not started are never launched;
     * the deadline guard fires;
     * an upstream cancels this node.
 
@@ -58,9 +73,16 @@ class _FanOutAttempt:
         self.settled = False
         self._local_event: Event | None = None
         self._deadline_event: Event | None = None
+        #: The node's edges grouped by `DownstreamEdge.wave`, ascending, and the
+        #: wave currently in flight. One group unless the edges carry more than
+        #: one distinct wave value.
+        self._waves: list[list[DownstreamEdge]] = []
+        self._wave_index = 0
+        #: The pending start of the next wave (scheduled, not yet run).
+        self._wave_event: Event | None = None
         self._remaining = 0
         #: True only inside the launch loop, so a synchronous rejection defers
-        #: its short-circuit until every edge has been launched.
+        #: its short-circuit until every edge of the wave has been launched.
         self._launching = False
         self._sync_failure: RootRequest | None = None
         self._launched: list[RootRequest] = []
@@ -102,17 +124,20 @@ class _FanOutAttempt:
         """The one settling path: every transition above ends here.
 
         Full teardown in a fixed order — drop the pending local completion,
-        drop the deadline guard, abandon downstream calls nobody is waiting for
-        (all but `keep`, the one that reported the outcome), then finalize.
-        Each step is a no-op on the paths that do not need it, so there is no
-        reason for a caller to skip one: a settle that skipped the sibling
-        teardown would leave abandoned calls consuming downstream capacity and
-        recording outcomes of their own.
+        drop the pending start of the next wave, drop the deadline guard,
+        abandon downstream calls nobody is waiting for (all but `keep`, the one
+        that reported the outcome), then finalize. Each step is a no-op on the
+        paths that do not need it, so there is no reason for a caller to skip
+        one: a settle that skipped the sibling teardown would leave abandoned
+        calls consuming downstream capacity and recording outcomes of their own.
         """
         self._commit()
         if self._local_event is not None:
             self._local_event.cancelled = True  # still in the local stage
             self._local_event = None
+        if self._wave_event is not None:
+            self._wave_event.cancelled = True  # between two waves: the next never starts
+            self._wave_event = None
         self._cancel_deadline_guard()
         self._abandon_siblings(except_root=keep)
         self._finalize(success, self._elapsed(), drop)
@@ -169,13 +194,36 @@ class _FanOutAttempt:
     # -- stage 2: fan out ----------------------------------------------------
 
     def _launch_fanout(self) -> None:
-        edges = list(self.node.downstreams)
-        self._remaining = len(edges)
+        # Grouped per attempt, from a snapshot: `downstreams` is a public,
+        # mutable list and an edge's `wave` can be reassigned. A dict keeps the
+        # list order inside each wave, so a node whose edges share one wave
+        # value launches them in exactly the order it always did.
+        waves: dict[int, list[DownstreamEdge]] = {}
+        for edge in list(self.node.downstreams):
+            waves.setdefault(edge.wave, []).append(edge)
+        self._waves = [waves[wave] for wave in sorted(waves)]
+        self._wave_index = 0
 
         # Guard before launching, so a downstream that completes synchronously
-        # cannot outlive the deadline unnoticed.
+        # cannot outlive the deadline unnoticed. Armed ONCE, for all the waves:
+        # being scheduled before any wave event exists is also what lets it win
+        # the tie when a wave completes at the deadline instant.
         if self.deadline is not None:
             self._deadline_event = self.sim.schedule(int(self.deadline), self._on_deadline)
+
+        self._launch_wave()
+
+        # After the FIRST wave only, and never from `_launch_wave`: the worker
+        # is handed back once (a second release raises), and handing it back
+        # resumes this service's queue, whose next attempt draws its service
+        # time -- so where this sits in the sequence is part of the RNG order.
+        if not self.settled and not self.node.hold_worker_during_fanout:
+            self._release_worker()
+
+    def _launch_wave(self) -> None:
+        """Launch every edge of the current wave, concurrently."""
+        edges = self._waves[self._wave_index]
+        self._remaining = len(edges)
 
         self._launching = True
         for edge in edges:
@@ -183,6 +231,8 @@ class _FanOutAttempt:
                 edge.client.start_request(
                     self.sim,
                     on_done=self._on_downstream_done,
+                    # The same absolute deadline for every wave: a later wave
+                    # simply has less of it left.
                     override_global_deadline=(
                         self.deadline if self.node.propagate_deadline else None
                     ),
@@ -191,12 +241,15 @@ class _FanOutAttempt:
         self._launching = False
 
         # A synchronous rejection during the loop was deferred so that every
-        # edge still got launched; act on it now.
+        # edge of the wave still got launched; act on it now.
         if self._sync_failure is not None and not self.settled:
             self._fail_from(self._sync_failure)
 
-        if not self.settled and not self.node.hold_worker_during_fanout:
-            self._release_worker()
+    def _on_next_wave(self) -> None:
+        self._wave_event = None
+        if self.settled:
+            return  # settled between the two waves (deadline, cancel from above)
+        self._launch_wave()
 
     def _on_downstream_done(self, root: RootRequest) -> None:
         if self.settled:
@@ -204,7 +257,18 @@ class _FanOutAttempt:
         if any(attempt.success for attempt in root.attempts):
             self._remaining -= 1
             if self._remaining == 0:
-                self._settle(True, DropReason.NONE)
+                if self._wave_index + 1 == len(self._waves):
+                    self._settle(True, DropReason.NONE)
+                    return
+                # The wave is complete and another follows. Start it through
+                # the event heap, at this same instant, rather than from inside
+                # this completion callback: the callee that just reported has
+                # freed its worker but not yet resumed its queue, so a call
+                # submitted synchronously here would start ahead of work that
+                # was queued first (the callback contract in
+                # `ServiceRuntime.submit_attempt`). Retries take the same hop.
+                self._wave_index += 1
+                self._wave_event = self.sim.schedule(self.sim.timestep, self._on_next_wave)
             return
         if self._launching:
             # Defer: launching the remaining edges first keeps downstream load
@@ -294,9 +358,11 @@ class ServiceNodeRuntime:
     ) -> AttemptControl:
         """Submit a logical attempt to this node.
 
-        Runs local service time, fans out to downstreams concurrently (AND
-        semantics), and completes only when the fan-out finishes. The local
-        worker is released after the local stage unless
+        Runs local service time, then calls the downstreams wave by wave
+        (``DownstreamEdge.wave``: concurrently within a wave, the next wave
+        once the previous one has succeeded; one wave by default), with AND
+        semantics throughout, and completes only when the last wave finishes.
+        The local worker is released after the local stage unless
         ``hold_worker_during_fanout`` is set, in which case it is held for the
         whole subtree (synchronous thread-per-request model).
         """

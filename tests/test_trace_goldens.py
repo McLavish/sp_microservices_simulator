@@ -371,6 +371,75 @@ def _retry_storm(seed: int = 4242):
     return sim, clients, [node.service for node in (a, b, c, x, y)]
 
 
+def _call_waves(seed: int = 2024):
+    """Sequential and staged downstream calls (`DownstreamEdge.wave`), under load.
+
+    A calls {B, C} concurrently and then D; B calls E and then F. C sits behind
+    a transport link, queues are small, F fails part of the time and D slows
+    down, so waves are cut short by failures, deadlines and full queues as well
+    as completing normally.
+    """
+    sim = Simulator(seed=seed)
+
+    def node(name: str, median_ms: float, workers: int, capacity: int, **faults):
+        return ServiceNodeRuntime(
+            service=ServiceRuntime(
+                cfg=ServiceConfig(
+                    name=name,
+                    latency_median=ms_to_ns(median_ms),
+                    latency_lognorm_sigma=0.5,
+                    workers=workers,
+                    queue_capacity=capacity,
+                    **faults,
+                )
+            ).bind()
+        )
+
+    a, b, c = node("A", 2, 8, 40), node("B", 3, 6, 30), node("C", 6, 3, 6)
+    d = node(
+        "D",
+        5,
+        3,
+        6,
+        latency_injections=[
+            LatencyInjection(TimeInterval(s_to_ns(3), s_to_ns(5)), add_latency=ms_to_ns(25))
+        ],
+    )
+    e = node("E", 4, 3, 6)
+    f = node(
+        "F",
+        4,
+        3,
+        6,
+        partial_failures=[PartialFailure(TimeInterval(s_to_ns(1), s_to_ns(3)), p_fail=0.4)],
+    )
+
+    def edge(parent, child, wave: int, attempt_ms: float, target=None) -> ClientRuntime:
+        client = ClientRuntime(
+            cfg=ClientConfig(retry=_fixed(2, 4), timeout_controller=_static(attempt_ms)),
+            service=target or child,
+        )
+        parent.add_downstream(DownstreamEdge(client=client, target=child, wave=wave))
+        return client
+
+    a_to_b = edge(a, b, 0, 70)
+    a_to_c = edge(a, c, 0, 50, target=TransportLink(c, TransportDelay(ms_to_ns(1), 0.3)))
+    a_to_d = edge(a, d, 1, 40)
+    b_to_e = edge(b, e, 0, 30)
+    b_to_f = edge(b, f, 1, 30)
+    top = ClientRuntime(
+        cfg=ClientConfig(retry=_fixed(2, 10), timeout_controller=_static(150, global_ms=400)),
+        service=a,
+    )
+    spike = LoadSpike(TimeInterval(s_to_ns(4), s_to_ns(5)), rps_multiplier=2.0)
+    Workload(base_rps=150.0, duration_s=6.0, load_spikes=[spike], rng_seed=seed).drive(
+        sim, top.start_request
+    )
+    sim.run()
+    clients = [top, a_to_b, a_to_c, a_to_d, b_to_e, b_to_f]
+    return sim, clients, [n.service for n in (a, b, c, d, e, f)]
+
+
 def _wrapped_policies(seed: int = 4321):
     """Two clients with deep policy stacks on one faulted service.
 
@@ -490,8 +559,23 @@ _WRAPPED_POLICIES: Trace = (
 )
 
 
+# One per mechanism added since, captured with the mechanism switched ON.
+_CALL_WAVES: Trace = (
+    "1ea7a1a18cc29afcd6028bf8c8b1d10f0f6ee89b182fa94f4e92f230eb9daf70",
+    23822,
+    "ced390460ed52428bd31da7f0e1cd51d157421913c49c6b95cfe32ff9d9898a7",
+)
+
+
 class TestTraceGoldens(unittest.TestCase):
     """If one of these fails, a seeded run no longer unfolds the way it did."""
+
+    def test_call_waves_trace(self):
+        sim, clients, services = _call_waves()
+        reasons = _reasons(clients)
+        for reason in ("NONE", "QUEUE_FULL", "DEADLINE", "SERVER_FAILURE"):
+            self.assertGreater(reasons[reason], 0, reason)
+        self.assertEqual(_trace(sim, clients, services), _CALL_WAVES)
 
     def test_single_service_trace(self):
         sim, clients, services = _single_service()
