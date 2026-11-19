@@ -11,10 +11,12 @@ A service is a Poisson-fed queue with **c** workers, a general (lognormal) servi
 time distribution, and an optional **K**-bounded queue:
 
 ```
-arrivals --> [ queue (FCFS, cap = queue_capacity) ] --> [ c workers ] --> done
+arrivals --> [ queue (FCFS*, cap = queue_capacity) ] --> [ c workers ] --> done
                        |                                      |
                    full -> drop QUEUE_FULL          service time ~ lognormal
 ```
+
+(\* FCFS unless `queue_discipline` says otherwise.)
 
 ### `ServiceConfig` (`service.py`, frozen)
 
@@ -27,9 +29,38 @@ arrivals --> [ queue (FCFS, cap = queue_capacity) ] --> [ c workers ] --> done
 | `queue_capacity` | max queued items; `None` = unbounded (no `QUEUE_FULL` drops) |
 | `latency_injections` | list of `LatencyInjection` windows (see below) |
 | `partial_failures` | list of `PartialFailure` windows |
+| `queue_discipline` | which waiting attempt a freed worker takes: `QueueDiscipline.FCFS` (default), `LIFO` or `RANDOM` (see below) |
 
 `register_fault_events(tracker)` (`service.py`) pushes this service's latency
 injections and partial failures into a `FaultEventsTracker` for plotting.
+
+### Queue discipline
+
+`queue_discipline` decides WHICH waiting attempt a freed worker takes, and nothing
+else: the capacity, the deadline rules and what counts as holding a queue slot are
+the same for all three orders.
+
+| `QueueDiscipline` | A freed worker takes | Draws from `sim.rng()` |
+| --- | --- | --- |
+| `FCFS` (default) | the oldest waiter (a heap on `(enqueued_at, seq)`) | no |
+| `LIFO` | the newest waiter (a stack) | no |
+| `RANDOM` | a waiter uniformly at random, picked **at dequeue** | one draw per pick among two or more entries |
+
+`FCFS` is what every pinned result was produced with, and its code path is
+unchanged. The other two are a what-if about an overloaded server. Under FCFS the
+oldest waiter goes first, and once the backlog is as long as the callers' patience
+that is an attempt about to time out: with 300 rps offered to a station that
+serves 190 rps and callers that give up after 100 ms, FCFS completes 38 % of the
+requests in time, LIFO 66 % and RANDOM 64 % (`tests/test_queue_discipline.py`).
+The price of LIFO is that an old entry is reached LAST: an attempt whose caller
+already gave up keeps its queue slot until the server reaches it (a server does
+not scan its backlog), so under LIFO a dead entry at the bottom of the stack goes
+on shedding load for as long as newer work keeps arriving.
+
+`RANDOM` is picked when a worker frees, not at arrival -- a pick at arrival would
+be a fixed priority, a different discipline -- and from the simulator's own
+generator, so the run is still reproducible from the seed. A single waiter is no
+choice and takes no draw.
 
 ### `ServiceRuntime` (`service.py`)
 

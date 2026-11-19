@@ -28,7 +28,7 @@ ClientRuntime.start_request ----> RootRequest(global_deadline = min(global_timeo
       v
 ServiceRuntime
       |  free worker? --no--> queue full? --yes--> drop QUEUE_FULL
-      |                       (else enqueue, FCFS)
+      |                       (else enqueue; FCFS unless queue_discipline says LIFO or RANDOM)
       |  deadline passes while queued? --yes--> drop DEADLINE, AT the deadline
       |            (caller's clock; the entry keeps its slot until dequeued, then is discarded)
       v

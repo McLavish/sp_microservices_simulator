@@ -49,7 +49,7 @@ from msim.retry_policies import (
     RetryByCausePolicy,
     TimeBasedCircuitBreakerPolicy,
 )
-from msim.service import ServiceConfig, ServiceRuntime, ServiceTime
+from msim.service import QueueDiscipline, ServiceConfig, ServiceRuntime, ServiceTime
 from msim.simulator import Simulator
 from msim.timeout_controllers import AdaptiveTimeoutController, StaticTimeoutController
 from msim.transport import TransportDelay, TransportLink
@@ -495,6 +495,77 @@ def _method_service_times(seed: int = 606):
     return sim, [writers, readers, front_to_write], [front.service, store]
 
 
+def _queue_order(discipline: QueueDiscipline, seed: int = 515):
+    """An overloaded station behind a relay, served in `discipline` order.
+
+    Callers give up after 60 ms and retry, so queued entries expire while they
+    wait, and the relay cancels what it abandons: every kind of queue entry
+    meets the order in which the station takes them.
+    """
+    sim = Simulator(seed=seed)
+    back = ServiceNodeRuntime(
+        service=ServiceRuntime(
+            cfg=ServiceConfig(
+                name="back",
+                latency_median=ms_to_ns(9),
+                latency_lognorm_sigma=0.6,
+                workers=2,
+                queue_capacity=30,
+                partial_failures=[PartialFailure(TimeInterval(s_to_ns(2), s_to_ns(3)), p_fail=0.3)],
+                queue_discipline=discipline,
+            )
+        ).bind()
+    )
+    side = ServiceNodeRuntime(
+        service=ServiceRuntime(
+            cfg=ServiceConfig(
+                name="side",
+                latency_median=ms_to_ns(3),
+                latency_lognorm_sigma=0.4,
+                workers=8,
+                queue_capacity=40,
+                queue_discipline=discipline,
+            )
+        ).bind()
+    )
+    relay = ServiceNodeRuntime(
+        service=ServiceRuntime(
+            cfg=ServiceConfig(
+                name="relay",
+                latency_median=ms_to_ns(1),
+                latency_lognorm_sigma=0.3,
+                workers=32,
+                queue_capacity=100,
+                queue_discipline=discipline,
+            )
+        ).bind(),
+        propagate_cancellation=True,
+    )
+    to_back = ClientRuntime(
+        cfg=ClientConfig(retry=_fixed(2, 4), timeout_controller=_static(60)), service=back
+    )
+    to_side = ClientRuntime(
+        cfg=ClientConfig(retry=_fixed(1, 0), timeout_controller=_static(60)), service=side
+    )
+    relay.add_downstream(DownstreamEdge(client=to_back, target=back))
+    relay.add_downstream(DownstreamEdge(client=to_side, target=side))
+    drivers = ClientRuntime(
+        cfg=ClientConfig(retry=_fixed(2, 10), timeout_controller=_static(90, 400)), service=relay
+    )
+    direct = ClientRuntime(
+        cfg=ClientConfig(retry=_fixed(3, 5), timeout_controller=_static(60)), service=back
+    )
+    spike = [LoadSpike(TimeInterval(s_to_ns(4), s_to_ns(5)), rps_multiplier=2.5)]
+    Workload(base_rps=150.0, duration_s=7.0, load_spikes=spike, rng_seed=seed).drive(
+        sim, drivers.start_request
+    )
+    Workload(base_rps=90.0, duration_s=7.0, load_spikes=spike, rng_seed=seed + 1).drive(
+        sim, direct.start_request
+    )
+    sim.run()
+    return sim, [drivers, direct, to_back, to_side], [relay.service, back.service, side.service]
+
+
 def _retry_by_cause(seed: int = 909):
     """Two clients that retry by the cause of the failure, on one small station.
 
@@ -694,8 +765,36 @@ _RETRY_BY_CAUSE: Trace = (
 )
 
 
+_QUEUE_ORDER: dict[str, Trace] = {
+    "lifo": (
+        "6f7dac7827cbeaf5c0f6056b0606d873dbf46fcdd6db4fccfa238221a97d48a6",
+        13892,
+        "891c7c2afe1b8d1a78a37bcdcde9de3513352aab79318a900a2a731ca53f8b96",
+    ),
+    "random": (
+        "0ee075a9c7b654e911b6781b295a5c887af06086c1fa14ea6cd90a7c2a21dcbc",
+        15338,
+        "5e7c8dde43642874ed5e96733d8bf7492e2ea82f64608bbfa116c3be0a78ac6b",
+    ),
+}
+
+
 class TestTraceGoldens(unittest.TestCase):
     """If one of these fails, a seeded run no longer unfolds the way it did."""
+
+    def test_queue_order_traces(self):
+        traces = {}
+        for discipline in QueueDiscipline:
+            sim, clients, services = _queue_order(discipline)
+            reasons = _reasons(clients)
+            for reason in ("NONE", "QUEUE_FULL", "DEADLINE", "SERVER_FAILURE", "CANCELLED"):
+                self.assertGreater(reasons[reason], 0, (discipline, reason))
+            traces[discipline.value] = _trace(sim, clients, services)
+        # Three different runs of the same offered load.
+        self.assertEqual(len({trace[0] for trace in traces.values()}), 3)
+        for name, expected in _QUEUE_ORDER.items():
+            with self.subTest(discipline=name):
+                self.assertEqual(traces[name], expected)
 
     def test_retry_by_cause_trace(self):
         sim, clients, services, policy_state = _retry_by_cause()

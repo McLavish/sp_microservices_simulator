@@ -2,6 +2,7 @@ import heapq
 import math
 from collections.abc import Callable
 from dataclasses import MISSING, dataclass, field, fields
+from enum import Enum
 from functools import partial
 
 from msim.core import DropReason, TimeDuration, TimePoint
@@ -18,6 +19,30 @@ from msim.simulator import Event, Simulator
 MIN_LOGNORM_SIGMA = 1e-6
 
 
+class QueueDiscipline(Enum):
+    """Which waiting attempt a freed worker takes next.
+
+    `FCFS` is the default and what every pinned result was produced with. The
+    other two answer a what-if about an overloaded server: under FCFS the oldest
+    waiter is served first, and beyond a point it is a waiter whose caller has
+    already given up, so the server works on dead requests while live ones age
+    behind them.
+
+    * `LIFO` takes the NEWEST waiter (a stack). Fresh requests are served within
+      their deadline; old ones sink and expire in the queue.
+    * `RANDOM` takes a waiter uniformly at random, drawn at the moment a worker
+      frees, from the simulator's own generator -- so the run stays reproducible
+      from the seed, and a station that is not `RANDOM` draws nothing.
+
+    The order only decides WHICH entry is taken. Capacity, the deadline rules
+    and what counts as holding a queue slot are the same for all three.
+    """
+
+    FCFS = "fcfs"
+    LIFO = "lifo"
+    RANDOM = "random"
+
+
 # https://en.wikipedia.org/wiki/Log-normal_distribution
 @dataclass(frozen=True)
 class ServiceConfig:
@@ -30,8 +55,14 @@ class ServiceConfig:
     queue_capacity: int | None = None  # None means unbounded
     latency_injections: list[LatencyInjection] = field(default_factory=list)
     partial_failures: list[PartialFailure] = field(default_factory=list)
+    # Which waiting attempt a freed worker takes (`QueueDiscipline`).
+    queue_discipline: QueueDiscipline = QueueDiscipline.FCFS
 
     def __post_init__(self):
+        if not isinstance(self.queue_discipline, QueueDiscipline):
+            raise ValueError(
+                f"queue_discipline must be a QueueDiscipline, got {self.queue_discipline!r}"
+            )
         if self.workers < 1:
             raise ValueError(
                 f"workers must be >= 1, got {self.workers}; with no workers "
@@ -180,7 +211,8 @@ class AttemptControl:
 
 @dataclass(order=True)
 class QItem:
-    # heap order keys (in order): enqueued_at, seq
+    # heap order keys (in order): enqueued_at, seq. Only FCFS orders by them;
+    # LIFO and RANDOM keep `ServiceRuntime.queue` as a plain list in arrival order.
     enqueued_at: TimePoint
     seq: int
     start: Callable[[], None] = field(compare=False)
@@ -280,9 +312,36 @@ class ServiceRuntime:
                 p_fail = max(p_fail, pf.p_fail)
         return rng.random() < p_fail
 
+    def _enqueue(self, item: QItem) -> None:
+        if self.cfg.queue_discipline is QueueDiscipline.FCFS:
+            heapq.heappush(self.queue, item)
+        else:
+            self.queue.append(item)  # arrival order; `_dequeue` decides who is taken
+
+    def _dequeue(self, sim: Simulator) -> QItem:
+        """Take the next entry in the station's order. `self.queue` is not empty.
+
+        The entry may be a tombstone (cancelled) or expired; `_start_next` looks
+        at it exactly as it looks at a heap head, whatever order produced it.
+        """
+        discipline = self.cfg.queue_discipline
+        if discipline is QueueDiscipline.FCFS:
+            return heapq.heappop(self.queue)
+        if discipline is QueueDiscipline.LIFO:
+            return self.queue.pop()
+        # RANDOM: uniform over what is waiting, drawn NOW -- a pick made at arrival
+        # would be a fixed priority, which is a different discipline. One entry is
+        # no choice and takes no draw.
+        last = len(self.queue) - 1
+        index = sim.rng().randrange(last + 1) if last > 0 else 0
+        item = self.queue[index]
+        self.queue[index] = self.queue[last]
+        self.queue.pop()
+        return item
+
     def _start_next(self, sim: Simulator):
         while self.in_flight < self.cfg.workers and self.queue:
-            item = heapq.heappop(self.queue)
+            item = self._dequeue(sim)
             if item.cancelled:
                 continue  # already discounted at cancel time; never took a worker
             self._queued -= 1
@@ -302,7 +361,8 @@ class ServiceRuntime:
     ):
         """
         Enqueue an attempt for this service.
-        Execution is FCFS with 'workers' concurrency.
+        Execution is FCFS with 'workers' concurrency (or the station's
+        `queue_discipline`, which changes only which waiter a freed worker takes).
 
         Deadline contract: `attempt_deadline` is the CALLER's clock. An attempt
         still waiting for a worker when it passes is reported as a DEADLINE drop
@@ -383,7 +443,7 @@ class ServiceRuntime:
             start_cb()
 
         item = QItem(enqueued_at=sim.timestep, seq=seq, start=start)
-        heapq.heappush(self.queue, item)
+        self._enqueue(item)
         self._queued += 1
 
         if attempt_deadline is not None:

@@ -1,1 +1,1 @@
-Easy: Implement Queue discipline -  FCFS / LCFS / RSS / RR / Prio
+Queue discipline: FCFS / LCFS / random order are done (`ServiceConfig.queue_discipline`). Still open: RR / Prio
