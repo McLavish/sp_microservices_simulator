@@ -504,6 +504,7 @@ def _queue_order(
     seed: int = 515,
     evict_expired: bool = False,
     direct_timeout_ms: float = 60,
+    server_deadline: str = "attempt",
 ):
     """An overloaded station behind a relay, served in `discipline` order.
 
@@ -518,6 +519,11 @@ def _queue_order(
     expire, and it is taken just before it does (and cut in service). A shorter
     one puts impatient entries BEHIND patient ones, which is where an FCFS
     queue holds dead entries.
+
+    `server_deadline` is what the three clients that have an attempt timeout
+    tell their target (`ClientConfig.server_deadline`). Anything but the default
+    leaves the attempt timeout to the client, so the stations work on for
+    callers that have left.
     """
     sim = Simulator(seed=seed)
     back = ServiceNodeRuntime(
@@ -562,7 +568,10 @@ def _queue_order(
         propagate_cancellation=True,
     )
     to_back = ClientRuntime(
-        cfg=ClientConfig(retry=_fixed(2, 4), timeout_controller=_static(60)), service=back
+        cfg=ClientConfig(
+            retry=_fixed(2, 4), timeout_controller=_static(60), server_deadline=server_deadline
+        ),
+        service=back,
     )
     to_side = ClientRuntime(
         cfg=ClientConfig(retry=_fixed(1, 0), timeout_controller=_static(60)), service=side
@@ -570,10 +579,19 @@ def _queue_order(
     relay.add_downstream(DownstreamEdge(client=to_back, target=back))
     relay.add_downstream(DownstreamEdge(client=to_side, target=side))
     drivers = ClientRuntime(
-        cfg=ClientConfig(retry=_fixed(2, 10), timeout_controller=_static(90, 400)), service=relay
+        cfg=ClientConfig(
+            retry=_fixed(2, 10),
+            timeout_controller=_static(90, 400),
+            server_deadline=server_deadline,
+        ),
+        service=relay,
     )
     direct = ClientRuntime(
-        cfg=ClientConfig(retry=_fixed(3, 5), timeout_controller=_static(direct_timeout_ms)),
+        cfg=ClientConfig(
+            retry=_fixed(3, 5),
+            timeout_controller=_static(direct_timeout_ms),
+            server_deadline=server_deadline,
+        ),
         service=back,
     )
     spike = [LoadSpike(TimeInterval(s_to_ns(4), s_to_ns(5)), rps_multiplier=2.5)]
@@ -800,6 +818,22 @@ _QUEUE_ORDER: dict[str, Trace] = {
 }
 
 
+# `_queue_order(QueueDiscipline.FCFS, server_deadline=...)`: the attempt timeout
+# stays with the client, and the stations serve the orphans it leaves behind.
+_ORPHANS: dict[str, Trace] = {
+    "global": (
+        "85c32003e31ee150c239df2a116f5127604db810f6e3739d53e324be04686ef7",
+        27213,
+        "0ce70a548709d9424bfb95d6ab3b22bf933f005a0cfe6bb3f2f690d04be7fa09",
+    ),
+    "none": (
+        "0a9564c1e052425fb77575d8de65eaf94e474fc2fb425d50f976a705e6eed3ba",
+        23672,
+        "0ce70a548709d9424bfb95d6ab3b22bf933f005a0cfe6bb3f2f690d04be7fa09",
+    ),
+}
+
+
 # `_queue_order(..., evict_expired=True, direct_timeout_ms=25)`.
 _EVICTING: dict[str, Trace] = {
     "fcfs": (
@@ -851,6 +885,23 @@ class TestTraceGoldens(unittest.TestCase):
                 # The scenario is only worth pinning while eviction changes the run.
                 sim, clients, services = _queue_order(discipline, direct_timeout_ms=25)
                 self.assertNotEqual(_trace(sim, clients, services)[0], evicting[0])
+
+    def test_server_deadline_traces(self):
+        sim, clients, services = _queue_order(QueueDiscipline.FCFS)
+        told = _trace(sim, clients, services)
+        for mode, expected in _ORPHANS.items():
+            with self.subTest(server_deadline=mode):
+                sim, clients, services = _queue_order(QueueDiscipline.FCFS, server_deadline=mode)
+                reasons = _reasons(clients)
+                for reason in ("NONE", "QUEUE_FULL", "DEADLINE", "CANCELLED"):
+                    self.assertGreater(reasons[reason], 0, reason)
+                # No caller ever sees a server failure here: the overloaded
+                # station spends its workers on attempts whose callers have
+                # left, so a live caller times out before its failure roll.
+                self.assertEqual(reasons["SERVER_FAILURE"], 0)
+                trace = _trace(sim, clients, services)
+                self.assertEqual(trace, expected)
+                self.assertNotEqual(trace[0], told[0])
 
     def test_retry_by_cause_trace(self):
         sim, clients, services, policy_state = _retry_by_cause()

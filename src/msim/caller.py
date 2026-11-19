@@ -42,6 +42,10 @@ class ServiceLike(Protocol):
     ) -> AttemptControl: ...
 
 
+#: The values of `ClientConfig.server_deadline`.
+SERVER_DEADLINE_MODES = ("attempt", "global", "none")
+
+
 @dataclass(frozen=True)
 class ClientConfig:
     retry: RetryPolicy
@@ -52,6 +56,25 @@ class ClientConfig:
     # no context is created and nothing downstream is handed one. It is the ROOT
     # client's tenant that counts: a request that arrives with a context keeps it.
     tenant: str | None = None
+    # What the target is told about this client's deadlines:
+    #   "attempt" (default) -> the attempt's own deadline, min(global deadline,
+    #     now + attempt timeout). The server enforces it: it reports a waiting
+    #     attempt at that instant and cuts one in service, freeing the worker.
+    #     A stack that sends its deadline with the call (gRPC's grpc-timeout).
+    #   "global" -> only the request's global deadline (None when it has none).
+    #     The attempt timeout stays with the client, which enforces it with a
+    #     timer of its own and walks away; the server keeps working on the
+    #     attempt -- an ORPHAN -- until it finishes or the global deadline cuts
+    #     it. A client-side timeout the server never hears about.
+    #   "none" -> nothing: the client enforces every deadline alone.
+    server_deadline: str = "attempt"
+
+    def __post_init__(self) -> None:
+        if self.server_deadline not in SERVER_DEADLINE_MODES:
+            raise ValueError(
+                f"server_deadline must be one of {', '.join(SERVER_DEADLINE_MODES)}; "
+                f"got {self.server_deadline!r}"
+            )
 
 
 @dataclass
@@ -295,9 +318,25 @@ class ClientRuntime:
         ctx.retry_event = None
         ctx.pending_retry_context = None
         on_done = partial(self._on_attempt_done, ctx, sim)
+
+        # What the target is told (`ClientConfig.server_deadline`). When that is
+        # later than the deadline this client works to -- or nothing at all --
+        # the client has to enforce its own deadline: a timer, armed BEFORE the
+        # attempt is submitted so that it precedes whatever the target schedules
+        # and therefore wins a tie at the deadline instant, as the half-open rule
+        # requires. An attempt told its real deadline needs none (the server
+        # reports at that instant itself), which is every attempt by default.
+        mode = self.cfg.server_deadline
+        if mode == "attempt":
+            disclosed = req_deadline
+        else:
+            disclosed = ctx.root.global_deadline if mode == "global" else None
+            if req_deadline is not None and (disclosed is None or req_deadline < disclosed):
+                on_done = self._race_own_deadline(sim, on_done, req_deadline)
+
         if ctx.request_ctx is None:
             # No request context: the call every target has always received.
-            ctx.control = self.service.submit_attempt(sim, on_done, attempt_deadline=req_deadline)
+            ctx.control = self.service.submit_attempt(sim, on_done, attempt_deadline=disclosed)
             return
         # The two hop-relative fields, for THIS attempt of THIS client. Attempts
         # are recorded on the root as they end and never overlap, so the next
@@ -308,8 +347,55 @@ class ClientRuntime:
             ctx.request_ctx, attempt=number, is_retry=ctx.request_ctx.is_retry or number > 1
         )
         ctx.control = self.service.submit_attempt(
-            sim, on_done, attempt_deadline=req_deadline, ctx=ctx.request_ctx
+            sim, on_done, attempt_deadline=disclosed, ctx=ctx.request_ctx
         )
+
+    def _race_own_deadline(
+        self, sim: Simulator, deliver: AttemptDoneCallback, deadline: TimePoint
+    ) -> AttemptDoneCallback:
+        """Race one attempt's answer against this client's own deadline.
+
+        Returns the callback to hand to the target instead of `deliver`. Whichever
+        comes first -- the target's report or the deadline -- is delivered, once;
+        the other is ignored. When the deadline wins, the client books a
+        `DEADLINE` drop that carries no queue size and no occupancy (it walked
+        away without learning either) and moves on: feedback, retry decision,
+        the next attempt. The attempt itself is NOT withdrawn. It stays at the
+        target as an orphan, holding its worker or its queue slot until the
+        target is done with it, and its eventual answer goes nowhere -- no
+        record, no policy feedback. Nothing holds a handle on an orphan, so a
+        later cancellation of the request cannot reach it either.
+
+        A report that arrives first disarms the timer, and that includes the
+        `CANCELLED` report of an attempt an upstream cancels.
+        """
+        settled = False
+
+        def on_done(
+            success: bool,
+            svc_time: TimeDuration,
+            drop_reason: DropReason,
+            queue_size: int | None,
+            occupancy_censored: bool,
+        ) -> None:
+            nonlocal settled
+            if settled:
+                return  # the orphan's answer: the client left at its deadline
+            settled = True
+            timer.cancelled = True
+            deliver(success, svc_time, drop_reason, queue_size, occupancy_censored)
+
+        def on_deadline() -> None:
+            nonlocal settled
+            if settled:
+                return
+            settled = True
+            deliver(False, 0, DropReason.DEADLINE, None, False)
+
+        # `max`: a deadline that is already behind us cannot be scheduled; the
+        # timer then fires now, after a target that answers synchronously.
+        timer = sim.schedule(max(deadline, sim.timestep), on_deadline)
+        return on_done
 
     def _on_attempt_done(
         self,

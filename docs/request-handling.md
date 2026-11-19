@@ -76,6 +76,38 @@ what happens next:
 > the branch that made the decision with one (`policy_layers` then refunds a
 > vetoed retry in that branch alone).
 
+### What the server learns about the deadline
+
+`ClientConfig.server_deadline` decides which of the client's deadlines the target
+is told, and so who enforces the attempt timeout:
+
+| Value | The target is told | Who enforces the attempt timeout |
+| --- | --- | --- |
+| `"attempt"` (default) | `min(global deadline, now + attempt timeout)` | the **server**: it reports a waiting attempt at that instant and cuts one in service, freeing the worker |
+| `"global"` | the request's global deadline (`None` if it has none) | the **client**, with a timer of its own |
+| `"none"` | nothing | the client, for every deadline |
+
+The default is a stack that sends its deadline with the call (gRPC's
+`grpc-timeout`). The other two are a client-side timeout the server never hears
+about: when the timer fires the client books a `DEADLINE` drop -- with no queue
+size and no occupancy, since it left without learning either -- gives feedback,
+and decides on a retry, while the attempt stays at the server as an **orphan**.
+An orphan keeps its worker or its queue slot until the server is done with it
+(in `"global"` mode the global deadline still cuts it), and its answer goes
+nowhere: no record, no policy feedback. Under overload this is the difference
+between a server that sheds dead work and one that serves it while live callers
+time out behind it.
+
+The timer and the real answer race once per attempt: whichever comes first is
+delivered, the other is ignored. The timer is armed before the attempt is
+submitted, so at the deadline instant it runs first and a tie goes to the
+deadline, as the half-open rule requires. A report that arrives first disarms
+the timer, including the `CANCELLED` report of an attempt an upstream cancels.
+An orphan is out of reach of a later cancellation: nothing holds a handle on it.
+When the deadline the client works to is the one the target is told (no attempt
+timeout in `"global"` mode, for instance), there is no timer and the run is
+event for event the default one.
+
 ### Request context: what travels with a request
 
 By default a request carries nothing from hop to hop but its deadline. A
