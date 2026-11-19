@@ -20,6 +20,7 @@ from msim.retry_policies import (
     RetryContext,
     RetryPolicy,
     TimeBasedCircuitBreakerPolicy,
+    policy_layers,
 )
 from msim.service import ServiceConfig, ServiceRuntime
 from msim.simulator import Simulator
@@ -937,3 +938,53 @@ class TestPolicyFeedbackReachesWrappedLayers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPolicyLayers(unittest.TestCase):
+    """`policy_layers` is the one walk every client traversal uses."""
+
+    def test_a_plain_policy_is_its_only_layer(self):
+        policy = NoRetryPolicy()
+        self.assertEqual(list(policy_layers(policy)), [policy])
+
+    def test_a_stack_is_walked_outermost_first(self):
+        backoff = FixedBackoffRetryPolicy(max_attempts=3, delay=0)
+        budget = RetryBudgetPolicy(budget_ratio=0.1, max_retries=1, underlying_strategy=backoff)
+        breaker = CountBasedCircuitBreakerPolicy(
+            failure_threshold_ratio=(5, 10),
+            success_threshold_ratio=(3, 5),
+            underlying_strategy=budget,
+            half_open_delay=0,
+        )
+        layers = list(policy_layers(breaker))
+        self.assertEqual(len(layers), 3)
+        for layer, expected in zip(layers, (breaker, budget, backoff), strict=True):
+            self.assertIs(layer, expected)
+
+    def test_the_client_reaches_every_layer_through_it(self):
+        """A deposit, a result and a refund each arrive at the wrapped layers."""
+        seen: list[str] = []
+
+        class Probe(FixedBackoffRetryPolicy):
+            def on_request_start(self, now):
+                seen.append("start")
+
+            def add_result(self, success, now):
+                seen.append("result")
+
+            def rollback(self, context):
+                seen.append("rollback")
+
+        probe = Probe(max_attempts=5, delay=0)
+        budget = RetryBudgetPolicy(budget_ratio=0.5, max_retries=4, underlying_strategy=probe)
+        service = ServiceRuntime(
+            cfg=ServiceConfig(name="svc", latency_median=1, latency_lognorm_sigma=0.1, workers=1)
+        ).bind()
+        client = ClientRuntime(
+            cfg=ClientConfig(retry=budget, timeout_controller=StaticTimeoutController()),
+            service=service,
+        )
+        client._notify_request_start(budget, 0)
+        client._update_policy_results(budget, False, 0)
+        client._rollback_policy(budget, RetryContext(attempt=1, now=0))
+        self.assertEqual(seen, ["start", "result", "rollback"])

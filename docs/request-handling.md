@@ -42,9 +42,12 @@ what happens next:
   reported at the deadline itself, not when a worker next frees (see
   [services-and-workload](services-and-workload.md#the-drop-points)).
 - **Policy result fan-out.** `_update_policy_results` (`caller.py`) walks the
-  policy via its `underlying_strategy` chain and calls `add_result(success, now)` on
-  every layer that supports it. This is the *only* way circuit breakers and retry
-  budgets learn outcomes.
+  policy's layers and calls `add_result(success, now)` on every one that supports
+  it. This is the *only* way circuit breakers and retry budgets learn outcomes.
+  The walk is `retry_policies.policy_layers(policy)` -- outermost first, through
+  each wrapper's `underlying_strategy` -- and it is the same one admission
+  (`allow_request`), the per-request notification (`on_request_start`) and refunds
+  (`rollback`) use, so a wrapper is reached by all four or by none.
 - **Timeout feedback.** The attempt latency is reported to
   `timeout_controller.record_result(...)` (so an adaptive controller can adjust).
 - **Retry or stop.** On failure it asks `retry.next_delay(RetryContext(attempt,

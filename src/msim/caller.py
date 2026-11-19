@@ -1,4 +1,4 @@
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Protocol, runtime_checkable
@@ -12,7 +12,7 @@ from msim.core import (
     TimePoint,
 )
 from msim.metrics import Metrics
-from msim.retry_policies import RetryContext, RetryPolicy
+from msim.retry_policies import RetryContext, RetryPolicy, policy_layers
 from msim.service import AttemptControl, AttemptDoneCallback, ServiceConfig
 from msim.simulator import Event, Simulator
 from msim.timeout_controllers import TimeoutController
@@ -21,11 +21,6 @@ from msim.timeout_controllers import TimeoutController
 @runtime_checkable
 class _SupportsAddResult(Protocol):
     def add_result(self, success: bool, now: TimePoint) -> None: ...
-
-
-@runtime_checkable
-class _SupportsUnderlying(Protocol):
-    underlying_strategy: RetryPolicy
 
 
 class ServiceLike(Protocol):
@@ -88,29 +83,19 @@ class ClientRuntime:
             return d1
         return min(d1, d2)
 
-    def _policy_chain(self, policy: RetryPolicy) -> Iterator[RetryPolicy]:
-        """Every layer of a wrapping policy, outermost first.
-
-        One walker for all four traversals. They previously each re-implemented
-        this recursion, so a wrapper that one of them reached and another missed
-        would silently see inconsistent notifications, results or refunds.
-        """
-        current: RetryPolicy | None = policy
-        while current is not None:
-            yield current
-            current = (
-                current.underlying_strategy if isinstance(current, _SupportsUnderlying) else None
-            )
+    # The four traversals below all reach the layers of a composed policy through
+    # `retry_policies.policy_layers`, the one walk: a wrapper is either seen by all
+    # of them or by none.
 
     def _update_policy_results(self, policy: RetryPolicy, success: bool, now: TimePoint) -> None:
         """Record an attempt outcome on every layer that tracks results."""
-        for layer in self._policy_chain(policy):
+        for layer in policy_layers(policy):
             if isinstance(layer, _SupportsAddResult):
                 layer.add_result(success, now)
 
     def _notify_request_start(self, policy: RetryPolicy, now: TimePoint) -> None:
         """Announce an admitted root request to every layer of the policy chain."""
-        for layer in self._policy_chain(policy):
+        for layer in policy_layers(policy):
             layer.on_request_start(now)
 
     def _rollback_policy(
@@ -129,13 +114,13 @@ class ClientRuntime:
         the charge standing, which is conservative — it over-counts rather than
         handing the same slot out twice.
         """
-        for layer in self._policy_chain(policy):
+        for layer in policy_layers(policy):
             if not deferred or layer.supports_deferred_rollback:
                 layer.rollback(context)
 
     def _allow_policy_request(self, policy: RetryPolicy, now: TimePoint) -> bool:
         """Admission requires EVERY layer to allow the request."""
-        return all(layer.allow_request(now) for layer in self._policy_chain(policy))
+        return all(layer.allow_request(now) for layer in policy_layers(policy))
 
     def _complete_root(self, root: RootRequest, now: TimePoint) -> None:
         root.done = True

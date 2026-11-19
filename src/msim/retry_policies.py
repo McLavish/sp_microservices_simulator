@@ -1,10 +1,11 @@
 import math
 import random
 from collections import deque
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import Enum
 from fractions import Fraction
-from typing import NamedTuple
+from typing import NamedTuple, Protocol, runtime_checkable
 
 from msim.core import TimeDuration, TimePoint
 
@@ -67,6 +68,28 @@ class RetryPolicy:
         only withdrawing when the caller commits to the retry.
         """
         return
+
+
+@runtime_checkable
+class _SupportsUnderlying(Protocol):
+    underlying_strategy: RetryPolicy
+
+
+def policy_layers(policy: RetryPolicy) -> Iterator[RetryPolicy]:
+    """Every layer of a composed policy, outermost first.
+
+    The ONE walk over a policy stack. `ClientRuntime` reaches the layers through
+    it for all four of its traversals -- admission, the per-request
+    notification, attempt results and refunds -- which once each re-implemented
+    the recursion, so that a wrapper one of them reached and another missed
+    silently saw inconsistent notifications, results or refunds. It lives beside
+    the policies because what a layer IS belongs to them: a policy that wraps
+    another exposes it as `underlying_strategy`.
+    """
+    current: RetryPolicy | None = policy
+    while current is not None:
+        yield current
+        current = current.underlying_strategy if isinstance(current, _SupportsUnderlying) else None
 
 
 @dataclass
