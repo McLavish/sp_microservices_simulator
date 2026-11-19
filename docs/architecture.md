@@ -140,7 +140,7 @@ src/msim/       the installable library package (import as `msim.<module>`)
   faults          LoadSpike / LatencyInjection / PartialFailure  --> fault_events (JSON overlay)
   service         M/G/c/K queue            <- faults, fault_events, simulator
   workload        Poisson arrivals         <- faults, fault_events, simulator
-  retry_policies  retry / circuit-breaker / rate-limit / budget
+  retry_policies  retry / circuit-breaker / rate-limit / budget / retry by failure cause
   timeout_controllers  static / adaptive timeouts
   caller          client + retry loop      <- retry_policies, timeout_controllers, service, metrics
   transport       per-link delay decorator <- caller, service, simulator

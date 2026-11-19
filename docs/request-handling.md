@@ -51,13 +51,20 @@ what happens next:
 - **Timeout feedback.** The attempt latency is reported to
   `timeout_controller.record_result(...)` (so an adaptive controller can adjust).
 - **Retry or stop.** On failure it asks `retry.next_delay(RetryContext(attempt,
-  now))`. It retries only if the policy says so **and** the next start would land
-  strictly before the global deadline (`caller.py`); otherwise the root
-  completes as a failure.
+  now, drop_reason))`. It retries only if the policy says so **and** the next
+  start would land strictly before the global deadline (`caller.py`); otherwise
+  the root completes as a failure. `drop_reason` is the cause the attempt was
+  just booked under -- `DEADLINE` for one that ran out of time, whatever the
+  service reported -- for a policy that decides by cause
+  ([below](#retry-by-failure-cause)); every other policy ignores it.
 
 > **Extending policies:** any wrapping policy must expose `underlying_strategy` (so
 > results propagate) and any stateful policy should implement `add_result(success,
-> now)`. Miss this and the inner policy silently never sees outcomes.
+> now)`. Miss this and the inner policy silently never sees outcomes. A policy
+> that chooses between SEVERAL wrapped policies implements
+> `sub_policies(context=None)` instead: every branch without a context, and only
+> the branch that made the decision with one (`policy_layers` then refunds a
+> vetoed retry in that branch alone).
 
 ### Example: client with fixed-backoff retries
 
@@ -106,7 +113,8 @@ Every policy implements `RetryPolicy`:
   breakers override it).
 - `next_delay(context) -> (should_retry, delay_ns)` — decide on a retry after a
   failed attempt. `RetryContext` carries `attempt` (1-indexed; the original try is
-  attempt 1) and `now`.
+  attempt 1), `now`, and `drop_reason`, the cause of the failure (`None` when the
+  caller does not say).
 
 ### Backoff strategies
 
@@ -165,6 +173,53 @@ conservative direction.
 Both breakers likewise share their admission half (`_CircuitBreakerBase`:
 `allow_request`, the OPEN -> HALF_OPEN transition and retry delegation), so the
 uncapped half-open probe admission noted above is one code path, not two.
+
+### Retry by failure cause
+
+A deployed client does not retry everything: gRPC retries the status codes it is
+told are retryable, and a deadline or a full queue is usually not among them.
+`RetryByCausePolicy(policies)` maps a failure cause (`DropReason`) to the policy
+that governs the retries of attempts that failed that way; **a cause with no
+entry is not retried**.
+
+```python
+from msim.core import DropReason, ms_to_ns
+from msim.retry_policies import FixedBackoffRetryPolicy, RetryBudgetPolicy, RetryByCausePolicy
+
+backoff = FixedBackoffRetryPolicy(max_attempts=3, delay=ms_to_ns(5))
+
+# The fixed list: retry what the server failed, nothing a deadline or a full queue ended.
+listed = RetryByCausePolicy.for_causes(
+    [DropReason.SERVER_FAILURE, DropReason.CIRCUIT_OPEN], backoff
+)
+
+# A budget per cause: server failures retry freely, the two overload signals
+# share ONE budget of 10 % of the requests.
+budget = RetryBudgetPolicy(budget_ratio=0.1, max_retries=10, underlying_strategy=backoff)
+budgeted = RetryByCausePolicy({
+    DropReason.SERVER_FAILURE: backoff,
+    DropReason.DEADLINE: budget,
+    DropReason.QUEUE_FULL: budget,
+})
+```
+
+- The policy is stateless and draws nothing: `next_delay` is the chosen branch's,
+  so an allowance (`max_attempts`) counts every attempt of the request, whatever
+  each one failed with.
+- The cause is the one the **client** books: `DEADLINE` for an attempt that
+  finishes at or after its deadline, and for a chain node's caller the cause of
+  the downstream call that failed the node -- so `QUEUE_FULL` and `CIRCUIT_OPEN`
+  can come from deeper in the tree (`CIRCUIT_OPEN` only that way: a client whose
+  own breaker is open never asks for a retry). `NONE` and `CANCELLED` are
+  rejected as keys; no retry decision is ever asked about them.
+- The same policy object may sit under several causes, and one budget may be
+  shared by several. `policy_layers` yields each distinct layer **once**, so a
+  shared budget gets one deposit per request and a breaker one result per
+  attempt; and a retry that was granted and then vetoed by the global deadline is
+  refunded **in the branch that granted it**, never in another (which charged
+  nothing, and would be handed quota it never spent).
+- Admission is not by cause -- a new request has none yet -- so a breaker placed
+  *inside* a branch gates every request. Put breakers above the policy.
 
 ### Example: a circuit breaker around no-retry
 

@@ -103,8 +103,8 @@ class ClientRuntime:
     ) -> None:
         """Refund a retry that ``next_delay`` authorised but we never issued.
 
-        Every layer that charged during `next_delay` sits on the chain, so every
-        layer gets the chance to refund.
+        Every layer that charged during `next_delay` sits on the path the
+        decision took, so every one of them gets the chance to refund.
 
         ``deferred=True`` marks a refund issued long after the charge (a cancel
         arriving mid-backoff). `RetryPolicy.rollback` is specified as undoing the
@@ -114,7 +114,9 @@ class ClientRuntime:
         the charge standing, which is conservative — it over-counts rather than
         handing the same slot out twice.
         """
-        for layer in policy_layers(policy):
+        # Only the layers that took part in THIS decision: a policy that chose a
+        # branch by the failure's cause is refunded in that branch alone.
+        for layer in policy_layers(policy, context):
             if not deferred or layer.supports_deferred_rollback:
                 layer.rollback(context)
 
@@ -337,6 +339,9 @@ class ClientRuntime:
         retry_context = RetryContext(
             attempt=ctx.root.attempt_count(),
             now=sim.timestep,
+            # The cause as booked above: DEADLINE for an attempt that ran out of
+            # time, whatever the service reported.
+            drop_reason=drop_reason,
         )
 
         decision = self.cfg.retry.next_delay(retry_context)

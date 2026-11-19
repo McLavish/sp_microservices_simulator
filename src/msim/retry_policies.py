@@ -1,20 +1,23 @@
 import math
 import random
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from fractions import Fraction
 from typing import NamedTuple, Protocol, runtime_checkable
 
-from msim.core import TimeDuration, TimePoint
+from msim.core import DropReason, TimeDuration, TimePoint
 
 
 @dataclass
 class RetryContext:
     attempt: int  # attempt starts at 1 (the original request is attempt 1)
     now: TimePoint  # current simulation time; required (rate limiters need it)
-    # last_result: Optional[bool] = None
+    # Why the attempt that just failed was dropped, as the client booked it. For a
+    # policy that decides by cause (`RetryByCausePolicy`); every other policy
+    # ignores it. None when the caller of `next_delay` does not say.
+    drop_reason: DropReason | None = None
 
 
 class DelayDecision(NamedTuple):
@@ -75,8 +78,23 @@ class _SupportsUnderlying(Protocol):
     underlying_strategy: RetryPolicy
 
 
-def policy_layers(policy: RetryPolicy) -> Iterator[RetryPolicy]:
-    """Every layer of a composed policy, outermost first.
+@runtime_checkable
+class _SupportsBranches(Protocol):
+    def sub_policies(self, context: RetryContext | None = None) -> tuple[RetryPolicy, ...]: ...
+
+
+def _wrapped(policy: RetryPolicy, context: RetryContext | None) -> tuple[RetryPolicy, ...]:
+    if isinstance(policy, _SupportsBranches):
+        return tuple(policy.sub_policies(context))
+    if isinstance(policy, _SupportsUnderlying):
+        return (policy.underlying_strategy,)
+    return ()
+
+
+def policy_layers(
+    policy: RetryPolicy, context: RetryContext | None = None
+) -> Iterator[RetryPolicy]:
+    """Every layer of a composed policy, outermost first, each one ONCE.
 
     The ONE walk over a policy stack. `ClientRuntime` reaches the layers through
     it for all four of its traversals -- admission, the per-request
@@ -84,12 +102,29 @@ def policy_layers(policy: RetryPolicy) -> Iterator[RetryPolicy]:
     the recursion, so that a wrapper one of them reached and another missed
     silently saw inconsistent notifications, results or refunds. It lives beside
     the policies because what a layer IS belongs to them: a policy that wraps
-    another exposes it as `underlying_strategy`.
+    one other exposes it as `underlying_strategy`, and a policy that chooses
+    between several (`RetryByCausePolicy`) implements `sub_policies(context)`.
+
+    With no `context` the walk covers every branch: an admission check, an
+    announced request and an attempt result concern all of them. With the
+    `context` of a retry decision it follows only the branch that MADE the
+    decision, which is what a refund has to do -- the other branches charged
+    nothing, and refunding them would mint quota.
+
+    A layer that can be reached twice (one budget shared by two causes, one
+    backoff under every cause) is yielded once, by identity: it gets one deposit
+    per request and one result per attempt, not one per path to it. A stack that
+    does not branch is walked exactly as it always was.
     """
-    current: RetryPolicy | None = policy
-    while current is not None:
+    seen: set[int] = set()
+    pending = [policy]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
         yield current
-        current = current.underlying_strategy if isinstance(current, _SupportsUnderlying) else None
+        pending.extend(reversed(_wrapped(current, context)))
 
 
 @dataclass
@@ -657,3 +692,80 @@ class FixedWindowBurstyLimiterPolicy(_ThrottledRetryPolicy):
 
 
 # class HedgePolicy:
+
+
+#: Causes a retry decision can never be asked about: a successful attempt has
+#: none, and a cancelled one is abandoned before the policy is consulted.
+_NOT_RETRYABLE_CAUSES = (DropReason.NONE, DropReason.CANCELLED)
+
+
+@dataclass
+class RetryByCausePolicy(RetryPolicy):
+    """Decide a retry by WHY the attempt failed.
+
+    `policies` maps a failure cause (`DropReason`) to the policy that governs
+    the retries of attempts that failed that way. A cause with no entry is not
+    retried. Two shapes cover what deployed clients do:
+
+    * a fixed list -- gRPC's `retryableStatusCodes`:
+      `RetryByCausePolicy.for_causes([SERVER_FAILURE, CIRCUIT_OPEN], backoff)`
+      retries what the server called transient and nothing a deadline or a full
+      queue ended;
+    * a budget per cause: map the causes a retry is cheap for straight to the
+      backoff, and the ones that signal overload (`QUEUE_FULL`, `DEADLINE`) to a
+      `RetryBudgetPolicy` over the same backoff, so THOSE retries are a bounded
+      fraction of the requests while the others stay free.
+
+    The policy holds no state and draws nothing: `next_delay` is the chosen
+    branch's, so the allowance (`max_attempts`) counts every attempt of the
+    request, whatever each one failed with. The same policy object may sit under
+    several causes and one budget may be shared by several; every distinct layer
+    is told of requests and results once, and a vetoed retry is refunded in the
+    branch that granted it and in no other (`policy_layers`).
+
+    The cause is the failed attempt's `drop_reason` as the CLIENT books it: an
+    attempt that finishes at or after its deadline is `DEADLINE`, and a chain
+    node relays the cause of the downstream call that failed it, so `QUEUE_FULL`
+    and `CIRCUIT_OPEN` can come from deeper in the tree. Admission is not by
+    cause -- a new request has none yet -- so a breaker inside a branch gates
+    every request; put a breaker ABOVE this policy unless that is the intent.
+    """
+
+    policies: Mapping[DropReason, RetryPolicy]
+
+    def __post_init__(self):
+        for cause, policy in self.policies.items():
+            if not isinstance(cause, DropReason):
+                raise ValueError(f"a cause must be a DropReason, got {cause!r}")
+            if cause in _NOT_RETRYABLE_CAUSES:
+                raise ValueError(
+                    f"{cause.name} is not a cause a retry decision is ever asked about, "
+                    "so a policy mapped to it would never run"
+                )
+            if not isinstance(policy, RetryPolicy):
+                raise ValueError(
+                    f"the policy for {cause.name} must be a RetryPolicy, got {policy!r}"
+                )
+        # Our own copy: the mapping is the policy, and the caller's dict is not.
+        self.policies = dict(self.policies)
+
+    @classmethod
+    def for_causes(cls, causes: Iterable[DropReason], policy: RetryPolicy) -> "RetryByCausePolicy":
+        """The fixed list: `policy` for the listed causes, no retry for any other."""
+        return cls(dict.fromkeys(causes, policy))
+
+    def _branch(self, context: RetryContext) -> RetryPolicy | None:
+        return None if context.drop_reason is None else self.policies.get(context.drop_reason)
+
+    def next_delay(self, context: RetryContext) -> DelayDecision:
+        branch = self._branch(context)
+        if branch is None:
+            return DelayDecision(False, 0)
+        return branch.next_delay(context)
+
+    def sub_policies(self, context: RetryContext | None = None) -> tuple[RetryPolicy, ...]:
+        """Every branch, or, given the context of a decision, the one that made it."""
+        if context is None:
+            return tuple(self.policies.values())
+        branch = self._branch(context)
+        return () if branch is None else (branch,)

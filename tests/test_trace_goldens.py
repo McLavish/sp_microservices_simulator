@@ -35,7 +35,7 @@ import pytest
 
 from msim.caller import ClientConfig, ClientRuntime
 from msim.chain import DownstreamEdge, ServiceNodeRuntime
-from msim.core import TimeInterval, ms_to_ns, s_to_ns
+from msim.core import DropReason, TimeInterval, ms_to_ns, s_to_ns
 from msim.faults import LatencyInjection, LoadSpike, PartialFailure
 from msim.retry_policies import (
     BurstyRateLimiterPolicy,
@@ -46,6 +46,7 @@ from msim.retry_policies import (
     JitterMode,
     LeakyRateLimiterPolicy,
     RetryBudgetPolicy,
+    RetryByCausePolicy,
     TimeBasedCircuitBreakerPolicy,
 )
 from msim.service import ServiceConfig, ServiceRuntime, ServiceTime
@@ -494,6 +495,65 @@ def _method_service_times(seed: int = 606):
     return sim, [writers, readers, front_to_write], [front.service, store]
 
 
+def _retry_by_cause(seed: int = 909):
+    """Two clients that retry by the cause of the failure, on one small station.
+
+    `listed` retries what the server failed and nothing else (the fixed list).
+    `budgeted` sits under a breaker, retries server failures freely and puts its
+    deadline and queue-full retries under ONE shared budget. The station sheds,
+    times out and fails in turn, so every branch is taken and the budget binds.
+    """
+    sim = Simulator(seed=seed)
+    svc = ServiceRuntime(
+        cfg=ServiceConfig(
+            name="svc",
+            latency_median=ms_to_ns(8),
+            latency_lognorm_sigma=0.7,
+            workers=3,
+            queue_capacity=6,
+            latency_injections=[
+                LatencyInjection(TimeInterval(s_to_ns(4), s_to_ns(6)), add_latency=ms_to_ns(25))
+            ],
+            partial_failures=[PartialFailure(TimeInterval(s_to_ns(1), s_to_ns(3)), p_fail=0.5)],
+        )
+    ).bind()
+    listed = ClientRuntime(
+        cfg=ClientConfig(
+            retry=RetryByCausePolicy.for_causes(
+                [DropReason.SERVER_FAILURE, DropReason.CIRCUIT_OPEN], _fixed(3, 6)
+            ),
+            timeout_controller=_static(40, 150),
+        ),
+        service=svc,
+    )
+    backoff = _fixed(4, 5)
+    budget = RetryBudgetPolicy(budget_ratio=0.2, max_retries=5, underlying_strategy=backoff)
+    breaker = CountBasedCircuitBreakerPolicy(
+        failure_threshold_ratio=(18, 20),
+        success_threshold_ratio=(2, 3),
+        underlying_strategy=RetryByCausePolicy(
+            {
+                DropReason.SERVER_FAILURE: backoff,
+                DropReason.DEADLINE: budget,
+                DropReason.QUEUE_FULL: budget,
+            }
+        ),
+        half_open_delay=ms_to_ns(400),
+    )
+    budgeted = ClientRuntime(
+        cfg=ClientConfig(retry=breaker, timeout_controller=_static(35, 200)), service=svc
+    )
+    spike = [LoadSpike(TimeInterval(s_to_ns(7), s_to_ns(8)), rps_multiplier=3.0)]
+    Workload(base_rps=140.0, duration_s=10.0, load_spikes=spike, rng_seed=seed).drive(
+        sim, listed.start_request
+    )
+    Workload(base_rps=170.0, duration_s=10.0, load_spikes=spike, rng_seed=seed + 1).drive(
+        sim, budgeted.start_request
+    )
+    sim.run()
+    return sim, [listed, budgeted], [svc], (budget._tokens, breaker.get_state().name)
+
+
 def _wrapped_policies(seed: int = 4321):
     """Two clients with deep policy stacks on one faulted service.
 
@@ -627,8 +687,28 @@ _METHOD_SERVICE_TIMES: Trace = (
 )
 
 
+_RETRY_BY_CAUSE: Trace = (
+    "0c8027244a92fb8eff9091532da7434e424e1d58db533a32ffc72ac74b99d401",
+    8272,
+    "af3c3d0450adb887a39e4b82a697995ef1b7e0e1ca75634dce3c01c009358952",
+)
+
+
 class TestTraceGoldens(unittest.TestCase):
     """If one of these fails, a seeded run no longer unfolds the way it did."""
+
+    def test_retry_by_cause_trace(self):
+        sim, clients, services, policy_state = _retry_by_cause()
+        listed, budgeted = clients
+        for reason in ("NONE", "QUEUE_FULL", "DEADLINE", "SERVER_FAILURE"):
+            self.assertGreater(_reasons([listed])[reason], 0, reason)
+            self.assertGreater(_reasons([budgeted])[reason], 0, reason)
+        self.assertGreater(_reasons([budgeted])["CIRCUIT_OPEN"], 0)
+        # The fixed list: an attempt is followed by another only after a server failure.
+        for root in listed.roots:
+            for attempt in root.attempts[:-1]:
+                self.assertEqual(attempt.drop_reason.name, "SERVER_FAILURE")
+        self.assertEqual(_trace(sim, clients, services, extra=policy_state), _RETRY_BY_CAUSE)
 
     def test_call_waves_trace(self):
         sim, clients, services = _call_waves()
