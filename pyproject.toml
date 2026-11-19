@@ -13,6 +13,9 @@ plot = [
     "pandas",
     "scipy",
 ]
+arolla = [
+    "pyyaml",
+]
 
 [dependency-groups]
 dev = [
@@ -24,6 +27,7 @@ dev = [
     "scipy",
     "matplotlib",
     "pandas",
+    "pyyaml",
 ]
 
 [build-system]

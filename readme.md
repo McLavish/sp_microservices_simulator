@@ -24,6 +24,9 @@ retry policies, PPO training) lives on the `rl-layer` branch, not here.
   windows.
 - **Outputs** — per-bucket CSV metrics + seconds-based fault JSON, plus plotting
   scripts that overlay the two.
+- **Other formats** — `msim.compat.arolla` reads the YAML scenarios of
+  [Arolla](https://github.com/eth-easl/Arolla)'s simulator and builds them here
+  (`docs/compat-arolla.md`).
 
 ## Requirements
 
@@ -44,7 +47,8 @@ make install        # uv sync --group dev + install the git pre-commit hook
 ```
 
 The simulator core depends only on `numpy`; the `plot` extra adds the `scipy` /
-`matplotlib` / `pandas` used by plotting and CSV export. The dev group adds `ruff`,
+`matplotlib` / `pandas` used by plotting and CSV export, and the `arolla` extra the
+PyYAML that `msim.compat.arolla` reads scenario files with. The dev group adds `ruff`,
 `ty`, `pytest` and those same libraries.
 
 ## Quickstart

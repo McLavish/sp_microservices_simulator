@@ -11,3 +11,4 @@ subsystem you care about.
 | [request-handling](request-handling.md) | Clients and the attempt loop, retry-policy catalog, timeout controllers, and chain/fan-out. |
 | [observability](observability.md) | `Metrics` summary, the per-bucket CSV schema, and the plotting scripts. |
 | [examples](examples.md) | Runnable example scenarios (`examples/`), their outputs, and how to write your own. |
+| [compat-arolla](compat-arolla.md) | Reading and running the scenario files of Arolla's simulator (`msim.compat.arolla`): the mapping, and where it departs from their code. |

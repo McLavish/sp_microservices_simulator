@@ -154,6 +154,7 @@ src/msim/       the installable library package (import as `msim.<module>`)
   chain           fan-out nodes            <- caller, service, simulator
   metrics         aggregation + CSV export
   plotting/       render CSV + fault JSON to PNG   (deps: the `plot` extra)
+  compat/arolla/  read and build Arolla's YAML scenarios   (deps: the `arolla` extra)
 
 examples/       runnable demo scenarios (not in the package)   --> CSV + fault JSON
 ```
