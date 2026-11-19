@@ -119,10 +119,10 @@ know about the request an attempt belongs to:
 | `tenant` | who the request belongs to | the client that starts the request (`ClientConfig.tenant`); unchanged down the tree |
 | `attempt` | the number of this attempt **at the hop that issued it** (1 = that client's first try) | each client, for its own attempts |
 | `is_retry` | **sticky**: this attempt is a retry, or was caused by one anywhere above it | each client: `incoming.is_retry or attempt > 1` |
-| `retry_allowance` | a `core.RetryAllowance`, one mutable object shared by the whole request: retries it may still issue over every hop | whoever creates the context; handed on by reference |
+| `retry_allowance` | a `core.RetryAllowance`, one mutable object shared by the whole request: retries it may still issue over every hop ([below](#a-retry-allowance-for-the-whole-request)) | the client that starts the request (`ClientConfig.retry_allowance`); handed on by reference |
 
 A context exists only for a request that was given one. A client whose
-`ClientConfig.tenant` is set creates one for every request it **starts**; a
+`ClientConfig.tenant` (or `retry_allowance`) is set creates one for every request it **starts**; a
 caller can pass its own as `start_request(sim, ctx=...)`; and a request that
 arrives with a context keeps it, so in a call tree the root client's tenant is
 the tenant at every hop (an edge client's own `tenant` only matters when nothing
@@ -252,6 +252,35 @@ conservative direction.
 Both breakers likewise share their admission half (`_CircuitBreakerBase`:
 `allow_request`, the OPEN -> HALF_OPEN transition and retry delegation), so the
 uncapped half-open probe admission noted above is one code path, not two.
+
+### A retry allowance for the whole request
+
+Per-hop limits multiply down a call tree: three attempts at each of three
+layers are 27 calls at the bottom. A **retry allowance** bounds the product
+directly: the number of retries one request may cause, wherever they happen.
+
+- `ClientConfig.retry_allowance = n` gives every request the client **starts** a
+  fresh `core.RetryAllowance(n)` in its
+  [request context](#request-context-what-travels-with-a-request): one mutable
+  counter, handed on by reference to every hop the request crosses.
+- `RetryAllowancePolicy(underlying_strategy)` makes a client take part: a retry
+  needs a unit, takes it when the wrapped policy grants the retry, and gives it
+  back if the retry is then not issued (a deadline veto, or a cancellation while
+  it waits: the refund is exact whenever it arrives, so the layer supports a
+  deferred rollback). With none left the wrapped policy is not even asked.
+
+```python
+edge = ClientConfig(retry=RetryAllowancePolicy(backoff), timeout_controller=...)
+root = ClientConfig(retry=backoff, timeout_controller=..., retry_allowance=5)
+```
+
+Put the layer on every client whose retries should count: on all of them for a
+bound on the whole tree, or only on the clients inside it, leaving the
+originator free to retry (its retried call then finds whatever is left). A
+client without the layer neither spends nor respects the allowance, a request
+without one passes through the layer untouched, and a request that arrives
+with a context keeps the allowance it came with. The count lives on the
+request; the layer has no state.
 
 ### Retry by failure cause
 

@@ -34,7 +34,7 @@ from pathlib import Path
 import pytest
 
 from msim.admission import AdmissionGate, GoodputCoupledBudget, TokenBucketBudget
-from msim.caller import ClientConfig, ClientRuntime
+from msim.caller import ClientConfig, ClientRuntime, RetryLayer
 from msim.chain import DownstreamEdge, ServiceNodeRuntime
 from msim.core import DropReason, TimeInterval, ms_to_ns, s_to_ns
 from msim.faults import LatencyInjection, LoadSpike, PartialFailure
@@ -46,6 +46,7 @@ from msim.retry_policies import (
     FixedWindowBurstyLimiterPolicy,
     JitterMode,
     LeakyRateLimiterPolicy,
+    RetryAllowancePolicy,
     RetryBudgetPolicy,
     RetryByCausePolicy,
     TimeBasedCircuitBreakerPolicy,
@@ -748,6 +749,69 @@ def _dependencies(seed: int = 2718):
     return sim, [top, *edges], [*services, *(replica.service for replica in replicas)]
 
 
+def _allowance(seed: int = 1618):
+    """Three retry loops on a failing store, under one allowance per request.
+
+    The driver keeps its timeout to itself and calls the gateway through the
+    gateway's own retry loop (a `RetryLayer`); the gateway calls a store that
+    fails and slows down, through the store's loop. Each request may cause
+    three retries in all: the two inner loops draw on that allowance and the
+    driver's own retry does not. So the trace has attempts the driver has given
+    up on that go on retrying, retries refused for want of allowance, and
+    units given back by the deadline's veto.
+    """
+    sim = Simulator(seed=seed)
+    store = ServiceRuntime(
+        cfg=ServiceConfig(
+            name="store",
+            latency_median=ms_to_ns(6),
+            latency_lognorm_sigma=0.6,
+            workers=3,
+            queue_capacity=8,
+            partial_failures=[PartialFailure(TimeInterval(s_to_ns(1), s_to_ns(3)), p_fail=0.5)],
+            latency_injections=[
+                LatencyInjection(TimeInterval(s_to_ns(3), s_to_ns(4)), add_latency=ms_to_ns(15))
+            ],
+        )
+    ).bind()
+    gateway = ServiceNodeRuntime(
+        service=ServiceRuntime(
+            cfg=ServiceConfig(
+                name="gateway",
+                latency_median=ms_to_ns(2),
+                latency_lognorm_sigma=0.3,
+                workers=6,
+                queue_capacity=30,
+            )
+        ).bind(),
+        hold_worker_during_fanout=True,
+        local_work="last",
+    )
+    store_loop = ClientRuntime(
+        cfg=ClientConfig(retry=RetryAllowancePolicy(_fixed(4, 1)), timeout_controller=_static(25)),
+        service=store,
+    )
+    gateway.add_downstream(DownstreamEdge(client=store_loop, target=gateway))
+    gateway_loop = ClientRuntime(
+        cfg=ClientConfig(retry=RetryAllowancePolicy(_fixed(3, 2)), timeout_controller=_static(60)),
+        service=gateway,
+    )
+    driver = ClientRuntime(
+        cfg=ClientConfig(
+            retry=_fixed(2, 5),
+            timeout_controller=_static(45, global_ms=200),
+            server_deadline="global",
+            retry_allowance=3,
+        ),
+        service=RetryLayer(gateway_loop),
+    )
+    Workload(base_rps=180.0, duration_s=5.0, load_spikes=[], rng_seed=seed).drive(
+        sim, driver.start_request
+    )
+    sim.run()
+    return sim, [driver, gateway_loop, store_loop], [gateway.service, store]
+
+
 def _retry_by_cause(seed: int = 909):
     """Two clients that retry by the cause of the failure, on one small station.
 
@@ -961,6 +1025,13 @@ _QUEUE_ORDER: dict[str, Trace] = {
 }
 
 
+_ALLOWANCE: Trace = (
+    "b642741852180ff0de349fdfcf4f7e78ac28a5813322ee3db561beda900c0191",
+    14073,
+    "c1df958ef5c661ecd3272b7bef65de9d6be7016cc45a3a181db94e5e5073a98e",
+)
+
+
 _DEPENDENCIES: Trace = (
     "b6b6a510d07b13a97a6c547f2ca71b99301527fb30dd7af39166ec532b867b8e",
     18297,
@@ -1059,6 +1130,21 @@ class TestTraceGoldens(unittest.TestCase):
                 trace = _trace(sim, clients, services)
                 self.assertEqual(trace, expected)
                 self.assertNotEqual(trace[0], told[0])
+
+    def test_allowance_trace(self):
+        sim, clients, services = _allowance()
+        driver, gateway_loop, store_loop = clients
+        reasons = _reasons(clients)
+        for reason in ("NONE", "QUEUE_FULL", "DEADLINE", "SERVER_FAILURE"):
+            self.assertGreater(reasons[reason], 0, reason)
+        # The driver's records are booked under the layer, not under the gateway.
+        self.assertEqual({a.service for r in driver.roots for a in r.attempts}, {"gateway.retries"})
+        # No call of the driver caused more than the three retries a request has:
+        # a gateway request and the store requests under it share them.
+        self.assertTrue(all(len(root.attempts) <= 3 for root in gateway_loop.roots))
+        self.assertTrue(all(len(root.attempts) <= 4 for root in store_loop.roots))
+        self.assertGreater(max(len(root.attempts) for root in store_loop.roots), 2)
+        self.assertEqual(_trace(sim, clients, services), _ALLOWANCE)
 
     def test_dependencies_trace(self):
         sim, clients, services = _dependencies()

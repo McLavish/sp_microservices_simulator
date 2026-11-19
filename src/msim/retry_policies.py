@@ -7,7 +7,14 @@ from enum import Enum
 from fractions import Fraction
 from typing import NamedTuple, Protocol, runtime_checkable
 
-from msim.core import S_TO_NS, DropReason, RequestContext, TimeDuration, TimePoint
+from msim.core import (
+    S_TO_NS,
+    DropReason,
+    RequestContext,
+    RetryAllowance,
+    TimeDuration,
+    TimePoint,
+)
 
 
 @dataclass
@@ -762,6 +769,56 @@ class FixedWindowBurstyLimiterPolicy(_ThrottledRetryPolicy):
         # at the same simulated instant, so no window rollover intervenes. A
         # later one would not — see supports_deferred_rollback.
         self._tokens = min(self.max_requests, self._tokens + 1)
+
+
+@dataclass
+class RetryAllowancePolicy(RetryPolicy):
+    """Charge this client's retries to the allowance of the REQUEST they belong to.
+
+    A request can carry a `core.RetryAllowance` in its context: the number of
+    retries it may still issue, one counter shared by every hop it crosses
+    (`ClientConfig.retry_allowance` gives one to every request a client
+    starts). Per-hop limits multiply down a call tree -- three attempts at each
+    of three layers are 27 calls at the bottom -- and this bounds the product
+    directly: a request with an allowance of 5 causes at most 5 retries,
+    wherever they happen.
+
+    The layer makes its client take part: a retry needs a unit of the
+    allowance, takes it when the wrapped policy grants the retry, and gives it
+    back if the retry is then not issued. Put it on every client whose retries
+    should count -- on all of them for a bound on the whole tree, or only on
+    the clients inside it, leaving the request's originator free to retry. A
+    client without the layer neither spends nor respects the allowance, and a
+    request without an allowance passes through the layer untouched.
+
+    No state of its own: the count lives on the request.
+    """
+
+    underlying_strategy: RetryPolicy
+
+    #: The allowance is a plain counter private to one request, with no cap and
+    #: no refill, so giving a unit back is exact whenever it happens.
+    supports_deferred_rollback = True
+
+    @staticmethod
+    def _allowance(context: RetryContext) -> RetryAllowance | None:
+        return None if context.request is None else context.request.retry_allowance
+
+    def next_delay(self, context: RetryContext) -> DelayDecision:
+        allowance = self._allowance(context)
+        if allowance is None:
+            return self.underlying_strategy.next_delay(context)
+        if allowance.remaining <= 0:
+            return DelayDecision(False, 0)
+        decision = self.underlying_strategy.next_delay(context)
+        if decision.allow:
+            allowance.remaining -= 1
+        return decision
+
+    def rollback(self, context: RetryContext) -> None:
+        allowance = self._allowance(context)
+        if allowance is not None:
+            allowance.remaining += 1
 
 
 # class HedgePolicy:

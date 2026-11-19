@@ -7,6 +7,7 @@ from msim.core import (
     DropReason,
     Request,
     RequestContext,
+    RetryAllowance,
     RootRequest,
     TimeDuration,
     TimeInterval,
@@ -68,12 +69,27 @@ class ClientConfig:
     #     it. A client-side timeout the server never hears about.
     #   "none" -> nothing: the client enforces every deadline alone.
     server_deadline: str = "attempt"
+    # How many retries each request this client STARTS may cause, over every hop
+    # it crosses: the request's context gets a fresh `core.RetryAllowance` of
+    # this size. It only counts where a client's policy is wrapped in
+    # `retry_policies.RetryAllowancePolicy`, which is also what spends it. None
+    # (the default): no allowance. As with `tenant`, a request that arrives with
+    # a context keeps what it came with.
+    retry_allowance: int | None = None
 
     def __post_init__(self) -> None:
         if self.server_deadline not in SERVER_DEADLINE_MODES:
             raise ValueError(
                 f"server_deadline must be one of {', '.join(SERVER_DEADLINE_MODES)}; "
                 f"got {self.server_deadline!r}"
+            )
+        if self.retry_allowance is not None and (
+            isinstance(self.retry_allowance, bool)
+            or not isinstance(self.retry_allowance, int)
+            or self.retry_allowance < 0
+        ):
+            raise ValueError(
+                f"retry_allowance must be an int >= 0 or None, got {self.retry_allowance!r}"
             )
 
 
@@ -242,8 +258,8 @@ class ClientRuntime:
 
         A request that arrives with a context keeps it (a chain node hands its
         own attempt's context to every downstream call). One that arrives with
-        none gets a fresh context when this client has a `tenant`, and none
-        otherwise.
+        none gets a fresh context when this client has a `tenant` or a
+        `retry_allowance`, and none otherwise.
         """
         root_req = RootRequest()
 
@@ -289,8 +305,13 @@ class ClientRuntime:
             interval=TimeInterval(begin=sim.timestep, end=sim.timestep),
             deadline=None,
         )
-        if ctx is None and self.cfg.tenant is not None:
-            ctx = RequestContext(tenant=self.cfg.tenant)
+        if ctx is None and (self.cfg.tenant is not None or self.cfg.retry_allowance is not None):
+            ctx = RequestContext(
+                tenant=self.cfg.tenant,
+                retry_allowance=None
+                if self.cfg.retry_allowance is None
+                else RetryAllowance(self.cfg.retry_allowance),
+            )
         initial_ctx = AttemptCtx(root=root_req, req=dummy_req, request_ctx=ctx)
         root_req.cancel = partial(self._cancel_root, initial_ctx, sim)
         self._start_attempt(sim, initial_ctx)
