@@ -42,6 +42,23 @@ own per-outcome table gets the same check by calling
 (it still tolerates a column missing from an older CSV), so a new outcome flows
 into the failure-mix figure without a manual edit.
 
+One level down, every `DropReason` an attempt can end with must map to an
+outcome: `classify_root` books a failed root by its final attempt's reason and
+falls back to a server failure for a reason it does not know, so `core.py` also
+raises at import when a reason has no entry
+(`core.require_drop_reason_coverage`, usable by a consumer with its own
+per-reason table).
+
+An outcome can be **optional** (`OutcomeReporting.optional`): one that most
+scenarios cannot produce. `RootOutcome.REJECTED` is the only one — the request's
+final attempt ended with `DropReason.REJECTED`, refused by admission control in
+front of the service before it joined a queue, which no stock component does. An
+optional outcome is counted like any other, but it is kept out of the fixed
+output: its CSV column is written after every fixed column and only when the
+outcome occurred (below), and `print_stats` prints no line for it while it is
+zero. A scenario without it therefore exports and prints exactly what it did
+before the outcome existed.
+
 ### `summary()` (`metrics.py`)
 
 Returns a `Summary` (`core.py`): `total`, `succeeded`, `dropped_*` by reason,
@@ -60,13 +77,18 @@ roots being summarized (`Metrics.attempts_on_roots()`). Notes:
   deliberately its own bucket, NOT folded into the other `dropped_*` counts:
   cancelled work did not fail, and charging it to a failure category would count
   one root cause once where it failed and again at every sibling it cancelled.
+- `dropped_rejected` counts roots whose **final** attempt was refused by
+  admission control (`DropReason.REJECTED`). A request refused once and then
+  served is a success; one refused on its last retry is rejected, whatever its
+  earlier attempts failed with.
 - `mean` / `max` are `nan` when no successful root completed, matching the
   percentiles. They are not 0, which would make an empty window read as a
   perfect one.
 
-`print_stats()` (`metrics.py`) dumps the summary to stdout.
+`print_stats()` (`metrics.py`) dumps the summary to stdout (an optional outcome
+only when it is not zero).
 
-### `export_csv(path, granularity_s=1.0)` (`metrics.py`)
+### `export_csv(path, granularity_s=1.0, include_optional=False)` (`metrics.py`)
 
 Writes one row per time bucket (default 1 s). `granularity_s` must round to at
 least 1 ns (values below 5e-10 s raise `ValueError`); the `timepoint` column is
@@ -92,6 +114,10 @@ The subtlety is **which event time a column is bucketed by** — start vs. end:
 | `total_failure` | end (cumulative) | running sum of failed roots |
 | `p50 p90 p95 p99 p99.9 p99.99 min max` | end | latency stats over **successful roots** completing in the bucket (ms) |
 | `queue_avg_at_attempt_end` | end | mean `queue_size_at_end` over attempts ending in the bucket |
+| `failure_rejected` (optional) | end | roots whose final attempt was refused by admission control. Written **after** the fixed columns above, and only when at least one root was rejected; `include_optional=True` writes it regardless, so the files of several runs of one arm share a header |
+
+A refused retry is a failed retry: it counts in `failure_retry` like one that
+failed at the service.
 
 Latency/queue cells are `nan` for buckets with no qualifying data. Because roots
 bucket by start but completions/latency by end, a spike of starts and the resulting

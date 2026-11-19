@@ -44,6 +44,7 @@ When adding completion paths in `behavior`, preserve AND semantics and route dea
 - `failure_retry` counts failed *retry attempts* (not first attempts), bucketed at attempt end.
 - Latency stats only include **successful root** latencies completed in that bucket.
 - `queue_avg_at_attempt_end` averages `Request.queue_size_at_end` for attempts ending in the bucket.
+- An **optional** outcome (`OutcomeReporting.optional`; today only `RootOutcome.REJECTED`, a final attempt refused by admission control) is outside the fixed header: its column is written after every fixed column and only when it occurred, or with `export_csv(..., include_optional=True)`, and `print_stats` skips it at zero. A scenario that cannot produce it exports byte-identical files.
 
 **Fault events** (`fault_events.py`) is a separate tracker that mirrors faults already configured on services/workloads, but emits them in seconds-based JSON for plotting overlays. Both `ServiceConfig.register_fault_events(tracker)` and `Workload.register_fault_events(tracker)` must be called explicitly — registration is *not* automatic.
 

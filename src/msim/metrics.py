@@ -106,7 +106,10 @@ class Metrics:
         print(f"Total Requests: {summary.total}")
         print(f"Succeeded: {summary.succeeded}")
         for reporting in FAILURE_OUTCOMES.values():
-            print(f"{reporting.label}: {getattr(summary, reporting.summary_field)}")
+            count = getattr(summary, reporting.summary_field)
+            if reporting.optional and count == 0:
+                continue  # an outcome this scenario cannot produce: no line for it
+            print(f"{reporting.label}: {count}")
         print(f"P50 Latency (ms): {summary.p50:.2f}")
         print(f"P95 Latency (ms): {summary.p95:.2f}")
         print(f"P99 Latency (ms): {summary.p99:.2f}")
@@ -117,13 +120,20 @@ class Metrics:
         print(f"Retries per Root Request: {summary.retries_per_root:.2f}")
         print(f"Total Attempts: {summary.attempts_total}")
 
-    def export_csv(self, path: str, granularity_s: float = 1.0) -> None:
+    def export_csv(
+        self, path: str, granularity_s: float = 1.0, include_optional: bool = False
+    ) -> None:
         """
         Notes:
         - failures are root-level, attributed to the final attempt's drop_reason,
         bucketed by the root's completion time (last attempt end).
         - failure_retry counts failed RETRY attempts (after the first), bucketed by attempt end.
         - latencies are for successful roots completed in the bucket.
+        - the column of an OPTIONAL outcome (`OutcomeReporting.optional`) comes after
+        every fixed column and is written only when the outcome occurred among these
+        roots. `include_optional=True` writes it regardless, so that the files of
+        several runs -- seeds of one arm, some with the outcome and some without --
+        share one header.
         """
         # Lazy import: pandas is a dev dependency; the simulation core stays
         # numpy+stdlib-only until export time.
@@ -138,7 +148,7 @@ class Metrics:
                 "the minimum representable bucket is 1 ns (1e-9 s)"
             )
 
-        columns = [
+        fixed_columns = [
             "timepoint",
             "root_requests",  # bucketed at the start
             "retries",  # bucketed at the start
@@ -149,8 +159,13 @@ class Metrics:
             # Per-reason breakdown, in the table's order — which is what fixes
             # this header, so appending an outcome is safe and reordering the
             # table rewrites every exported CSV. A new RootOutcome gets its
-            # column here automatically (plotting still needs its own list).
-            *(reporting.csv_column for reporting in FAILURE_OUTCOMES.values()),
+            # column here automatically (plotting still needs its own list),
+            # unless it is optional: those follow the fixed header, below.
+            *(
+                reporting.csv_column
+                for reporting in FAILURE_OUTCOMES.values()
+                if not reporting.optional
+            ),
             "total_request",  # cumulative root_requests, bucketed at the start
             "total_failure",  # cumulative failure_root, bucketed at the end
             "p50",  # percentiles are all bucketed at the end
@@ -197,6 +212,16 @@ class Metrics:
                         else int(a.queue_size_at_end),
                     }
                 )
+
+        # Optional outcomes get a column only when they occurred here (or on
+        # request), appended AFTER the fixed header: a consumer reading the fixed
+        # columns by position or by name sees the file it always saw.
+        occurred = {row["outcome"] for row in root_rows}
+        columns = fixed_columns + [
+            reporting.csv_column
+            for outcome, reporting in FAILURE_OUTCOMES.items()
+            if reporting.optional and (include_optional or outcome in occurred)
+        ]
 
         if not attempt_rows:
             pd.DataFrame(columns=columns).to_csv(path, index=False, lineterminator="\r\n")

@@ -56,6 +56,13 @@ class DropReason(Enum):
     # this call while it was still outstanding. Only produced when a
     # ServiceNodeRuntime has propagate_cancellation=True.
     CANCELLED = auto()
+    # Refused, not served: admission control in front of the service turned the
+    # attempt away before it joined the queue. Not QUEUE_FULL (the server's own
+    # backlog shed it) and not CIRCUIT_OPEN (the CLIENT's breaker shed it): the
+    # refusal is a server-side policy decision about this one attempt. No stock
+    # component produces it, so it occurs only in a scenario that builds one
+    # that does.
+    REJECTED = auto()
 
 
 class RootOutcome(Enum):
@@ -76,6 +83,7 @@ class RootOutcome(Enum):
     SERVER_FAILURE = auto()
     CIRCUIT_OPEN = auto()
     CANCELLED = auto()
+    REJECTED = auto()
 
 
 _OUTCOME_BY_DROP_REASON: "dict[DropReason, RootOutcome]" = {
@@ -84,6 +92,7 @@ _OUTCOME_BY_DROP_REASON: "dict[DropReason, RootOutcome]" = {
     DropReason.CIRCUIT_OPEN: RootOutcome.CIRCUIT_OPEN,
     DropReason.CANCELLED: RootOutcome.CANCELLED,
     DropReason.SERVER_FAILURE: RootOutcome.SERVER_FAILURE,
+    DropReason.REJECTED: RootOutcome.REJECTED,
 }
 
 
@@ -98,6 +107,12 @@ class OutcomeReporting:
     csv_column: str
     #: Human-readable name used by `Metrics.print_stats`.
     label: str
+    #: An outcome most scenarios cannot produce. Its CSV column is not part of
+    #: the fixed header: `Metrics.export_csv` writes it after every fixed column,
+    #: and only when the outcome occurred among the exported roots (or when the
+    #: caller asks for it), and `print_stats` leaves it out while it is zero. So
+    #: adding an optional outcome changes no output of a scenario without it.
+    optional: bool = False
 
 
 #: The authoritative enumeration of non-success outcomes, in reporting order.
@@ -112,7 +127,8 @@ class OutcomeReporting:
 #: reason were not.
 #:
 #: ORDER IS LOAD-BEARING for `csv_column`: it fixes the column order of every
-#: exported CSV, so appending is safe and reordering rewrites the header.
+#: exported CSV, so appending is safe and reordering rewrites the header. An
+#: `optional` outcome is outside that fixed block (see `OutcomeReporting`).
 FAILURE_OUTCOMES: "dict[RootOutcome, OutcomeReporting]" = {
     RootOutcome.QUEUE_FULL: OutcomeReporting(
         summary_field="dropped_queue",
@@ -138,6 +154,12 @@ FAILURE_OUTCOMES: "dict[RootOutcome, OutcomeReporting]" = {
         summary_field="dropped_cancelled",
         csv_column="failure_cancelled",
         label="Cancelled (Abandoned Upstream)",
+    ),
+    RootOutcome.REJECTED: OutcomeReporting(
+        summary_field="dropped_rejected",
+        csv_column="failure_rejected",
+        label="Rejected (Admission)",
+        optional=True,
     ),
 }
 
@@ -165,6 +187,27 @@ def require_outcome_coverage(mapping: "Mapping[RootOutcome, object]", *, owner: 
         )
 
 
+def require_drop_reason_coverage(mapping: "Mapping[DropReason, object]", *, owner: str) -> None:
+    """Fail at import time when `mapping` misses a `DropReason` an attempt can end with.
+
+    The twin of `require_outcome_coverage`, one level down. `classify_root` books
+    a failed root by its final attempt's reason and falls back to SERVER_FAILURE
+    for a reason it has no entry for, so a reason added to the enum and not to
+    the table would be counted as a server failure by every consumer, silently.
+    `NONE` is exempt: it is the absence of a reason.
+    """
+    missing = [
+        reason.name
+        for reason in DropReason
+        if reason is not DropReason.NONE and reason not in mapping
+    ]
+    if missing:
+        raise RuntimeError(
+            f"{owner} has no entry for DropReason member(s) {', '.join(missing)}; "
+            "an attempt ending with one of them would be booked under another reason"
+        )
+
+
 def classify_root(root: "RootRequest") -> RootOutcome:
     """Classify a completed root. Order matters and is load-bearing.
 
@@ -183,7 +226,9 @@ def classify_root(root: "RootRequest") -> RootOutcome:
         # that does count them disagree with the CSV; callers already guard
         # this shape.
         raise ValueError("cannot classify a RootRequest with no attempts")
-    # Append order is completion order (ties on end time are ambiguous).
+    # Append order is completion order (ties on end time are ambiguous). The
+    # fallback is for NONE alone -- a failed attempt that names no reason is the
+    # server's failure; every real reason has an entry (checked at import).
     return _OUTCOME_BY_DROP_REASON.get(root.attempts[-1].drop_reason, RootOutcome.SERVER_FAILURE)
 
 
@@ -293,6 +338,10 @@ class Summary:
     # twice (once where it failed, once at every sibling it cancelled).
     # Declared last so existing positional construction keeps working.
     dropped_cancelled: int = 0
+    # Refused by admission control in front of the service (DropReason.REJECTED):
+    # the request's final attempt was turned away before it joined a queue. Zero
+    # in every scenario that builds no admission control.
+    dropped_rejected: int = 0
 
 
 # Definition-time completeness checks for FAILURE_OUTCOMES, at module scope so a
@@ -300,6 +349,7 @@ class Summary:
 # import with one clear message, instead of as a KeyError several minutes into
 # an experiment. They live down here only because they need `Summary`.
 require_outcome_coverage(FAILURE_OUTCOMES, owner="core.FAILURE_OUTCOMES")
+require_drop_reason_coverage(_OUTCOME_BY_DROP_REASON, owner="core._OUTCOME_BY_DROP_REASON")
 _SUMMARY_FIELDS = {f.name for f in fields(Summary)}
 _UNKNOWN_SUMMARY_FIELDS = sorted(
     reporting.summary_field

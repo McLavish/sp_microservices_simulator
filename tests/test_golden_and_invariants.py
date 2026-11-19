@@ -602,6 +602,8 @@ class TestRootClassificationAgreement(unittest.TestCase):
             root(DropReason.SERVER_FAILURE),
             root(DropReason.CIRCUIT_OPEN),
             root(DropReason.CANCELLED, cancelled=True),
+            root(DropReason.REJECTED),
+            root(DropReason.REJECTED, attempts=2),  # the retry was refused
             # The shape that caused the drift: cancelled during backoff, so the
             # final attempt still carries DEADLINE and completion is later.
             root(DropReason.DEADLINE, cancelled=True, completed_at=ms_to_ns(500)),
@@ -621,14 +623,16 @@ class TestRootClassificationAgreement(unittest.TestCase):
             Metrics(roots=roots, attempts_total=1).export_csv(path, granularity_s=1.0)
             df = pd.read_csv(path)
 
-        for label, from_summary, csv_col in (
-            ("success", summary.succeeded, "success_root"),
-            ("deadline", summary.dropped_deadline, "failure_deadline"),
-            ("queue", summary.dropped_queue, "failure_queue_full"),
-            ("server", summary.dropped_server_failure, "failure_server"),
-            ("circuit", summary.dropped_circuit_open, "failure_circuit_open"),
-            ("cancelled", summary.dropped_cancelled, "failure_cancelled"),
-        ):
+        # Every outcome the table reports, not a list kept here: an outcome
+        # added to the table is compared the day it exists.
+        from msim.core import FAILURE_OUTCOMES
+
+        categories = [("success", summary.succeeded, "success_root")]
+        for outcome, reporting in FAILURE_OUTCOMES.items():
+            count = getattr(summary, reporting.summary_field)
+            self.assertGreater(count, 0, f"_population has no {outcome.name} root")
+            categories.append((outcome.name, count, reporting.csv_column))
+        for label, from_summary, csv_col in categories:
             with self.subTest(category=label):
                 self.assertEqual(
                     from_summary,
@@ -671,27 +675,26 @@ class TestRootClassificationAgreement(unittest.TestCase):
             classify_root(root(DropReason.NONE, success=True, cancelled=True)),
             RootOutcome.SUCCESS,
         )
-        # Plain mappings.
-        for reason, expected in (
-            (DropReason.QUEUE_FULL, RootOutcome.QUEUE_FULL),
-            (DropReason.DEADLINE, RootOutcome.DEADLINE),
-            (DropReason.SERVER_FAILURE, RootOutcome.SERVER_FAILURE),
-            (DropReason.CIRCUIT_OPEN, RootOutcome.CIRCUIT_OPEN),
-            (DropReason.CANCELLED, RootOutcome.CANCELLED),
-        ):
+        # Plain mappings: a failed root is booked under the outcome of the SAME
+        # NAME as its final attempt's reason, for every reason there is.
+        for reason in DropReason:
+            if reason is DropReason.NONE:
+                continue
             with self.subTest(reason=reason):
-                self.assertEqual(classify_root(root(reason)), expected)
+                self.assertEqual(classify_root(root(reason)), RootOutcome[reason.name])
+        # A failed attempt that names no reason is the server's failure.
+        self.assertEqual(classify_root(root(DropReason.NONE)), RootOutcome.SERVER_FAILURE)
 
     def test_every_root_lands_in_exactly_one_category(self):
         roots = self._population()
         summary = Metrics(roots=roots, attempts_total=1).summary()
+        from msim.core import FAILURE_OUTCOMES
+
         self.assertEqual(
             summary.succeeded
-            + summary.dropped_queue
-            + summary.dropped_deadline
-            + summary.dropped_server_failure
-            + summary.dropped_circuit_open
-            + summary.dropped_cancelled,
+            + sum(
+                getattr(summary, reporting.summary_field) for reporting in FAILURE_OUTCOMES.values()
+            ),
             summary.total,
         )
 
