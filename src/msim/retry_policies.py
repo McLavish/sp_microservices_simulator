@@ -7,7 +7,7 @@ from enum import Enum
 from fractions import Fraction
 from typing import NamedTuple, Protocol, runtime_checkable
 
-from msim.core import DropReason, RequestContext, TimeDuration, TimePoint
+from msim.core import S_TO_NS, DropReason, RequestContext, TimeDuration, TimePoint
 
 
 @dataclass
@@ -45,6 +45,26 @@ class RetryPolicy:
         *request*. Default is a no-op.
         """
         return
+
+    def record_attempt(self, context: RetryContext, success: bool) -> None:
+        """Told once per attempt that ended, with the context of that attempt.
+
+        The client calls this on every layer of the policy, for every attempt it
+        books (not for one an upstream cancelled: that is not evidence about the
+        service). `context` is the very one the retry decision for a failed
+        attempt is then asked with: `attempt` is the number of the attempt that
+        just ended, `drop_reason` what it ended with (`NONE` for a success),
+        `request` its request context.
+
+        The default passes the outcome to `add_result(success, now)` when the
+        policy has one, which is all a breaker or a windowed gate needs: they
+        keep implementing `add_result`. Override this instead when WHICH attempt
+        it was matters -- a budget that only first attempts fund, a gate that
+        counts retries apart from first tries.
+        """
+        add_result = getattr(self, "add_result", None)
+        if add_result is not None:
+            add_result(success, context.now)
 
     #: Whether `rollback` is safe to apply LATER than the `next_delay` it undoes.
     #: FALSE by default, because that is the safe answer for every policy that
@@ -539,6 +559,14 @@ class RetryBudgetPolicy(_ThrottledRetryPolicy):
     success would enforce `retries <= ratio x successes`, which is strictly
     tighter during exactly the failure storms a budget exists to damp, and does
     not match a retries-per-root amplification constraint.
+
+    `min_retries_per_sec` (default None: off) is a floor under the ratio, as in
+    Finagle's `minRetriesPerSec`: that many retries per second accrue with TIME,
+    whatever the request rate, under the same cap. It is for a client that sends
+    too few requests for a ratio to fund a retry when it needs one. The accrual
+    is exact (a rational number of tokens per nanosecond, the remainder carried),
+    and it starts the first time the policy is consulted, which loses nothing:
+    the budget starts full.
     """
 
     budget_ratio: float  # retries can be at most this ratio of requests (e.g., 0.1 for 10%)
@@ -554,6 +582,14 @@ class RetryBudgetPolicy(_ThrottledRetryPolicy):
     _deposit: int = field(init=False)
     _max_tokens: int = field(init=False)
     _tokens: int = field(init=False)
+    # Retries per second that accrue with time (see the class docstring). After
+    # the fields above so positional construction keeps its meaning.
+    min_retries_per_sec: float | None = None
+    # Tokens per nanosecond the floor earns, the fraction of a token it has
+    # earned and not yet credited, and when it was last credited.
+    _refill_rate: Fraction = field(default=Fraction(0), init=False, repr=False)
+    _refill_carry: Fraction = field(default=Fraction(0), init=False, repr=False)
+    _last_refill: TimePoint | None = field(default=None, init=False, repr=False)
 
     #: Rationalization bound. Wide enough that every ratio a caller can
     #: plausibly mean survives it: at 10_000 anything below ~1/20000 rounded to
@@ -578,8 +614,40 @@ class RetryBudgetPolicy(_ThrottledRetryPolicy):
         self._deposit = ratio.numerator
         self._max_tokens = self._retry_cost * self.max_retries
         self._tokens = self._max_tokens  # start with full budget
+        if self.min_retries_per_sec is not None:
+            if not math.isfinite(self.min_retries_per_sec) or self.min_retries_per_sec <= 0:
+                raise ValueError(
+                    "min_retries_per_sec must be a finite rate > 0, or None for no "
+                    f"time-based refill; got {self.min_retries_per_sec!r}"
+                )
+            rate = Fraction(self.min_retries_per_sec).limit_denominator(self._MAX_RATIO_DENOMINATOR)
+            if rate.numerator == 0:
+                raise ValueError(
+                    f"min_retries_per_sec {self.min_retries_per_sec!r} is below the "
+                    f"representable floor 1/{self._MAX_RATIO_DENOMINATOR}"
+                )
+            self._refill_rate = rate * self._retry_cost / S_TO_NS
+
+    def _accrue(self, now: TimePoint) -> None:
+        """Credit what `min_retries_per_sec` has earned since the last look."""
+        if self.min_retries_per_sec is None:
+            return
+        last, self._last_refill = self._last_refill, now
+        if last is None or now <= last:
+            return
+        earned = self._refill_carry + self._refill_rate * (now - last)
+        whole = earned.numerator // earned.denominator
+        if self._tokens + whole >= self._max_tokens:
+            # Full. A capped balance banks nothing past its cap, and that
+            # includes the fraction of a token in hand.
+            self._tokens = self._max_tokens
+            self._refill_carry = Fraction(0)
+        else:
+            self._tokens += whole
+            self._refill_carry = earned - whole
 
     def on_request_start(self, now: TimePoint) -> None:
+        self._accrue(now)
         # One deposit per admitted request, regardless of how it turns out.
         self._tokens = min(self._max_tokens, self._tokens + self._deposit)
 
@@ -591,6 +659,7 @@ class RetryBudgetPolicy(_ThrottledRetryPolicy):
         return self._tokens / self._retry_cost * 100.0
 
     def _throttle_allows(self, now: TimePoint) -> bool:
+        self._accrue(now)
         return self.can_retry()
 
     def _charge(self) -> None:

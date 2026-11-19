@@ -985,6 +985,6 @@ class TestPolicyLayers(unittest.TestCase):
             service=service,
         )
         client._notify_request_start(budget, 0)
-        client._update_policy_results(budget, False, 0)
+        client._update_policy_results(budget, RetryContext(attempt=1, now=0), False)
         client._rollback_policy(budget, RetryContext(attempt=1, now=0))
         self.assertEqual(seen, ["start", "result", "rollback"])

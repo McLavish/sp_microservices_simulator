@@ -1,7 +1,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from functools import partial
-from typing import Protocol, runtime_checkable
+from typing import Protocol
 
 from msim.core import (
     DropReason,
@@ -17,11 +17,6 @@ from msim.retry_policies import RetryContext, RetryPolicy, policy_layers
 from msim.service import AttemptControl, AttemptDoneCallback, ServiceConfig
 from msim.simulator import Event, Simulator
 from msim.timeout_controllers import TimeoutController
-
-
-@runtime_checkable
-class _SupportsAddResult(Protocol):
-    def add_result(self, success: bool, now: TimePoint) -> None: ...
 
 
 class ServiceLike(Protocol):
@@ -104,11 +99,19 @@ class ClientRuntime:
     # `retry_policies.policy_layers`, the one walk: a wrapper is either seen by all
     # of them or by none.
 
-    def _update_policy_results(self, policy: RetryPolicy, success: bool, now: TimePoint) -> None:
-        """Record an attempt outcome on every layer that tracks results."""
+    def _update_policy_results(
+        self, policy: RetryPolicy, context: RetryContext, success: bool
+    ) -> None:
+        """Tell every layer of the policy how an attempt ended.
+
+        EVERY layer, whichever branch the retry decision will take, so the walk
+        is deliberately not given `context` (with one it follows the deciding
+        branch alone, which is what a refund needs). The context is what each
+        layer is TOLD: `RetryPolicy.record_attempt`, whose default feeds
+        `add_result(success, now)` to the layers that have one.
+        """
         for layer in policy_layers(policy):
-            if isinstance(layer, _SupportsAddResult):
-                layer.add_result(success, now)
+            layer.record_attempt(context, success)
 
     def _notify_request_start(self, policy: RetryPolicy, now: TimePoint) -> None:
         """Announce an admitted root request to every layer of the policy chain."""
@@ -354,8 +357,20 @@ class ClientRuntime:
             self._complete_root(ctx.root, sim.timestep)
             return
 
+        # One context for this attempt's outcome. Every policy layer is told
+        # with it, and for a failed attempt the retry decision is asked with it
+        # and, should the retry never be issued, refunded with it.
+        retry_context = RetryContext(
+            attempt=ctx.root.attempt_count(),
+            now=sim.timestep,
+            # The cause as booked above: DEADLINE for an attempt that ran out of
+            # time, whatever the service reported; NONE for a success.
+            drop_reason=drop_reason,
+            request=ctx.request_ctx,
+        )
+
         # Update circuit breaker state if policy supports it
-        self._update_policy_results(self.cfg.retry, success_effective, sim.timestep)
+        self._update_policy_results(self.cfg.retry, retry_context, success_effective)
 
         # Record timeout controller results
         request_latency = ctx.req.interval.end - ctx.req.interval.begin
@@ -376,16 +391,6 @@ class ClientRuntime:
             ctx.root.cancelled = True
             self._complete_root(ctx.root, sim.timestep)
             return
-
-        # Build retry context
-        retry_context = RetryContext(
-            attempt=ctx.root.attempt_count(),
-            now=sim.timestep,
-            # The cause as booked above: DEADLINE for an attempt that ran out of
-            # time, whatever the service reported.
-            drop_reason=drop_reason,
-            request=ctx.request_ctx,
-        )
 
         decision = self.cfg.retry.next_delay(retry_context)
         next_start = sim.timestep + decision.delay

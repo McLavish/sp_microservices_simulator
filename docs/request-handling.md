@@ -44,16 +44,22 @@ what happens next:
   reported at the deadline itself, not when a worker next frees (see
   [services-and-workload](services-and-workload.md#the-drop-points)).
 - **Policy result fan-out.** `_update_policy_results` (`caller.py`) walks the
-  policy's layers and calls `add_result(success, now)` on every one that supports
-  it. This is the *only* way circuit breakers and retry budgets learn outcomes.
+  policy's layers and tells every one how the attempt ended:
+  `record_attempt(context, success)`, whose default calls `add_result(success,
+  now)` on a layer that has one. This is the *only* way circuit breakers and
+  retry budgets learn outcomes. `context` is the `RetryContext` of the attempt
+  that just ended -- its number, what it ended with (`NONE` for a success), its
+  request context -- so a policy can tell a first attempt from a retry; a
+  cancelled attempt is not reported at all.
   The walk is `retry_policies.policy_layers(policy)` -- outermost first, through
   each wrapper's `underlying_strategy` -- and it is the same one admission
   (`allow_request`), the per-request notification (`on_request_start`) and refunds
   (`rollback`) use, so a wrapper is reached by all four or by none.
 - **Timeout feedback.** The attempt latency is reported to
   `timeout_controller.record_result(...)` (so an adaptive controller can adjust).
-- **Retry or stop.** On failure it asks `retry.next_delay(RetryContext(attempt,
-  now, drop_reason))`. It retries only if the policy says so **and** the next
+- **Retry or stop.** On failure it asks `retry.next_delay(context)` with that
+  same context (`RetryContext(attempt, now, drop_reason, request)`), and refunds
+  with it if the retry is then not issued. It retries only if the policy says so **and** the next
   start would land strictly before the global deadline (`caller.py`); otherwise
   the root completes as a failure. `drop_reason` is the cause the attempt was
   just booked under -- `DEADLINE` for one that ran out of time, whatever the
@@ -62,7 +68,9 @@ what happens next:
 
 > **Extending policies:** any wrapping policy must expose `underlying_strategy` (so
 > results propagate) and any stateful policy should implement `add_result(success,
-> now)`. Miss this and the inner policy silently never sees outcomes. A policy
+> now)` -- or override `record_attempt(context, success)` when it needs to know
+> WHICH attempt ended (a budget only first attempts fund, a gate that counts
+> retries apart). Miss this and the inner policy silently never sees outcomes. A policy
 > that chooses between SEVERAL wrapped policies implements
 > `sub_policies(context=None)` instead: every branch without a context, and only
 > the branch that made the decision with one (`policy_layers` then refunds a
@@ -195,7 +203,7 @@ sets it).
 | `LeakyRateLimiterPolicy` (`retry_policies.py`) | `max_requests`, `max_attempts`, `period` | leaky-bucket-as-queue: spaces retries exactly `period/max_requests` apart (the reserved slot is kept as a rational instant, so an uneven division does not accumulate a rounding gain), returns the whole-ns delay. Does **not** wrap an underlying policy. |
 | `BurstyRateLimiterPolicy` (`retry_policies.py`) | `max_requests`, `refill_rate`, `period`, `underlying_strategy` | token bucket with continuous refill; one token per retry |
 | `FixedWindowBurstyLimiterPolicy` (`retry_policies.py`) | `max_requests`, `period`, `underlying_strategy` | fixed-window quota, reset on each window boundary |
-| `RetryBudgetPolicy` (`retry_policies.py`) | `budget_ratio`, `max_retries`, `underlying_strategy` | token economy: each **admitted request** deposits `100 * budget_ratio` tokens (cap `100 * max_retries`), each retry costs 100 and is refunded if the retry is never issued. Finagle semantics — the ratio is retries per *request*. No deposit TTL (documented divergence). `budget_ratio` is rationalized exactly; a ratio too small to represent (below roughly `1e-9`) is rejected rather than silently becoming a zero deposit |
+| `RetryBudgetPolicy` (`retry_policies.py`) | `budget_ratio`, `max_retries`, `underlying_strategy`, `min_retries_per_sec=None` | token economy: each **admitted request** deposits `100 * budget_ratio` tokens (cap `100 * max_retries`), each retry costs 100 and is refunded if the retry is never issued. Finagle semantics — the ratio is retries per *request*. No deposit TTL (documented divergence). `budget_ratio` is rationalized exactly; a ratio too small to represent (below roughly `1e-9`) is rejected rather than silently becoming a zero deposit. `min_retries_per_sec` (off by default) is a floor under the ratio: that many retries per second accrue with time, exactly, under the same cap -- for a client that sends too few requests for a ratio to fund a retry |
 
 The three wrapping throttles share one `next_delay`/`rollback` implementation
 (`_ThrottledRetryPolicy`): quota is charged **only** on the path that returns
