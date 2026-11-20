@@ -1,0 +1,428 @@
+"""The simulator as a Gymnasium environment: an agent that tunes retries.
+
+One step is one window of simulated time. The agent picks a level of every
+setting the scenario declares; the settings are applied, the simulation runs
+`step_s` further, and the agent is shown what its own clients measured in that
+window and is paid the scenario's goodput: the requests that succeeded in it,
+over the number expected to arrive.
+
+    env = RetryEnv(SingleService())
+    observation, info = env.reset(seed=1)
+    observation, reward, terminated, truncated, info = env.step(env.action_space.sample())
+
+The environment drives the simulation from outside, with `Simulator.run(until=)`,
+and changes nothing in it but the settings: a run paused at every window is, event
+for event, the run left alone.
+
+An episode never terminates; it is cut at the scenario's horizon (`truncated`),
+so a learner bootstraps over the cut and gains nothing by pushing failures past
+it. After the cut the arrivals are stopped and the requests still in flight are
+left to finish; they count in the episode summary that the last `info` carries
+(the `ep_*` keys), never in a reward.
+"""
+
+import math
+from dataclasses import dataclass, field
+from typing import Any
+
+import numpy as np
+
+from msim.caller import ClientRuntime
+from msim.core import (
+    FAILURE_OUTCOMES,
+    RootOutcome,
+    RootRequest,
+    TimePoint,
+    classify_root,
+    ns_to_s,
+    s_to_ns,
+)
+from msim.rl.scenario import Episode, Knob, Scenario, Window
+
+try:
+    import gymnasium
+    from gymnasium import spaces
+except ImportError as error:  # pragma: no cover - depends on the environment
+    raise ImportError("msim.rl needs Gymnasium: install microservices-simulator[rl]") from error
+
+#: What the agent is shown of its clients, in this order, each in [0, 1]. The
+#: level of every knob follows (`knob:<name>`, 0 for the first level, 1 for the last).
+FEATURES = (
+    "has_data",  # 1 when an attempt ended in the window: tells "idle" from "all failed"
+    "request_rate",  # requests started, over twice the rate expected when all is well
+    "in_flight",  # requests not yet finished, over the worst the settings allow
+    "attempt_success",  # share of the attempts that ended, by how they ended ...
+    "attempt_deadline",
+    "attempt_queue_full",
+    "attempt_server_failure",
+    "attempt_other",
+    "retry_share",  # share of the attempts that were retries
+    "retry_success",  # share of the retries that succeeded
+    "latency_mean",  # of successful attempts, over the longest an attempt may take
+    "latency_p95",
+    "budget_balance",  # how full the retry budget is
+)
+
+#: A window counts as recovered when this share of its finished requests succeeded.
+RECOVERED = 0.95
+
+_FAILED = tuple(outcome.name.lower() for outcome in FAILURE_OUTCOMES)
+
+
+@dataclass
+class _Tally:
+    """Requests that finished, on the clients the reward is counted on."""
+
+    requests: int = 0
+    succeeded: int = 0
+    attempts: int = 0
+    #: Among them, the requests that started inside a fault window.
+    fault_requests: int = 0
+    fault_succeeded: int = 0
+    failed: dict[str, int] = field(default_factory=lambda: dict.fromkeys(_FAILED, 0))
+
+    def add(self, other: "_Tally") -> None:
+        self.requests += other.requests
+        self.succeeded += other.succeeded
+        self.attempts += other.attempts
+        self.fault_requests += other.fault_requests
+        self.fault_succeeded += other.fault_succeeded
+        for name, count in other.failed.items():
+            self.failed[name] += count
+
+
+def _ratio(numerator: float, denominator: float) -> float:
+    """A share, or nan when there is nothing to take a share of."""
+    return numerator / denominator if denominator > 0 else math.nan
+
+
+class RetryEnv(gymnasium.Env):
+    """An agent that sets the retry policy of some clients, window after window.
+
+    `scenario` is a `msim.rl.scenario.Scenario`: it declares the knobs, gives the
+    length of an episode and builds a fresh simulation for each one. The
+    observation is described by `feature_names`; the action is one level index
+    per knob that has more than one level (`knob_names`).
+
+    `reset(seed=...)` seeds the environment; every reset then draws the seed of
+    its episode, so a seeded environment replays the same sequence of episodes.
+    `reset(options={"episode_seed": n})` asks for one episode in particular,
+    which is how two policies are put on the same episodes.
+    """
+
+    metadata: dict[str, Any] = {"render_modes": []}
+
+    def __init__(
+        self,
+        scenario: Scenario,
+        *,
+        step_s: float = 1.0,
+        warmup_s: float = 5.0,
+        drain: bool = True,
+        keep_records: bool = False,
+    ) -> None:
+        if not math.isfinite(step_s) or step_s <= 0:
+            raise ValueError(f"step_s must be > 0, got {step_s}")
+        if not math.isfinite(warmup_s) or warmup_s < 0:
+            raise ValueError(f"warmup_s must be >= 0, got {warmup_s}")
+        self.scenario = scenario
+        self.step_s = step_s
+        self.warmup_s = warmup_s
+        #: Whether the requests in flight at the horizon are run to their end for
+        #: the summary. Off: the summary covers what finished inside the horizon.
+        self.drain = drain
+        #: Whether the clients keep the records of finished requests
+        #: (`ClientRuntime.roots`), for `Metrics` or a CSV afterwards. Off, the
+        #: environment drops what it has read, which makes a long chain episode
+        #: about twice as fast and far smaller.
+        self.keep_records = keep_records
+
+        self._step_ns = s_to_ns(step_s)
+        self._warmup_ns = s_to_ns(warmup_s)
+        horizon_ns = s_to_ns(scenario.horizon_s)
+        steps, rest = divmod(horizon_ns - self._warmup_ns, self._step_ns)
+        if steps < 1 or rest:
+            raise ValueError(
+                f"the scenario's horizon ({scenario.horizon_s} s) minus the warm-up ({warmup_s} s) "
+                f"must be a whole number of steps of {step_s} s, and at least one"
+            )
+        #: Steps in an episode.
+        self.episode_steps = int(steps)
+
+        knobs = scenario.knobs
+        if len({knob.name for knob in knobs}) != len(knobs):
+            raise ValueError(f"two knobs share a name: {[knob.name for knob in knobs]}")
+        self._knobs: tuple[Knob, ...] = tuple(knob for knob in knobs if len(knob.values) > 1)
+        if not self._knobs:
+            raise ValueError(
+                "the scenario leaves the agent nothing to choose: no knob has two levels"
+            )
+        #: The knobs of the action, in its order, and how many levels each has.
+        self.knob_names = tuple(knob.name for knob in self._knobs)
+        self.knob_levels = tuple(len(knob.values) for knob in self._knobs)
+        #: What each entry of the observation is.
+        self.feature_names = FEATURES + tuple(f"knob:{name}" for name in self.knob_names)
+        self.action_space = spaces.MultiDiscrete(list(self.knob_levels))
+        self.observation_space = spaces.Box(0.0, 1.0, (len(self.feature_names),), np.float32)
+
+        self._episode: Episode | None = None
+        self._over = True
+        self._now: TimePoint = 0
+        self._step_index = 0
+        self._levels: list[int] = [knob.default for knob in self._knobs]
+        self._cursors: list[int] = []
+        self._faults: list[tuple[TimePoint, TimePoint]] = []
+        self._started = 0  # requests the agent's clients started, since the build
+        self._finished = 0  # ... and finished
+        self._in_horizon = _Tally()
+        self._tail = _Tally()
+        self._agent = Window()  # the agent's clients over the episode, warm-up excluded
+        self._windows: list[tuple[TimePoint, int, int]] = []  # (begin, requests, succeeded)
+        self._return = 0.0
+
+    # ------------------------------------------------------------------ API
+
+    def reset(
+        self, *, seed: int | None = None, options: dict[str, Any] | None = None
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        super().reset(seed=seed)
+        episode_seed = (options or {}).get("episode_seed")
+        if episode_seed is None:
+            # Drawn at EVERY reset: vector environments seed only the first one,
+            # and an episode seed that fell back to a constant would train on
+            # one episode repeated.
+            episode_seed = int(self.np_random.integers(2**31 - 1))
+        episode_seed = int(episode_seed)
+
+        episode = self._episode = self.scenario.build(episode_seed)
+        self._over = False
+        self._now = 0
+        self._step_index = 0
+        self._levels = [knob.default for knob in self._knobs]
+        self._cursors = [0] * len(episode.clients)
+        self._faults = [(s_to_ns(a), s_to_ns(b)) for a, b in episode.fault_windows]
+        self._started = self._finished = 0
+        self._in_horizon, self._tail, self._agent = _Tally(), _Tally(), Window()
+        self._windows = []
+        self._return = 0.0
+
+        episode.agent.apply(self._setting())
+        # The first observation is of the warm-up, run under the default setting:
+        # the system the agent takes over is one that is already serving.
+        self._run(self._warmup_ns)
+        self._collect()
+        observation = self._observe(self.warmup_s, count=False)
+        return observation, {"episode_seed": episode_seed, **self._step_info(_Tally())}
+
+    def step(self, action: Any) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
+        episode = self._episode
+        if episode is None or self._over:
+            raise RuntimeError("the episode is over (or was never started): call reset() first")
+        levels = np.asarray(action, dtype=np.int64).reshape(-1)
+        if levels.shape != (len(self._knobs),) or not self.action_space.contains(levels):
+            raise ValueError(
+                f"an action is one level index per knob {self.knob_names}, "
+                f"within {list(self.knob_levels)}; got {action!r}"
+            )
+        self._levels = [int(level) for level in levels]
+        episode.agent.apply(self._setting())
+
+        begin = self._now
+        self._run(self._step_ns)
+        tally = self._collect()
+        self._in_horizon.add(tally)
+        self._windows.append((begin, tally.requests, tally.succeeded))
+        observation = self._observe(self.step_s, count=True)
+        reward = tally.succeeded / (episode.expected_rps * self.step_s)
+        self._return += reward
+        info = self._step_info(tally)
+
+        self._step_index += 1
+        truncated = self._step_index >= self.episode_steps
+        if truncated:
+            self._over = True
+            info.update(self._finish())
+        return observation, float(reward), False, truncated, info
+
+    def close(self) -> None:
+        self._episode = None
+        self._over = True
+
+    @property
+    def episode(self) -> Episode:
+        """The simulation of the current episode, for a look inside (tests, analysis)."""
+        if self._episode is None:
+            raise RuntimeError("there is no episode yet: call reset() first")
+        return self._episode
+
+    def setting(self, action: Any) -> dict[str, float]:
+        """What an action means: the value each knob is put to."""
+        return {
+            knob.name: knob.values[int(level)]
+            for knob, level in zip(self._knobs, action, strict=True)
+        }
+
+    # ------------------------------------------------------------ internals
+
+    def _setting(self) -> dict[str, float]:
+        return {
+            knob.name: knob.values[level]
+            for knob, level in zip(self._knobs, self._levels, strict=True)
+        }
+
+    def _run(self, duration: int) -> None:
+        assert self._episode is not None
+        self._now += duration
+        self._episode.sim.run(until=self._now)
+
+    def _take(self, index: int, client: ClientRuntime) -> list[RootRequest]:
+        """The requests `client` finished since they were last taken."""
+        if self.keep_records:
+            fresh = client.roots[self._cursors[index] :]
+            self._cursors[index] = len(client.roots)
+            return fresh
+        # A new list rather than `clear()`: whoever holds the old one (a
+        # `Metrics` made earlier) keeps what it had.
+        fresh, client.roots = client.roots, []
+        return fresh
+
+    def _collect(self) -> _Tally:
+        """Read what finished since the last call: the reward's side of a window."""
+        episode = self._episode
+        assert episode is not None
+        rewarded = {id(client) for client in episode.reward_clients}
+        agents = {id(client) for client in episode.agent.clients}
+        tally = _Tally()
+        for index, client in enumerate(episode.clients):
+            fresh = self._take(index, client)
+            if id(client) in agents:
+                self._finished += len(fresh)
+            if id(client) not in rewarded:
+                continue
+            for root in fresh:
+                if not root.attempts:
+                    continue  # nothing was tried: `Metrics` skips these too
+                outcome = classify_root(root)
+                succeeded = outcome is RootOutcome.SUCCESS
+                tally.requests += 1
+                tally.attempts += len(root.attempts)
+                if succeeded:
+                    tally.succeeded += 1
+                else:
+                    tally.failed[outcome.name.lower()] += 1
+                started = root.attempts[0].interval.begin
+                if any(begin <= started < end for begin, end in self._faults):
+                    tally.fault_requests += 1
+                    tally.fault_succeeded += succeeded
+        return tally
+
+    def _observe(self, window_s: float, *, count: bool) -> np.ndarray:
+        """What the agent's clients measured in the window just run; resets the window."""
+        episode = self._episode
+        assert episode is not None
+        agent = episode.agent
+        window = agent.window
+        self._started += window.requests
+        if count:
+            for name in ("requests", "attempts", "ok", "retries", "retry_ok"):
+                setattr(self._agent, name, getattr(self._agent, name) + getattr(window, name))
+
+        attempts = window.attempts
+        latencies = window.latencies
+        if latencies:
+            taken = np.asarray(latencies, dtype=np.float64) / agent.latency_scale
+            latency_mean, latency_p95 = float(taken.mean()), float(np.quantile(taken, 0.95))
+        else:
+            latency_mean = latency_p95 = 0.0
+        share = (lambda n: n / attempts) if attempts else (lambda n: 0.0)
+        expected = agent.agent_rps * window_s  # 0 for a warm-up of no length
+        values = [
+            1.0 if attempts else 0.0,
+            window.requests / (2.0 * expected) if expected > 0 else 0.0,
+            max(0, self._started - self._finished) / agent.in_flight_scale,
+            share(window.ok),
+            share(window.deadline),
+            share(window.queue_full),
+            share(window.server_failure),
+            share(window.other),
+            share(window.retries),
+            window.retry_ok / window.retries if window.retries else 0.0,
+            latency_mean,
+            latency_p95,
+            agent.budget_balance(),
+        ]
+        values += [
+            level / (len(knob.values) - 1)
+            for knob, level in zip(self._knobs, self._levels, strict=True)
+        ]
+        window.reset()
+        # A new array every call, clipped: the declared bounds are the real ones.
+        return np.clip(np.asarray(values, dtype=np.float32), 0.0, 1.0)
+
+    def _step_info(self, tally: _Tally) -> dict[str, Any]:
+        episode = self._episode
+        assert episode is not None
+        info: dict[str, Any] = {
+            "t": ns_to_s(self._now),
+            "requests": tally.requests,
+            "succeeded": tally.succeeded,
+            "attempts": tally.attempts,
+            "agent_in_flight": max(0, self._started - self._finished),
+        }
+        for name, count in tally.failed.items():
+            info[f"failed_{name}"] = count
+        for name, value in self._setting().items():
+            info[f"knob_{name}"] = value
+        # What the agent is NOT shown: the state of the stations.
+        for name, service in episode.services.items():
+            info[f"queue_{name}"] = service.queue_len()
+            info[f"in_flight_{name}"] = service.in_flight
+        return info
+
+    def _finish(self) -> dict[str, float]:
+        """The episode summary. Past the horizon nothing is rewarded any more."""
+        episode = self._episode
+        assert episode is not None
+        if self.drain:
+            for workload in episode.workloads:
+                workload.stop()
+            episode.sim.run()
+            self._tail = self._collect()
+            self._observe(self.step_s, count=True)  # the agent's last attempts
+        total = _Tally()
+        total.add(self._in_horizon)
+        total.add(self._tail)
+        agent = self._agent
+        summary = {
+            "ep_return": self._return,
+            "ep_requests": float(total.requests),
+            "ep_success_rate": _ratio(total.succeeded, total.requests),
+            # The population the rewards were counted on: what finished in time.
+            "ep_horizon_success_rate": _ratio(
+                self._in_horizon.succeeded, self._in_horizon.requests
+            ),
+            "ep_fault_success_rate": _ratio(total.fault_succeeded, total.fault_requests),
+            # Of the agent's clients: attempts per request, and what retrying bought.
+            "ep_amplification": _ratio(agent.attempts, agent.requests),
+            "ep_retry_efficiency": _ratio(agent.retry_ok, agent.retries),
+            "ep_recovery_s": self._recovery_s(),
+        }
+        for name, count in total.failed.items():
+            summary[f"ep_failed_{name}"] = float(count)
+        return summary
+
+    def _recovery_s(self) -> float:
+        """Seconds from the end of the last fault to the first window that is healthy again.
+
+        The first window that begins at or after the fault's end and in which at
+        least `RECOVERED` of the finished requests succeeded; 0 when that is the
+        very next window. `inf` when no window of the episode qualifies, `nan`
+        when the episode has no fault.
+        """
+        if not self._faults:
+            return math.nan
+        fault_end = max(end for _, end in self._faults)
+        for begin, requests, succeeded in self._windows:
+            if begin >= fault_end and requests and succeeded >= RECOVERED * requests:
+                return ns_to_s(begin - fault_end)
+        return math.inf

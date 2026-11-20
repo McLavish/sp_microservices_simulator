@@ -16,6 +16,16 @@ plot = [
 arolla = [
     "pyyaml",
 ]
+# The Gymnasium environment (`msim.rl`): the simulator as a control problem.
+rl = [
+    "gymnasium>=1.0",
+]
+# Training on it (`msim.rl.train`): Stable-Baselines3, which brings PyTorch.
+train = [
+    "gymnasium>=1.0",
+    "stable-baselines3>=2.9",
+    "torch>=2.8",
+]
 
 [dependency-groups]
 dev = [
@@ -28,7 +38,18 @@ dev = [
     "matplotlib",
     "pandas",
     "pyyaml",
+    "gymnasium>=1.0",
 ]
+
+# PyTorch from its CPU-only index: the policies trained here are small MLPs, the
+# simulator is the bottleneck, and the default Linux wheels pull in gigabytes of CUDA.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [build-system]
 requires = ["uv_build>=0.11,<0.12"]
