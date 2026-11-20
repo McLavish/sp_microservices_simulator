@@ -385,6 +385,31 @@ class TestEpisodesThatVary(unittest.TestCase):
         failure = again.services["svc"].cfg.partial_failures[0]
         self.assertEqual(failure.p_fail, self.WIDE.draw(3)["p_fail"])
 
+    def test_the_agent_can_see_the_load_it_was_given(self):
+        """The request rate is measured against the file's rate, not the episode's own.
+
+        Against the episode's own rate every load reads 0.5 and an agent cannot
+        tell a quiet service from a busy one. The reward keeps the episode's
+        rate: it is a share of the requests that came.
+        """
+        seen = {}
+        for load in (0.7, 1.3):
+            scenario = _scenario(
+                TENANTS, ["plain", "untimed"], variation=Variation(load=(load, load))
+            )
+            episode = scenario.build(1)
+            self.assertEqual(episode.agent.agent_rps, 80)
+            self.assertAlmostEqual(episode.expected_rps, load * 80)
+            env = RetryEnv(scenario)
+            env.reset(options={"episode_seed": 1})
+            rates = []
+            for _ in range(4):  # before the failure
+                observation, *_ = env.step(env.action_space.sample())
+                rates.append(float(observation[env.feature_names.index("request_rate")]))
+            seen[load] = sum(rates) / len(rates)
+        self.assertAlmostEqual(seen[0.7], 0.35, delta=0.05)
+        self.assertAlmostEqual(seen[1.3], 0.65, delta=0.05)
+
     def test_the_draws_depend_on_the_seed_alone(self):
         """Not on which ranges are set: pinning one leaves the others where they were."""
         pinned = replace(self.WIDE, p_fail=(0.75, 0.75), load=None)

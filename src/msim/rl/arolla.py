@@ -301,7 +301,10 @@ class ArollaScenario:
                         f"in its policy stack ({type(layer).__name__}: the service's own limiter, "
                         "or a retry allowance); taking the stack over would drop it"
                     )
-        rps = sum(_rps(experiment, name) for name in self.agent)
+        # The rate the FILE gives the agent's clients, not this episode's: it is
+        # what the observation's request rate is measured against, and against
+        # the episode's own rate every load would read the same.
+        rps = sum(_rps(self.experiment, name) for name in self.agent)
         agent = self.grid.install(runtimes, agent_rps=rps)
         for client in built.clients:
             client.workload.drive(built.sim, client.runtime.start_request)
