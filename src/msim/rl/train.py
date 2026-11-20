@@ -25,7 +25,7 @@ import math
 import platform
 import subprocess
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, is_dataclass
 from functools import partial
 from pathlib import Path
@@ -113,6 +113,32 @@ def _summary_logger():
     return LogSummaries()
 
 
+def _snapshots(every: int, folder: Path, sidecar: Callable[[int], str]):
+    """A callback that saves the model every `every` steps, each copy with a sidecar.
+
+    A copy is taken where a rollout starts, so it is the model as the updates on
+    every step counted so far left it; its name carries that count.
+    """
+    from stable_baselines3.common.callbacks import BaseCallback
+
+    class Snapshots(BaseCallback):
+        due = every
+
+        def _on_step(self) -> bool:
+            return True
+
+        def _on_rollout_start(self) -> None:
+            if self.num_timesteps < self.due:
+                return
+            while self.due <= self.num_timesteps:
+                self.due += every
+            path = folder / f"model-{self.num_timesteps}.zip"
+            self.model.save(path)
+            path.with_suffix(".json").write_text(sidecar(self.num_timesteps), "utf-8")
+
+    return Snapshots()
+
+
 def _commit() -> str | None:
     """The commit of the checkout this package runs from, when it is one."""
     try:
@@ -169,13 +195,17 @@ def train(
     device: str = "auto",
     torch_threads: int = 4,
     verbose: int = 1,
+    snapshots: int = 0,
 ) -> dict[str, Any]:
     """Train PPO on the scenario and save `model.zip` and `model.json` in `out`.
 
     `n_steps` (per environment, between two updates) defaults to two episodes
     and `batch_size` to a twelfth of a rollout. `reward_offset` is what the
     learner's reward is shifted down by (`_Offset`); the logs and every
-    evaluation use the environment's own reward. Returns the sidecar.
+    evaluation use the environment's own reward. `snapshots` asks for that
+    many copies of the model on the way, evenly spaced
+    (`snapshots/model-<steps>.zip`, each with a sidecar of its own). Returns
+    the sidecar.
     """
     import stable_baselines3
     import torch
@@ -211,49 +241,65 @@ def train(
         verbose=verbose,
     )
     model.set_logger(configure(str(out), ["stdout", "csv"] if verbose else ["csv"]))
+    commit = _commit()  # of the code that is running: read before a long run, not after
     started = time.monotonic()
+
+    def sidecar(steps: int) -> str:
+        """What a model saved after `steps` steps was trained on, as its file reads."""
+        wall_s = time.monotonic() - started
+        return (
+            json.dumps(
+                {
+                    "scenario": scenario_name,
+                    "scenario_settings": _settings(scenario),
+                    **_describe(probe),
+                    "timesteps_asked": timesteps,
+                    "timesteps_trained": steps,
+                    "episodes_trained": steps // probe.episode_steps,
+                    "wall_s": round(wall_s, 1),
+                    "steps_per_s": round(steps / wall_s, 1),
+                    "ppo": {
+                        "n_envs": n_envs,
+                        "seed": seed,
+                        "n_steps": n_steps,
+                        "batch_size": batch_size,
+                        "n_epochs": n_epochs,
+                        "gamma": gamma,
+                        "gae_lambda": gae_lambda,
+                        "ent_coef": ent_coef,
+                        "learning_rate": learning_rate,
+                        "reward_offset": reward_offset,
+                        "device": str(model.device),
+                    },
+                    "msim_commit": commit,
+                    "versions": {
+                        "python": platform.python_version(),
+                        "gymnasium": gymnasium.__version__,
+                        "stable_baselines3": stable_baselines3.__version__,
+                        "torch": torch.__version__,
+                        "numpy": np.__version__,
+                    },
+                },
+                indent=2,
+                default=str,
+            )
+            + "\n"
+        )
+
+    callbacks = [_summary_logger()]
+    if snapshots > 0:
+        (out / "snapshots").mkdir(exist_ok=True)
+        every = max(1, timesteps // (snapshots + 1))
+        callbacks.append(_snapshots(every, out / "snapshots", sidecar))
     try:
-        model.learn(total_timesteps=timesteps, callback=_summary_logger())
+        model.learn(total_timesteps=timesteps, callback=callbacks)
     finally:
         envs.close()
-    wall_s = time.monotonic() - started
     if model.num_timesteps < timesteps:
         raise RuntimeError(f"asked for {timesteps} steps, trained {model.num_timesteps}")
     model.save(out / "model.zip")
-
-    sidecar = {
-        "scenario": scenario_name,
-        "scenario_settings": _settings(scenario),
-        **_describe(probe),
-        "timesteps_asked": timesteps,
-        "timesteps_trained": int(model.num_timesteps),
-        "episodes_trained": int(model.num_timesteps) // probe.episode_steps,
-        "wall_s": round(wall_s, 1),
-        "steps_per_s": round(model.num_timesteps / wall_s, 1),
-        "ppo": {
-            "n_envs": n_envs,
-            "seed": seed,
-            "n_steps": n_steps,
-            "batch_size": batch_size,
-            "n_epochs": n_epochs,
-            "gamma": gamma,
-            "gae_lambda": gae_lambda,
-            "ent_coef": ent_coef,
-            "learning_rate": learning_rate,
-            "reward_offset": reward_offset,
-            "device": str(model.device),
-        },
-        "msim_commit": _commit(),
-        "versions": {
-            "python": platform.python_version(),
-            "gymnasium": gymnasium.__version__,
-            "stable_baselines3": stable_baselines3.__version__,
-            "torch": torch.__version__,
-            "numpy": np.__version__,
-        },
-    }
-    text = json.dumps(sidecar, indent=2, default=str)
-    (out / "model.json").write_text(text + "\n", "utf-8")
+    text = sidecar(int(model.num_timesteps))
+    (out / "model.json").write_text(text, "utf-8")
     return json.loads(text)  # as it reads back: tuples are lists
 
 
@@ -350,6 +396,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
     parser.add_argument("--jobs", type=int, help="processes for the comparison (default: n-envs)")
     parser.add_argument("--test-seeds", type=int, default=len(evaluate.TEST_SEEDS))
     parser.add_argument("--selection-seeds", type=int, default=len(evaluate.SELECTION_SEEDS))
+    parser.add_argument("--snapshots", type=int, default=0, help="copies of the model on the way")
     parser.add_argument("--no-comparison", action="store_true", help="train and save only")
     args = parser.parse_args(arguments)
 
@@ -370,6 +417,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
         learning_rate=args.learning_rate,
         reward_offset=args.reward_offset,
         device=args.device,
+        snapshots=args.snapshots,
     )
     print(
         f"trained {sidecar['timesteps_trained']} steps ({sidecar['episodes_trained']} episodes) "

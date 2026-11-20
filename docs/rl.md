@@ -257,6 +257,10 @@ training log `progress.csv`, one monitor file per environment, and the
 comparison with the fixed settings on the test episodes (`comparison.csv`,
 `episodes.csv`, `static.csv`). The model compared is the one training ended
 with: no checkpoint is picked on the test episodes.
+`--snapshots n` also keeps `n` copies of the model on the way, evenly spaced
+(`snapshots/model-<steps>.zip`, each with a sidecar of its own, so each is a
+model like the final one). Choosing among them is a choice like any other:
+make it on the selection episodes.
 
 The sidecar says what the model was trained on: the scenario and its settings,
 the knobs with their levels in order, the observation's entries, the step, the

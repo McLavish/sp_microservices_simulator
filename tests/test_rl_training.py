@@ -158,6 +158,30 @@ class TestTraining(unittest.TestCase):
         np.testing.assert_equal(together, alone)
 
 
+class TestSnapshots(unittest.TestCase):
+    def test_copies_on_the_way_each_a_model_of_its_own(self):
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder)
+            final = tr.train(TINY, out, timesteps=500, n_envs=2, seed=3, verbose=0, snapshots=2)
+            # Every 166 steps, taken where the next rollout of 2 x 30 steps starts.
+            copies = sorted(out.glob("snapshots/*.zip"), key=lambda path: len(path.name))
+            self.assertEqual([c.name for c in copies], ["model-180.zip", "model-360.zip"])
+            env = RetryEnv(TINY)
+            for copy, steps in zip(copies, (180, 360), strict=True):
+                sidecar = json.loads(copy.with_suffix(".json").read_text())
+                self.assertEqual(sidecar["timesteps_trained"], steps)
+                self.assertEqual(sidecar["knobs"], final["knobs"])
+                tr.load_policy(copy, env)  # tied to the environment like the final one
+                (episode,) = tr.evaluate_model(copy, [2000], scenario=TINY)
+                self.assertGreater(episode["success_rate"], 0.5)
+            self.assertEqual(final["timesteps_trained"], 540)
+
+    def test_none_unless_asked_for(self):
+        with tempfile.TemporaryDirectory() as folder:
+            tr.train(TINY, Path(folder), timesteps=100, n_envs=2, seed=3, verbose=0)
+            self.assertFalse((Path(folder) / "snapshots").exists())
+
+
 class TestTheCommandLine(unittest.TestCase):
     def test_it_trains_compares_and_writes_everything(self):
         with (
