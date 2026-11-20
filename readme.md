@@ -5,9 +5,6 @@ models queues, retries, timeouts, partial failures, latency injection, and load
 spikes across single services, chains, and fan-outs, and exports per-second CSV
 metrics and fault-event JSON for plotting.
 
-A reinforcement-learning layer that built on the simulator (Gymnasium env, learned
-retry policies, PPO training) lives on the `rl-layer` branch, not here.
-
 - **Services** — M/G/c/K queues with lognormal service times (one per service, or
   one per handler over a shared station), bounded queues served first-come, newest-first
   or at random, and configurable workers.
@@ -27,6 +24,11 @@ retry policies, PPO training) lives on the `rl-layer` branch, not here.
 - **Other formats** — `msim.compat.arolla` reads the YAML scenarios of
   [Arolla](https://github.com/eth-easl/Arolla)'s simulator and builds them here
   (`docs/compat-arolla.md`).
+- **Reinforcement learning** — `msim.rl` is a [Gymnasium](https://gymnasium.farama.org)
+  environment in which an agent re-tunes the retry policy of some clients, window
+  by window, while a simulation runs; with scenarios whose best fixed policy
+  depends on the fault, a search over the fixed policies to compare against, and
+  PPO training on simulations run side by side (`docs/rl.md`).
 
 ## Requirements
 
@@ -47,9 +49,12 @@ make install        # uv sync --group dev + install the git pre-commit hook
 ```
 
 The simulator core depends only on `numpy`; the `plot` extra adds the `scipy` /
-`matplotlib` / `pandas` used by plotting and CSV export, and the `arolla` extra the
-PyYAML that `msim.compat.arolla` reads scenario files with. The dev group adds `ruff`,
-`ty`, `pytest` and those same libraries.
+`matplotlib` / `pandas` used by plotting and CSV export, the `arolla` extra the
+PyYAML that `msim.compat.arolla` reads scenario files with, and the `rl` extra the
+Gymnasium that `msim.rl` is written against. The dev group adds `ruff`, `ty`, `pytest`
+and those same libraries. Training (`msim.rl.train`) needs the `train` extra on top:
+Stable-Baselines3 and a CPU build of PyTorch, about 1 GB
+(`uv sync --group dev --extra train`).
 
 ## Quickstart
 

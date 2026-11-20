@@ -155,6 +155,8 @@ src/msim/       the installable library package (import as `msim.<module>`)
   metrics         aggregation + CSV export
   plotting/       render CSV + fault JSON to PNG   (deps: the `plot` extra)
   compat/arolla/  read and build Arolla's YAML scenarios   (deps: the `arolla` extra)
+  rl/             the simulator as a Gymnasium environment, scenarios, evaluation, PPO
+                  training   (deps: the `rl` extra; `train` for training)
 
 examples/       runnable demo scenarios (not in the package)   --> CSV + fault JSON
 ```
@@ -182,3 +184,5 @@ sim.run()
 - [request-handling](request-handling.md) — clients, retries, timeouts, and chains.
 - [observability](observability.md) — metrics, CSV export, and plotting.
 - [examples](examples.md) — runnable example scenarios.
+- [rl](rl.md) — the simulator as a Gymnasium environment: an agent that re-tunes
+  retry policies while a simulation runs.
