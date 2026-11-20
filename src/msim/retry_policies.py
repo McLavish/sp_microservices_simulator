@@ -5,7 +5,7 @@ from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from fractions import Fraction
-from typing import NamedTuple, Protocol, runtime_checkable
+from typing import Any, NamedTuple
 
 from msim.core import DropReason, TimeDuration, TimePoint
 
@@ -73,22 +73,25 @@ class RetryPolicy:
         return
 
 
-@runtime_checkable
-class _SupportsUnderlying(Protocol):
-    underlying_strategy: RetryPolicy
-
-
-@runtime_checkable
-class _SupportsBranches(Protocol):
-    def sub_policies(self, context: RetryContext | None = None) -> tuple[RetryPolicy, ...]: ...
+#: "No such attribute", as distinct from an attribute that is there and holds None.
+_MISSING: Any = object()
 
 
 def _wrapped(policy: RetryPolicy, context: RetryContext | None) -> tuple[RetryPolicy, ...]:
-    if isinstance(policy, _SupportsBranches):
-        return tuple(policy.sub_policies(context))
-    if isinstance(policy, _SupportsUnderlying):
-        return (policy.underlying_strategy,)
-    return ()
+    """The policies directly inside `policy`: its branches, the one it wraps, or none.
+
+    A policy that chooses between several implements `sub_policies(context)`; one
+    that wraps another exposes it as `underlying_strategy`. Both are read as plain
+    attributes, on purpose: this runs for every layer of every walk, three walks
+    per request, and the `isinstance` checks against runtime-checkable Protocols
+    that stood here searched the object and its classes in Python on every call,
+    which was more than half of a run's time.
+    """
+    branches = getattr(policy, "sub_policies", None)
+    if branches is not None:
+        return tuple(branches(context))
+    inner = getattr(policy, "underlying_strategy", _MISSING)
+    return () if inner is _MISSING else (inner,)
 
 
 def policy_layers(

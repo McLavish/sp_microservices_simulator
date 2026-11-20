@@ -1,7 +1,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Protocol, runtime_checkable
+from typing import Protocol
 
 from msim.core import (
     DropReason,
@@ -16,11 +16,6 @@ from msim.retry_policies import RetryContext, RetryPolicy, policy_layers
 from msim.service import AttemptControl, AttemptDoneCallback, ServiceConfig
 from msim.simulator import Event, Simulator
 from msim.timeout_controllers import TimeoutController
-
-
-@runtime_checkable
-class _SupportsAddResult(Protocol):
-    def add_result(self, success: bool, now: TimePoint) -> None: ...
 
 
 class ServiceLike(Protocol):
@@ -90,8 +85,11 @@ class ClientRuntime:
     def _update_policy_results(self, policy: RetryPolicy, success: bool, now: TimePoint) -> None:
         """Record an attempt outcome on every layer that tracks results."""
         for layer in policy_layers(policy):
-            if isinstance(layer, _SupportsAddResult):
-                layer.add_result(success, now)
+            # A plain attribute lookup, not an `isinstance` against a Protocol:
+            # this runs for every layer on every attempt (see `policy_layers`).
+            add_result = getattr(layer, "add_result", None)
+            if add_result is not None:
+                add_result(success, now)
 
     def _notify_request_start(self, policy: RetryPolicy, now: TimePoint) -> None:
         """Announce an admitted root request to every layer of the policy chain."""
