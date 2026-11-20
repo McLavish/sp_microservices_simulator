@@ -59,6 +59,27 @@ class TestWithStableBaselines(unittest.TestCase):
         finally:
             envs.close()
 
+    def test_the_learner_can_be_paid_the_reward_minus_a_constant(self):
+        """What it is given moves; what the environment paid, and what is logged, does not."""
+        paid = {}
+        for offset in (0.0, 1.0):
+            envs = tr.make_envs(TINY, n_envs=1, seed=5, reward_offset=offset)
+            try:
+                envs.reset()
+                given, info = [], {}
+                for _ in range(15):
+                    _, rewards, _, infos = envs.step(np.array([[1, 1]]))
+                    given.append(float(rewards[0]))
+                    info = infos[0]
+                paid[offset] = (given, info["episode"]["r"], info["ep_return"])
+            finally:
+                envs.close()
+        plain, shifted = paid[0.0], paid[1.0]
+        np.testing.assert_allclose(shifted[0], [r - 1.0 for r in plain[0]], atol=1e-6)
+        self.assertEqual(shifted[1:], plain[1:])  # the monitor's return and the summary's
+        self.assertAlmostEqual(plain[1], sum(plain[0]), places=4)
+        self.assertLess(abs(sum(shifted[0])), 4.0)  # about zero when most windows are healthy
+
 
 class TestTraining(unittest.TestCase):
     @classmethod
@@ -76,6 +97,7 @@ class TestTraining(unittest.TestCase):
         self.assertEqual(self.sidecar["timesteps_trained"], 540)  # whole rollouts of 2 x 30 steps
         self.assertEqual(self.sidecar["episodes_trained"], 36)
         self.assertEqual(self.sidecar["ppo"]["n_steps"], 30)  # two episodes
+        self.assertEqual(self.sidecar["ppo"]["reward_offset"], 1.0)
         self.assertTrue((self.out / "model.zip").exists())
         self.assertEqual(json.loads((self.out / "model.json").read_text()), self.sidecar)
 

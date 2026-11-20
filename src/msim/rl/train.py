@@ -27,9 +27,11 @@ import subprocess
 import time
 from collections.abc import Sequence
 from dataclasses import asdict, is_dataclass
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, SupportsFloat
 
+import gymnasium
 import numpy as np
 
 from msim.rl import evaluate
@@ -41,14 +43,41 @@ from msim.rl.scenario import Scenario
 LOGGED = ("ep_success_rate", "ep_fault_success_rate", "ep_amplification")
 
 
+class _Offset(gymnasium.RewardWrapper):
+    """What the learner is paid: the environment's reward minus a constant.
+
+    The environment pays about 1 for every healthy window, and an episode is
+    cut at its horizon, not ended, so the learner bootstraps over the cut: the
+    value of a healthy state is then about `1 / (1 - gamma)`, a hundred at the
+    usual discount, and the value function spends the first part of training
+    climbing there while the advantages it yields are mostly its own error.
+    With 1 taken off, a healthy window pays 0 and only what a fault costs is
+    left to learn. All episodes of a scenario have the same number of steps,
+    so the constant changes no comparison between two policies.
+    """
+
+    def __init__(self, env: gymnasium.Env, offset: float) -> None:
+        super().__init__(env)
+        self.offset = offset
+
+    def reward(self, reward: SupportsFloat) -> float:
+        return float(reward) - self.offset
+
+
 def make_envs(
-    scenario: Scenario, n_envs: int, seed: int, monitor_dir: Path | None = None, **env: Any
+    scenario: Scenario,
+    n_envs: int,
+    seed: int,
+    monitor_dir: Path | None = None,
+    reward_offset: float = 0.0,
+    **env: Any,
 ):
     """`n_envs` environments on the scenario, each in its own process when there are several.
 
     Environment `i` is seeded with `seed + i` at its first reset and draws
     every later episode from its own generator, so no two of them see the same
-    episodes.
+    episodes. `reward_offset` is taken off every reward the learner is given
+    (`_Offset`); what is logged per episode stays the environment's own return.
     """
     from stable_baselines3.common.env_util import make_vec_env
     from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
@@ -61,6 +90,8 @@ def make_envs(
         vec_env_cls=SubprocVecEnv if n_envs > 1 else DummyVecEnv,
         monitor_dir=None if monitor_dir is None else str(monitor_dir),
         monitor_kwargs={"info_keywords": LOGGED},
+        # Outside the monitor, which therefore records what the environment paid.
+        wrapper_class=partial(_Offset, offset=reward_offset) if reward_offset else None,
     )
 
 
@@ -134,15 +165,18 @@ def train(
     gae_lambda: float = 0.95,
     ent_coef: float = 0.01,
     learning_rate: float = 3e-4,
+    reward_offset: float = 1.0,
+    device: str = "auto",
     torch_threads: int = 4,
     verbose: int = 1,
 ) -> dict[str, Any]:
     """Train PPO on the scenario and save `model.zip` and `model.json` in `out`.
 
     `n_steps` (per environment, between two updates) defaults to two episodes
-    and `batch_size` to a twelfth of a rollout. Returns the sidecar.
+    and `batch_size` to a twelfth of a rollout. `reward_offset` is what the
+    learner's reward is shifted down by (`_Offset`); the logs and every
+    evaluation use the environment's own reward. Returns the sidecar.
     """
-    import gymnasium
     import stable_baselines3
     import torch
     from stable_baselines3 import PPO
@@ -154,7 +188,14 @@ def train(
     n_steps = n_steps or 2 * probe.episode_steps
     batch_size = batch_size or max(32, n_steps * n_envs // 12)
 
-    envs = make_envs(scenario, n_envs, seed, monitor_dir=out / "monitor", step_s=step_s)
+    envs = make_envs(
+        scenario,
+        n_envs,
+        seed,
+        monitor_dir=out / "monitor",
+        reward_offset=reward_offset,
+        step_s=step_s,
+    )
     model = PPO(
         "MlpPolicy",
         envs,
@@ -166,7 +207,7 @@ def train(
         ent_coef=ent_coef,
         learning_rate=learning_rate,
         seed=seed,
-        device="cpu",
+        device=device,
         verbose=verbose,
     )
     model.set_logger(configure(str(out), ["stdout", "csv"] if verbose else ["csv"]))
@@ -199,6 +240,8 @@ def train(
             "gae_lambda": gae_lambda,
             "ent_coef": ent_coef,
             "learning_rate": learning_rate,
+            "reward_offset": reward_offset,
+            "device": str(model.device),
         },
         "msim_commit": _commit(),
         "versions": {
@@ -290,8 +333,20 @@ def main(arguments: Sequence[str] | None = None) -> None:
     parser.add_argument("--n-steps", type=int, help="steps per environment between updates")
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--ent-coef", type=float, default=0.01)
+    parser.add_argument(
+        "--reward-offset",
+        type=float,
+        default=1.0,
+        help="taken off the reward the learner is given (a healthy window pays about 1)",
+    )
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="where the learner runs: cpu, cuda, or auto (cuda when this PyTorch build has it)",
+    )
     parser.add_argument("--jobs", type=int, help="processes for the comparison (default: n-envs)")
     parser.add_argument("--test-seeds", type=int, default=len(evaluate.TEST_SEEDS))
     parser.add_argument("--selection-seeds", type=int, default=len(evaluate.SELECTION_SEEDS))
@@ -310,8 +365,11 @@ def main(arguments: Sequence[str] | None = None) -> None:
         n_steps=args.n_steps,
         batch_size=args.batch_size,
         gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
         ent_coef=args.ent_coef,
         learning_rate=args.learning_rate,
+        reward_offset=args.reward_offset,
+        device=args.device,
     )
     print(
         f"trained {sidecar['timesteps_trained']} steps ({sidecar['episodes_trained']} episodes) "
