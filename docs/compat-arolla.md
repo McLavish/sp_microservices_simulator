@@ -81,13 +81,16 @@ identical arrivals and stay paired.
 **Run controls.** `build(experiment, seed=, arrivals=, duration_s=)` replaces
 the simulator seed, the base of every arrival stream, and cuts every workload
 short. `Scenario.run()` drives the workloads to the end and lets the system
-drain.
+drain. `Scenario.admission_counts(client)` is what the limiter of the service a
+client calls counted of its calls -- the retries it sent and how many were let
+in -- wherever the mapping put the door.
 
 ## Intended behaviour, not their bugs
 
 The mapping reproduces what their simulator is meant to do. Where its code does
 something else, the intent is kept here. The same defects are fixed on a branch
 of their repository, which is what msim is compared against (below).
+
 | Their code | Here |
 | --- | --- |
 | a dependency call completes on the dependency's first attempt, and again on each later one | once, when the dependency has finished retrying |

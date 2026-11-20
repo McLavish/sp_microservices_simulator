@@ -167,6 +167,24 @@ class Scenario:
     def group(self, name: str) -> list[ImportedClient]:
         return [client for client in self.clients if client.group == name]
 
+    def admission_counts(self, client: ImportedClient) -> AdmissionCounts | None:
+        """What the limiter of the service a client calls counted of its calls.
+
+        The retries the client sent and how many were let in, wherever the
+        mapping put the door: the gate in front of a plain service, or the
+        service's own loop where it has one. `None` when the service has no
+        limiter. A relay's counts are empty: its retries are the service's own,
+        gated inside the loop and never put to the limiter on arrival.
+        """
+        if client.target not in self.controllers:
+            return None
+        door: object = client.runtime.service
+        if isinstance(door, RetryLayer):
+            door = door.client  # the service's own loop, which admits each call
+        if isinstance(door, AdmissionGate | AdmittingLoop):
+            return door.counts.get(client.name) or AdmissionCounts()
+        return AdmissionCounts()
+
 
 def arrival_seed(rng_seed: int | None, position: int = 0, replica: int = 0) -> int | None:
     """Seed of one client's arrival stream (the rule of Arolla's builder).

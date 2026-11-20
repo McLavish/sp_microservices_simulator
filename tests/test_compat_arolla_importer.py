@@ -323,6 +323,10 @@ class TestTheRelayClient(unittest.TestCase):
         self.assertGreater(summary.attempts_total, summary.total)  # the service's retries
         self.assertEqual(summary.dropped_rejected, 0)  # its retries stop; none is turned away
         self.assertEqual(self.scenario.stations["svc"].in_flight, 0)
+        # ... and none arrived at a door: the limiter gated them inside the loop.
+        counts = self.scenario.admission_counts(self.client)
+        assert counts is not None
+        self.assertEqual((counts.retries_asked, counts.retries_admitted), (0, 0))
 
 
 class TestClientsWithTheirOwnPolicy(unittest.TestCase):
@@ -426,6 +430,9 @@ class TestClientsWithTheirOwnPolicy(unittest.TestCase):
         (timer,) = self.scenario.group("timer")
         reasons = {a.drop_reason for root in timer.runtime.roots for a in root.attempts}
         self.assertIn(DropReason.REJECTED, reasons)
+        self.assertIs(self.scenario.admission_counts(timer), gate.counts["timer"])
+        # A service without a limiter counts nothing for anybody.
+        self.assertIsNone(self.scenario.admission_counts(self.scenario.group("breaker")[0]))
 
 
 class TestServiceLimiters(unittest.TestCase):
@@ -957,6 +964,8 @@ class TestAdmissionWhereTheServiceRunsALoop(unittest.TestCase):
         self.assertEqual(
             (loop.counts["timer"].retries_asked, loop.counts["timer"].rejected), (3, 3)
         )
+        # The scenario answers for the client wherever its door is.
+        self.assertIs(scenario.admission_counts(timer), loop.counts["timer"])
 
 
 class TestAClientWithATimerAndNoPolicy(unittest.TestCase):

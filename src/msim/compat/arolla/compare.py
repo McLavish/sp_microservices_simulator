@@ -141,13 +141,9 @@ def run_msim(config: dict[str, Any], seed: int, duration_s: float | None) -> Mea
                 continue
             ok = classify_root(root) is RootOutcome.SUCCESS
             group.add(root_started_at(root), ok, len(root.attempts), root_latency(root))
-        gate = scenario.gates.get(client.target)
-        if gate is not None:
-            counts = gate.counts.get(client.name)
-            if counts is not None:
-                group.admission(counts.retries_asked, counts.retries_admitted)
-            else:
-                group.admission(0, 0)
+        counts = scenario.admission_counts(client)
+        if counts is not None:
+            group.admission(counts.retries_asked, counts.retries_admitted)
     return {name: group.measures() for name, group in groups.items()}
 
 
