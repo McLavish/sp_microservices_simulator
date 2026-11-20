@@ -14,16 +14,20 @@ clients themselves measure. Is the service better off than with the tenants
 as their files have them behind Arolla's limiter? And is that the agent's
 doing, or would any sensible fixed client setting do as well?
 
-    python -m examples.rl_vs_arolla static  --arolla ~/Arolla --out study --jobs 48
-    python -m examples.rl_vs_arolla train   --arolla ~/Arolla --out study/runs/a-100 --seed 100
-    python -m examples.rl_vs_arolla compare --arolla ~/Arolla --out study --jobs 48
+    python -m examples.rl_vs_arolla static   --arolla ~/Arolla --out study --jobs 48
+    python -m examples.rl_vs_arolla informed --arolla ~/Arolla --out study --jobs 48
+    python -m examples.rl_vs_arolla train    --arolla ~/Arolla --out study/runs/a-100 --seed 100
+    python -m examples.rl_vs_arolla compare  --arolla ~/Arolla --out study --jobs 48
 
 Training episodes vary the failure the way Arolla's paper varies it in its
 evaluation (failure rate, how long it lasts, offered load); the comparison is
 made on their file as it is, on that distribution, and along each axis.
 Everything is paired: for a seed, every row faces the same failure and the
-same arrivals. The fixed setting is chosen on other episodes than it is
-reported on, and so is the trained run when there are several.
+same arrivals. Whatever is chosen is chosen on other episodes than it is
+reported on: the fixed setting, the trained model among the runs and their
+snapshots, and the `alpha` of the row that gives their limiter its best value.
+`informed` adds a yardstick that is no contender: per condition, the fixed
+setting that is best for that condition alone.
 
 Needs the `train` and `arolla` extras and a checkout of their repository.
 """
@@ -44,8 +48,14 @@ from msim.rl.env import RetryEnv
 TENANTS = ("three_retries", "exponential_backoff_jitter", "circuit_breaker", "retry_budget")
 #: Their server-side policies, by file.
 SERVER_POLICIES = ("none", "cb", "rb", "aimd", "arolla")
-#: The row everything is measured against.
+#: The row everything is measured against: their limiter as their file sets it.
 REFERENCE = "their clients, arolla"
+#: And their limiter at its best: `alpha`, the share of the goodput it admits as
+#: retries, over the values their own `sensitivity/sensitivity-arolla.yaml` tries.
+TUNED = "their clients, arolla tuned"
+ALPHAS = (0.01, 0.05, 0.1, 0.2, 0.5)
+#: The yardstick: per condition, the fixed client setting best for it alone.
+INFORMED = "fixed, told the fault"
 
 #: What a training episode draws. Their file is the middle of it: half the calls
 #: failing from 20 s for 20 s, at the file's load.
@@ -93,8 +103,8 @@ def situation(arolla: Path, variation: Variation | None) -> ArollaScenario:
 def _episodes(task: tuple[str, Any, Path, Variation, tuple[int, ...]]) -> list[dict[str, float]]:
     """One row of one condition: a trained model, a fixed setting, or their file as written."""
     kind, what, arolla, variation, seeds = task
-    if kind == "written":
-        path = folder(arolla) / f"policy-{what}.yaml"
+    if kind == "written":  # one of their files by its policy's name, or a file of ours
+        path = what if isinstance(what, Path) else folder(arolla) / f"policy-{what}.yaml"
         return as_written(path, seeds, variation=variation)
     scenario = situation(arolla, variation)
     if kind == "model":
@@ -102,6 +112,30 @@ def _episodes(task: tuple[str, Any, Path, Variation, tuple[int, ...]]) -> list[d
 
         return evaluate_model(what, seeds, scenario=scenario)
     return evaluate.rollout(RetryEnv(scenario), evaluate.constant(what), seeds)
+
+
+def _success(episodes: Sequence[dict[str, float]]) -> float:
+    """What choices are made on: the share of all requests that succeeded, in percent."""
+    return 100.0 * evaluate.mean(episodes, "success_rate")
+
+
+def _name(out: Path, model: Path) -> str:
+    """A model by its run, and by its steps when it is a copy taken on the way."""
+    run, *rest = model.relative_to(out / "runs").parts
+    return run if len(rest) == 1 else f"{run}@{model.stem.removeprefix('model-')}"
+
+
+def with_alpha(arolla: Path, out: Path) -> dict[float, Path]:
+    """Their `policy-arolla.yaml` once per value of `alpha`, written under `out`."""
+    text = (folder(arolla) / "policy-arolla.yaml").read_text("utf-8")
+    if text.count("alpha: 0.1\n") != 1:
+        raise ValueError("policy-arolla.yaml no longer sets `alpha: 0.1` exactly once")
+    (out / "alpha").mkdir(parents=True, exist_ok=True)
+    files = {}
+    for alpha in ALPHAS:
+        files[alpha] = out / "alpha" / f"policy-arolla-alpha-{alpha:g}.yaml"
+        files[alpha].write_text(text.replace("alpha: 0.1\n", f"alpha: {alpha:g}\n"), "utf-8")
+    return files
 
 
 def static(args: argparse.Namespace) -> None:
@@ -123,6 +157,30 @@ def static(args: argparse.Namespace) -> None:
         print({k: (round(v, 4) if isinstance(v, float) else v) for k, v in row.items()})
 
 
+def informed(args: argparse.Namespace) -> None:
+    """The best fixed client setting for each condition by itself.
+
+    What a client could do with ONE setting had it been told the failure and
+    the load in advance. Nobody is told, so this is a yardstick and not a
+    contender: an agent that adapts well should come close to it everywhere,
+    and the one setting chosen for the whole distribution cannot.
+    """
+    best = {}
+    for name, variation in conditions().items():
+        scenario = situation(args.arolla, variation)
+        first = evaluate.static_search(scenario, args.selection, jobs=args.jobs)[0]
+        best[name] = {
+            "action": list(first.action),
+            **first.setting,
+            **{m: evaluate.mean(first.episodes, m) for m in evaluate.METRICS},
+        }
+        print(
+            name, {k: (round(v, 4) if isinstance(v, float) else v) for k, v in best[name].items()}
+        )
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "informed.json").write_text(json.dumps(best, indent=1) + "\n", "utf-8")
+
+
 def train(args: argparse.Namespace) -> None:
     """One PPO run on the training distribution."""
     from msim.rl.train import train as train_ppo
@@ -139,6 +197,7 @@ def train(args: argparse.Namespace) -> None:
         ent_coef=args.ent_coef,
         learning_rate=args.learning_rate,
         torch_threads=2,
+        snapshots=args.snapshots,
     )
     print(
         f"trained {sidecar['timesteps_trained']} steps in {sidecar['wall_s']} s "
@@ -152,14 +211,16 @@ def compare(args: argparse.Namespace) -> None:
     best_static = tuple(json.loads((out / "static.json").read_text("utf-8"))[0]["action"])
     env = RetryEnv(situation(arolla, None))
     models = sorted(path for path in (out / "runs").glob("*/model.zip"))
+    # Copies taken on the way are candidates like the final models.
+    candidates = models + sorted((out / "runs").glob("*/snapshots/model-*.zip"))
 
-    # Which trained run to report: the best on the SELECTION episodes of the
+    # Which trained model to report: the best on the SELECTION episodes of the
     # training distribution. The test episodes play no part in the choice.
-    tasks = [("model", model, arolla, TRAINING, args.selection) for model in models]
-    scores = [evaluate.mean(e, "return") for e in evaluate.in_parallel(_episodes, tasks, args.jobs)]
-    ranked = sorted(zip(scores, models, strict=True), reverse=True)
+    tasks = [("model", model, arolla, TRAINING, args.selection) for model in candidates]
+    scores = [_success(e) for e in evaluate.in_parallel(_episodes, tasks, args.jobs)]
+    ranked = sorted(zip(scores, candidates, strict=True), reverse=True)
     for score, model in ranked:
-        print(f"selection return {score:7.3f}  {model.parent.name}")
+        print(f"selection success {score:6.2f}%  {_name(out, model)}")
     chosen = ranked[0][1]
 
     rows: dict[str, tuple[str, Any]] = {"ppo": ("model", chosen)}
@@ -170,15 +231,62 @@ def compare(args: argparse.Namespace) -> None:
     for policy in SERVER_POLICIES:
         rows[f"their clients, {policy}"] = ("written", policy)
 
+    # Their limiter at its best, chosen the way our rows are: on the selection
+    # episodes of the training distribution.
+    files = with_alpha(arolla, out)
+    tasks = [("written", path, arolla, TRAINING, args.selection) for path in files.values()]
+    scores = [_success(e) for e in evaluate.in_parallel(_episodes, tasks, args.jobs)]
+    by_alpha = dict(zip(files, scores, strict=True))
+    for alpha, score in by_alpha.items():
+        print(f"selection success {score:6.2f}%  their clients, arolla with alpha = {alpha:g}")
+    best_alpha = max(by_alpha, key=lambda alpha: by_alpha[alpha])
+    rows[TUNED] = ("written", files[best_alpha])
+
+    # The yardstick, when `informed` has been run: per condition, the fixed
+    # setting that is best for that condition alone.
+    told = out / "informed.json"
+    per_condition = json.loads(told.read_text("utf-8")) if told.exists() else {}
+
+    def rows_of(name: str) -> dict[str, tuple[str, Any]]:
+        if name not in per_condition:
+            return rows
+        return rows | {INFORMED: ("constant", tuple(per_condition[name]["action"]))}
+
     where = conditions()
-    tasks = [(k, w, arolla, v, args.test) for v in where.values() for k, w in rows.values()]
+    tasks = [
+        (k, w, arolla, v, args.test) for name, v in where.items() for k, w in rows_of(name).values()
+    ]
     done = iter(evaluate.in_parallel(_episodes, tasks, args.jobs))
     results: dict[str, list[dict[str, Any]]] = {}
+    against_tuned: dict[str, dict[str, float]] = {}
     for name in where:
-        runs = {row: next(done) for row in rows}
+        runs = {row: next(done) for row in rows_of(name)}
         results[name] = evaluate.compare(runs, reference=REFERENCE)
+        tuned = {row["policy"]: row for row in evaluate.compare(runs, reference=TUNED)}
+        against_tuned[name] = {
+            row: tuned[row]["vs_reference"] for row in ("ppo", "best fixed setting")
+        } | {"ppo_se": tuned["ppo"]["vs_reference_se"]}
         print(f"\n== {name}")
         print(evaluate.table(results[name], reference=REFERENCE))
+
+    print(f"\nsuccess of all requests, %; alpha = {best_alpha:g} for the tuned limiter")
+    header = ("ppo", "best fixed setting", INFORMED, "no retries", REFERENCE, TUNED)
+    header += ("their clients, none",)
+    print(
+        f"{'':24s}"
+        + "".join(f"{h.replace('their clients, ', ''):>20s}" for h in header)
+        + f"{'ppo - arolla':>18s}{'ppo - tuned':>18s}"
+    )
+    for name, table in results.items():
+        by_row = {row["policy"]: row for row in table}
+        gap, tuned_gap = by_row["ppo"], against_tuned[name]
+        cells = [by_row[h]["success_rate"] if h in by_row else math.nan for h in header]
+        print(
+            f"{name:24s}"
+            + "".join(f"{100 * cell:20.2f}" for cell in cells)
+            + f"{100 * gap['vs_reference']:11.2f} ± {100 * gap['vs_reference_se']:4.2f}"
+            + f"{100 * tuned_gap['ppo']:11.2f} ± {100 * tuned_gap['ppo_se']:4.2f}"
+        )
 
     # How much rides on the run that was chosen: every run, on their file and
     # on the training distribution.
@@ -200,9 +308,14 @@ def compare(args: argparse.Namespace) -> None:
         return None if isinstance(value, float) and not math.isfinite(value) else value
 
     summary = {
-        "chosen": chosen.parent.name,
-        "selection": {model.parent.name: score for score, model in ranked},
+        "chosen": _name(out, chosen),
+        "selection": {_name(out, model): score for score, model in ranked},
         "best_fixed_setting": env.setting(best_static),
+        "arolla_alpha": {
+            "selection": {f"{a:g}": s for a, s in by_alpha.items()},
+            "best": best_alpha,
+        },
+        "against_tuned": against_tuned,
         "conditions": {
             name: [{k: plain(v) for k, v in row.items()} for row in table]
             for name, table in results.items()
@@ -214,7 +327,7 @@ def compare(args: argparse.Namespace) -> None:
 
 def main(arguments: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="A learned client retry policy against Arolla.")
-    parser.add_argument("command", choices=("static", "train", "compare"))
+    parser.add_argument("command", choices=("static", "informed", "train", "compare"))
     parser.add_argument("--arolla", type=Path, required=True, help="a checkout of their repository")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--jobs", type=int, default=1)
@@ -226,6 +339,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
     parser.add_argument("--gae-lambda", type=float, default=0.9)
     parser.add_argument("--ent-coef", type=float, default=0.01)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--snapshots", type=int, default=0, help="copies on the way")
     parser.add_argument(
         "--selection-seeds", type=int, default=32, help="episodes choices are made on"
     )
@@ -235,7 +349,8 @@ def main(arguments: Sequence[str] | None = None) -> None:
     args = parser.parse_args(arguments)
     args.selection = tuple(range(1_000, 1_000 + args.selection_seeds))
     args.test = tuple(range(2_000, 2_000 + args.test_seeds))
-    {"static": static, "train": train, "compare": compare}[args.command](args)
+    commands = {"static": static, "informed": informed, "train": train, "compare": compare}
+    commands[args.command](args)
 
 
 if __name__ == "__main__":
