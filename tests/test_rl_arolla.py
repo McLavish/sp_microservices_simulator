@@ -19,7 +19,7 @@ from msim.admission import AdmissionGate
 from msim.compat.arolla import UnsupportedScenario, build, parse
 from msim.retry_policies import FixedBackoffRetryPolicy, RetryBudgetPolicy, policy_layers
 from msim.rl import RetryEnv, RetryGrid, evaluate
-from msim.rl.arolla import ArollaScenario, agent_part, as_written, file_grid
+from msim.rl.arolla import ArollaScenario, Variation, agent_part, as_written, file_grid
 
 #: The shape of their post-mortem files: one arm per service, the same fault on each.
 ARMS = """
@@ -361,6 +361,84 @@ class TestTheFileAsItIsWritten(unittest.TestCase):
         self.assertEqual(entry["amplification"], 1.0)  # the client that enters does not retry
         self.assertGreater(loops["amplification"], 1.1)  # the services behind it do
         self.assertEqual(loops["success_rate"], entry["success_rate"])
+
+
+class TestEpisodesThatVary(unittest.TestCase):
+    """`Variation`: a file's failure and load drawn per episode, the same for whoever runs it."""
+
+    WIDE = Variation(p_fail=(0.1, 0.9), onset_s=(6.0, 9.0), length_s=(3.0, 8.0), load=(0.7, 1.3))
+
+    def test_each_episode_draws_its_own_and_a_seed_draws_the_same_again(self):
+        scenario = _scenario(TENANTS, ["plain", "untimed"], variation=self.WIDE)
+        episodes = [scenario.build(seed) for seed in range(12)]
+        (start, end), spike = episodes[3].fault_windows  # the failure, then the file's own spike
+        self.assertEqual(spike, (15, 17))
+        self.assertTrue(6.0 <= start <= 9.0 and 3.0 <= end - start <= 8.0)
+        self.assertEqual(len({tuple(e.fault_windows) for e in episodes}), 12)
+        rates = [e.expected_rps for e in episodes]
+        self.assertTrue(all(0.7 * 80 <= rps <= 1.3 * 80 for rps in rates))
+        self.assertGreater(max(rates) - min(rates), 20)
+        again = scenario.build(3)
+        self.assertEqual(
+            (again.fault_windows, again.expected_rps), (episodes[3].fault_windows, rates[3])
+        )
+        failure = again.services["svc"].cfg.partial_failures[0]
+        self.assertEqual(failure.p_fail, self.WIDE.draw(3)["p_fail"])
+
+    def test_the_draws_depend_on_the_seed_alone(self):
+        """Not on which ranges are set: pinning one leaves the others where they were."""
+        pinned = replace(self.WIDE, p_fail=(0.75, 0.75), load=None)
+        for seed in range(5):
+            wide, narrow = self.WIDE.draw(seed), pinned.draw(seed)
+            self.assertEqual(narrow["p_fail"], 0.75)
+            self.assertNotIn("load", narrow)
+            self.assertEqual(
+                (narrow["onset_s"], narrow["length_s"]), (wide["onset_s"], wide["length_s"])
+            )
+
+    def test_their_file_and_the_agents_get_the_same_failure_and_load(self):
+        """Two files that differ in the limiter only: what `as_written` is compared on."""
+        limited = parse(yaml.safe_load(TENANTS))
+        unlimited = parse(
+            yaml.safe_load(TENANTS.replace("    arolla_retry_budget: {alpha: 0.1}\n", ""))
+        )
+        for seed in (1, 2):
+            a, b = self.WIDE.apply(limited, seed), self.WIDE.apply(unlimited, seed)
+            self.assertEqual(a.services[0].partial_failures, b.services[0].partial_failures)
+            self.assertEqual([c.workload for c in a.clients], [c.workload for c in b.clients])
+            self.assertNotEqual(
+                a.services[0].partial_failures, limited.services[0].partial_failures
+            )
+
+    def test_the_file_as_written_varies_the_same_way(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "scenario.yaml"
+            path.write_text(TENANTS, encoding="utf-8")
+            plain = as_written(path, [1, 2])
+            varied = as_written(path, [1, 2], variation=self.WIDE)
+            harsh = as_written(path, [1, 2], variation=replace(self.WIDE, p_fail=(0.9, 0.9)))
+            # A variation that says what the file says changes nothing.
+            same = Variation(
+                p_fail=(0.5, 0.5), onset_s=(8.0, 8.0), length_s=(6.0, 6.0), load=(1.0, 1.0)
+            )
+            np.testing.assert_equal(as_written(path, [1, 2], variation=same), plain)
+        self.assertNotEqual(varied[0]["requests"], plain[0]["requests"])  # another load
+        for episode, worse in zip(varied, harsh, strict=True):
+            self.assertLess(worse["fault_success_rate"], episode["fault_success_rate"])
+
+    def test_what_makes_no_sense_is_refused(self):
+        for bad, message in (
+            (lambda: Variation(p_fail=(0.5, 1.2)), "probability"),
+            (lambda: Variation(p_fail=(0.6, 0.4)), "low <= high"),
+            (lambda: Variation(length_s=(0.0, 5.0)), "length > 0"),
+            (lambda: Variation(load=(0.0, 1.0)), "factor > 0"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                bad()
+        with self.assertRaisesRegex(ValueError, "past the 20 s the file runs for"):
+            _scenario(
+                TENANTS, "plain", variation=Variation(onset_s=(18.0, 18.0), length_s=(5.0, 5.0))
+            )
 
 
 class TestOnTheCommandLine(unittest.TestCase):

@@ -25,6 +25,7 @@ arm as the file has it wherever a fixed backoff can say it.
 Needs PyYAML to read a file: the `arolla` extra.
 """
 
+import random
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -158,6 +159,87 @@ def file_grid(experiment: Experiment, agent: Sequence[str]) -> RetryGrid:
 
 
 @dataclass(frozen=True)
+class Variation:
+    """How an episode departs from the file it is built from: its failure, and its load.
+
+    A file describes ONE situation. A policy trained on it alone has seen one
+    failure rate at one time under one load; this draws those per episode.
+    Each range is `(low, high)`, drawn uniformly from the episode seed, and
+    `None` leaves what the file says:
+
+    * `p_fail`, `onset_s`, `length_s`: the probability and the window of EVERY
+      partial failure of the file (a length alone keeps each one's start);
+    * `load`: a factor on every client's request rate.
+
+    The four draws of an episode depend on its seed and on nothing else: not on
+    the file, and not on which ranges are set. So two files that differ only in
+    what stands in front of their services get the same failure and the same
+    load for a seed, which is how an agent's episodes and `as_written` are
+    paired; and pinning one range to a point (`p_fail=(0.75, 0.75)`) to walk an
+    axis leaves the other draws where they were.
+    """
+
+    p_fail: tuple[float, float] | None = None
+    onset_s: tuple[float, float] | None = None
+    length_s: tuple[float, float] | None = None
+    load: tuple[float, float] | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("p_fail", "onset_s", "length_s", "load"):
+            bounds = getattr(self, name)
+            if bounds is not None and not 0 <= bounds[0] <= bounds[1]:
+                raise ValueError(f"{name} is a range (low, high) with 0 <= low <= high: {bounds}")
+        if self.p_fail is not None and self.p_fail[1] > 1:
+            raise ValueError(f"p_fail is a probability, got {self.p_fail}")
+        if self.length_s is not None and self.length_s[0] <= 0:
+            raise ValueError(f"a failure needs a length > 0, got {self.length_s}")
+        if self.load is not None and self.load[0] <= 0:
+            raise ValueError(f"load is a factor > 0, got {self.load}")
+
+    def draw(self, seed: int) -> dict[str, float]:
+        """The episode's values, for the ranges that are set."""
+        draws = random.Random(f"Variation/{seed}")
+        values = {}
+        for name in ("p_fail", "onset_s", "length_s", "load"):
+            u = draws.random()  # one per name, set or not
+            bounds = getattr(self, name)
+            if bounds is not None:
+                values[name] = bounds[0] + u * (bounds[1] - bounds[0])
+        return values
+
+    def apply(self, experiment: Experiment, seed: int) -> Experiment:
+        """`experiment` as the episode of this seed has it."""
+        drawn = self.draw(seed)
+
+        def failure(f: schema.PartialFailure) -> schema.PartialFailure:
+            start = drawn.get("onset_s", f.start_s)
+            length = drawn.get("length_s", f.end_s - f.start_s)
+            return replace(
+                f, start_s=start, end_s=start + length, p_fail=drawn.get("p_fail", f.p_fail)
+            )
+
+        def loaded(workload: schema.Workload) -> schema.Workload:
+            return replace(workload, base_rps=workload.base_rps * drawn.get("load", 1.0))
+
+        varied = replace(
+            experiment,
+            services=tuple(
+                replace(s, partial_failures=tuple(failure(f) for f in s.partial_failures))
+                for s in experiment.services
+            ),
+            clients=tuple(replace(c, workload=loaded(c.workload)) for c in experiment.clients),
+            workload=None if experiment.workload is None else loaded(experiment.workload),
+        )
+        latest = max((end for _, end in fault_windows(varied)), default=0.0)
+        if latest > horizon_s(varied):
+            raise ValueError(
+                f"a failure would last until {latest:g} s, past the {horizon_s(varied):g} s "
+                f"the file runs for"
+            )
+        return varied
+
+
+@dataclass(frozen=True)
 class ArollaScenario:
     """One arm of an Arolla scenario, handed to the agent. Make it with `from_file`."""
 
@@ -166,6 +248,8 @@ class ArollaScenario:
     #: Who the agent drives: client entries, or services that retry their own calls.
     agent: tuple[str, ...]
     grid: RetryGrid
+    #: What changes from one episode to the next. None: every episode is the file's situation.
+    variation: Variation | None = None
 
     @classmethod
     def from_file(
@@ -175,18 +259,19 @@ class ArollaScenario:
         *,
         point: int = 0,
         grid: RetryGrid | None = None,
+        variation: Variation | None = None,
     ) -> "ArollaScenario":
         """The scenario of `path` (its sweep point `point`) with `agent` taken over.
 
         `agent` names one or several client entries or services. `grid`
-        replaces the levels `file_grid` would derive.
+        replaces the levels `file_grid` would derive. `variation` draws each
+        episode's failure and load instead of repeating the file's.
         """
         names = _names(agent)
         experiment = agent_part(parse(read(path)[point].config), names)
-        scenario = cls(experiment, names, grid or file_grid(experiment, names))
-        scenario.build(
-            experiment.seed
-        )  # a scenario that cannot be built fails here, not in a worker
+        scenario = cls(experiment, names, grid or file_grid(experiment, names), variation)
+        # A scenario that cannot be built fails here, not in a worker.
+        scenario.build(experiment.seed)
         return scenario
 
     @property
@@ -204,6 +289,8 @@ class ArollaScenario:
 
     def build(self, seed: int) -> Episode:
         experiment = self.experiment
+        if self.variation is not None:
+            experiment = self.variation.apply(experiment, seed)
         built = build_file(experiment, seed=seed, arrivals=seed)
         runtimes = [rt for name in self.agent for rt in _runtimes(experiment, built, name)]
         for runtime in runtimes:
@@ -293,6 +380,7 @@ def as_written(
     *,
     part_of: str | Sequence[str] | None = None,
     effort: str | Sequence[str] | None = None,
+    variation: Variation | None = None,
     point: int = 0,
     warmup_s: float = 5.0,
     step_s: float = 1.0,
@@ -307,13 +395,15 @@ def as_written(
     `part_of` keeps only the part of the file the named clients interact with,
     as `from_file` does for an agent. `effort` names the client entries or
     service loops whose attempts per request and retry efficiency are reported
-    (every client entry unless given).
+    (every client entry unless given). `variation` gives each episode the
+    failure and the load an `ArollaScenario` with the same variation gives it.
     """
-    experiment = parse(read(path)[point].config)
+    written = parse(read(path)[point].config)
     if part_of is not None:
-        experiment = agent_part(experiment, _names(part_of))
+        written = agent_part(written, _names(part_of))
     episodes = []
     for seed in seeds:
+        experiment = written if variation is None else variation.apply(written, seed)
         built = build_file(experiment, seed=seed, arrivals=seed)
         built.run()
         spent = None
