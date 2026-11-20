@@ -246,6 +246,15 @@ def main(arguments: Sequence[str] | None = None) -> None:
     parser.add_argument("--test-seeds", type=int, default=len(TEST_SEEDS))
     parser.add_argument("--step-s", type=float, default=1.0)
     parser.add_argument("--model", type=Path, help="a model saved by msim.rl.train, to add")
+    parser.add_argument(
+        "--as-written",
+        type=Path,
+        nargs="*",
+        default=[],
+        metavar="FILE",
+        help="Arolla scenario files to add as they are written, nobody taken over: "
+        "their own clients, behind their own limiters, on the same episodes",
+    )
     parser.add_argument("--out", type=Path, help="a directory for static.csv and comparison.csv")
     args = parser.parse_args(arguments)
 
@@ -260,6 +269,11 @@ def main(arguments: Sequence[str] | None = None) -> None:
 
         learned = evaluate_model(args.model, test, scenario=scenario, jobs=args.jobs)
         runs = {"ppo": learned, **runs}
+    if args.as_written:
+        from msim.rl.arolla import as_written  # needs the `arolla` extra
+
+        for file in args.as_written:
+            runs[f"as written: {file.stem}"] = as_written(file, test, step_s=args.step_s)
 
     print(f"{args.scenario}: {len(search)} fixed settings on {len(selection)} selection episodes")
     for static in search[:5]:

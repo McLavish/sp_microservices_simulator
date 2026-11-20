@@ -1,6 +1,8 @@
 """Arolla scenario files as situations for the agent (`msim.rl.arolla`)."""
 
+import contextlib
 import hashlib
+import io
 import os
 import pickle
 import tempfile
@@ -16,7 +18,7 @@ from gymnasium.utils.env_checker import check_env
 from msim.admission import AdmissionGate
 from msim.compat.arolla import UnsupportedScenario, build, parse
 from msim.retry_policies import FixedBackoffRetryPolicy, RetryBudgetPolicy, policy_layers
-from msim.rl import RetryEnv, RetryGrid
+from msim.rl import RetryEnv, RetryGrid, evaluate
 from msim.rl.arolla import ArollaScenario, agent_part, as_written, file_grid
 
 #: The shape of their post-mortem files: one arm per service, the same fault on each.
@@ -359,6 +361,33 @@ class TestTheFileAsItIsWritten(unittest.TestCase):
         self.assertEqual(entry["amplification"], 1.0)  # the client that enters does not retry
         self.assertGreater(loops["amplification"], 1.1)  # the services behind it do
         self.assertEqual(loops["success_rate"], entry["success_rate"])
+
+
+class TestOnTheCommandLine(unittest.TestCase):
+    def test_files_as_written_next_to_the_fixed_settings_of_one(self):
+        """Their clients behind their limiter, and an agent's on the same service without one."""
+        with tempfile.TemporaryDirectory() as folder:
+            limited = Path(folder) / "limited.yaml"
+            limited.write_text(TENANTS, encoding="utf-8")
+            unlimited = Path(folder) / "unlimited.yaml"
+            without = TENANTS.replace("    arolla_retry_budget: {alpha: 0.1}\n", "")
+            self.assertNotEqual(without, TENANTS)
+            unlimited.write_text(without, encoding="utf-8")
+            arguments = [f"arolla:{unlimited}:plain,untimed", "--as-written", str(limited)]
+            arguments += [str(unlimited), "--selection-seeds", "1", "--test-seeds", "2"]
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                evaluate.main(arguments)
+        text = out.getvalue()
+        self.assertIn("60 fixed settings on 1 selection episodes", text)
+        rows = {line[:34].strip(): line for line in text.splitlines()}
+        for name in ("best static", "default", "no retries"):
+            self.assertIn(name, rows)
+        # Their file with no limiter is not the agent's default: its clients keep their own
+        # policies (three attempts with a backoff for one of them, where the default is four).
+        self.assertIn("as written: unlimited", rows)
+        self.assertIn("as written: limited", rows)
+        self.assertNotEqual(rows["as written: limited"][34:], rows["as written: unlimited"][34:])
 
 
 #: A checkout of https://github.com/eth-easl/Arolla, to run the tests below.
