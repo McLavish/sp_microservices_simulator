@@ -586,6 +586,112 @@ class TestRetryBudgetExactArithmetic(unittest.TestCase):
             )
 
 
+class TestRetryBudgetRatioChange(unittest.TestCase):
+    """`set_budget_ratio`: the ratio of a budget that is already in use."""
+
+    def _budget(self, ratio, max_retries=10, **kwargs):
+        return RetryBudgetPolicy(
+            budget_ratio=ratio,
+            max_retries=max_retries,
+            underlying_strategy=FixedBackoffRetryPolicy(max_attempts=100, delay=0),
+            **kwargs,
+        )
+
+    def _retries(self, policy):
+        """The balance, in retries."""
+        return policy.get_token_balance() / 100
+
+    def _used(self, ratio, **kwargs):
+        """A budget some way into a run: 3 retries spent, 5 requests deposited."""
+        policy = self._budget(ratio, **kwargs)
+        for attempt in (1, 2, 3):
+            self.assertTrue(policy.next_delay(RetryContext(attempt=attempt, now=0)).allow)
+        for _ in range(5):
+            policy.on_request_start(now=0)
+        return policy
+
+    def test_assigning_the_field_changes_nothing(self):
+        """Why the method exists: the ratio is baked into token units at construction."""
+        policy = self._used(0.1)
+        policy.budget_ratio = 0.5
+        policy.on_request_start(now=0)
+        self.assertEqual(self._retries(policy), 7.6)  # still a tenth per request
+
+    def test_the_same_ratio_is_an_exact_no_op(self):
+        policy = self._used(0.1, min_retries_per_sec=3)
+        policy.next_delay(RetryContext(attempt=1, now=s_to_ns(0.05)))  # the floor has a carry
+        before = dict(vars(policy))
+        policy.set_budget_ratio(0.1)
+        self.assertEqual(vars(policy), before)
+
+    def test_a_full_budget_stays_full(self):
+        policy = self._budget(0.1, max_retries=3)
+        policy.set_budget_ratio(1 / 3)
+        self.assertEqual(policy._tokens, policy._max_tokens)
+        self.assertEqual(self._retries(policy), 3)
+        policy.on_request_start(now=0)  # and the cap is still 3 retries
+        self.assertEqual(self._retries(policy), 3)
+
+    def test_the_balance_keeps_its_value_in_retries(self):
+        policy = self._used(0.1)  # 10 - 3 + 5 x 0.1
+        self.assertEqual(self._retries(policy), 7.5)
+        policy.set_budget_ratio(0.25)  # quarters: 7.5 retries are 30 tokens, exactly
+        self.assertEqual(self._retries(policy), 7.5)
+        self.assertEqual((policy._deposit, policy._retry_cost, policy._max_tokens), (1, 4, 40))
+
+    def test_an_inexact_conversion_rounds_down_by_less_than_one_token(self):
+        policy = self._used(0.1)
+        policy.set_budget_ratio(1 / 3)  # thirds: 7.5 retries are 22.5 tokens
+        self.assertEqual(policy._tokens, 22)
+        lost = 7.5 - self._retries(policy)
+        self.assertGreaterEqual(lost, 0)  # never mints
+        self.assertLess(lost, 1 / 3)
+
+    def test_requests_deposit_at_the_new_ratio(self):
+        policy = self._budget(0.1, max_retries=1)
+        policy.next_delay(RetryContext(attempt=1, now=0))  # drained
+        policy.set_budget_ratio(0.5)
+        policy.on_request_start(now=0)
+        self.assertFalse(policy.can_retry())
+        policy.on_request_start(now=0)
+        self.assertTrue(policy.can_retry())  # two requests fund one retry now
+
+    def test_a_refund_after_a_change_gives_back_one_retry(self):
+        policy = self._used(0.1)
+        context = RetryContext(attempt=4, now=0)
+        self.assertTrue(policy.next_delay(context).allow)  # 6.5 left, one charged
+        policy.set_budget_ratio(0.25)
+        policy.rollback(context)
+        self.assertEqual(self._retries(policy), 7.5)
+
+    def test_the_time_floor_keeps_its_rate_and_its_carry(self):
+        # Two retries per second, whatever the ratio. A bucket of one, drained.
+        policy = self._budget(0.1, max_retries=1, min_retries_per_sec=2)
+        policy.next_delay(RetryContext(attempt=1, now=0))
+        # A quarter of a second on: half a retry earned (5 of 10 tokens) ...
+        self.assertFalse(policy.next_delay(RetryContext(attempt=1, now=s_to_ns(0.25))).allow)
+        self.assertEqual(policy._tokens, 5)
+        # ... plus a hundredth of a token on the way, when the ratio changes.
+        self.assertFalse(policy.next_delay(RetryContext(attempt=1, now=s_to_ns(0.2505))).allow)
+        carry = policy._refill_carry
+        self.assertGreater(carry, 0)
+        policy.set_budget_ratio(0.05)  # twentieths: 5 tokens become 10, the carry doubles
+        self.assertEqual(policy._tokens, 10)
+        self.assertEqual(policy._refill_carry, 2 * carry)
+        # The second half arrives exactly when it would have: at 0.5 s, not before.
+        just_before = RetryContext(attempt=1, now=s_to_ns(0.5) - 1)
+        self.assertFalse(policy.next_delay(just_before).allow)
+        self.assertTrue(policy.next_delay(RetryContext(attempt=1, now=s_to_ns(0.5))).allow)
+
+    def test_an_invalid_ratio_is_rejected_and_changes_nothing(self):
+        policy = self._used(0.1, min_retries_per_sec=3)
+        before = dict(vars(policy))
+        for bad in (0, -0.1, 1.5, 1e-12, float("nan")):
+            with self.subTest(ratio=bad), self.assertRaisesRegex(ValueError, "budget_ratio"):
+                policy.set_budget_ratio(bad)
+        self.assertEqual(vars(policy), before)
+
+
 class TestAdmissionGateOrdering(unittest.TestCase):
     """Finagle's RetryFilter deposits per request that ENTERS the filter.
 

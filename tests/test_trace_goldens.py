@@ -871,6 +871,44 @@ def _retry_by_cause(seed: int = 909):
     return sim, [listed, budgeted], [svc], (budget._tokens, breaker.get_state().name)
 
 
+def _budget_ratio_changes(seed: int = 3131, ratios: tuple[float, float] | None = (0.5, 1 / 3)):
+    """A client whose retry budget is re-tuned twice while the run is in progress.
+
+    The way a controller outside the event loop does it: the run is paused at an
+    instant (`run(until=...)`), the ratio is set, the run goes on. The station
+    fails half its calls from 1 s to 9 s, so the budget (a tenth of the requests
+    to begin with) binds throughout and each ratio shows in the retries issued.
+    `ratios=None` is the same run left alone: never paused, never re-tuned.
+    """
+    sim = Simulator(seed=seed)
+    svc = ServiceRuntime(
+        cfg=ServiceConfig(
+            name="svc",
+            latency_median=ms_to_ns(8),
+            latency_lognorm_sigma=0.6,
+            workers=4,
+            queue_capacity=30,
+            partial_failures=[PartialFailure(TimeInterval(s_to_ns(1), s_to_ns(9)), p_fail=0.5)],
+        )
+    ).bind()
+    budget = RetryBudgetPolicy(
+        budget_ratio=0.1, max_retries=5, underlying_strategy=_fixed(4, 5), min_retries_per_sec=2
+    )
+    client = ClientRuntime(
+        cfg=ClientConfig(retry=budget, timeout_controller=_static(60, 300)), service=svc
+    )
+    Workload(base_rps=150.0, duration_s=10.0, load_spikes=[], rng_seed=seed).drive(
+        sim, client.start_request
+    )
+    if ratios is not None:
+        sim.run(until=s_to_ns(4))
+        budget.set_budget_ratio(ratios[0])
+        sim.run(until=s_to_ns(7))
+        budget.set_budget_ratio(ratios[1])
+    sim.run()
+    return sim, [client], [svc], (budget._tokens, budget._retry_cost, budget._refill_carry)
+
+
 def _wrapped_policies(seed: int = 4321):
     """Two clients with deep policy stacks on one faulted service.
 
@@ -1008,6 +1046,13 @@ _RETRY_BY_CAUSE: Trace = (
     "0c8027244a92fb8eff9091532da7434e424e1d58db533a32ffc72ac74b99d401",
     8272,
     "af3c3d0450adb887a39e4b82a697995ef1b7e0e1ca75634dce3c01c009358952",
+)
+
+# A retry budget whose ratio is set twice during the run (`set_budget_ratio`).
+_BUDGET_RATIO_CHANGES: Trace = (
+    "b3654683dd42fb3f453e497a68fdd30af110adf69463928ec91ff93a0cbe93c5",
+    4250,
+    "078b23e5887a0eaefb2fc83f2ecb483d95bd9c08f1c6e7070f394dc7c6c1b7d6",
 )
 
 
@@ -1188,6 +1233,34 @@ class TestTraceGoldens(unittest.TestCase):
             for attempt in root.attempts[:-1]:
                 self.assertEqual(attempt.drop_reason.name, "SERVER_FAILURE")
         self.assertEqual(_trace(sim, clients, services, extra=policy_state), _RETRY_BY_CAUSE)
+
+    def test_budget_ratio_change_trace(self):
+        sim, clients, services, budget_state = _budget_ratio_changes()
+
+        def retries_per_second(begin_s: float, end_s: float) -> float:
+            started = sum(
+                1
+                for root in clients[0].roots
+                for attempt in root.attempts[1:]
+                if s_to_ns(begin_s) <= attempt.interval.begin < s_to_ns(end_s)
+            )
+            return started / (end_s - begin_s)
+
+        # A tenth of the requests, then half, then a third: each ratio is in force
+        # from the instant it is set, and only from then.
+        tenth, half, third = (retries_per_second(*phase) for phase in ((1, 4), (4, 7), (7, 9)))
+        self.assertLess(tenth, 0.6 * third)
+        self.assertLess(third, 0.9 * half)
+        self.assertEqual(_trace(sim, clients, services, extra=budget_state), _BUDGET_RATIO_CHANGES)
+
+    def test_setting_the_ratio_a_budget_has_changes_no_trace(self):
+        """Pausing a run and re-setting the same ratio twice is the run left alone."""
+        left_alone = _budget_ratio_changes(ratios=None)
+        reset = _budget_ratio_changes(ratios=(0.1, 0.1))
+        self.assertEqual(
+            _trace(*reset[:3], extra=reset[3]), _trace(*left_alone[:3], extra=left_alone[3])
+        )
+        self.assertNotEqual(_trace(*left_alone[:3]), _BUDGET_RATIO_CHANGES)
 
     def test_call_waves_trace(self):
         sim, clients, services = _call_waves()

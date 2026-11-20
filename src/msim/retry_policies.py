@@ -613,13 +613,7 @@ class RetryBudgetPolicy(_ThrottledRetryPolicy):
             raise ValueError("budget_ratio must be in (0, 1]")
         if self.max_retries < 1:
             raise ValueError("max_retries must be >= 1")
-        ratio = Fraction(self.budget_ratio).limit_denominator(self._MAX_RATIO_DENOMINATOR)
-        if ratio.numerator == 0:
-            raise ValueError(
-                f"budget_ratio {self.budget_ratio!r} is below the representable floor "
-                f"1/{self._MAX_RATIO_DENOMINATOR}: it would rationalize to a zero deposit, "
-                "so the budget would never refill"
-            )
+        ratio = self._rationalize(self.budget_ratio)
         self._retry_cost = ratio.denominator
         self._deposit = ratio.numerator
         self._max_tokens = self._retry_cost * self.max_retries
@@ -637,6 +631,49 @@ class RetryBudgetPolicy(_ThrottledRetryPolicy):
                     f"representable floor 1/{self._MAX_RATIO_DENOMINATOR}"
                 )
             self._refill_rate = rate * self._retry_cost / S_TO_NS
+
+    @classmethod
+    def _rationalize(cls, budget_ratio: float) -> Fraction:
+        """`budget_ratio` as the exact fraction the token economy runs on."""
+        if not 0 < budget_ratio <= 1:
+            raise ValueError("budget_ratio must be in (0, 1]")
+        ratio = Fraction(budget_ratio).limit_denominator(cls._MAX_RATIO_DENOMINATOR)
+        if ratio.numerator == 0:
+            raise ValueError(
+                f"budget_ratio {budget_ratio!r} is below the representable floor "
+                f"1/{cls._MAX_RATIO_DENOMINATOR}: it would rationalize to a zero deposit, "
+                "so the budget would never refill"
+            )
+        return ratio
+
+    def set_budget_ratio(self, budget_ratio: float) -> None:
+        """Change the ratio of a budget that is in use.
+
+        For a controller that tunes the budget while a run is in progress; call
+        it between two events, as anything outside the event loop does. Assigning
+        to `budget_ratio` would do nothing: the ratio is turned into integer
+        token units once, when the policy is built.
+
+        Requests deposit at the new ratio from now on. What the budget HOLDS
+        keeps its value in retries: the balance is converted to the new token
+        unit and rounded down, so a change never mints quota and loses less than
+        one new token (1/denominator of a retry). A full budget stays full, the
+        cap stays `max_retries` retries, and the `min_retries_per_sec` floor
+        keeps its rate and what it had earned towards the next token. Setting
+        the ratio the budget already has changes nothing at all.
+        """
+        ratio = self._rationalize(budget_ratio)  # raises before anything is touched
+        old_cost, new_cost = self._retry_cost, ratio.denominator
+        self.budget_ratio = budget_ratio
+        self._deposit = ratio.numerator
+        if new_cost == old_cost:
+            return
+        # Everything else is kept in tokens, and a token is 1/_retry_cost of a retry.
+        self._tokens = self._tokens * new_cost // old_cost
+        self._refill_carry = self._refill_carry * new_cost / old_cost
+        self._refill_rate = self._refill_rate * new_cost / old_cost
+        self._retry_cost = new_cost
+        self._max_tokens = new_cost * self.max_retries
 
     def _accrue(self, now: TimePoint) -> None:
         """Credit what `min_retries_per_sec` has earned since the last look."""

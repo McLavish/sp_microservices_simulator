@@ -253,6 +253,30 @@ Both breakers likewise share their admission half (`_CircuitBreakerBase`:
 `allow_request`, the OPEN -> HALF_OPEN transition and retry delegation), so the
 uncapped half-open probe admission noted above is one code path, not two.
 
+### Changing a policy while a run is in progress
+
+A controller outside the event loop can re-tune a client between two events: it
+pauses the run at an instant (`sim.run(until=t)` returns with every event up to
+`t` done; resuming changes nothing), sets what it wants, and lets the run go on.
+Four settings are meant for this, and `tests/test_policy_changes_mid_run.py` pins
+when each takes effect:
+
+| Setting | Read | So a new value applies |
+| --- | --- | --- |
+| `FixedBackoffRetryPolicy.max_attempts`, `.delay` | at each retry decision (when an attempt has failed) | to the next decision of every request, those in flight included. A retry already scheduled stays scheduled, at the time it was given |
+| `StaticTimeoutController.attempt_timeout` | when an attempt starts | to attempts that start afterwards. An attempt in flight keeps its deadline |
+| `StaticTimeoutController.global_timeout` | when a request starts | to requests that start afterwards |
+| `RetryBudgetPolicy.set_budget_ratio(ratio)` | at each deposit | to the requests admitted afterwards. The balance keeps its value in retries (rounded down by less than one token), a full budget stays full, and the same ratio again is an exact no-op |
+
+Assign the first three; the budget's ratio has a method because the ratio is
+turned into integer token units when the policy is built, so assigning
+`budget_ratio` does nothing. The same holds for other parameters that are
+converted or sized at construction (a limiter's period, a breaker's window
+sizes): changing those means building a new policy and replacing
+`client.cfg`, which starts its state afresh. None of the four draws from the
+simulator's RNG or schedules an event, so a run in which nothing is changed is
+the run it always was.
+
 ### A retry allowance for the whole request
 
 Per-hop limits multiply down a call tree: three attempts at each of three
