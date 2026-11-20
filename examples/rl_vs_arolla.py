@@ -96,7 +96,15 @@ def situation(arolla: Path, variation: Variation | None) -> ArollaScenario:
     # Finer budget levels than the stock grid: the best budget here is set by the
     # service's spare capacity, which lies between the stock 0.2 and 0.5.
     budgets = (0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0)
-    grid = replace(file_grid(base.experiment, TENANTS), budget_ratio=budgets)
+    # Until an agent's first action its clients run on the grid's defaults,
+    # and that is the whole warm-up. The file's own (four attempts, nothing in
+    # the way) is a retry storm in the making from 1.15 times the load on: an
+    # episode would begin in one that no policy chose, and at that load a
+    # backlog takes most of the episode to drain. No retries until the agent
+    # says otherwise.
+    grid = replace(
+        file_grid(base.experiment, TENANTS), budget_ratio=budgets, default_max_attempts=1
+    )
     return replace(base, grid=grid, variation=variation)
 
 
