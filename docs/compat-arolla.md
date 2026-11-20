@@ -103,6 +103,7 @@ of their repository, which is what msim is compared against (below).
 | a shared client budget hands every client the first client's whole policy and ignores `min_retries_per_sec` | one balance, a backoff per client, the configured rate |
 | a `count_based` breaker's thresholds are cut down to whole counts (0.29 of 100 is 28) | the ratio is compared as it is |
 | a client with a timeout and no retry policy has the timer armed for the service's first attempt only | read as a client that does not retry, and reported |
+| a bursty or fixed-window rate limiter that refuses a retry ends the run (a `TypeError`) | the retry is refused |
 | the first request of every client arrives at t = 0 | an exact Poisson process |
 
 One property of their admission rule is kept as it is, because it IS the rule:
@@ -152,3 +153,115 @@ The reference is imported from the checkout given with `--arolla` and needs what
 that code needs (pydantic, numpy, pandas, PyYAML); it should be a checkout whose
 known defects are fixed, or the comparison measures those. The tool is not part
 of the test suite.
+
+## How close the two simulators are
+
+Every scenario file Arolla ships was put to both simulators: each sweep point
+(183 scenarios), 200 seeds per engine and per point, msim at `958357c` against
+their `main` with its defects fixed (the local branch `Arolla-PR`, at
+`57f9ae8`) and its first arrival drawn (`--reference-start poisson`). A cell is
+one measure of one client group at one sweep point.
+
+| Scenario file | Points | Seeds | Cells | Worst cell (SE) | Beyond 3 SE → on fresh seeds | Their fixes that change it | Largest shift in success, shipped → fixed |
+| --- | ---: | ---: | ---: | ---: | --- | --- | --- |
+| `dependency/diamond` | 1 | 200 | 4 | 1.51 |  | 1, 2, 3 | `user` [20-40s]: 47.5 → 96.8 % |
+| `diversity/N10_M1` | 1 | 200 | 4 | 1.72 |  | 4, 5 | none above 0.3 points |
+| `diversity/N100_M1` | 1 | 200 | 4 | 1.42 |  | 4, 5 | none above 0.3 points |
+| `diversity/N200_M1` | 1 | 200 | 4 | 1.44 |  | 4, 5 | `group_0`: 30.4 → 27.0 % |
+| `diversity/N1000_M1` (first 5 s) | 1 | 200 | 3 | 0.84 |  | 4 | none above 0.3 points |
+| `diversity/N10000_M1` (first 1 s) | 1 | 200 | 3 | 1.62 |  | 4 | none above 0.3 points |
+| `industry_retreat/motivation` | 1 | 200 | 20 | 1.61 |  | 3 | `exponential_backoff_jitter` [20-40s]: 5.0 → 1.8 % |
+| `industry_retreat/motivation-detail` | 1 | 200 | 4 | 1.34 |  | 3 | none above 0.3 points |
+| `industry_retreat/motivation-mixed` | 1 | 200 | 16 | 1.85 |  | 3, 4 | `retry_budget`: 52.7 → 74.9 % |
+| `industry_retreat/motivation-varied` | 1 | 200 | 20 | 1.76 |  | 3 | `exponential_backoff_jitter` [20-40s]: 5.0 → 1.8 % |
+| `industry_retreat/multi-client` | 27 | 200 | 216 | 3.20 | 1: 3.20 → 1.14 | 4 | `retry-budget` at p_fail=0.2,replicas=1000: 88.7 → 93.2 % |
+| `industry_retreat/multi-client-test` | 1 | 200 | 8 | 0.99 |  | 4 | `circuit-breaker`: 66.3 → 67.6 % |
+| `load_spike_metastable_failure/ep1` | 1 | 200 | 4 | 0.98 |  | none | identical runs |
+| `load_spike_metastable_failure/ep2_1` | 1 | 200 | 4 | 0.41 |  | none | identical runs |
+| `load_spike_metastable_failure/ep2_2` | 1 | 200 | 4 | 0.41 |  | none | identical runs |
+| `load_spike_metastable_failure/ep2_3` | 1 | 200 | 4 | 0.78 |  | none | identical runs |
+| `load_spike_metastable_failure/ep3` | 1 | 200 | 6 | 0.94 |  | none | identical runs |
+| `load_spike_metastable_failure/ep4` | 1 | 200 | 6 | 1.03 |  | none | identical runs |
+| `partial_failure_metastable_failure/ep3` | 1 | 200 | 4 | 1.44 |  | none | identical runs |
+| `partial_failure_metastable_failure/ep4` | 1 | 200 | 4 | 1.16 |  | none | identical runs |
+| `partial_failure_metastable_failure/ep5` | 1 | 200 | 6 | 1.04 |  | none | identical runs |
+| `partial_failure_metastable_failure/ep5_aimd` | 1 | 200 | 6 | 0.53 |  | none | identical runs |
+| `post_mortem_simulation/s01__buggy_release` | 1 | 200 | 20 | 2.36 |  | 3 | `jittered` [180-360s]: 3.5 → 1.7 % |
+| `post_mortem_simulation/s02__shaky_foundations` | 1 | 200 | 20 | 2.06 |  | 3 | `three_retries` [20-40s]: 67.3 → 54.6 % |
+| `post_mortem_simulation/s03__thundering_herd` | 1 | 200 | 20 | 2.12 |  | 3, 4 | `jittered`: 64.8 → 28.7 % |
+| `post_mortem_simulation/s04__internal_retry_rogue` | 1 | 200 | 15 | 1.86 |  | 1, 2 | `full_retries`: 40.5 → 52.9 % |
+| `sensitivity/sensitivity-aimd` | 25 | 200 | 600 | 3.26 | 4: 3.13 → 0.49, 3.26 → 0.54, 3.14 → 0.98, 3.10 → 0.84 | 3, 4 | `circuit_breaker` [20-40s] at p_fail=0.3,failure_threshold=0.5: 13.8 → 52.3 % |
+| `sensitivity/sensitivity-arolla` | 25 | 200 | 600 | 3.13 | 1: 3.13 → 0.16 | 3, 4 | `three_retries` [20-40s] at p_fail=0.3,alpha=0.5: 75.1 → 91.8 % |
+| `sensitivity/sensitivity-cb` | 25 | 200 | 600 | 3.10 | 1: 3.10 → 0.53 | 3, 4, 8 | `circuit_breaker` [20-40s] at p_fail=0.3,failure_threshold=0.5: 14.1 → 52.3 % |
+| `sensitivity/sensitivity-rb` | 25 | 200 | 600 | 3.55 | 3: 3.55 → 0.62, 3.47 → 0.89, 3.19 → 1.51 | 3, 4 | `circuit_breaker` [20-40s] at p_fail=0.5,budget_ratio=0.5: 43.8 → 54.0 % |
+| `snowflake/motivation` | 1 | 200 | 22 | 1.69 |  | 3 | `no_control` [20-40s]: 3.1 → 1.3 % |
+| `snowflake/motivation_f10` | 1 | 200 | 22 | 1.48 |  | 3, 8 | none above 0.3 points |
+| `snowflake/motivation_f25` | 1 | 200 | 22 | 2.00 |  | 3 | `no_control` [20-40s]: 8.9 → 5.6 % |
+| `snowflake/motivation_f75` | 1 | 200 | 22 | 2.50 |  | 3 | `no_control` [20-40s]: 1.2 → 0.4 % |
+| `snowflake/motivation_f90` | 1 | 200 | 22 | 2.16 |  | 3 | none above 0.3 points |
+| `snowflake/multi-client` | 18 | 200 | 144 | 2.31 |  | 4 | `retry-budget` at p_fail=1.0,replicas=1000: 1.7 → 0.1 % |
+| `snowflake/policy-aimd` | 1 | 200 | 24 | 1.82 |  | 3, 4 | none above 0.3 points |
+| `snowflake/policy-arolla` | 1 | 200 | 24 | 1.95 |  | 3, 4 | `circuit_breaker` [20-40s]: 50.6 → 52.1 % |
+| `snowflake/policy-cb` | 1 | 200 | 24 | 2.89 |  | 3, 4 | none above 0.3 points |
+| `snowflake/policy-none` | 1 | 200 | 16 | 1.85 |  | 3, 4 | `retry_budget`: 52.7 → 74.9 % |
+| `snowflake/policy-rb` | 1 | 200 | 24 | 2.23 |  | 3, 4 | `circuit_breaker` [20-40s]: 48.8 → 50.6 % |
+| `snowflake/sensitivity_arolla` | 1 | 200 | 6 | 1.44 |  | 3 | none above 0.3 points |
+| `snowflake/sensitivity_circuitbreaker` | 1 | 200 | 6 | 1.03 |  | 3 | none above 0.3 points |
+| `snowflake/sensitivity_retrybudget` | 1 | 200 | 6 | 1.22 |  | 3 | none above 0.3 points |
+| **44 files** | **183** | | **3213** | | **10** | | |
+
+The 3213 cells differ as chance has them differ: 68.5 % are within one
+standard error and 95.5 % within two (a normal law gives 68.3 and 95.4),
+ten are beyond three where about nine are expected, and none of them
+is beyond three when its sweep point is run again on fresh seeds. Across the
+points of a sweep no measure leans one way either: of the 112 measures of the
+six sweep files, none has a combined gap beyond 3 SE.
+
+`diversity/N1000_M1` and `N10000_M1` are run on the first 5 s and 1 s of their
+100 s. As written they send 188 000 and 1.88 million requests per second to a
+service with 16 workers: nothing succeeds from the first second on (0.004 % and
+0.002 %, in both simulators), and the fault at 30 s has nothing left to change.
+
+**The last two columns** are about their simulator alone. The first names the
+commits of their branch that change the file's numbers: every file was run on
+every commit with the same seeds, and their simulator is deterministic for a
+seed, so a difference is the commit's. The second is the largest change in a
+success rate between the simulator they ship and the fixed one over 30 seeds
+(10 per sweep point), among the changes above 0.3 points and three standard
+errors of the paired difference.
+
+| Fix | Their code before it | Files it changes |
+| --- | --- | ---: |
+| 1 `bd7fc72` | a dependency call completes on the dependency's first attempt, and again on each later one | 2 |
+| 2 `83dea18` | a client with its own policy takes the service's first attempt for the call's result | 2 |
+| 3 `5c95f08` | the answer to a call the client has timed out is processed as a new result | 25 |
+| 4 `bb5f8d3` | replicas, and clients that share a workload block, arrive at the same instants | 19 |
+| 5 `15a2f3f` | a retry-budget deposit is cut to whole hundredths of a retry | 3 |
+| 8 `b85063c` | the time-based breaker does not close when its window sits exactly on the threshold | 2 |
+| 6, 7, 9, 10, 11 | the queue average in their own output; the bursty and leaky rate limiters and the refusal that ends the run, which no shipped file configures; an event scheduled in the past, which no shipped file produces | 0 |
+
+A success rate moves in 22 of the 44 files. The ten `load_spike_*` and
+`partial_failure_*` files, one service and one relaying client each, are
+untouched by every fix: their shipped numbers stand. Fix 8 changes single runs
+of its two files, where a decision falls exactly on the breaker's threshold, and
+no average that 40 to 120 paired seeds can tell apart.
+
+**The first arrival.** With the reference left as it is -- every client's first
+request at t = 0 -- the same comparison shows what that rule does where there
+are many clients. In `snowflake/multi-client` 35 of the 144 cells were beyond
+3 SE, all of them at 100 and 1000 clients: at 1000 clients and `p_fail` 0.2 the
+median latency was 10.21 ms in their simulator against 10.07 in msim (117 SE),
+and their retry-budget clients made 1.1642 attempts per request against 1.1650
+(20 SE). With the first arrival drawn, no cell of that file is beyond 2.4 SE.
+
+**What no shipped file uses.** The five scenarios of `tests/arolla_scenarios/`,
+the same comparison, msim at `bc951ea` against their branch at `ed79bdd` (the
+rate limiters need its last fix):
+
+| Scenario | What it covers | Cells | Worst cell (SE) |
+| --- | --- | ---: | ---: |
+| `admission_between_services` | a limiter on a service that another service calls, and on one that retries under a client that retries too | 10 | 1.36 |
+| `dependencies` | optional, several sequential, and parallel dependencies whose callees retry | 12 | 1.50 |
+| `e2e_budget` | an end-to-end retry budget across three layers | 8 | 1.90 |
+| `faults_and_backoff` | a latency injection, plain exponential backoff, equal jitter, the goodput budget's burst cap | 24 | 2.57 |
+| `own_retry_gates` | the three rate limiters, the count-based breaker and the retry gate on a service | 20 | 1.45 |
