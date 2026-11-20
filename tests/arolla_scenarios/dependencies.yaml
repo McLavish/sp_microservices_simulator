@@ -1,0 +1,43 @@
+# Optional and several sequential dependencies, and a parallel pair, each callee retrying.
+name: synthetic_dependencies
+seed: 1
+services:
+  - name: cache
+    latency: {median_ms: 3, lognorm_sigma: 0.3}
+    workers: 8
+    queue_capacity: 50
+    partial_failures: [{start_s: 5, end_s: 25, p_fail: 0.6}]
+  - name: db
+    latency: {median_ms: 15, lognorm_sigma: 0.4}
+    workers: 8
+    queue_capacity: 100
+    retry: {type: fixed, max_attempts: 2, delay_ms: 0}
+    partial_failures: [{start_s: 10, end_s: 20, p_fail: 0.3}]
+  - name: auth
+    latency: {median_ms: 4, lognorm_sigma: 0.2}
+    workers: 8
+    queue_capacity: 100
+    partial_failures: [{start_s: 15, end_s: 20, p_fail: 0.2}]
+  - name: seq
+    latency: {median_ms: 5, lognorm_sigma: 0.2}
+    workers: 16
+    queue_capacity: 100
+    timeout: {attempt_ms: 400}
+    retry: {type: fixed, max_attempts: 2, delay_ms: 0}
+    dependencies: [{service: auth}, {service: cache, optional: true}, {service: db}]
+  - name: par
+    latency: {median_ms: 5, lognorm_sigma: 0.2}
+    workers: 16
+    queue_capacity: 100
+    timeout: {attempt_ms: 400}
+    dependencies: [{service: auth}, {service: cache, optional: true}, {service: db}]
+    dependency_call_pattern: parallel
+clients:
+  - name: sequential
+    target_service: seq
+    retry: {type: fixed, max_attempts: 2, delay_ms: 10}
+    timeout: {attempt_ms: 250, global_ms: 1000}
+    workload: &load {base_rps: 60, duration_s: 30}
+  - name: parallel
+    target_service: par
+    workload: *load

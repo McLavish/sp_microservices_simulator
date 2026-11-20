@@ -1,0 +1,36 @@
+# A latency injection, an exponential backoff, equal jitter, and the goodput budget's burst cap.
+name: synthetic_faults_and_backoff
+seed: 1
+services:
+  - name: slow
+    latency: {median_ms: 20, lognorm_sigma: 0.4}
+    workers: 12
+    queue_capacity: 200
+    latency_injections: [{start_s: 10, end_s: 15, add_latency_ms: 60, multiplier: 2}]
+  - name: capped
+    latency: {median_ms: 20, lognorm_sigma: 0.4}
+    workers: 12
+    queue_capacity: 200
+    arolla_retry_budget: {alpha: 0.5, beta_down: 0.3, beta_up: 0.15, window_ms: 1000, max_retry_ratio: 0.05}
+    partial_failures: [{start_s: 10, end_s: 20, p_fail: 0.5}]
+clients:
+  - name: exponential
+    target_service: slow
+    retry: {type: exponential, max_attempts: 4, initial_delay_ms: 10, max_delay_ms: 50}
+    timeout: {attempt_ms: 120}
+    workload: &load {base_rps: 100, duration_s: 30}
+  - name: equal_jitter
+    target_service: slow
+    retry: {type: jittered, max_attempts: 4, initial_delay_ms: 10, max_delay_ms: 50, jitter_mode: equal}
+    timeout: {attempt_ms: 120}
+    workload: *load
+  - name: capped_a
+    target_service: capped
+    retry: {type: fixed, max_attempts: 4, delay_ms: 0}
+    timeout: {attempt_ms: 192}
+    workload: *load
+  - name: capped_b
+    target_service: capped
+    retry: {type: jittered, max_attempts: 4, initial_delay_ms: 13, max_delay_ms: 200, jitter_mode: full}
+    timeout: {attempt_ms: 192}
+    workload: *load

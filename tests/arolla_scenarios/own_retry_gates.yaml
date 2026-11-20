@@ -1,0 +1,60 @@
+# The limiters that gate only a service's own retries, one per service, relay clients.
+name: synthetic_own_retry_gates
+seed: 1
+services:
+  - name: svc-bursty
+    latency: &lat {median_ms: 20, lognorm_sigma: 0.4}
+    workers: &w 12
+    queue_capacity: &q 200
+    timeout: &t {attempt_ms: 150}
+    retry: &r {type: fixed, max_attempts: 4, delay_ms: 0}
+    partial_failures: &f [{start_s: 10, end_s: 20, p_fail: 0.5}]
+    rate_limiter: {type: bursty, max_requests: 10, period_ms: 1000, refill_rate: 20}
+  - name: svc-window
+    latency: *lat
+    workers: *w
+    queue_capacity: *q
+    timeout: *t
+    retry: *r
+    partial_failures: *f
+    rate_limiter: {type: fixed_window, max_requests: 25, period_ms: 1000}
+  - name: svc-leaky
+    latency: *lat
+    workers: *w
+    queue_capacity: *q
+    timeout: *t
+    retry: *r
+    partial_failures: *f
+    rate_limiter: {type: leaky, max_requests: 50, period_ms: 1000, max_attempts: 3}
+  - name: svc-count
+    latency: *lat
+    workers: *w
+    queue_capacity: *q
+    timeout: *t
+    retry: *r
+    partial_failures: *f
+    circuit_breaker: {type: count_based, failure_threshold: 0.5, success_threshold: 0.8, half_open_delay_ms: 500, failure_window_size: 20, success_window_size: 10}
+  - name: svc-gate
+    latency: *lat
+    workers: *w
+    queue_capacity: *q
+    timeout: *t
+    retry: *r
+    partial_failures: *f
+    circuit_breaker: {type: retry_circuit_breaker, failure_threshold: 0.3, half_open_delay_ms: 0, window_duration_ms: 2000, min_requests: 20}
+clients:
+  - name: bursty
+    target_service: svc-bursty
+    workload: &load {base_rps: 120, duration_s: 30}
+  - name: fixed_window
+    target_service: svc-window
+    workload: *load
+  - name: leaky
+    target_service: svc-leaky
+    workload: *load
+  - name: count_based
+    target_service: svc-count
+    workload: *load
+  - name: retry_gate
+    target_service: svc-gate
+    workload: *load

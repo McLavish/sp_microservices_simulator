@@ -1043,6 +1043,67 @@ class TestSmallThings(unittest.TestCase):
         self.assertEqual(len(seeds), 160)
 
 
+#: Scenarios for the parts of the schema that no file Arolla ships uses, as files,
+#: so that `msim.compat.arolla.compare` can put them to both simulators.
+SCENARIOS = Path(__file__).parent / "arolla_scenarios"
+
+
+class TestTheScenariosForWhatNoShippedFileUses(unittest.TestCase):
+    def test_each_is_read_built_and_run(self):
+        from msim.compat.arolla import read
+
+        paths = sorted(SCENARIOS.glob("*.yaml"))
+        self.assertEqual(
+            [path.stem for path in paths],
+            [
+                "admission_between_services",
+                "dependencies",
+                "e2e_budget",
+                "faults_and_backoff",
+                "own_retry_gates",
+            ],
+        )
+        for path in paths:
+            with self.subTest(path.stem):
+                (point,) = read(path)
+                experiment = parse(point.config)
+                self.assertEqual(experiment.warnings, ())
+                # Twelve seconds reach two seconds into every fault window.
+                scenario = build(experiment, duration_s=12)
+                scenario.run()
+                for client in scenario.clients:
+                    roots = client.runtime.roots
+                    self.assertGreater(len(roots), 500)
+                    self.assertTrue(all(root.attempts for root in roots))
+                for station in scenario.stations.values():
+                    self.assertEqual(station.in_flight, 0)
+                # The faults were reached: something failed, and a client or a
+                # service's own loop retried.
+                runtimes = [c.runtime for c in scenario.clients] + list(scenario.loops.values())
+                roots = [root for runtime in runtimes for root in runtime.roots]
+                self.assertTrue(any(not a.success for root in roots for a in root.attempts))
+                self.assertTrue(any(len(root.attempts) > 1 for root in roots))
+
+    def test_the_admission_scenario_turns_retries_away_at_both_doors(self):
+        from msim.compat.arolla import read
+
+        (point,) = read(SCENARIOS / "admission_between_services.yaml")
+        scenario = build(parse(point.config), duration_s=14)
+        scenario.run()
+        # A service's retries, refused by the service it calls ...
+        between = scenario.loops["db"]
+        assert isinstance(between, AdmittingLoop)
+        (counts,) = between.counts.values()
+        self.assertGreater(counts.retries_asked, counts.retries_admitted)
+        self.assertGreater(counts.retries_admitted, 0)
+        # ... and a client's retries, refused by a service that retries too.
+        (client,) = scenario.group("retrying_client")
+        counts = scenario.admission_counts(client)
+        assert counts is not None
+        self.assertGreater(counts.retries_asked, counts.retries_admitted)
+        self.assertGreater(counts.retries_admitted, 0)
+
+
 #: A checkout of https://github.com/eth-easl/Arolla, to run the test below.
 AROLLA_CHECKOUT = os.environ.get("AROLLA_CHECKOUT")
 

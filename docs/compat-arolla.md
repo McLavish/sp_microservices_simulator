@@ -116,7 +116,9 @@ All 44 scenario files Arolla ships are built, and so is the rest of what their
 schema can say: the keys no shipped file uses (`e2e_retry_budget`, optional and
 several sequential dependencies, the goodput budget's success-rate gate and
 burst cap, latency injections, rate limiters, the count-based breaker) are
-exercised by small scenarios in `tests/test_compat_arolla_importer.py`. Nothing
+exercised by small scenarios in `tests/test_compat_arolla_importer.py`, and by
+five scenario files in `tests/arolla_scenarios/` written so that both
+simulators can be put to them (below). Nothing
 valid raises `UnsupportedScenario` today; the class stays for whatever their
 schema grows next, since a reader must refuse what it cannot build rather than
 approximate it. Two things their schema accepts are refused outright, because

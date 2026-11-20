@@ -1,0 +1,50 @@
+# End-to-end retry budget (their "Level 2"): two identical three-layer stacks, one with a budget.
+name: synthetic_e2e_budget
+seed: 1
+services:
+  - name: db-free
+    latency: &db {median_ms: 20, lognorm_sigma: 0.4}
+    workers: &dbw 8
+    queue_capacity: &dbq 100
+    partial_failures: &dbf [{start_s: 10, end_s: 20, p_fail: 0.5}]
+  - name: app-free
+    latency: &app {median_ms: 5, lognorm_sigma: 0.2}
+    workers: &appw 16
+    queue_capacity: &appq 100
+    timeout: &appt {attempt_ms: 300}
+    retry: &appr {type: fixed, max_attempts: 4, delay_ms: 0}
+    dependencies: [{service: db-free}]
+  - name: gw-free
+    latency: &gw {median_ms: 2, lognorm_sigma: 0.1}
+    workers: &gww 16
+    queue_capacity: &gwq 100
+    timeout: &gwt {attempt_ms: 800}
+    retry: &gwr {type: fixed, max_attempts: 4, delay_ms: 0}
+    dependencies: [{service: app-free}]
+  - name: db-budget
+    latency: *db
+    workers: *dbw
+    queue_capacity: *dbq
+    partial_failures: *dbf
+  - name: app-budget
+    latency: *app
+    workers: *appw
+    queue_capacity: *appq
+    timeout: *appt
+    retry: *appr
+    dependencies: [{service: db-budget}]
+  - name: gw-budget
+    latency: *gw
+    workers: *gww
+    queue_capacity: *gwq
+    timeout: *gwt
+    retry: *gwr
+    dependencies: [{service: app-budget}]
+clients:
+  - name: free
+    target_service: gw-free
+    workload: &load {base_rps: 100, duration_s: 30}
+  - name: budget
+    target_service: gw-budget
+    e2e_retry_budget: 2
+    workload: *load
