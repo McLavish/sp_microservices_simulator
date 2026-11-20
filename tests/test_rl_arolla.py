@@ -1,0 +1,367 @@
+"""Arolla scenario files as situations for the agent (`msim.rl.arolla`)."""
+
+import hashlib
+import os
+import pickle
+import tempfile
+import unittest
+import warnings
+from dataclasses import replace
+from pathlib import Path
+
+import numpy as np
+import yaml
+from gymnasium.utils.env_checker import check_env
+
+from msim.admission import AdmissionGate
+from msim.compat.arolla import UnsupportedScenario, build, parse
+from msim.retry_policies import FixedBackoffRetryPolicy, RetryBudgetPolicy, policy_layers
+from msim.rl import RetryEnv, RetryGrid
+from msim.rl.arolla import ArollaScenario, agent_part, file_grid
+
+#: The shape of their post-mortem files: one arm per service, the same fault on each.
+ARMS = """
+name: arms
+seed: 7
+services:
+  - name: svc-none
+    latency: &latency {median_ms: 15, lognorm_sigma: 0.5}
+    workers: &workers 4
+    queue_capacity: &queue 200
+    partial_failures: &failures [{start_s: 8, end_s: 11, p_fail: 1}]
+  - name: svc-retry
+    latency: *latency
+    workers: *workers
+    queue_capacity: *queue
+    partial_failures: *failures
+  - name: svc-jittered
+    latency: *latency
+    workers: *workers
+    queue_capacity: *queue
+    partial_failures: *failures
+clients:
+  - name: no_retries
+    target_service: svc-none
+    replicas: 3
+    retry: {type: fixed, max_attempts: 1, delay_ms: 0}
+    timeout: &timeout {attempt_ms: 200}
+    workload: &load {base_rps: 30, duration_s: 20, rng_seed: 1}
+  - name: three_retries
+    target_service: svc-retry
+    replicas: 3
+    retry: {type: fixed, max_attempts: 4, delay_ms: 0}
+    timeout: *timeout
+    workload: *load
+  - name: jittered
+    target_service: svc-jittered
+    replicas: 3
+    retry: {type: jittered, max_attempts: 4, initial_delay_ms: 20, max_delay_ms: 200, jitter_mode: full}
+    timeout: *timeout
+    workload: *load
+"""
+
+#: The shape of their policy files: tenants on one service behind its retry limiter.
+TENANTS = """
+name: tenants
+seed: 5
+services:
+  - name: svc
+    latency: {median_ms: 20, lognorm_sigma: 0.5}
+    workers: 6
+    queue_capacity: 100
+    arolla_retry_budget: {alpha: 0.1}
+    partial_failures: [{start_s: 8, end_s: 14, p_fail: 0.5}]
+clients:
+  - name: plain
+    target_service: svc
+    retry: {type: fixed, max_attempts: 4, delay_ms: 0}
+    timeout: {attempt_ms: 150}
+    workload: &load {base_rps: 40, duration_s: 20, rng_seed: 3, load_spikes: [{start_s: 15, end_s: 17, rps_multiplier: 2}]}
+  - name: untimed
+    target_service: svc
+    retry: {type: fixed, max_attempts: 3, delay_ms: 10}
+    workload: *load
+"""
+
+#: The shape of s04: clients that do not retry, services that retry their own calls.
+LAYERS = """
+name: layers
+seed: 3
+services:
+  - name: db
+    latency: {median_ms: 20, lognorm_sigma: 0.5}
+    workers: 6
+    queue_capacity: 100
+    partial_failures: [{start_s: 8, end_s: 12, p_fail: 0.6}]
+  - name: app
+    latency: {median_ms: 5, lognorm_sigma: 0.5}
+    workers: 8
+    queue_capacity: 100
+    retry: {type: fixed, max_attempts: 5, delay_ms: 0}
+    timeout: {attempt_ms: 300, global_ms: 900}
+    dependencies: [{service: db}]
+  - name: gw
+    latency: {median_ms: 2, lognorm_sigma: 0.5}
+    workers: 8
+    queue_capacity: 100
+    retry: {type: fixed, max_attempts: 5, delay_ms: 0}
+    timeout: {attempt_ms: 500, global_ms: 1500}
+    dependencies: [{service: app}]
+  - name: other-db
+    latency: {median_ms: 20, lognorm_sigma: 0.5}
+    workers: 6
+  - name: other-gw
+    latency: {median_ms: 2, lognorm_sigma: 0.5}
+    workers: 8
+    timeout: {attempt_ms: 500, global_ms: 1500}
+    dependencies: [{service: other-db}]
+clients:
+  - name: through
+    target_service: gw
+    retry: {type: none, max_attempts: 1}
+    timeout: {attempt_ms: 1000, global_ms: 3000}
+    workload: &load {base_rps: 50, duration_s: 20, rng_seed: 1}
+  - name: elsewhere
+    target_service: other-gw
+    retry: {type: none, max_attempts: 1}
+    timeout: {attempt_ms: 1000, global_ms: 3000}
+    workload: *load
+"""
+
+
+def _scenario(text: str, agent, **kwargs) -> ArollaScenario:
+    """`ArollaScenario.from_file` on a scenario written here."""
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "scenario.yaml"
+        path.write_text(text, encoding="utf-8")
+        return ArollaScenario.from_file(path, agent, **kwargs)
+
+
+def _records(sim, clients) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    for client in clients:
+        for root in client.roots:
+            for a in root.attempts:
+                digest.update(
+                    repr((a.interval.begin, a.interval.end, a.success, a.drop_reason.name)).encode()
+                )
+    return digest.hexdigest(), sim._seq
+
+
+def _play(env: RetryEnv, action, seed: int = 4):
+    observation, info = env.reset(options={"episode_seed": seed})
+    observations = [observation]
+    for _ in range(env.episode_steps):
+        observation, _, _, _, info = env.step(action)
+        observations.append(observation)
+    return observations, info
+
+
+class TestOneArmOfAFile(unittest.TestCase):
+    def test_only_the_agents_arm_is_built(self):
+        scenario = _scenario(ARMS, "three_retries")
+        experiment = scenario.experiment
+        self.assertEqual([s.name for s in experiment.services], ["svc-retry"])
+        self.assertEqual([c.name for c in experiment.clients], ["three_retries"])
+        episode = scenario.build(1)
+        self.assertEqual(len(episode.agent.clients), 3)  # every replica
+        self.assertEqual(len(episode.clients), 3)
+        self.assertEqual(episode.expected_rps, 90)
+        self.assertEqual(episode.agent.agent_rps, 90)
+        self.assertEqual(episode.fault_windows, [(8, 11)])
+        self.assertEqual(scenario.horizon_s, 20)
+
+    def test_the_levels_come_from_the_file(self):
+        self.assertEqual(
+            _scenario(ARMS, "three_retries").grid,
+            RetryGrid(
+                max_attempts=(1, 2, 3, 4),
+                default_max_attempts=4,
+                backoff_ms=(0.0, 10.0, 50.0),
+                default_backoff_ms=0.0,
+                attempt_timeout_ms=(100.0, 200.0, 400.0),
+                default_attempt_timeout_ms=200.0,
+                default_budget_ratio=1.0,
+            ),
+        )
+        jittered = _scenario(ARMS, "jittered").grid
+        self.assertEqual(
+            (jittered.backoff_ms, jittered.default_backoff_ms), ((0.0, 10.0, 20.0, 50.0), 20.0)
+        )
+
+    def test_the_default_setting_is_the_arm_as_the_file_has_it(self):
+        """With no budget in the grid, an episode left at its defaults is their arm, record for record."""
+        scenario = _scenario(ARMS, "three_retries")
+        scenario = replace(scenario, grid=replace(scenario.grid, budget_ratio=None))
+        env = RetryEnv(scenario, keep_records=True)
+        action = [knob.default for knob in scenario.knobs if len(knob.values) > 1]
+        _play(env, action, seed=11)
+
+        plain = build(scenario.experiment, seed=11, arrivals=11)  # the importer's own build
+        plain.run()
+        self.assertEqual(
+            _records(env.episode.sim, env.episode.clients),
+            _records(plain.sim, [client.runtime for client in plain.clients]),
+        )
+        self.assertGreater(sum(len(c.runtime.roots) for c in plain.clients), 1500)
+
+    def test_the_agent_can_be_several_entries(self):
+        scenario = _scenario(ARMS, ["no_retries", "three_retries"])
+        self.assertEqual([s.name for s in scenario.experiment.services], ["svc-none", "svc-retry"])
+        episode = scenario.build(1)
+        self.assertEqual(len(episode.agent.clients), 6)
+        self.assertEqual(scenario.grid.default_max_attempts, 4)
+
+    def test_a_scenario_pickles(self):
+        scenario = _scenario(ARMS, "three_retries")
+        self.assertEqual(pickle.loads(pickle.dumps(scenario)), scenario)
+
+    def test_an_unknown_agent_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "neither a client entry .* nor a service"):
+            _scenario(ARMS, "four_retries")
+        with self.assertRaisesRegex(UnsupportedScenario, "no retry loop of its own"):
+            _scenario(ARMS, "svc-retry")  # a plain service: its callers hold the policy
+
+
+class TestTenantsBehindALimiter(unittest.TestCase):
+    def test_the_whole_file_is_kept_and_the_limiter_stays_in_front(self):
+        scenario = _scenario(TENANTS, ["plain", "untimed"])
+        self.assertEqual(len(scenario.experiment.clients), 2)
+        episode = scenario.build(1)
+        for client in episode.agent.clients:
+            self.assertIsInstance(client.service, AdmissionGate)  # still theirs, still there
+            self.assertIsNotNone(client.cfg.tenant)
+        self.assertEqual(episode.fault_windows, [(8, 14), (15, 17)])
+
+    def test_one_tenant_can_be_the_agent_among_the_others(self):
+        scenario = _scenario(TENANTS, "plain")
+        episode = scenario.build(1)
+        self.assertEqual(len(scenario.experiment.clients), 2)  # the other shares the service
+        self.assertEqual(len(episode.agent.clients), 1)
+        self.assertEqual(len(episode.reward_clients), 2)
+        self.assertEqual((episode.agent.agent_rps, episode.expected_rps), (40, 80))
+        (other,) = [c for c in episode.clients if c is not episode.agent.clients[0]]
+        layers = list(policy_layers(other.cfg.retry))
+        self.assertFalse(any(isinstance(layer, RetryBudgetPolicy) for layer in layers))  # untouched
+
+    def test_clients_with_different_timeouts_keep_their_own(self):
+        scenario = _scenario(TENANTS, ["plain", "untimed"])
+        self.assertIsNone(scenario.grid.attempt_timeout_ms)
+        self.assertNotIn("attempt_timeout_ms", [knob.name for knob in scenario.knobs])
+        plain, untimed = scenario.build(1).agent.clients
+        self.assertEqual(plain.cfg.timeout_controller.get_attempt_timeout(), 150_000_000)
+        self.assertIsNone(untimed.cfg.timeout_controller.get_attempt_timeout())
+        self.assertEqual(plain.cfg.server_deadline, "global")  # as the importer built it
+
+    def test_refused_retries_reach_the_agent_and_the_summary(self):
+        scenario = _scenario(TENANTS, ["plain", "untimed"])
+        env = RetryEnv(scenario)
+        observations, info = _play(env, [3, 0, 4])  # four attempts, no backoff, budget 1.0
+        other = env.feature_names.index("attempt_other")
+        self.assertGreater(max(float(o[other]) for o in observations), 0.02)
+        self.assertGreater(info["ep_failed_rejected"], 0)
+        self.assertLess(info["ep_fault_success_rate"], info["ep_success_rate"])
+
+
+class TestServicesThatRetryTheirOwnCalls(unittest.TestCase):
+    def test_the_agent_takes_over_the_services_retry_loops(self):
+        scenario = _scenario(LAYERS, ["gw", "app"])
+        self.assertEqual([s.name for s in scenario.experiment.services], ["db", "app", "gw"])
+        self.assertEqual([c.name for c in scenario.experiment.clients], ["through"])
+        episode = scenario.build(1)
+        self.assertEqual(len(episode.agent.clients), 2)
+        self.assertEqual({c.service.cfg.name for c in episode.agent.clients}, {"gw", "app"})
+        self.assertEqual(len(episode.reward_clients), 1)  # the client that enters
+        self.assertEqual((episode.agent.agent_rps, episode.expected_rps), (100, 50))
+        self.assertEqual(scenario.grid.max_attempts, (1, 2, 3, 4, 5))
+        self.assertEqual(scenario.grid.default_max_attempts, 5)
+        self.assertIsNone(scenario.grid.attempt_timeout_ms)  # 500 ms and 300 ms: each its own
+        for client in episode.agent.clients:
+            backoff = next(
+                layer
+                for layer in policy_layers(client.cfg.retry)
+                if isinstance(layer, FixedBackoffRetryPolicy)
+            )
+            self.assertEqual(backoff.max_attempts, 5)
+
+    def test_fewer_attempts_at_every_layer_mean_fewer_calls_on_the_database(self):
+        calls = {}
+        for attempts in (0, 4):  # one attempt, five attempts
+            env = RetryEnv(_scenario(LAYERS, ["gw", "app"]))
+            _, info = _play(env, [attempts, 0, 4])
+            calls[attempts] = env.episode.services["db"].admitted_total
+        self.assertGreater(calls[4], 1.2 * calls[0])
+
+    def test_a_loop_that_carries_the_services_limiter_is_not_taken_over(self):
+        limited = LAYERS.replace(
+            "    retry: {type: fixed, max_attempts: 5, delay_ms: 0}\n    timeout: {attempt_ms: 300",
+            "    retry: {type: fixed, max_attempts: 5, delay_ms: 0}\n"
+            "    global_retry_budget: {target_rps: 10}\n    timeout: {attempt_ms: 300",
+        )
+        with self.assertRaisesRegex(UnsupportedScenario, "would drop it"):
+            _scenario(limited, ["gw", "app"])
+        _scenario(limited, "gw")  # the gateway's loop holds no limiter
+
+
+class TestTheCut(unittest.TestCase):
+    def test_what_is_cut_shares_no_station_with_what_is_kept(self):
+        experiment = parse(yaml.safe_load(LAYERS))
+        part = agent_part(experiment, ["app"])
+        self.assertEqual([s.name for s in part.services], ["db", "app", "gw"])  # and who calls it
+        self.assertEqual([c.name for c in part.clients], ["through"])
+        whole = agent_part(experiment, ["through", "elsewhere"])
+        self.assertEqual(len(whole.services), 5)
+
+    def test_a_grid_can_be_given(self):
+        grid = replace(
+            file_grid(parse(yaml.safe_load(ARMS)), ["three_retries"]), max_attempts=(1, 4)
+        )
+        self.assertEqual(_scenario(ARMS, "three_retries", grid=grid).grid.max_attempts, (1, 4))
+
+
+#: A checkout of https://github.com/eth-easl/Arolla, to run the tests below.
+AROLLA_CHECKOUT = os.environ.get("AROLLA_CHECKOUT")
+_ALL_TENANTS = ("three_retries", "exponential_backoff_jitter", "circuit_breaker", "retry_budget")
+#: The files the environment is wired to first, and who the agent is in each.
+SHIPPED = {
+    "post_mortem_simulation/s01__buggy_release.yaml": "three_retries",
+    "post_mortem_simulation/s02__shaky_foundations.yaml": "three_retries",
+    "post_mortem_simulation/s03__thundering_herd.yaml": "three_retries",
+    "post_mortem_simulation/s04__internal_retry_rogue.yaml": ("gw-full-retry", "app-full-retry"),
+    "snowflake/policy-none.yaml": _ALL_TENANTS,
+    "snowflake/policy-cb.yaml": _ALL_TENANTS,
+    "snowflake/policy-rb.yaml": _ALL_TENANTS,
+    "snowflake/policy-aimd.yaml": _ALL_TENANTS,
+    "snowflake/policy-arolla.yaml": _ALL_TENANTS,
+}
+
+
+@unittest.skipUnless(AROLLA_CHECKOUT, "set AROLLA_CHECKOUT to a checkout of Arolla to run this")
+class TestTheFilesArollaShips(unittest.TestCase):
+    def test_each_one_is_an_environment(self):
+        assert AROLLA_CHECKOUT is not None
+        folder = Path(AROLLA_CHECKOUT) / "simulator" / "experiments" / "yaml"
+        for file, agent in SHIPPED.items():
+            with self.subTest(file=file), warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                scenario = ArollaScenario.from_file(folder / file, agent)
+                env = RetryEnv(scenario)
+                check_env(env, skip_render_check=True)
+                self.assertEqual(
+                    [str(w.message) for w in caught if "gymnasium" in str(w.filename)], []
+                )
+                rng = np.random.default_rng(1)
+                observation, _ = env.reset(seed=1)
+                rewards = []
+                for _ in range(20):
+                    observation, reward, _, _, _ = env.step(rng.integers(0, env.knob_levels))
+                    self.assertTrue(env.observation_space.contains(observation))
+                    rewards.append(reward)
+                self.assertGreater(
+                    float(np.mean(rewards)), 0.5
+                )  # the first 25 s are mostly healthy
+                self.assertTrue(scenario.fault_windows())
+
+
+if __name__ == "__main__":
+    unittest.main()
