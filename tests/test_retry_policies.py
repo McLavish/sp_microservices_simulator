@@ -1,4 +1,6 @@
 import random
+import sys
+import typing
 import unittest
 
 from msim.caller import ClientConfig, ClientRuntime
@@ -25,6 +27,7 @@ from msim.retry_policies import (
 from msim.service import ServiceConfig, ServiceRuntime
 from msim.simulator import Simulator
 from msim.timeout_controllers import StaticTimeoutController
+from msim.workload import Workload
 
 
 class TestRetryPolicies(unittest.TestCase):
@@ -988,3 +991,116 @@ class TestPolicyLayers(unittest.TestCase):
         client._update_policy_results(budget, RetryContext(attempt=1, now=0), False)
         client._rollback_policy(budget, RetryContext(attempt=1, now=0))
         self.assertEqual(seen, ["start", "result", "rollback"])
+
+
+class TestWhatALayerContains(unittest.TestCase):
+    """Two attributes say what is inside a layer, and reading them is all the walk does."""
+
+    def test_branches_come_before_a_wrapped_policy(self):
+        chosen, ignored = NoRetryPolicy(), NoRetryPolicy()
+
+        class Both(NoRetryPolicy):
+            underlying_strategy = ignored
+
+            def sub_policies(self, context=None):
+                return (chosen,)
+
+        policy = Both()
+        layers = list(policy_layers(policy))
+        self.assertEqual(len(layers), 2)
+        self.assertIs(layers[0], policy)
+        self.assertIs(layers[1], chosen)
+
+    def test_branches_are_asked_with_the_context_of_the_walk(self):
+        asked: list[RetryContext | None] = []
+
+        class Brancher(NoRetryPolicy):
+            def sub_policies(self, context=None):
+                asked.append(context)
+                return ()
+
+        policy = Brancher()
+        context = RetryContext(attempt=2, now=7)
+        list(policy_layers(policy))
+        list(policy_layers(policy, context))
+        self.assertEqual(asked, [None, context])
+
+    def test_sub_policies_set_to_none_means_no_branches(self):
+        inner = NoRetryPolicy()
+
+        class Wrapper(NoRetryPolicy):
+            sub_policies = None
+            underlying_strategy = inner
+
+        policy = Wrapper()
+        layers = list(policy_layers(policy))
+        self.assertEqual(len(layers), 2)
+        self.assertIs(layers[1], inner)
+
+    def test_a_simulation_makes_no_runtime_protocol_check(self):
+        """An `isinstance` against a runtime-checkable Protocol is a search of the
+        object and its classes written in Python. Two of them per layer, on every
+        walk, once took more than half of a run, and no result showed it."""
+
+        def protocol_checks(run) -> int:
+            calls = 0
+
+            def hook(frame, event, _arg):
+                nonlocal calls
+                code = frame.f_code
+                if (
+                    event == "call"
+                    and code.co_name == "__instancecheck__"
+                    and code.co_filename == typing.__file__
+                ):
+                    calls += 1
+
+            previous = sys.getprofile()
+            sys.setprofile(hook)
+            try:
+                run()
+            finally:
+                sys.setprofile(previous)
+            return calls
+
+        # The hook sees such a check when there is one ...
+        self.assertGreater(protocol_checks(lambda: isinstance(3, typing.SupportsInt)), 0)
+
+        attempts: list[int] = []
+
+        def run() -> None:
+            sim = Simulator(seed=3)
+            service = ServiceRuntime(
+                cfg=ServiceConfig(
+                    name="svc",
+                    latency_median=1_000_000,
+                    latency_lognorm_sigma=0.3,
+                    workers=2,
+                    queue_capacity=5,
+                    partial_failures=[
+                        PartialFailure(duration=TimeInterval(begin=0, end=s_to_ns(2)), p_fail=0.5)
+                    ],
+                )
+            ).bind()
+            backoff = FixedBackoffRetryPolicy(max_attempts=3, delay=0)
+            budget = RetryBudgetPolicy(
+                budget_ratio=0.5, max_retries=10, underlying_strategy=backoff
+            )
+            breaker = CountBasedCircuitBreakerPolicy(
+                failure_threshold_ratio=(9, 10),
+                success_threshold_ratio=(3, 5),
+                underlying_strategy=budget,
+                half_open_delay=0,
+            )
+            client = ClientRuntime(
+                cfg=ClientConfig(retry=breaker, timeout_controller=StaticTimeoutController()),
+                service=service,
+            )
+            Workload(base_rps=200, duration_s=2, load_spikes=[]).drive(sim, client.start_request)
+            sim.run()
+            attempts.extend(len(root.attempts) for root in client.roots)
+
+        # ... and a run with a three-layer policy, retries and refusals has none.
+        self.assertEqual(protocol_checks(run), 0)
+        self.assertGreater(len(attempts), 300)
+        self.assertGreater(sum(attempts), len(attempts))  # it retried
