@@ -101,6 +101,14 @@ root = ["./src", "."]
 # but real type errors (None narrowing, protocol mismatches, numpy
 # misuse) are kept clean.
 
+# Stable-Baselines3 and PyTorch are the `train` extra, which the dev group does
+# not install: the two files that import them must still pass without them.
+[[tool.ty.overrides]]
+include = ["src/msim/rl/train.py", "tests/test_rl_training.py"]
+
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]

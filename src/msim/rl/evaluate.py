@@ -245,6 +245,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
     parser.add_argument("--selection-seeds", type=int, default=len(SELECTION_SEEDS))
     parser.add_argument("--test-seeds", type=int, default=len(TEST_SEEDS))
     parser.add_argument("--step-s", type=float, default=1.0)
+    parser.add_argument("--model", type=Path, help="a model saved by msim.rl.train, to add")
     parser.add_argument("--out", type=Path, help="a directory for static.csv and comparison.csv")
     args = parser.parse_args(arguments)
 
@@ -254,6 +255,11 @@ def main(arguments: Sequence[str] | None = None) -> None:
     runs, search = baselines(
         scenario, selection_seeds=selection, test_seeds=test, jobs=args.jobs, step_s=args.step_s
     )
+    if args.model is not None:
+        from msim.rl.train import evaluate_model  # needs the `train` extra
+
+        learned = evaluate_model(args.model, test, scenario=scenario, jobs=args.jobs)
+        runs = {"ppo": learned, **runs}
 
     print(f"{args.scenario}: {len(search)} fixed settings on {len(selection)} selection episodes")
     for static in search[:5]:

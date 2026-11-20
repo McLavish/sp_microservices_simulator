@@ -2,7 +2,7 @@
 # Targets are run via uv so the .venv stays consistent for everyone.
 
 .DEFAULT_GOAL := help
-.PHONY: help install lint lint-fix fmt fmt-check type test cov pre-commit check clean
+.PHONY: help install lint lint-fix fmt fmt-check type test test-train cov pre-commit check clean
 
 help:  ## Show this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "Available targets:\n"} /^[a-zA-Z_-]+:.*##/ { printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
@@ -28,6 +28,9 @@ type:  ## Run ty type checker.
 
 test:  ## Run the test suite.
 	uv run pytest
+
+test-train:  ## Run the training tests (installs the train extra: Stable-Baselines3, CPU PyTorch).
+	uv run --extra train pytest tests/test_rl_training.py
 
 cov:  ## Run tests with coverage report.
 	uv run pytest --cov
