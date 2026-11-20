@@ -330,6 +330,45 @@ class TestWhatTheAgentSees(unittest.TestCase):
         self.assertEqual(max(float(o.max()) for o in seen), 1.0)  # something did hit the bound
         self.assertLess(self._named(env, seen[-1])["attempt_success"], 0.01)
 
+    def test_a_slow_copy_of_what_it_measures_when_asked_for(self):
+        """`slow_s`: every measured entry again, averaged exponentially over about that long."""
+        plain, env = RetryEnv(Small()), RetryEnv(Small(), slow_s=4.0)
+        n = len(FEATURES)
+        self.assertEqual(plain.feature_names[:n], FEATURES)  # unchanged without it
+        self.assertEqual(
+            env.feature_names,
+            FEATURES
+            + tuple(f"{name}~4s" for name in FEATURES)
+            + tuple(f"knob:{name}" for name in env.knob_names),
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            check_env(env, skip_render_check=True)
+
+        action = _default_action(env)
+        first, _ = env.reset(options={"episode_seed": 21})
+        np.testing.assert_array_equal(first[n : 2 * n], first[:n])  # it starts at the warm-up
+        # The same episode without it: the last-window entries are the same numbers.
+        (start, *_), *steps = _play(plain, action, options={"episode_seed": 21})
+        np.testing.assert_array_equal(first[:n], start[:n])
+        slow, weight = first[:n].astype(np.float64), 1.0 - math.exp(-1.0 / 4.0)
+        for expected, *_ in steps:
+            observation, *_ = env.step(action)
+            np.testing.assert_array_equal(observation[:n], expected[:n])
+            np.testing.assert_array_equal(observation[2 * n :], expected[n:])  # the knobs
+            slow = slow + weight * (expected[:n].astype(np.float64) - slow)
+            np.testing.assert_allclose(observation[n : 2 * n], slow, atol=1e-5)
+            self.assertTrue(env.observation_space.contains(observation))
+        named = self._named(env, observation)
+        # The failure is over at the end; the slow share of failures has not forgotten it.
+        self.assertEqual(named["attempt_server_failure"], 0.0)
+        self.assertGreater(named["attempt_server_failure~4s"], 0.0)
+
+    def test_a_slow_copy_needs_a_time_constant(self):
+        for bad in (0.0, -1.0, math.inf):
+            with self.subTest(slow_s=bad), self.assertRaisesRegex(ValueError, "slow_s"):
+                RetryEnv(Small(), slow_s=bad)
+
     def test_an_idle_window_says_so(self):
         env = RetryEnv(Small(rps=0.001))
         observation, _ = env.reset(seed=1)

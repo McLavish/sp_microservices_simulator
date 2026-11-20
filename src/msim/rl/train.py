@@ -172,6 +172,7 @@ def _describe(env: RetryEnv) -> dict[str, Any]:
         "features": list(env.feature_names),
         "step_s": env.step_s,
         "warmup_s": env.warmup_s,
+        "slow_s": env.slow_s,
     }
 
 
@@ -196,6 +197,7 @@ def train(
     torch_threads: int = 4,
     verbose: int = 1,
     snapshots: int = 0,
+    slow_s: float | None = None,
 ) -> dict[str, Any]:
     """Train PPO on the scenario and save `model.zip` and `model.json` in `out`.
 
@@ -204,8 +206,8 @@ def train(
     learner's reward is shifted down by (`_Offset`); the logs and every
     evaluation use the environment's own reward. `snapshots` asks for that
     many copies of the model on the way, evenly spaced
-    (`snapshots/model-<steps>.zip`, each with a sidecar of its own). Returns
-    the sidecar.
+    (`snapshots/model-<steps>.zip`, each with a sidecar of its own). `slow_s`
+    is the environment's (`RetryEnv.slow_s`). Returns the sidecar.
     """
     import stable_baselines3
     import torch
@@ -214,7 +216,7 @@ def train(
 
     out.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(torch_threads)  # the cores are for the simulations
-    probe = RetryEnv(scenario, step_s=step_s)
+    probe = RetryEnv(scenario, step_s=step_s, slow_s=slow_s)
     n_steps = n_steps or 2 * probe.episode_steps
     batch_size = batch_size or max(32, n_steps * n_envs // 12)
 
@@ -225,6 +227,7 @@ def train(
         monitor_dir=out / "monitor",
         reward_offset=reward_offset,
         step_s=step_s,
+        slow_s=slow_s,
     )
     model = PPO(
         "MlpPolicy",
@@ -316,9 +319,10 @@ def load_policy(model: Path, env: RetryEnv) -> Policy:
     sidecar = json.loads(model.with_suffix(".json").read_text("utf-8"))
     here = _describe(env)
     for name, value in here.items():
-        if sidecar[name] != value:
+        # `.get`: a sidecar written before a setting existed was trained without it.
+        if sidecar.get(name) != value:
             raise ValueError(
-                f"{model} was trained with {name} = {sidecar[name]!r}, "
+                f"{model} was trained with {name} = {sidecar.get(name)!r}, "
                 f"this environment has {value!r}"
             )
     trained = PPO.load(model, device="cpu")
@@ -358,7 +362,11 @@ def evaluate_model(
                 f"{model} does not name its scenario: pass the scenario it was trained on"
             )
         scenario = evaluate.scenario_from(sidecar["scenario"])
-    env_arguments = {"step_s": sidecar["step_s"], "warmup_s": sidecar["warmup_s"]}
+    env_arguments = {
+        "step_s": sidecar["step_s"],
+        "warmup_s": sidecar["warmup_s"],
+        "slow_s": sidecar.get("slow_s"),
+    }
     seeds = tuple(seeds)
     chunks = [seeds[i::jobs] for i in range(max(1, min(jobs, len(seeds))))]
     tasks = [(model, scenario, env_arguments, chunk) for chunk in chunks]
@@ -397,6 +405,9 @@ def main(arguments: Sequence[str] | None = None) -> None:
     parser.add_argument("--test-seeds", type=int, default=len(evaluate.TEST_SEEDS))
     parser.add_argument("--selection-seeds", type=int, default=len(evaluate.SELECTION_SEEDS))
     parser.add_argument("--snapshots", type=int, default=0, help="copies of the model on the way")
+    parser.add_argument(
+        "--slow-s", type=float, help="also show the measurements averaged over about this long"
+    )
     parser.add_argument("--no-comparison", action="store_true", help="train and save only")
     args = parser.parse_args(arguments)
 
@@ -418,6 +429,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
         reward_offset=args.reward_offset,
         device=args.device,
         snapshots=args.snapshots,
+        slow_s=args.slow_s,
     )
     print(
         f"trained {sidecar['timesteps_trained']} steps ({sidecar['episodes_trained']} episodes) "

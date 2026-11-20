@@ -78,6 +78,15 @@ attempt is known when it ends, not when its request has finished retrying).
 `env.feature_names` lists them in order. There is no clock and no fault flag:
 the agent has to read the fault off its clients, as a deployed one would.
 
+One window is a noisy measurement: a second of 160 requests tells the request
+rate to within 8%, and the policy has no memory. `RetryEnv(scenario,
+slow_s=10)` shows every measured entry a second time, averaged exponentially
+over about that many seconds (`<name>~10s`, between the entries of the last
+window and the knob levels; the average starts at the warm-up). It is off by
+default and a model is tied to it by its sidecar. An agent whose best setting
+depends on something that holds for a whole episode (the load it is under)
+needs it: without it, it cannot tell 1.15 times a load from 1.3 times.
+
 ### The episode summary
 
 The last step's `info` carries it as `ep_*` keys; `rl/summary.py` is the one

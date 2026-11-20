@@ -80,14 +80,24 @@ class RetryEnv(gymnasium.Env):
         warmup_s: float = 5.0,
         drain: bool = True,
         keep_records: bool = False,
+        slow_s: float | None = None,
     ) -> None:
         if not math.isfinite(step_s) or step_s <= 0:
             raise ValueError(f"step_s must be > 0, got {step_s}")
         if not math.isfinite(warmup_s) or warmup_s < 0:
             raise ValueError(f"warmup_s must be >= 0, got {warmup_s}")
+        if slow_s is not None and (not math.isfinite(slow_s) or slow_s <= 0):
+            raise ValueError(f"slow_s must be > 0 or None, got {slow_s}")
         self.scenario = scenario
         self.step_s = step_s
         self.warmup_s = warmup_s
+        #: `None`, or the time constant in seconds of a second copy of every
+        #: measured entry, averaged exponentially over about that long
+        #: (`<name>~<slow_s>s`, after the entries of the last window). One window
+        #: is a noisy measurement: a second of 160 requests per second tells the
+        #: rate to within 8%. An agent that has to know its load, or whether a
+        #: failure is a blip, needs the longer look as well, and has no memory.
+        self.slow_s = slow_s
         #: Whether the requests in flight at the horizon are run to their end for
         #: the summary. Off: the summary covers what finished inside the horizon.
         self.drain = drain
@@ -121,7 +131,10 @@ class RetryEnv(gymnasium.Env):
         self.knob_names = tuple(knob.name for knob in self._knobs)
         self.knob_levels = tuple(len(knob.values) for knob in self._knobs)
         #: What each entry of the observation is.
-        self.feature_names = FEATURES + tuple(f"knob:{name}" for name in self.knob_names)
+        slow = () if slow_s is None else tuple(f"{name}~{slow_s:g}s" for name in FEATURES)
+        self.feature_names = FEATURES + slow + tuple(f"knob:{name}" for name in self.knob_names)
+        self._slow_weight = 0.0 if slow_s is None else 1.0 - math.exp(-step_s / slow_s)
+        self._slow: np.ndarray | None = None  # the averaged copy, once there is a window
         self.action_space = spaces.MultiDiscrete(list(self.knob_levels))
         self.observation_space = spaces.Box(0.0, 1.0, (len(self.feature_names),), np.float32)
 
@@ -165,6 +178,7 @@ class RetryEnv(gymnasium.Env):
         self._in_horizon, self._tail, self._effort = Tally(), Tally(), Effort()
         self._windows = []
         self._return = 0.0
+        self._slow = None
 
         episode.agent.apply(self._setting())
         # The first observation is of the warm-up, run under the default setting:
@@ -299,6 +313,15 @@ class RetryEnv(gymnasium.Env):
             latency_p95,
             agent.budget_balance(),
         ]
+        if self.slow_s is not None:
+            # Of the entries as the agent is shown them, clipped; the warm-up is
+            # where the average starts.
+            measured = np.clip(np.asarray(values, dtype=np.float64), 0.0, 1.0)
+            if self._slow is None:
+                self._slow = measured
+            else:
+                self._slow = self._slow + self._slow_weight * (measured - self._slow)
+            values += self._slow.tolist()
         values += [
             level / (len(knob.values) - 1)
             for knob, level in zip(self._knobs, self._levels, strict=True)

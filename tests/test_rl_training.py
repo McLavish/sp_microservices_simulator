@@ -176,6 +176,19 @@ class TestSnapshots(unittest.TestCase):
                 self.assertGreater(episode["success_rate"], 0.5)
             self.assertEqual(final["timesteps_trained"], 540)
 
+    def test_a_model_keeps_the_slow_averages_it_was_trained_with(self):
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder)
+            sidecar = tr.train(TINY, out, timesteps=100, n_envs=2, seed=3, verbose=0, slow_s=5.0)
+            self.assertEqual(sidecar["slow_s"], 5.0)
+            self.assertIn("request_rate~5s", sidecar["features"])
+            # Evaluated on the environment its sidecar describes ...
+            (episode,) = tr.evaluate_model(out / "model.zip", [2000], scenario=TINY)
+            self.assertGreater(episode["success_rate"], 0.5)
+            # ... and refused on one that shows something else.
+            with self.assertRaisesRegex(ValueError, "trained with features"):
+                tr.load_policy(out / "model.zip", RetryEnv(TINY))
+
     def test_none_unless_asked_for(self):
         with tempfile.TemporaryDirectory() as folder:
             tr.train(TINY, Path(folder), timesteps=100, n_envs=2, seed=3, verbose=0)
