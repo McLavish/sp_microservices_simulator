@@ -22,22 +22,14 @@ left to finish; they count in the episode summary that the last `info` carries
 """
 
 import math
-from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 
 from msim.caller import ClientRuntime
-from msim.core import (
-    FAILURE_OUTCOMES,
-    RootOutcome,
-    RootRequest,
-    TimePoint,
-    classify_root,
-    ns_to_s,
-    s_to_ns,
-)
-from msim.rl.scenario import Episode, Knob, Scenario, Window
+from msim.core import RootRequest, TimePoint, ns_to_s, s_to_ns
+from msim.rl.scenario import Episode, Knob, Scenario
+from msim.rl.summary import Effort, Tally, WindowCount, summary
 
 try:
     import gymnasium
@@ -62,38 +54,6 @@ FEATURES = (
     "latency_p95",
     "budget_balance",  # how full the retry budget is
 )
-
-#: A window counts as recovered when this share of its finished requests succeeded.
-RECOVERED = 0.95
-
-_FAILED = tuple(outcome.name.lower() for outcome in FAILURE_OUTCOMES)
-
-
-@dataclass
-class _Tally:
-    """Requests that finished, on the clients the reward is counted on."""
-
-    requests: int = 0
-    succeeded: int = 0
-    attempts: int = 0
-    #: Among them, the requests that started inside a fault window.
-    fault_requests: int = 0
-    fault_succeeded: int = 0
-    failed: dict[str, int] = field(default_factory=lambda: dict.fromkeys(_FAILED, 0))
-
-    def add(self, other: "_Tally") -> None:
-        self.requests += other.requests
-        self.succeeded += other.succeeded
-        self.attempts += other.attempts
-        self.fault_requests += other.fault_requests
-        self.fault_succeeded += other.fault_succeeded
-        for name, count in other.failed.items():
-            self.failed[name] += count
-
-
-def _ratio(numerator: float, denominator: float) -> float:
-    """A share, or nan when there is nothing to take a share of."""
-    return numerator / denominator if denominator > 0 else math.nan
 
 
 class RetryEnv(gymnasium.Env):
@@ -174,10 +134,10 @@ class RetryEnv(gymnasium.Env):
         self._faults: list[tuple[TimePoint, TimePoint]] = []
         self._started = 0  # requests the agent's clients started, since the build
         self._finished = 0  # ... and finished
-        self._in_horizon = _Tally()
-        self._tail = _Tally()
-        self._agent = Window()  # the agent's clients over the episode, warm-up excluded
-        self._windows: list[tuple[TimePoint, int, int]] = []  # (begin, requests, succeeded)
+        self._in_horizon = Tally()
+        self._tail = Tally()
+        self._effort = Effort()  # of the agent's clients over the episode, warm-up excluded
+        self._windows: list[WindowCount] = []
         self._return = 0.0
 
     # ------------------------------------------------------------------ API
@@ -202,7 +162,7 @@ class RetryEnv(gymnasium.Env):
         self._cursors = [0] * len(episode.clients)
         self._faults = [(s_to_ns(a), s_to_ns(b)) for a, b in episode.fault_windows]
         self._started = self._finished = 0
-        self._in_horizon, self._tail, self._agent = _Tally(), _Tally(), Window()
+        self._in_horizon, self._tail, self._effort = Tally(), Tally(), Effort()
         self._windows = []
         self._return = 0.0
 
@@ -210,9 +170,9 @@ class RetryEnv(gymnasium.Env):
         # The first observation is of the warm-up, run under the default setting:
         # the system the agent takes over is one that is already serving.
         self._run(self._warmup_ns)
-        self._collect()
-        observation = self._observe(self.warmup_s, count=False)
-        return observation, {"episode_seed": episode_seed, **self._step_info(_Tally())}
+        self._collect(scored=False)
+        observation = self._observe(self.warmup_s)
+        return observation, {"episode_seed": episode_seed, **self._step_info(Tally())}
 
     def step(self, action: Any) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         episode = self._episode
@@ -232,7 +192,7 @@ class RetryEnv(gymnasium.Env):
         tally = self._collect()
         self._in_horizon.add(tally)
         self._windows.append((begin, tally.requests, tally.succeeded))
-        observation = self._observe(self.step_s, count=True)
+        observation = self._observe(self.step_s)
         reward = tally.succeeded / (episode.expected_rps * self.step_s)
         self._return += reward
         info = self._step_info(tally)
@@ -286,46 +246,34 @@ class RetryEnv(gymnasium.Env):
         fresh, client.roots = client.roots, []
         return fresh
 
-    def _collect(self) -> _Tally:
-        """Read what finished since the last call: the reward's side of a window."""
+    def _collect(self, *, scored: bool = True) -> Tally:
+        """Read what finished since the last call: the reward's side of a window.
+
+        `scored=False` for the warm-up: what the agent's clients spent on it is
+        not part of the episode.
+        """
         episode = self._episode
         assert episode is not None
         rewarded = {id(client) for client in episode.reward_clients}
         agents = {id(client) for client in episode.agent.clients}
-        tally = _Tally()
+        tally = Tally()
         for index, client in enumerate(episode.clients):
             fresh = self._take(index, client)
             if id(client) in agents:
                 self._finished += len(fresh)
-            if id(client) not in rewarded:
-                continue
-            for root in fresh:
-                if not root.attempts:
-                    continue  # nothing was tried: `Metrics` skips these too
-                outcome = classify_root(root)
-                succeeded = outcome is RootOutcome.SUCCESS
-                tally.requests += 1
-                tally.attempts += len(root.attempts)
-                if succeeded:
-                    tally.succeeded += 1
-                else:
-                    tally.failed[outcome.name.lower()] += 1
-                started = root.attempts[0].interval.begin
-                if any(begin <= started < end for begin, end in self._faults):
-                    tally.fault_requests += 1
-                    tally.fault_succeeded += succeeded
+                if scored:
+                    self._effort.count(fresh)
+            if id(client) in rewarded:
+                tally.count(fresh, self._faults)
         return tally
 
-    def _observe(self, window_s: float, *, count: bool) -> np.ndarray:
+    def _observe(self, window_s: float) -> np.ndarray:
         """What the agent's clients measured in the window just run; resets the window."""
         episode = self._episode
         assert episode is not None
         agent = episode.agent
         window = agent.window
         self._started += window.requests
-        if count:
-            for name in ("requests", "attempts", "ok", "retries", "retry_ok"):
-                setattr(self._agent, name, getattr(self._agent, name) + getattr(window, name))
 
         attempts = window.attempts
         latencies = window.latencies
@@ -359,7 +307,7 @@ class RetryEnv(gymnasium.Env):
         # A new array every call, clipped: the declared bounds are the real ones.
         return np.clip(np.asarray(values, dtype=np.float32), 0.0, 1.0)
 
-    def _step_info(self, tally: _Tally) -> dict[str, Any]:
+    def _step_info(self, tally: Tally) -> dict[str, Any]:
         episode = self._episode
         assert episode is not None
         info: dict[str, Any] = {
@@ -380,7 +328,11 @@ class RetryEnv(gymnasium.Env):
         return info
 
     def _finish(self) -> dict[str, float]:
-        """The episode summary. Past the horizon nothing is rewarded any more."""
+        """The episode summary (`msim.rl.summary`), as `ep_*` keys.
+
+        Past the horizon nothing is rewarded any more: what is still in flight
+        is run to its end for the totals only.
+        """
         episode = self._episode
         assert episode is not None
         if self.drain:
@@ -388,41 +340,12 @@ class RetryEnv(gymnasium.Env):
                 workload.stop()
             episode.sim.run()
             self._tail = self._collect()
-            self._observe(self.step_s, count=True)  # the agent's last attempts
-        total = _Tally()
-        total.add(self._in_horizon)
-        total.add(self._tail)
-        agent = self._agent
-        summary = {
-            "ep_return": self._return,
-            "ep_requests": float(total.requests),
-            "ep_success_rate": _ratio(total.succeeded, total.requests),
-            # The population the rewards were counted on: what finished in time.
-            "ep_horizon_success_rate": _ratio(
-                self._in_horizon.succeeded, self._in_horizon.requests
-            ),
-            "ep_fault_success_rate": _ratio(total.fault_succeeded, total.fault_requests),
-            # Of the agent's clients: attempts per request, and what retrying bought.
-            "ep_amplification": _ratio(agent.attempts, agent.requests),
-            "ep_retry_efficiency": _ratio(agent.retry_ok, agent.retries),
-            "ep_recovery_s": self._recovery_s(),
-        }
-        for name, count in total.failed.items():
-            summary[f"ep_failed_{name}"] = float(count)
-        return summary
-
-    def _recovery_s(self) -> float:
-        """Seconds from the end of the last fault to the first window that is healthy again.
-
-        The first window that begins at or after the fault's end and in which at
-        least `RECOVERED` of the finished requests succeeded; 0 when that is the
-        very next window. `inf` when no window of the episode qualifies, `nan`
-        when the episode has no fault.
-        """
-        if not self._faults:
-            return math.nan
-        fault_end = max(end for _, end in self._faults)
-        for begin, requests, succeeded in self._windows:
-            if begin >= fault_end and requests and succeeded >= RECOVERED * requests:
-                return ns_to_s(begin - fault_end)
-        return math.inf
+        scored = summary(
+            episode_return=self._return,
+            in_horizon=self._in_horizon,
+            tail=self._tail,
+            windows=self._windows,
+            faults=self._faults,
+            effort=self._effort,
+        )
+        return {f"ep_{name}": value for name, value in scored.items()}

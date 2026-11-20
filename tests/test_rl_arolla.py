@@ -17,7 +17,7 @@ from msim.admission import AdmissionGate
 from msim.compat.arolla import UnsupportedScenario, build, parse
 from msim.retry_policies import FixedBackoffRetryPolicy, RetryBudgetPolicy, policy_layers
 from msim.rl import RetryEnv, RetryGrid
-from msim.rl.arolla import ArollaScenario, agent_part, file_grid
+from msim.rl.arolla import ArollaScenario, agent_part, as_written, file_grid
 
 #: The shape of their post-mortem files: one arm per service, the same fault on each.
 ARMS = """
@@ -317,6 +317,48 @@ class TestTheCut(unittest.TestCase):
             file_grid(parse(yaml.safe_load(ARMS)), ["three_retries"]), max_attempts=(1, 4)
         )
         self.assertEqual(_scenario(ARMS, "three_retries", grid=grid).grid.max_attempts, (1, 4))
+
+
+class TestTheFileAsItIsWritten(unittest.TestCase):
+    """`as_written`: their clients left alone, scored the way an agent's episode is."""
+
+    def _summaries(self, text: str, seeds, **kwargs):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "scenario.yaml"
+            path.write_text(text, encoding="utf-8")
+            return as_written(path, seeds, **kwargs)
+
+    def test_an_arm_scores_as_the_environment_scores_it_at_its_defaults(self):
+        scenario = _scenario(ARMS, "three_retries")
+        scenario = replace(scenario, grid=replace(scenario.grid, budget_ratio=None))
+        env = RetryEnv(scenario)
+        action = [knob.default for knob in scenario.knobs if len(knob.values) > 1]
+        _, info = _play(env, action, seed=11)
+
+        (written,) = self._summaries(ARMS, [11], part_of="three_retries")
+        self.assertEqual(written.pop("seed"), 11.0)
+        by_env = {name[3:]: value for name, value in info.items() if name.startswith("ep_")}
+        np.testing.assert_equal(written, by_env)  # every entry of the summary, exactly
+        self.assertLess(written["fault_success_rate"], 0.2)  # three seconds of total failure
+
+    def test_the_whole_file_is_every_arm_together(self):
+        (whole,) = self._summaries(ARMS, [3])
+        (arm,) = self._summaries(ARMS, [3], part_of="no_retries")
+        self.assertAlmostEqual(
+            whole["requests"], 3 * arm["requests"], delta=0.1 * whole["requests"]
+        )
+        self.assertEqual(arm["amplification"], 1.0)
+        self.assertGreater(whole["amplification"], 1.05)
+
+    def test_the_clients_behind_a_limiter_and_whose_effort_is_reported(self):
+        both = self._summaries(TENANTS, [1, 2])
+        self.assertEqual([episode["seed"] for episode in both], [1.0, 2.0])
+        self.assertGreater(both[0]["failed_rejected"], 0)  # their limiter turned retries away
+        (loops,) = self._summaries(LAYERS, [1], part_of="gw", effort=["gw", "app"])
+        (entry,) = self._summaries(LAYERS, [1], part_of="gw")
+        self.assertEqual(entry["amplification"], 1.0)  # the client that enters does not retry
+        self.assertGreater(loops["amplification"], 1.1)  # the services behind it do
+        self.assertEqual(loops["success_rate"], entry["success_rate"])
 
 
 #: A checkout of https://github.com/eth-easl/Arolla, to run the tests below.

@@ -25,7 +25,7 @@ arm as the file has it wherever a fixed backoff can say it.
 Needs PyYAML to read a file: the `arolla` extra.
 """
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -37,6 +37,7 @@ from msim.compat.arolla.importer import IMPLICIT_CLIENT
 from msim.compat.arolla.importer import Scenario as Built
 from msim.retry_policies import RetryAllowancePolicy, policy_layers
 from msim.rl.scenario import Episode, Knob, RetryGrid
+from msim.rl.summary import of_records
 
 
 def _entries(experiment: Experiment) -> tuple[schema.Client, ...]:
@@ -180,7 +181,7 @@ class ArollaScenario:
         `agent` names one or several client entries or services. `grid`
         replaces the levels `file_grid` would derive.
         """
-        names = (agent,) if isinstance(agent, str) else tuple(agent)
+        names = _names(agent)
         experiment = agent_part(parse(read(path)[point].config), names)
         scenario = cls(experiment, names, grid or file_grid(experiment, names))
         scenario.build(
@@ -195,57 +196,16 @@ class ArollaScenario:
     @property
     def horizon_s(self) -> float:
         """The length the file gives its workloads."""
-        return float(max(entry.workload.duration_s for entry in _entries(self.experiment)))
+        return horizon_s(self.experiment)
 
     def fault_windows(self) -> list[tuple[float, float]]:
         """When the file's faults are: failures, injected latency, load spikes."""
-        experiment = self.experiment
-        windows = {
-            (f.start_s, f.end_s)
-            for service in experiment.services
-            for f in service.partial_failures
-            if f.p_fail > 0
-        }
-        windows |= {
-            (f.start_s, f.end_s)
-            for service in experiment.services
-            for f in service.latency_injections
-            if f.add_latency_ms > 0 or f.multiplier > 1
-        }
-        windows |= {
-            (spike.start_s, spike.end_s)
-            for entry in _entries(experiment)
-            for spike in entry.workload.load_spikes
-            if spike.rps_multiplier != 1
-        }
-        return sorted(windows)
-
-    def _rps(self, name: str) -> float:
-        """Requests per second the agent called `name` starts when all is well."""
-        experiment = self.experiment
-        entries = _entries(experiment)
-        own = [entry for entry in entries if entry.name == name]
-        if not own:  # a service's loop: one call for each request that reaches the service
-            own = [e for e in entries if name in _reach(experiment, _target(experiment, e))]
-        return sum(entry.workload.base_rps * entry.replicas for entry in own)
-
-    def _runtimes(self, built: Built, name: str) -> list[ClientRuntime]:
-        """The clients the agent called `name` is, in the built scenario."""
-        replicas = [client.runtime for client in built.group(name)]
-        if replicas:
-            return replicas
-        loop = built.loops.get(name)
-        if loop is None:
-            raise UnsupportedScenario(
-                f"{name!r} is a service with no retry loop of its own in {self.experiment.name!r}: "
-                "its callers hold the policy. Name a client entry instead"
-            )
-        return [loop]
+        return fault_windows(self.experiment)
 
     def build(self, seed: int) -> Episode:
         experiment = self.experiment
         built = build_file(experiment, seed=seed, arrivals=seed)
-        runtimes = [rt for name in self.agent for rt in self._runtimes(built, name)]
+        runtimes = [rt for name in self.agent for rt in _runtimes(experiment, built, name)]
         for runtime in runtimes:
             for layer in policy_layers(runtime.cfg.retry):
                 if isinstance(layer, ControlledRetryPolicy | RetryAllowancePolicy):
@@ -254,7 +214,8 @@ class ArollaScenario:
                         f"in its policy stack ({type(layer).__name__}: the service's own limiter, "
                         "or a retry allowance); taking the stack over would drop it"
                     )
-        agent = self.grid.install(runtimes, agent_rps=sum(self._rps(name) for name in self.agent))
+        rps = sum(_rps(experiment, name) for name in self.agent)
+        agent = self.grid.install(runtimes, agent_rps=rps)
         for client in built.clients:
             client.workload.drive(built.sim, client.runtime.start_request)
         roots = [client.runtime for client in built.clients]
@@ -264,7 +225,112 @@ class ArollaScenario:
             agent=agent,
             reward_clients=roots,
             clients=[*roots, *built.loops.values()],
-            expected_rps=sum(e.workload.base_rps * e.replicas for e in _entries(experiment)),
-            fault_windows=self.fault_windows(),
+            expected_rps=expected_rps(experiment),
+            fault_windows=fault_windows(experiment),
             services=dict(built.stations),
         )
+
+
+def horizon_s(experiment: Experiment) -> float:
+    """The length the file gives its workloads."""
+    return float(max(entry.workload.duration_s for entry in _entries(experiment)))
+
+
+def expected_rps(experiment: Experiment) -> float:
+    """Requests per second the file's clients send together."""
+    return sum(entry.workload.base_rps * entry.replicas for entry in _entries(experiment))
+
+
+def fault_windows(experiment: Experiment) -> list[tuple[float, float]]:
+    """When the file's faults are: failures, injected latency, load spikes."""
+    windows = {
+        (f.start_s, f.end_s)
+        for service in experiment.services
+        for f in service.partial_failures
+        if f.p_fail > 0
+    }
+    windows |= {
+        (f.start_s, f.end_s)
+        for service in experiment.services
+        for f in service.latency_injections
+        if f.add_latency_ms > 0 or f.multiplier > 1
+    }
+    windows |= {
+        (spike.start_s, spike.end_s)
+        for entry in _entries(experiment)
+        for spike in entry.workload.load_spikes
+        if spike.rps_multiplier != 1
+    }
+    return sorted(windows)
+
+
+def _rps(experiment: Experiment, name: str) -> float:
+    """Requests per second the client entry or service loop called `name` starts when all is well."""
+    entries = _entries(experiment)
+    own = [entry for entry in entries if entry.name == name]
+    if not own:  # a service's loop: one call for each request that reaches the service
+        own = [e for e in entries if name in _reach(experiment, _target(experiment, e))]
+    return sum(entry.workload.base_rps * entry.replicas for entry in own)
+
+
+def _runtimes(experiment: Experiment, built: Built, name: str) -> list[ClientRuntime]:
+    """The clients that the entry or service called `name` is, in the built scenario."""
+    replicas = [client.runtime for client in built.group(name)]
+    if replicas:
+        return replicas
+    loop = built.loops.get(name)
+    if loop is None:
+        raise UnsupportedScenario(
+            f"{name!r} is a service with no retry loop of its own in {experiment.name!r}: "
+            "its callers hold the policy. Name a client entry instead"
+        )
+    return [loop]
+
+
+def as_written(
+    path: str | Path,
+    seeds: Iterable[int],
+    *,
+    part_of: str | Sequence[str] | None = None,
+    effort: str | Sequence[str] | None = None,
+    point: int = 0,
+    warmup_s: float = 5.0,
+    step_s: float = 1.0,
+) -> list[dict[str, float]]:
+    """The file run as it is written, with nobody taken over: one summary per seed.
+
+    What a learned policy on this file is put next to: the file's own clients,
+    behind whatever the file puts in front of its services. Each episode is
+    built and seeded as `ArollaScenario` does it and scored by the same
+    definitions (`msim.rl.summary`), on every client of the file.
+
+    `part_of` keeps only the part of the file the named clients interact with,
+    as `from_file` does for an agent. `effort` names the client entries or
+    service loops whose attempts per request and retry efficiency are reported
+    (every client entry unless given).
+    """
+    experiment = parse(read(path)[point].config)
+    if part_of is not None:
+        experiment = agent_part(experiment, _names(part_of))
+    episodes = []
+    for seed in seeds:
+        built = build_file(experiment, seed=seed, arrivals=seed)
+        built.run()
+        spent = None
+        if effort is not None:
+            spent = [rt for name in _names(effort) for rt in _runtimes(experiment, built, name)]
+        scored = of_records(
+            [client.runtime for client in built.clients],
+            expected_rps=expected_rps(experiment),
+            fault_windows=fault_windows(experiment),
+            horizon_s=horizon_s(experiment),
+            warmup_s=warmup_s,
+            step_s=step_s,
+            effort_clients=spent,
+        )
+        episodes.append({"seed": float(seed), **scored})
+    return episodes
+
+
+def _names(names: str | Sequence[str]) -> tuple[str, ...]:
+    return (names,) if isinstance(names, str) else tuple(names)
