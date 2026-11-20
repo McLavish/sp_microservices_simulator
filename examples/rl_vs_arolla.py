@@ -206,6 +206,7 @@ def train(args: argparse.Namespace) -> None:
         learning_rate=args.learning_rate,
         torch_threads=2,
         snapshots=args.snapshots,
+        slow_s=args.slow_s,
     )
     print(
         f"trained {sidecar['timesteps_trained']} steps in {sidecar['wall_s']} s "
@@ -348,6 +349,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
     parser.add_argument("--ent-coef", type=float, default=0.01)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--snapshots", type=int, default=0, help="copies on the way")
+    parser.add_argument("--slow-s", type=float, help="the agent also sees slow averages")
     parser.add_argument(
         "--selection-seeds", type=int, default=32, help="episodes choices are made on"
     )
