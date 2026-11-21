@@ -1,12 +1,13 @@
 """A trained limiter (`msim.rl.limiter`) as the configuration of the Envoy filter next to this file.
 
     python deploy/envoy-limiter/export.py MODEL.zip OUT.json --rates R [R ...]
-        [--tenants NAME [NAME ...]] [--one-level] [--rest] [--fixture FILE]
+        [--tenants NAME [NAME ...]] [--one-level] [--rest] [--in-flight-cap C] [--fixture FILE]
 
 Writes the `limiter` block of the filter's plugin configuration: the tenants in the policy's
 order, the requests per second each sends one PROXY when all is well (`--rates`, the scale of
 everything the policy is shown), the ladder of shares, the probe floor and the resting quota
-the model was trained with (`--rest` turns the second on for a model trained without it), the
+the model was trained with (`--rest` and `--in-flight-cap` turn those on for a model trained
+without them), the
 level held until the policy has spoken, the window, the time constant of the slow
 averages, and the policy's weights (`msim.rl.train.policy_weights`).
 
@@ -42,6 +43,7 @@ def limiter_block(
     rates: list[float],
     one_level: bool = False,
     rest: bool = False,
+    in_flight_cap: float | None = None,
 ) -> dict:
     sidecar = json.loads(model.with_suffix(".json").read_text("utf-8"))
     knobs = sidecar["knobs"]
@@ -67,7 +69,7 @@ def limiter_block(
         "in_flight": bool(trained_grid(sidecar).get("in_flight", False)),
         "step_up": int(trained_grid(sidecar).get("step_up", 0)),
         "hold_above": trained_grid(sidecar).get("hold_above"),
-        "in_flight_cap": trained_grid(sidecar).get("in_flight_cap"),
+        "in_flight_cap": in_flight_cap or trained_grid(sidecar).get("in_flight_cap"),
         "shares": shares,
         "default_level": knobs[0]["default"],
         "window_ms": round(1000 * sidecar["step_s"]),
@@ -86,10 +88,13 @@ def main() -> None:
     parser.add_argument("--tenants", nargs="+")
     parser.add_argument("--one-level", action="store_true")
     parser.add_argument("--rest", action="store_true")
+    parser.add_argument("--in-flight-cap", type=float, default=None)
     parser.add_argument("--fixture", type=Path)
     args = parser.parse_args()
 
-    limiter = limiter_block(args.model, args.tenants, args.rates, args.one_level, args.rest)
+    limiter = limiter_block(
+        args.model, args.tenants, args.rates, args.one_level, args.rest, args.in_flight_cap
+    )
     args.out.write_text(json.dumps(limiter), "utf-8")
     entries = len(limiter["policy"]["hidden"][0]["w"][0])
     print(
