@@ -213,6 +213,7 @@ def train(args: argparse.Namespace) -> None:
         torch_threads=2,
         snapshots=args.snapshots,
         slow_s=args.slow_s,
+        lr_decay=args.lr_decay,
     )
     print(
         f"trained {sidecar['timesteps_trained']} steps in {sidecar['wall_s']} s "
@@ -382,6 +383,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
     parser.add_argument("--gae-lambda", type=float, default=0.9)
     parser.add_argument("--ent-coef", type=float, default=0.01)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--lr-decay", action="store_true", help="falling to zero over the run")
     parser.add_argument("--snapshots", type=int, default=0, help="copies on the way")
     parser.add_argument("--slow-s", type=float, help="the agent also sees slow averages")
     parser.add_argument(

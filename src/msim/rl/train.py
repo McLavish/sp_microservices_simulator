@@ -113,6 +113,14 @@ def _summary_logger():
     return LogSummaries()
 
 
+def _decaying(progress_remaining: float, start: float) -> float:
+    """A learning rate that falls linearly from `start` to zero over a run.
+
+    A module-level function and not a lambda: the schedule is saved with the model.
+    """
+    return start * progress_remaining
+
+
 def _snapshots(every: int, folder: Path, sidecar: Callable[[int], str]):
     """A callback that saves the model every `every` steps, each copy with a sidecar.
 
@@ -198,6 +206,7 @@ def train(
     verbose: int = 1,
     snapshots: int = 0,
     slow_s: float | None = None,
+    lr_decay: bool = False,
 ) -> dict[str, Any]:
     """Train PPO on the scenario and save `model.zip` and `model.json` in `out`.
 
@@ -207,7 +216,9 @@ def train(
     evaluation use the environment's own reward. `snapshots` asks for that
     many copies of the model on the way, evenly spaced
     (`snapshots/model-<steps>.zip`, each with a sidecar of its own). `slow_s`
-    is the environment's (`RetryEnv.slow_s`). Returns the sidecar.
+    is the environment's (`RetryEnv.slow_s`). `lr_decay` lets the learning rate
+    fall linearly to zero over the run, so that the policy settles at the end
+    instead of moving as much as on the first day. Returns the sidecar.
     """
     import stable_baselines3
     import torch
@@ -238,7 +249,7 @@ def train(
         gamma=gamma,
         gae_lambda=gae_lambda,
         ent_coef=ent_coef,
-        learning_rate=learning_rate,
+        learning_rate=partial(_decaying, start=learning_rate) if lr_decay else learning_rate,
         seed=seed,
         device=device,
         verbose=verbose,
@@ -271,6 +282,7 @@ def train(
                         "gae_lambda": gae_lambda,
                         "ent_coef": ent_coef,
                         "learning_rate": learning_rate,
+                        "lr_decay": lr_decay,
                         "reward_offset": reward_offset,
                         "device": str(model.device),
                     },
@@ -396,6 +408,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
         help="taken off the reward the learner is given (a healthy window pays about 1)",
     )
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--lr-decay", action="store_true", help="let it fall to zero over the run")
     parser.add_argument(
         "--device",
         default="auto",
@@ -430,6 +443,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
         device=args.device,
         snapshots=args.snapshots,
         slow_s=args.slow_s,
+        lr_decay=args.lr_decay,
     )
     print(
         f"trained {sidecar['timesteps_trained']} steps ({sidecar['episodes_trained']} episodes) "

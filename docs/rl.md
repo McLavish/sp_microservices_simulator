@@ -270,6 +270,8 @@ with: no checkpoint is picked on the test episodes.
 (`snapshots/model-<steps>.zip`, each with a sidecar of its own, so each is a
 model like the final one). Choosing among them is a choice like any other:
 make it on the selection episodes.
+`--lr-decay` lets the learning rate fall linearly to zero over the run, so
+that the policy settles at the end.
 
 The sidecar says what the model was trained on: the scenario and its settings,
 the knobs with their levels in order, the observation's entries, the step, the

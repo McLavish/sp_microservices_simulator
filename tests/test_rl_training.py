@@ -189,6 +189,20 @@ class TestSnapshots(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "trained with features"):
                 tr.load_policy(out / "model.zip", RetryEnv(TINY))
 
+    def test_a_learning_rate_that_falls_to_zero_over_the_run(self):
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder)
+            sidecar = tr.train(TINY, out, timesteps=240, n_envs=2, seed=3, verbose=0, lr_decay=True)
+            self.assertTrue(sidecar["ppo"]["lr_decay"])
+            with (out / "progress.csv").open() as handle:
+                logged = [row["train/learning_rate"] for row in csv.DictReader(handle)]
+            rates = [float(rate) for rate in logged if rate]  # a row is written before its update
+            # Four rollouts of 60 steps: the rate of an update is what is left of the run.
+            np.testing.assert_allclose(rates, [3e-4 * left for left in (0.75, 0.5, 0.25)])
+            # The schedule is saved with the model, and the model loads.
+            (episode,) = tr.evaluate_model(out / "model.zip", [2000], scenario=TINY)
+            self.assertGreater(episode["success_rate"], 0.5)
+
     def test_none_unless_asked_for(self):
         with tempfile.TemporaryDirectory() as folder:
             tr.train(TINY, Path(folder), timesteps=100, n_envs=2, seed=3, verbose=0)
