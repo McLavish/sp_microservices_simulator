@@ -369,6 +369,36 @@ class TestTheQuotaGrid(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "hold_above"):
             QuotaGrid(hold_above=1.5)
 
+    def test_with_an_in_flight_cap_retries_are_refused_while_attempts_pile_up(self):
+        # Eight times the load in seconds 15 to 17, a queue that holds it, every retry let in.
+        burst = TestAttemptsInFlight.BURST
+
+        def episode(grid: QuotaGrid) -> tuple[dict, list[int]]:
+            """The episode's summary, and the retries the cap refused by the end of each step."""
+            env = RetryEnv(_scenario(burst, grid=grid))
+            env.reset(options={"episode_seed": 1})
+            cap = _limiter(env).cap
+            if cap is not None:
+                # The warm-up was at rest: there is a limit, and it is not below the floor.
+                assert cap.limit is not None
+                self.assertGreaterEqual(cap.limit, 8.0)
+            refused, info = [], {}
+            for _ in range(env.episode_steps):
+                _, _, _, _, info = env.step((1, 1))
+                refused.append(0 if cap is None else cap.refused)
+            return info, refused
+
+        without, _ = episode(OPEN)
+        capped, refused = episode(replace(OPEN, in_flight_cap=2.5))
+        # Seconds 5 to 15: half the attempts fail from 8 on, and the service
+        # has room for every retry: (almost) none is refused. Then the burst.
+        self.assertLess(refused[9], 20)
+        self.assertGreater(refused[-1] - refused[9], 100)
+        # Fewer retries reach a service that has no room for them.
+        self.assertLess(capped["ep_retries_served"], without["ep_retries_served"])
+        with self.assertRaisesRegex(ValueError, "in_flight_cap"):
+            QuotaGrid(in_flight_cap=0.5)
+
     def test_validation(self):
         with self.assertRaisesRegex(ValueError, "not one of its levels"):
             QuotaGrid(default_share=0.07)

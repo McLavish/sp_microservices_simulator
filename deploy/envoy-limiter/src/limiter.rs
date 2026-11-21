@@ -26,6 +26,8 @@ const GOODPUT: f64 = 2.0;
 /// rise from one window to the next, and the attempts a window needs to move it.
 const DRIFT: f64 = 0.02;
 const AT_REST: u64 = 10;
+/// `rl.limiter.CAP_FLOOR`: the cap never refuses while fewer attempts are in flight.
+const CAP_FLOOR: f64 = 8.0;
 
 /// One dense layer: `w[out][in]`, `b[out]`.
 #[derive(Debug, Deserialize, Clone)]
@@ -136,6 +138,11 @@ pub struct Settings {
     /// A value of the in-flight entry above which no quota rises, whatever
     /// the policy says (`QuotaGrid.hold_above`). Not set: no such rule.
     pub hold_above: Option<f64>,
+    /// A retry is refused while this limiter has more attempts in flight than
+    /// this many times what the attempts it let in during the last window
+    /// have in flight at rest (`QuotaGrid.in_flight_cap`): the one rule that
+    /// acts within a window. Not set: no such rule.
+    pub in_flight_cap: Option<f64>,
     pub policy: Policy,
 }
 
@@ -155,6 +162,7 @@ impl Default for Settings {
             in_flight: false,
             step_up: 0,
             hold_above: None,
+            in_flight_cap: None,
             policy: Policy::default(),
         }
     }
@@ -280,6 +288,12 @@ pub struct Limiter {
     /// Time in flight per attempt let in while nothing fails (ms): the lowest
     /// it was in a window in which no retry asked, drifting up by `DRIFT`.
     flight_at_rest: Option<f64>,
+    /// The attempts this limiter let in during the window last taken, and the
+    /// attempts in flight above which it refuses a retry (`in_flight_cap`).
+    own_admitted: u64,
+    pub cap_limit: Option<f64>,
+    /// Retries the cap refused since the filter started.
+    pub cap_refused: u64,
     /// The observation the policy was last shown, for inspection.
     pub last_observation: Vec<f64>,
     /// The counts of the window that just ended, per tenant.
@@ -313,6 +327,9 @@ impl Limiter {
             slow: None,
             last_step: None,
             flight_at_rest: None,
+            own_admitted: 0,
+            cap_limit: None,
+            cap_refused: 0,
             last_observation: Vec::new(),
             last_counts: Vec::new(),
             last_in_flight: None,
@@ -359,6 +376,8 @@ impl Limiter {
     pub fn admit(&mut self, tenant: usize, is_retry: bool, now: u64) -> bool {
         self.trim(tenant, now);
         let share = self.share(tenant);
+        let known = self.known();
+        let in_flight: u64 = self.tenants[..known].iter().map(|t| t.in_flight).sum();
         let state = &mut self.tenants[tenant];
         state.advance(now);
         if !is_retry {
@@ -368,6 +387,16 @@ impl Limiter {
             return true;
         }
         state.seen.retries_asked += 1;
+        // Crowded: no retry gets in, whatever its tenant's share.
+        if tenant < known {
+            if let Some(limit) = self.cap_limit {
+                if in_flight as f64 > limit {
+                    self.cap_refused += 1;
+                    return false;
+                }
+            }
+        }
+        let state = &mut self.tenants[tenant];
         // The probe, then: retries < share x firsts, the count against the
         // product as it is.
         let floor = if tenant < self.settings.tenants.len() { self.settings.floor } else { 0 };
@@ -411,6 +440,8 @@ impl Limiter {
         for tenant in self.tenants.iter_mut() {
             tenant.advance(now);
         }
+        self.own_admitted =
+            self.tenants[..known].iter().map(|t| t.seen.firsts + t.seen.retries_admitted).sum();
         self.tenants[known].seen = Seen::default(); // nobody's: counted, never shown
         self.tenants[..known].iter_mut().map(|t| std::mem::take(&mut t.seen)).collect()
     }
@@ -474,6 +505,12 @@ impl Limiter {
             }
         };
         self.last_in_flight = Some(crowding);
+        if let (Some(times), Some(at_rest)) = (self.settings.in_flight_cap, self.flight_at_rest) {
+            // What the attempts THIS limiter let in have in flight when each
+            // takes the time it takes at rest (rate x time), times the cap.
+            let in_flight_at_rest = self.own_admitted as f64 / (window_s * 1000.0) * at_rest;
+            self.cap_limit = Some((times * in_flight_at_rest).max(CAP_FLOOR));
+        }
         // One level for everybody: the tenants' counts and rates added up, and
         // the policy shown them as one tenant's. Each tenant's quota is still
         // a share of ITS first attempts, so with one share for all of them the
@@ -1065,6 +1102,61 @@ mod tests {
             l.admit(0, true, 2001 + i * 20 + 10);
         }
         assert_eq!(l.step(3000), vec![1]);
+    }
+
+    #[test]
+    fn with_an_in_flight_cap_retries_are_refused_while_attempts_pile_up() {
+        let mut l = Limiter::new(Settings {
+            tenants: vec!["a".into()],
+            rates: vec![1000.0],
+            shares: vec![3.0],
+            default_level: 0,
+            in_flight_cap: Some(2.5),
+            ..Settings::default()
+        })
+        .unwrap();
+        // At rest: a thousand attempts a second, each in flight for 10 ms, so
+        // ten in flight; the cap is 2.5 times that.
+        for i in 0..1000 {
+            l.admit(0, false, i);
+            if i >= 10 {
+                l.ended(0, false, true, i);
+            }
+        }
+        assert!(l.cap_limit.is_none()); // nothing to compare with yet
+        l.step(1000);
+        assert!((l.cap_limit.unwrap() - 25.0).abs() < 0.5, "{:?}", l.cap_limit);
+        // Ten in flight: a retry is let in. Thirty: it is not, at a share that
+        // refuses nothing; and it has asked all the same.
+        assert!(l.admit(0, true, 1000));
+        for i in 0..20 {
+            l.admit(0, false, 1001 + i);
+        }
+        assert!(!l.admit(0, true, 1030));
+        assert_eq!(l.cap_refused, 1);
+        // They end: there is room again.
+        for _ in 0..20 {
+            l.ended(0, false, false, 1040);
+        }
+        assert!(l.admit(0, true, 1041));
+        let seen = &l.take(1050)[0];
+        assert_eq!((seen.retries_asked, seen.retries_admitted), (3, 2));
+        // A limiter with little traffic never refuses below the floor.
+        let mut quiet = Limiter::new(Settings {
+            tenants: vec!["a".into()],
+            rates: vec![10.0],
+            shares: vec![3.0],
+            default_level: 0,
+            in_flight_cap: Some(2.5),
+            ..Settings::default()
+        })
+        .unwrap();
+        for i in 0..10 {
+            quiet.admit(0, false, i * 100);
+            quiet.ended(0, false, true, i * 100 + 10);
+        }
+        quiet.step(1000);
+        assert_eq!(quiet.cap_limit, Some(8.0));
     }
 
     #[test]

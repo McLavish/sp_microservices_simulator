@@ -285,6 +285,18 @@ level's effect before the next. The agent is shown the level in force.
 is above `x`, whatever the agent says (the entry is measured for this rule
 whether or not the agent is shown it).
 
+Both of those act once a window, and a service is past what it serves within
+milliseconds. `QuotaGrid(in_flight_cap=c)` is the rule that acts on every
+retry: it is refused while the gate has more attempts in flight than `c`
+times what the attempts let in during the last window have in flight at rest
+(their rate times the time one is in flight while nothing fails; never while
+fewer than 8 are in flight). By Little's law that holds the time in flight to
+about `c` times its time at rest whatever share the agent chose, so the two
+questions are apart: the agent decides whether retries are worth letting in,
+and the cap whether the service has room for them now. It is a concurrency
+limit on retries of the kind proxies have, with the limit measured instead of
+configured.
+
 So the scenario and `as_written` on the same file differ in the limiter and in
 nothing else: `tests/test_rl_limiter.py` checks that a quota which refuses
 nothing gives the file with no limiter, summary for summary.

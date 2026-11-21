@@ -34,6 +34,7 @@ from msim.admission import (
     AdmissionGate,
     AdmissionOutcome,
     AdmissionRequest,
+    RetryController,
     TenantRetryQuota,
 )
 from msim.caller import ClientRuntime
@@ -59,6 +60,8 @@ IN_FLIGHT = "in_flight"
 DRIFT = 0.02
 #: A window with fewer attempts let in than this does not move the level at rest.
 AT_REST = 10
+#: `QuotaGrid(in_flight_cap=c)` never refuses a retry while fewer attempts than this are in flight.
+CAP_FLOOR = 8.0
 #: The scales, in requests of the tenant when all is well. A tenant that tries
 #: four times sends up to four attempts per request; goodput cannot pass the
 #: requests that arrive, and twice the expected rate leaves room for a heavy load.
@@ -152,6 +155,28 @@ class _GateTap(AdmissionController):
             seen.retries_ok += outcome.success
 
 
+class _FlightCap(RetryController):
+    """Refuses a retry while the gate has more than `limit` attempts in flight.
+
+    The one rule here that acts within a window: a quota is a count per window,
+    and a service that is pushed past what it serves is past it within
+    milliseconds. `limit` is set by `LimiterKnobs.measure` (`QuotaGrid.in_flight_cap`);
+    `None`, until there is a window at rest to compare with, refuses nothing.
+    """
+
+    def __init__(self) -> None:
+        self.limit: float | None = None
+        self.refused = 0  # retries it refused since the episode began
+
+    def admits_retry(self, request: AdmissionRequest) -> bool:
+        if self.limit is None or request.outstanding is None:
+            return True
+        if request.outstanding <= self.limit:
+            return True
+        self.refused += 1
+        return False
+
+
 class LimiterKnobs:
     """The quota of each tenant in one episode, and what the limiter counts.
 
@@ -173,9 +198,15 @@ class LimiterKnobs:
         step_up: int = 0,
         start: float = 0.0,
         hold_above: float | None = None,
+        cap: _FlightCap | None = None,
+        cap_times: float = 0.0,
     ) -> None:
         self.quota = quota
         self._tap = tap
+        #: `QuotaGrid.in_flight_cap`: the controller that refuses retries while the
+        #: service is crowded, and how many times the attempts in flight at rest it allows.
+        self.cap = cap
+        self._cap_times = cap_times
         #: `QuotaGrid.step_up`: the levels of `ladder` a share may rise per window (0: any);
         #: `QuotaGrid.hold_above`: no rise at all while `IN_FLIGHT` is above it. Each
         #: tenant's place on the ladder now (it starts at `start`) is kept for both.
@@ -264,6 +295,11 @@ class LimiterKnobs:
             ]
         self._now += s_to_ns(window_s)
         self._entry = self._crowding(self._tap.take_flight(self._now), admitted)
+        if self.cap is not None and window_s > 0 and self._flight_at_rest is not None:
+            # What the attempts let in at this rate have in flight when each takes
+            # the time it takes at rest (rate x time), times `in_flight_cap`.
+            at_rest = admitted / s_to_ns(window_s) * self._flight_at_rest
+            self.cap.limit = max(CAP_FLOOR, self._cap_times * at_rest)
         if self._in_flight:
             values.append(self._entry)
         return started, values
@@ -322,6 +358,17 @@ class QuotaGrid:
     above which no share rises, whatever the agent says: while attempts are in
     flight that much longer than at rest, the quota holds or falls. It is
     measured whether or not the agent is shown it.
+
+    `in_flight_cap` (default `None`: no such rule) is the bound that acts
+    WITHIN a window: a retry is refused while the gate has more attempts in
+    flight than `in_flight_cap` times what the attempts it let in during the
+    last window have in flight at rest (their rate times the time one is in
+    flight while nothing fails), and never while fewer than `CAP_FLOOR` are.
+    By Little's law that holds the time an attempt is in flight to about
+    `in_flight_cap` times its time at rest, whatever share the agent chose: the
+    agent decides whether retries are worth letting in, this decides whether
+    the service has room for them now. Until there has been a window at rest
+    it refuses nothing.
     """
 
     shares: tuple[float, ...] = (0.0, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 3.0)
@@ -332,6 +379,7 @@ class QuotaGrid:
     in_flight: bool = False
     step_up: int = 0
     hold_above: float | None = None
+    in_flight_cap: float | None = None
 
     def __post_init__(self) -> None:
         if self.default_share not in self.shares:
@@ -342,6 +390,11 @@ class QuotaGrid:
             raise ValueError(f"step_up is a number of levels >= 0, got {self.step_up}")
         if self.hold_above is not None and not 0.0 <= self.hold_above <= 1.0:
             raise ValueError(f"hold_above is a value of the in-flight entry, got {self.hold_above}")
+        if self.in_flight_cap is not None and self.in_flight_cap < 1.0:
+            raise ValueError(
+                f"in_flight_cap is a multiple >= 1 of the attempts in flight at rest, "
+                f"got {self.in_flight_cap}"
+            )
         if any(share < 0 for share in self.shares) or self.window_s <= 0:
             raise ValueError("shares are >= 0 and the window is > 0")
 
@@ -379,7 +432,8 @@ class QuotaGrid:
             share=self.default_share, window=s_to_ns(self.window_s), floor=self.floor
         )
         tap = _GateTap()
-        gate.controllers = (tap, quota)
+        cap = _FlightCap() if self.in_flight_cap is not None else None
+        gate.controllers = (tap, quota) if cap is None else (tap, cap, quota)
         rest = self.default_share if self.rest else None
         return LimiterKnobs(
             quota,
@@ -393,4 +447,6 @@ class QuotaGrid:
             step_up=self.step_up,
             start=self.default_share,
             hold_above=self.hold_above,
+            cap=cap,
+            cap_times=self.in_flight_cap or 0.0,
         )
