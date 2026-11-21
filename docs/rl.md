@@ -807,7 +807,7 @@ and nominal rate, which Arolla's rule does not need, and in the simulator it
 falls behind Arolla's rule in one corner it was not run in on the cluster: a
 capacity a fifth below the measured one at the full nominal rate with part of
 the calls failing (by 2 points at 10 s, 16 to 19 at 20 s; ahead or level in the
-other 66 cells of that grid). The fixed 10%
+other 68 cells of that grid). The fixed 10%
 quota the filter gives retries that name no tenant (calls inside the mesh) was
 never exercised: their faults are injected in the caller's proxy, and the
 gateway does not retry a 500. And the two changes to the filter that the long
