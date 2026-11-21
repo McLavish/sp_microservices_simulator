@@ -130,9 +130,13 @@ class LimiterKnobs:
         tenants: Sequence[str],
         clients: Sequence[ClientRuntime],
         rates: Mapping[str, float],
+        rest: float | None = None,
     ) -> None:
         self.quota = quota
         self._tap = tap
+        #: The share every tenant has while no retry asks (`QuotaGrid.rest`), or `None`.
+        self._rest = rest
+        self._asked = 1  # retries that asked in the last window measured (none measured yet)
         self.tenants = tuple(tenants)
         #: Every client in front of the gate: the requests the quota governs.
         self.clients = list(clients)
@@ -140,24 +144,36 @@ class LimiterKnobs:
         #: what is measured, the same in every episode.
         self.rates = {tenant: float(rates[tenant]) for tenant in self.tenants}
 
-    def apply(self, values: Mapping[str, float]) -> None:
-        """Give each named tenant (`quota:<tenant>`) its share."""
-        for name, share in values.items():
+    def apply(self, values: Mapping[str, float]) -> Mapping[str, float] | None:
+        """Give each named tenant (`quota:<tenant>`) its share.
+
+        With `QuotaGrid(rest=True)`, when no retry asked in the window last
+        measured, every tenant gets the default share instead, whatever is
+        given, and that is what is returned (the shares in force).
+        """
+        for name in values:
             tenant = name.removeprefix(_PREFIX)
             if not name.startswith(_PREFIX) or tenant not in self.rates:
                 raise KeyError(
                     f"no quota named {name!r}; there are "
                     f"{[_PREFIX + tenant for tenant in self.tenants]}"
                 )
-            self.quota.set_share(tenant, share)
+        resting = self._rest is not None and self._asked == 0
+        if resting:
+            values = {_PREFIX + tenant: self._rest for tenant in self.tenants}
+        for name, share in values.items():
+            self.quota.set_share(name.removeprefix(_PREFIX), share)
+        return dict(values) if resting else None
 
     def measure(self, window_s: float) -> tuple[int, list[float]]:
         """Requests that began in the window, and `MEASURES` for every tenant; resets the counts."""
         started = 0
+        self._asked = 0
         values: list[float] = []
         for tenant in self.tenants:
             seen = self._tap.take(tenant)
             started += seen.firsts
+            self._asked += seen.retries_asked
             expected = self.rates[tenant] * window_s
             per_request = 1.0 / expected if expected > 0 else 0.0  # a warm-up of no length
             values += [
@@ -184,12 +200,21 @@ class QuotaGrid:
     failure is what its retries do keeps a level above zero to go on seeing,
     and pays for it in retries that cannot succeed; with a floor of 1 the
     lowest level is no longer blind.
+
+    `rest` (default `False`): while no retry asks, the quota is at its default.
+    When the last window had no retry asking, of any tenant, every tenant's
+    share is the default whatever the agent chose, and the agent is shown that
+    level. The level an agent holds while nothing fails earns nothing either
+    way, so what it learns to hold is arbitrary, it stays there (its own level
+    is part of what it is shown), and a failure then starts from wherever that
+    was. With `rest` every failure starts from the default.
     """
 
     shares: tuple[float, ...] = (0.0, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 3.0)
     default_share: float = 0.0
     window_s: float = 1.0
     floor: int = 0
+    rest: bool = False
 
     def __post_init__(self) -> None:
         if self.default_share not in self.shares:
@@ -233,4 +258,5 @@ class QuotaGrid:
         )
         tap = _GateTap()
         gate.controllers = (tap, quota)
-        return LimiterKnobs(quota, tap, tenants, clients, rates)
+        rest = self.default_share if self.rest else None
+        return LimiterKnobs(quota, tap, tenants, clients, rates, rest=rest)

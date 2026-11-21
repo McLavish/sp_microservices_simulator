@@ -23,7 +23,7 @@ header says more than 1 (`x-envoy-attempt-count`, set by the mesh, or
 (a call inside the mesh) is kept apart: it is in no tenant's counts, the policy
 never sees it, and its retries get the fixed `other_share` (10%).
 
-Three things the simulator has no notion of:
+Four things the simulator has no notion of:
 
 - **Threads.** Every Envoy worker thread has a filter instance of its own, and
   Envoy does not spread connections evenly over them (one thread of a gateway
@@ -32,6 +32,12 @@ Three things the simulator has no notion of:
   each leaves its last window in the proxy's shared data and decides on the
   sum. `rates` are therefore requests per second per PROXY. The quota needs no
   pooling: it is a share of a thread's own first attempts.
+- **No traffic.** A simulated service always has some; a proxy starts before
+  its traffic does. A window in which nothing arrived and nothing ended is not
+  something the policy was trained on, and what it answers there sticks (its
+  own level is part of what it is shown next): a filter was seen to open every
+  quota at start-up and stay open. Such a window is taken as the start of an
+  episode: the default level, the averages starting afresh.
 - **Callers that give up.** An attempt whose caller went away before any
   response is counted as ended and failed when its stream closes, as the
   simulator's gate is told of a deadline.
@@ -85,6 +91,7 @@ pluginConfig:
     other_share: 0.1
     one_level: false      # one level for every tenant, from their counts together
     floor: 0              # retries per tenant, window and thread let in whatever the level (a probe)
+    rest: false           # the default level while no retry asks (`QuotaGrid.rest`)
     policy: {hidden: [...], head: {...}}
 ```
 

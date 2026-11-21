@@ -210,7 +210,7 @@ class RetryEnv(gymnasium.Env):
         self._return = 0.0
         self._slow = None
 
-        episode.agent.apply(self._setting())
+        self._apply(episode)
         # The first observation is of the warm-up, run under the default setting:
         # the system the agent takes over is one that is already serving.
         self._run(self._warmup_ns)
@@ -229,7 +229,7 @@ class RetryEnv(gymnasium.Env):
                 f"within {list(self.knob_levels)}; got {action!r}"
             )
         self._levels = [int(level) for level in levels]
-        episode.agent.apply(self._setting())
+        self._apply(episode)
 
         begin = self._now
         self._run(self._step_ns)
@@ -268,6 +268,15 @@ class RetryEnv(gymnasium.Env):
         }
 
     # ------------------------------------------------------------ internals
+
+    def _apply(self, episode: Episode) -> None:
+        """Give the agent's object the setting chosen, and take back what is in force."""
+        in_force = episode.agent.apply(self._setting())
+        if in_force is not None:  # it did not take what it was given (`QuotaGrid.rest`)
+            self._levels = [
+                knob.values.index(in_force[knob.name]) if knob.name in in_force else level
+                for knob, level in zip(self._knobs, self._levels, strict=True)
+            ]
 
     def _setting(self) -> dict[str, float]:
         return {

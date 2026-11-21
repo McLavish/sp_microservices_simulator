@@ -228,7 +228,12 @@ holds through the warm-up. `QuotaGrid(floor=1)` lets one retry per tenant and
 window in whatever the level (`TenantRetryQuota.floor`): much of what the
 agent is shown is what its retries do, so at a level of 0 it is blind to a
 failure ending, and an agent without the floor learns to hold a few percent
-through a total failure just to go on seeing.
+through a total failure just to go on seeing. `QuotaGrid(rest=True)` puts the
+quota at its default whenever the last window had no retry asking, whatever
+the agent chose, and shows the agent that level: the level held while nothing
+fails earns nothing either way, so what an agent learns to hold there is
+arbitrary and sticks (its own level is part of what it is shown), and a
+failure would start from wherever that was.
 
 Such an agent is shown what a limiter can count where it stands and nothing
 else, per tenant and window (`limiter.MEASURES`, as `<tenant>:<measure>`):

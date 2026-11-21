@@ -118,6 +118,11 @@ pub struct Settings {
     /// Retries per tenant and window let in whatever the level: a probe, so
     /// that a level of 0 still shows whether a retry succeeds again.
     pub floor: usize,
+    /// While no retry asks, every tenant's level is the default: after a
+    /// window in which none did, whatever the policy answers. The level held
+    /// while nothing fails earns nothing either way, and a failure should not
+    /// start from wherever it happened to be.
+    pub rest: bool,
     pub policy: Policy,
 }
 
@@ -133,6 +138,7 @@ impl Default for Settings {
             other_share: 0.1,
             one_level: false,
             floor: 0,
+            rest: false,
             policy: Policy::default(),
         }
     }
@@ -375,6 +381,22 @@ impl Limiter {
                 retries_admitted: seen.retries_admitted,
             })
             .collect();
+        // A window in which nothing arrived and nothing ended is not a
+        // situation the policy was trained on (a simulated service always has
+        // traffic), and what it answers there sticks, because its own level is
+        // part of what it is shown next: a proxy that starts before its
+        // traffic was seen to open every quota and stay open. Such a window is
+        // the start of an episode instead: the default level, no averages yet.
+        if counts.iter().all(|seen| seen.firsts == 0 && seen.ended == 0 && seen.retries_asked == 0) {
+            let default = self.settings.default_level;
+            for tenant in self.tenants[..known].iter_mut() {
+                tenant.level = default;
+            }
+            self.slow = None;
+            self.last_observation.clear();
+            return self.levels();
+        }
+        let resting = self.settings.rest && counts.iter().all(|seen| seen.retries_asked == 0);
         // One level for everybody: the tenants' counts and rates added up, and
         // the policy shown them as one tenant's. Each tenant's quota is still
         // a share of ITS first attempts, so with one share for all of them the
@@ -450,6 +472,12 @@ impl Limiter {
                 tenant.level = level;
             }
         }
+        if resting {
+            let default = self.settings.default_level;
+            for tenant in self.tenants[..known].iter_mut() {
+                tenant.level = default;
+            }
+        }
         self.last_observation = observation;
         self.levels()
     }
@@ -521,10 +549,11 @@ mod tests {
         }
         // 10% of 20 first attempts, whatever the tenants' level is.
         assert_eq!((0..10).filter(|_| l.admit(other, true, 30)).count(), 2);
-        // None of it is in what the policy is shown.
+        // None of it is in what the policy is shown: for the tenants the
+        // window is an empty one.
         l.step(1000);
         assert_eq!(l.levels().len(), 2);
-        assert!(l.last_observation[..20].iter().all(|v| *v == 0.0));
+        assert!(l.last_observation.is_empty());
         assert_eq!(l.last_counts, vec![Counts::default(), Counts::default()]);
         assert!(!l.admit(0, true, 1030)); // and a tenant's retry is still refused
     }
@@ -553,11 +582,16 @@ mod tests {
         assert_eq!(o.len(), 10 + 10 + 2);
         assert!(near(o[10], o[0])); // the average starts at the first window
         assert!(near(o[20], 0.5) && near(o[21], 0.5)); // level 1 of 0..2
-        // A second, empty window: the slow copy decays towards it.
+        // A second, nearly empty window: the slow copy moves towards it.
+        for i in 0..8 {
+            l.admit(0, false, 1000 + i);
+            l.ended(0, false, true);
+        }
         l.step(2000);
         let weight = 1.0 - (-1.0f64 / 10.0).exp();
-        assert!(near(l.last_observation[0], 0.0));
-        assert!(near(l.last_observation[10], (50.0 / 160.0) * (1.0 - weight)));
+        let (was, is) = (50.0 / 160.0, 8.0 / 160.0);
+        assert!(near(l.last_observation[0], is));
+        assert!(near(l.last_observation[10], was + weight * (is - was)));
     }
 
     #[test]
@@ -588,7 +622,11 @@ mod tests {
             l.ended(0, false, true);
         }
         assert_eq!(l.step(1000), vec![2, 1]); // goodput 0.5: tanh(1) > 0
-        assert_eq!(l.step(2000), vec![0, 1]); // nothing arrived: tanh(-1) < 0
+        for i in 0..4 {
+            l.admit(0, false, 1000 + i);
+            l.ended(0, false, false);
+        }
+        assert_eq!(l.step(2000), vec![0, 1]); // nothing succeeded: tanh(-1) < 0
         assert_eq!(l.share(0), 0.0);
     }
 
@@ -727,6 +765,72 @@ mod tests {
         // Not for requests that are nobody's: theirs is the fixed share.
         let other = l.tenant(None);
         assert_eq!((0..10).filter(|_| l.admit(other, true, 30)).count(), 0);
+    }
+
+    #[test]
+    fn a_window_with_no_traffic_is_the_start_of_an_episode() {
+        // The policy of the tests above, turned round: level 2 when the goodput
+        // it is shown is LOW. Shown nothing at all it would open the quota.
+        let mut hidden_w = vec![0.0; 22];
+        hidden_w[1] = -8.0;
+        let policy = Policy {
+            hidden: vec![Layer { w: vec![hidden_w], b: vec![2.0] }],
+            head: Some(Layer {
+                w: vec![vec![-1.0], vec![0.0], vec![1.0], vec![0.0], vec![0.0], vec![0.0]],
+                b: vec![0.0, -5.0, 0.0, 1.0, 0.0, 0.0],
+            }),
+        };
+        let mut l = Limiter::new(Settings {
+            tenants: vec!["a".into(), "b".into()],
+            rates: vec![40.0, 40.0],
+            shares: vec![0.0, 0.5, 3.0],
+            default_level: 1,
+            policy,
+            ..Settings::default()
+        })
+        .unwrap();
+        assert_eq!(l.step(1000), vec![1, 1]); // nothing arrived: nothing is decided
+        assert!(l.last_observation.is_empty());
+        for i in 0..40 {
+            l.admit(0, false, 1000 + i);
+            l.ended(0, false, false); // every one fails: low goodput
+        }
+        assert_eq!(l.step(2000), vec![2, 0]);
+        let first = l.last_observation[10]; // the average starts at this window
+        assert!((first - l.last_observation[0]).abs() < 1e-9);
+        assert_eq!(l.step(3000), vec![1, 1]); // quiet again: back to the default
+    }
+
+    #[test]
+    fn with_rest_the_levels_are_the_default_while_no_retry_asks() {
+        // A policy that always answers level 2.
+        let policy = Policy {
+            hidden: vec![Layer { w: vec![vec![0.0; 11]], b: vec![0.0] }],
+            head: Some(Layer { w: vec![vec![0.0], vec![0.0], vec![0.0]], b: vec![0.0, 0.0, 1.0] }),
+        };
+        let mut l = Limiter::new(Settings {
+            tenants: vec!["a".into()],
+            rates: vec![40.0],
+            shares: vec![0.0, 0.5, 3.0],
+            default_level: 0,
+            rest: true,
+            policy,
+            ..Settings::default()
+        })
+        .unwrap();
+        for i in 0..40 {
+            l.admit(0, false, i);
+            l.ended(0, false, true);
+        }
+        assert_eq!(l.step(1000), vec![0]); // traffic, and no retry asked: at rest
+        assert_eq!(l.last_observation.len(), 11); // the window is still what the averages see
+        for i in 0..40 {
+            l.admit(0, false, 1000 + i);
+            l.ended(0, false, false);
+        }
+        assert!(!l.admit(0, true, 1050)); // a retry asks, and is refused at level 0
+        assert_eq!(l.step(2000), vec![2]); // now the policy's answer is in force
+        assert!((l.last_observation[10] - 0.0).abs() < 1e-9); // and it was shown level 0
     }
 
     #[test]

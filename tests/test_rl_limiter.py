@@ -230,6 +230,32 @@ class TestTheQuotaGrid(unittest.TestCase):
         self.assertLess(seen["retries_served"], 2 * 2 * _scenario().horizon_s)  # two tenants
         self.assertEqual(_limiter(probing).quota.floor, 1)
 
+    def test_with_rest_the_quota_is_at_its_default_while_no_retry_asks(self):
+        env = RetryEnv(_scenario(grid=QuotaGrid(rest=True)))
+        env.reset(options={"episode_seed": 1})
+        wide = (9, 9)  # a share of 3 for both tenants
+        # Nothing failed during the warm-up, so nothing asked to retry: the
+        # quota rests, whatever is chosen, and the agent is shown that.
+        observation, _, _, _, info = env.step(wide)
+        shown = dict(zip(env.feature_names, observation, strict=True))
+        self.assertEqual((shown["knob:quota:plain"], shown["knob:quota:untimed"]), (0.0, 0.0))
+        self.assertEqual((info["knob_quota:plain"], info["knob_quota:untimed"]), (0.0, 0.0))
+        self.assertEqual(_limiter(env).quota.share_of("plain"), 0.0)
+        # Once retries ask (the failure), the share chosen is the share in force.
+        for _ in range(env.episode_steps - 1):
+            observation, _, _, _, info = env.step(wide)
+            if info["knob_quota:plain"] == 3.0:
+                break
+        self.assertEqual((info["knob_quota:plain"], info["knob_quota:untimed"]), (3.0, 3.0))
+        self.assertEqual(_limiter(env).quota.share_of("untimed"), 3.0)
+        shown = dict(zip(env.feature_names, observation, strict=True))
+        self.assertEqual(shown["knob:quota:plain"], 1.0)
+        # Without it the share chosen holds from the first step on.
+        plain = RetryEnv(_scenario())
+        plain.reset(options={"episode_seed": 1})
+        _, _, _, _, info = plain.step(wide)
+        self.assertEqual(info["knob_quota:plain"], 3.0)
+
     def test_validation(self):
         with self.assertRaisesRegex(ValueError, "not one of its levels"):
             QuotaGrid(default_share=0.07)

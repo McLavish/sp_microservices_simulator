@@ -1,12 +1,13 @@
 """A trained limiter (`msim.rl.limiter`) as the configuration of the Envoy filter next to this file.
 
     python deploy/envoy-limiter/export.py MODEL.zip OUT.json --rates R [R ...]
-        [--tenants NAME [NAME ...]] [--one-level] [--fixture FILE]
+        [--tenants NAME [NAME ...]] [--one-level] [--rest] [--fixture FILE]
 
 Writes the `limiter` block of the filter's plugin configuration: the tenants in the policy's
 order, the requests per second each sends one PROXY when all is well (`--rates`, the scale of
-everything the policy is shown), the ladder of shares, the probe floor the model was trained
-with, the level held until the policy has spoken, the window, the time constant of the slow
+everything the policy is shown), the ladder of shares, the probe floor and the resting quota
+the model was trained with (`--rest` turns the second on for a model trained without it), the
+level held until the policy has spoken, the window, the time constant of the slow
 averages, and the policy's weights (`msim.rl.train.policy_weights`).
 
 `--tenants` names the tenants as the deployment's requests name them (the model knows them by
@@ -28,15 +29,19 @@ import numpy as np
 from msim.rl import train
 
 
-def trained_floor(sidecar: dict) -> int:
-    """`QuotaGrid.floor` of the scenario the model was trained on (0 when it had none)."""
+def trained_grid(sidecar: dict) -> dict:
+    """The `QuotaGrid` of the scenario the model was trained on, as its sidecar has it."""
     settings = sidecar.get("scenario_settings") or {}
     first = (settings.get("scenarios") or [settings])[0]  # one of several, or the only one
-    return int((first.get("grid") or {}).get("floor", 0))
+    return first.get("grid") or {}
 
 
 def limiter_block(
-    model: Path, tenants: list[str] | None, rates: list[float], one_level: bool = False
+    model: Path,
+    tenants: list[str] | None,
+    rates: list[float],
+    one_level: bool = False,
+    rest: bool = False,
 ) -> dict:
     sidecar = json.loads(model.with_suffix(".json").read_text("utf-8"))
     knobs = sidecar["knobs"]
@@ -57,7 +62,8 @@ def limiter_block(
         "tenants": tenants,
         "rates": rates,
         "one_level": one_level,
-        "floor": trained_floor(sidecar),
+        "floor": int(trained_grid(sidecar).get("floor", 0)),
+        "rest": bool(rest or trained_grid(sidecar).get("rest", False)),
         "shares": shares,
         "default_level": knobs[0]["default"],
         "window_ms": round(1000 * sidecar["step_s"]),
@@ -75,10 +81,11 @@ def main() -> None:
     parser.add_argument("--rates", nargs="+", type=float, required=True)
     parser.add_argument("--tenants", nargs="+")
     parser.add_argument("--one-level", action="store_true")
+    parser.add_argument("--rest", action="store_true")
     parser.add_argument("--fixture", type=Path)
     args = parser.parse_args()
 
-    limiter = limiter_block(args.model, args.tenants, args.rates, args.one_level)
+    limiter = limiter_block(args.model, args.tenants, args.rates, args.one_level, args.rest)
     args.out.write_text(json.dumps(limiter), "utf-8")
     entries = len(limiter["policy"]["hidden"][0]["w"][0])
     print(

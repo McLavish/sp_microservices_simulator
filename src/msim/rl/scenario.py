@@ -366,8 +366,13 @@ class Agent(Protocol):
         """The clients whose requests the agent's settings govern."""
         ...
 
-    def apply(self, values: Mapping[str, float]) -> None:
-        """Put each named setting to its value."""
+    def apply(self, values: Mapping[str, float]) -> Mapping[str, float] | None:
+        """Put each named setting to its value.
+
+        An agent that does not always take what it is given (a limiter whose
+        quota rests while nobody retries, `QuotaGrid(rest=True)`) returns the
+        settings in force, and the environment shows the agent those.
+        """
         ...
 
 
