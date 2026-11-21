@@ -353,6 +353,49 @@ def load_policy(model: Path, env: RetryEnv) -> Policy:
     return policy
 
 
+def policy_weights(model: Path) -> dict[str, Any]:
+    """The saved model's policy network as plain numbers, for an evaluator that is not Python.
+
+    The network `train` gives PPO: tanh layers, then one linear layer whose
+    outputs are the logits of every knob's levels, one knob after the other.
+    Acting greedily is the largest logit of each knob (the first of equals).
+    Returned as `{"hidden": [{"w": rows, "b": [...]}, ...], "head": {...}}`,
+    `w[out][in]`, each number with the nine significant digits that give a
+    32-bit weight back exactly. `greedy_actions` is what such an evaluator has
+    to reproduce; `deploy/envoy-limiter` is one (a limiter as an Envoy filter).
+    """
+    from stable_baselines3 import PPO
+
+    trained = PPO.load(model, device="cpu")
+
+    def layer(module: Any) -> dict[str, Any]:
+        def short(values: Any) -> list[float]:
+            return [float(f"{float(value):.9g}") for value in values]
+
+        return {
+            "w": [short(row) for row in module.weight.detach().numpy()],
+            "b": short(module.bias.detach().numpy()),
+        }
+
+    network = trained.policy.mlp_extractor.policy_net
+    return {
+        "hidden": [layer(module) for module in network if hasattr(module, "weight")],
+        "head": layer(trained.policy.action_net),
+    }
+
+
+def greedy_actions(model: Path, observations: np.ndarray) -> list[list[int]]:
+    """What the saved model does on each row of `observations`, acting greedily.
+
+    On raw observations, with no environment to match: for checking another
+    evaluator of `policy_weights` against the model itself.
+    """
+    from stable_baselines3 import PPO
+
+    actions, _ = PPO.load(model, device="cpu").predict(observations, deterministic=True)
+    return np.asarray(actions).reshape(len(observations), -1).tolist()
+
+
 def _run_model(task: tuple[Path, Scenario, dict[str, Any], tuple[int, ...]]):
     model, scenario, env_arguments, seeds = task
     import torch

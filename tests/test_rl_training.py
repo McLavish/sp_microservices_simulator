@@ -158,6 +158,34 @@ class TestTraining(unittest.TestCase):
         np.testing.assert_equal(together, alone)
 
 
+class TestTheWeightsAsPlainNumbers(unittest.TestCase):
+    """`policy_weights`: what an evaluator outside Python is given, and has to reproduce."""
+
+    def test_a_forward_pass_on_them_picks_the_models_own_actions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tr.train(TINY, Path(tmp), timesteps=64, n_envs=1, seed=3, verbose=0)
+            model = Path(tmp) / "model.zip"
+            weights = tr.policy_weights(model)
+            env = RetryEnv(TINY)
+            entries = len(env.feature_names)
+            observations = np.random.default_rng(1).random((200, entries), dtype=np.float32)
+            expected = tr.greedy_actions(model, observations)
+        x = observations.astype(np.float64)
+        for layer in weights["hidden"]:
+            x = np.tanh(x @ np.asarray(layer["w"]).T + np.asarray(layer["b"]))
+        logits = x @ np.asarray(weights["head"]["w"]).T + np.asarray(weights["head"]["b"])
+        levels = [int(n) for n in env.knob_levels]
+        self.assertEqual(logits.shape[1], sum(levels))  # every knob's levels, one after the other
+        picked, at = [], 0
+        for n in levels:
+            picked.append(logits[:, at : at + n].argmax(axis=1))
+            at += n
+        self.assertEqual(np.stack(picked, axis=1).tolist(), expected)
+        # Plain lists of floats all the way down: it goes into a configuration file.
+        json.dumps(weights)
+        self.assertEqual(len(weights["hidden"][0]["w"][0]), observations.shape[1])
+
+
 class TestSnapshots(unittest.TestCase):
     def test_copies_on_the_way_each_a_model_of_its_own(self):
         with tempfile.TemporaryDirectory() as folder:
