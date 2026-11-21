@@ -158,9 +158,9 @@ class TestTheRecordsGiveTheSameSummary(unittest.TestCase):
                 del by_env["seed"]
                 np.testing.assert_equal(by_records, by_env)  # every entry, nan for nan
 
-    def test_with_a_latency_bound_on_what_is_paid(self):
+    def test_with_a_latency_bound_and_a_price_on_retries(self):
         scenario = Small()
-        env = RetryEnv(scenario, reward_within_s=0.02)
+        env = RetryEnv(scenario, reward_within_s=0.02, retry_cost=0.1)
         (by_env,) = ev.rollout(env, ev.constant([2, 1, 1, 2]), [21])
         episode = scenario.build(21)  # the same episode, left alone
         episode.sim.run()
@@ -170,7 +170,9 @@ class TestTheRecordsGiveTheSameSummary(unittest.TestCase):
             fault_windows=episode.fault_windows,
             horizon_s=scenario.horizon_s,
             within_s=0.02,
+            retry_cost=0.1,
         )
+        self.assertGreater(by_env["retries_served"], 0)
         del by_env["seed"]
         self.assertLess(by_env["on_time_rate"], by_env["success_rate"])
         np.testing.assert_equal(by_records, by_env)

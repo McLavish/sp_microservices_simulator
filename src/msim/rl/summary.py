@@ -21,7 +21,11 @@ The quantities, on the clients the reward is counted on unless said otherwise:
   is counted with, of all that finished after the warm-up. Without a bound it
   is `success_rate`. With one (`RetryEnv(reward_within_s=...)`,
   `of_records(within_s=...)`) a request served after it is a success and is
-  not on time, and `return` adds up the on-time ones.
+  not on time, and `return` adds up the on-time ones;
+* `retries_served`: the retries of those requests that reached their target,
+  that is, that no limiter refused and no breaker of the caller held back.
+  With a price on them (`RetryEnv(retry_cost=...)`, `of_records(retry_cost=...)`)
+  `return` is paid less by that price for each.
 """
 
 import math
@@ -31,6 +35,7 @@ from dataclasses import dataclass, field
 from msim.caller import ClientRuntime
 from msim.core import (
     FAILURE_OUTCOMES,
+    DropReason,
     RootOutcome,
     RootRequest,
     TimeDuration,
@@ -43,6 +48,9 @@ from msim.core import (
 
 #: A window counts as recovered when this share of its finished requests succeeded.
 RECOVERED = 0.95
+
+#: A retry with one of these outcomes never reached its target.
+NOT_SENT = (DropReason.REJECTED, DropReason.CIRCUIT_OPEN)
 
 #: The ways a request can fail, as they are named in a summary (`failed_<name>`).
 FAILED = tuple(outcome.name.lower() for outcome in FAILURE_OUTCOMES)
@@ -60,6 +68,8 @@ class Tally:
     #: Among the successes, those inside the latency bound (all of them without one).
     on_time: int = 0
     attempts: int = 0
+    #: Retries that reached their target (not refused, not held back by a breaker).
+    retries_served: int = 0
     #: Among them, the requests that started inside a fault window.
     fault_requests: int = 0
     fault_succeeded: int = 0
@@ -70,6 +80,7 @@ class Tally:
         self.succeeded += other.succeeded
         self.on_time += other.on_time
         self.attempts += other.attempts
+        self.retries_served += other.retries_served
         self.fault_requests += other.fault_requests
         self.fault_succeeded += other.fault_succeeded
         for name, count in other.failed.items():
@@ -94,6 +105,9 @@ class Tally:
             started = root.attempts[0].interval.begin
             self.requests += 1
             self.attempts += len(root.attempts)
+            self.retries_served += sum(
+                1 for attempt in root.attempts[1:] if attempt.drop_reason not in NOT_SENT
+            )
             if succeeded:
                 self.succeeded += 1
                 if within is None or root_completed_at(root) - started <= within:
@@ -123,6 +137,13 @@ class Effort:
             self.attempts += len(root.attempts)
             self.retries += len(root.attempts) - 1
             self.retry_ok += sum(1 for attempt in root.attempts[1:] if attempt.success)
+
+
+def paid(tally: Tally, retry_cost: float = 0.0) -> float:
+    """What a window's reward counts: the requests served on time, less the price of its retries."""
+    if not retry_cost:
+        return tally.on_time  # the same number, to the last bit, as before there was a price
+    return tally.on_time - retry_cost * tally.retries_served
 
 
 def ratio(numerator: float, denominator: float) -> float:
@@ -164,6 +185,7 @@ def summary(
         "requests": float(total.requests),
         "success_rate": ratio(total.succeeded, total.requests),
         "on_time_rate": ratio(total.on_time, total.requests),
+        "retries_served": float(total.retries_served),
         "horizon_success_rate": ratio(in_horizon.succeeded, in_horizon.requests),
         "fault_success_rate": ratio(total.fault_succeeded, total.fault_requests),
         "amplification": ratio(effort.attempts, effort.requests),
@@ -185,6 +207,7 @@ def of_records(
     step_s: float = 1.0,
     effort_clients: Sequence[ClientRuntime] | None = None,
     within_s: float | None = None,
+    retry_cost: float = 0.0,
 ) -> dict[str, float]:
     """The summary of a run that is over, from the records its clients kept.
 
@@ -196,7 +219,9 @@ def of_records(
     and in no window. `effort_clients` are the clients whose attempts and
     retries are reported (the reward clients unless given). `within_s` is the
     latency bound of the environment's `reward_within_s`: with it `return`
-    adds up the requests that succeeded inside the bound.
+    adds up the requests that succeeded inside the bound. `retry_cost` is the
+    environment's too: what `return` is paid less for every retry that reached
+    its target.
     """
     faults = [(s_to_ns(begin), s_to_ns(end)) for begin, end in fault_windows]
     within = None if within_s is None else s_to_ns(within_s)
@@ -214,13 +239,13 @@ def of_records(
 
     in_horizon, tail = Tally(), Tally()
     windows: list[WindowCount] = []
-    on_time: list[int] = []  # what each window is paid for
+    on_time: list[float] = []  # what each window is paid for
     for index, roots in enumerate(per_window):
         window = Tally()
         window.count(roots, faults, within)
         in_horizon.add(window)
         windows.append((warmup + index * step, window.requests, window.succeeded))
-        on_time.append(window.on_time)
+        on_time.append(paid(window, retry_cost))
     tail.count(late, faults, within)
 
     effort = Effort()
@@ -229,8 +254,8 @@ def of_records(
     # Added up window by window, the way the environment adds up its rewards
     # (`sum()` compensates its rounding and would differ in the last digit).
     episode_return = 0.0
-    for paid in on_time:
-        episode_return += paid / (expected_rps * step_s)
+    for amount in on_time:
+        episode_return += amount / (expected_rps * step_s)
     return summary(
         episode_return=episode_return,
         in_horizon=in_horizon,

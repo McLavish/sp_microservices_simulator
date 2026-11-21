@@ -51,6 +51,11 @@ observation, reward, terminated, truncated, info = env.step(env.action_space.sam
   same, and where a queue can carry requests past a failure, a limiter learns
   to fill it (see "On their Kubernetes prototype"). The bound changes what is
   paid and one line of the summary (`ep_on_time_rate`), never the simulation.
+  `RetryEnv(retry_cost=...)` (default 0) takes that many requests off the
+  reward for every retry that reached its target (`ep_retries_served`: not
+  refused by a limiter, not held back by the caller's breaker). A retry that
+  cannot succeed pays nothing either way, so without a price an agent that
+  decides what is let in has no reason to refuse it, and keeps letting some in.
 - **An episode never terminates.** It is cut at the scenario's horizon
   (`truncated`), so a learner bootstraps over the cut and gains nothing by
   pushing failures past it. After the cut the arrivals stop and what is in
@@ -104,6 +109,7 @@ run that had none (`summary.of_records`).
 | `ep_return` | the rewards, added up |
 | `ep_success_rate` | requests that succeeded, of all that finished after the warm-up, the tail included |
 | `ep_on_time_rate` | those that succeeded within `reward_within_s` of their first attempt (`ep_success_rate` when there is no bound) |
+| `ep_retries_served` | the retries of those requests that reached their target (what `retry_cost` is charged on) |
 | `ep_horizon_success_rate` | the same, of what finished inside the horizon (what the rewards count) |
 | `ep_fault_success_rate` | of the requests that started inside a fault window |
 | `ep_amplification` | attempts per request of the agent's clients |

@@ -208,6 +208,7 @@ def train(
     slow_s: float | None = None,
     lr_decay: bool = False,
     reward_within_s: float | None = None,
+    retry_cost: float = 0.0,
 ) -> dict[str, Any]:
     """Train PPO on the scenario and save `model.zip` and `model.json` in `out`.
 
@@ -221,9 +222,10 @@ def train(
     fall linearly to zero over the run, so that the policy settles at the end
     instead of moving as much as on the first day. `reward_within_s` is the
     environment's latency bound on what the reward counts
-    (`RetryEnv.reward_within_s`); it is written to the sidecar and is no part
-    of what a model is matched against, since it changes neither what the
-    agent is shown nor what its actions mean. Returns the sidecar.
+    (`RetryEnv.reward_within_s`) and `retry_cost` its price of a retry that
+    reaches its target; both are written to the sidecar and are no part of
+    what a model is matched against, since they change neither what the agent
+    is shown nor what its actions mean. Returns the sidecar.
     """
     import stable_baselines3
     import torch
@@ -232,7 +234,13 @@ def train(
 
     out.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(torch_threads)  # the cores are for the simulations
-    probe = RetryEnv(scenario, step_s=step_s, slow_s=slow_s, reward_within_s=reward_within_s)
+    probe = RetryEnv(
+        scenario,
+        step_s=step_s,
+        slow_s=slow_s,
+        reward_within_s=reward_within_s,
+        retry_cost=retry_cost,
+    )
     n_steps = n_steps or 2 * probe.episode_steps
     batch_size = batch_size or max(32, n_steps * n_envs // 12)
 
@@ -245,6 +253,7 @@ def train(
         step_s=step_s,
         slow_s=slow_s,
         reward_within_s=reward_within_s,
+        retry_cost=retry_cost,
     )
     model = PPO(
         "MlpPolicy",
@@ -274,6 +283,7 @@ def train(
                     "scenario_settings": _settings(scenario),
                     **_describe(probe),
                     "reward_within_s": reward_within_s,
+                    "retry_cost": retry_cost,
                     "timesteps_asked": timesteps,
                     "timesteps_trained": steps,
                     "episodes_trained": steps // probe.episode_steps,

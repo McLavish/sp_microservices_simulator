@@ -312,6 +312,32 @@ class TestRewardAndSummary(unittest.TestCase):
         # Without a bound every success is on time.
         self.assertEqual(unbounded["ep_on_time_rate"], unbounded["ep_success_rate"])
 
+    def test_a_price_on_the_retries_that_reach_the_service(self):
+        scenario = Small()
+        slow = [3, 2, 2, 4]  # 4 attempts, 80 ms timeout, 50 ms backoff, budget 1.0
+        env, steps = self._episode(scenario, slow, retry_cost=0.25)
+        _, plain = self._episode(scenario, slow)
+        client = env.episode.clients[0]
+        begin, end = s_to_ns(env.warmup_s), s_to_ns(scenario.horizon_s)
+        in_time = [r for r in client.roots if begin < root_completed_at(r) <= end]
+        ok = sum(1 for r in in_time if classify_root(r) is RootOutcome.SUCCESS)
+        # Nothing refuses a retry here, so every retry was served.
+        retries = sum(len(r.attempts) - 1 for r in in_time)
+        self.assertGreater(retries, 0)
+        rewards = [reward for _, reward, _, _, _ in steps[1:]]
+        self.assertAlmostEqual(
+            sum(rewards) * scenario.rps * env.step_s, ok - 0.25 * retries, places=6
+        )
+        info, free = steps[-1][4], plain[-1][4]
+        self.assertLess(info["ep_return"], free["ep_return"])
+        for name, value in free.items():  # the price is on the pay alone
+            if name != "ep_return":
+                np.testing.assert_equal(info[name], value)
+        after = [r for r in client.roots if root_completed_at(r) > begin]
+        self.assertEqual(info["ep_retries_served"], sum(len(r.attempts) - 1 for r in after))
+        with self.assertRaisesRegex(ValueError, "retry_cost"):
+            RetryEnv(Small(), retry_cost=-0.1)
+
     def test_a_latency_bound_is_a_time(self):
         for bad in (0.0, -1.0, math.inf):
             with (

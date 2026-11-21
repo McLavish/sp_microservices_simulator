@@ -84,6 +84,16 @@ class TestTheLimiterAsAnEnvironment(unittest.TestCase):
         # One try each: half of the 480 requests of the failure succeed, and the 320
         # of the load spike that follows (a fault window too) nearly all do.
         self.assertAlmostEqual(closed["fault_success_rate"], 0.7, delta=0.05)
+        # A retry that was refused never reached the service: it is asked for
+        # (the clients still made the attempt) and it is not served, so a price
+        # on served retries charges an open limiter and not a closed one.
+        self.assertGreater(closed["amplification"], 1.0)
+        self.assertEqual(closed["retries_served"], 0)
+        self.assertGreater(open_["retries_served"], 0)
+        (priced,) = evaluate.rollout(
+            RetryEnv(_scenario(), retry_cost=0.5), evaluate.constant((0, 0)), [3]
+        )
+        self.assertEqual(priced["return"], closed["return"])
 
     def test_the_summary_is_the_one_of_the_records(self):
         scenario = _scenario()

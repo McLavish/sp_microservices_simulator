@@ -29,7 +29,7 @@ import numpy as np
 from msim.caller import ClientRuntime
 from msim.core import RootRequest, TimePoint, ns_to_s, s_to_ns
 from msim.rl.scenario import Episode, Knob, RetryKnobs, Scenario
-from msim.rl.summary import Effort, Tally, WindowCount, summary
+from msim.rl.summary import Effort, Tally, WindowCount, paid, summary
 
 try:
     import gymnasium
@@ -82,6 +82,7 @@ class RetryEnv(gymnasium.Env):
         keep_records: bool = False,
         slow_s: float | None = None,
         reward_within_s: float | None = None,
+        retry_cost: float = 0.0,
     ) -> None:
         if not math.isfinite(step_s) or step_s <= 0:
             raise ValueError(f"step_s must be > 0, got {step_s}")
@@ -93,6 +94,8 @@ class RetryEnv(gymnasium.Env):
             not math.isfinite(reward_within_s) or reward_within_s <= 0
         ):
             raise ValueError(f"reward_within_s must be > 0 or None, got {reward_within_s}")
+        if not math.isfinite(retry_cost) or retry_cost < 0:
+            raise ValueError(f"retry_cost must be >= 0, got {retry_cost}")
         self.scenario = scenario
         self.step_s = step_s
         self.warmup_s = warmup_s
@@ -110,6 +113,12 @@ class RetryEnv(gymnasium.Env):
         #: failure in a queue for three seconds, and learns to fill the queue.
         self.reward_within_s = reward_within_s
         self._within = None if reward_within_s is None else s_to_ns(reward_within_s)
+        #: What the reward is paid less for every retry that reached its target,
+        #: in requests (0: nothing). A retry that cannot succeed costs the
+        #: service work and pays nothing either way, so without a price an agent
+        #: that decides what is let in has no reason to refuse it; with a small
+        #: one (0.05) it lets in the retries that pay and no others.
+        self.retry_cost = retry_cost
         #: Whether the requests in flight at the horizon are run to their end for
         #: the summary. Off: the summary covers what finished inside the horizon.
         self.drain = drain
@@ -228,8 +237,8 @@ class RetryEnv(gymnasium.Env):
         self._in_horizon.add(tally)
         self._windows.append((begin, tally.requests, tally.succeeded))
         observation = self._observe(self.step_s)
-        # `on_time` is `succeeded` unless a latency bound is set.
-        reward = tally.on_time / (episode.expected_rps * self.step_s)
+        # `on_time` is `succeeded` unless a latency bound is set; a retry has no price unless one is.
+        reward = paid(tally, self.retry_cost) / (episode.expected_rps * self.step_s)
         self._return += reward
         info = self._step_info(tally)
 
