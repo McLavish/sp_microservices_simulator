@@ -26,11 +26,11 @@ Needs PyYAML to read a file: the `arolla` extra.
 """
 
 import random
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from msim.admission import ControlledRetryPolicy
+from msim.admission import AdmissionController, ControlledRetryPolicy
 from msim.caller import ClientRuntime
 from msim.compat.arolla import Experiment, UnsupportedScenario, parse, read, schema
 from msim.compat.arolla import build as build_file
@@ -483,6 +483,7 @@ def as_written(
     point: int = 0,
     warmup_s: float = 5.0,
     step_s: float = 1.0,
+    limiter: Callable[[], AdmissionController] | None = None,
 ) -> list[dict[str, float]]:
     """The file run as it is written, with nobody taken over: one summary per seed.
 
@@ -496,6 +497,12 @@ def as_written(
     service loops whose attempts per request and retry efficiency are reported
     (every client entry unless given). `variation` gives each episode the
     failure and the load an `ArollaScenario` with the same variation gives it.
+
+    `limiter` puts another rule in the gates the file's limiters became: it is
+    called once per gate and episode, and what it returns decides there alone.
+    That is how a limiter their file format cannot name (the bucket of their
+    Kubernetes prototype, `admission.MixedRefillBudget`) is run in front of the
+    same clients. The file has to give some service a limiter for a gate to exist.
     """
     written = parse(read(path)[point].config)
     if part_of is not None:
@@ -504,6 +511,14 @@ def as_written(
     for seed in seeds:
         experiment = written if variation is None else variation.apply(written, seed)
         built = build_file(experiment, seed=seed, arrivals=seed)
+        if limiter is not None:
+            if not built.gates:
+                raise UnsupportedScenario(
+                    f"{experiment.name!r} puts no limiter in front of a service for clients "
+                    "that retry, so there is no gate to give another rule"
+                )
+            for gate in built.gates.values():
+                gate.controllers = (limiter(),)
         built.run()
         spent = None
         if effort is not None:

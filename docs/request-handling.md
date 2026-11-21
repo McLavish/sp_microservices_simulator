@@ -798,6 +798,7 @@ that have left, and a tandem chain node holds no worker while it waits.
 | `FailureRateGate(failure_threshold, min_requests, window, open_delay)` | unless more than the threshold of the last window's outcomes failed; closes again when the success rate is back and `open_delay` has passed | global |
 | `GoodputCoupledBudget(alpha, beta_down, beta_up, window, ...)` | while the tenant has fewer than `alpha x goodput` retries in the window, its goodput being its smoothed rate of successes here (quick to fall, slow to recover) | **per tenant** |
 | `ConcurrencyRetryBudget(budget_percent, min_retry_concurrency)` | while the retries in flight are less than a share of all attempts in flight (Envoy's retry budget) | the gate's account |
+| `MixedRefillBudget(r, capacity, t, deep_from, deep_cost)` | while one bucket of `capacity` tokens holds a token; every **success** deposits `r` of one and `t` arrive per second (the Envoy filter of Arolla's Kubernetes prototype, which is not the rule of their simulator); with `deep_from`, a retry deep in its chain costs more than one (their fairness filter) | global |
 | `TenantRetryQuota(share, window)` | while the tenant has fewer than `share x n` retries in the window, `n` being ITS first attempts let in during that window; each tenant can be given a share of its own, while a run is in progress (`set_share`) | **per tenant** |
 
 All of them only ever refuse retries (`RetryController`): a first attempt passes

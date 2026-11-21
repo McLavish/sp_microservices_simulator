@@ -29,6 +29,7 @@ from msim.admission import (
     ControlledRetryPolicy,
     FailureRateGate,
     GoodputCoupledBudget,
+    MixedRefillBudget,
     SuccessFundedBudget,
     TenantRetryQuota,
     TokenBucketBudget,
@@ -770,6 +771,80 @@ class TestGoodputCoupledBudget(unittest.TestCase):
         for kwargs in bad:
             with self.subTest(**kwargs), self.assertRaises(ValueError):
                 GoodputCoupledBudget(**kwargs)
+
+
+class TestMixedRefillBudget(unittest.TestCase):
+    """Arolla's prototype filter: one bucket, refilled by successes and by time."""
+
+    def test_the_bucket_starts_full_and_a_retry_takes_one_token(self):
+        budget = MixedRefillBudget(r=0.1, capacity=3, t=0.0)
+        self.assertEqual(_drain(budget, 0, "a"), 3)
+        self.assertFalse(_take(budget, S, "b"))  # no time refill, and one bucket for everybody
+
+    def test_successes_deposit_r_whoever_they_belong_to(self):
+        budget = MixedRefillBudget(r=0.1, capacity=3, t=0.0)
+        _drain(budget, 0)
+        for i in range(9):
+            budget.observe(_outcome(i, success=True, tenant="a"))
+        budget.observe(_outcome(9, success=False, tenant="a"))  # a failure pays nothing
+        self.assertFalse(_take(budget, 10, "b"))  # 0.9 of a token
+        budget.observe(_outcome(11, success=True, tenant="a"))
+        self.assertTrue(_take(budget, 12, "b"))  # paid for by a's successes
+        self.assertEqual(budget.balance, 0.0)
+
+    def test_time_refills_it_too_and_exactly(self):
+        budget = MixedRefillBudget(r=0.0, capacity=5, t=2.0)
+        _drain(budget, 0)
+        for i in range(1, 1001):  # looked at every millisecond for a second
+            budget.check(_retry(i * MS))
+        self.assertEqual(budget.balance, 2.0)
+        self.assertEqual(_drain(budget, 10 * S), 5)  # and never above its capacity
+
+    def test_both_refills_fill_one_bucket(self):
+        budget = MixedRefillBudget(r=0.5, capacity=10, t=1.0)
+        _drain(budget, 0)
+        for _ in range(4):
+            budget.observe(_outcome(S // 2, success=True))
+        self.assertEqual(budget.balance, 0.5 + 4 * 0.5)  # half a second, and four successes
+        self.assertEqual(_drain(budget, S // 2), 2)
+
+    def test_a_deep_retry_costs_more_in_the_fairness_filter(self):
+        def retry(attempt: int) -> AdmissionRequest:
+            return AdmissionRequest(now=0, tenant="a", attempt=attempt, is_retry=True)
+
+        for mode, cost in (("linear", 4), ("triangular", 6), ("quadratic", 16)):
+            with self.subTest(deep_cost=mode):
+                budget = MixedRefillBudget(r=0.0, capacity=20, t=0.0, deep_from=3, deep_cost=mode)
+                for attempt in (2, 3):  # up to the threshold: one token each
+                    budget.commit(retry(attempt))
+                self.assertEqual(budget.balance, 18.0)
+                self.assertTrue(budget.check(retry(4)))
+                budget.commit(retry(4))
+                self.assertEqual(budget.balance, 18.0 - cost)
+                budget.refund(retry(4))
+                self.assertEqual(budget.balance, 18.0)
+        poor = MixedRefillBudget(r=0.0, capacity=5, t=0.0, deep_from=3, deep_cost="triangular")
+        self.assertFalse(poor.check(retry(4)))  # six tokens, and the bucket holds five
+        self.assertTrue(poor.check(retry(3)))
+
+    def test_checking_alone_spends_nothing(self):
+        budget = MixedRefillBudget(r=0.1, capacity=2, t=0.0)
+        for _ in range(5):
+            self.assertTrue(budget.check(_retry(0)))
+        self.assertEqual(budget.balance, 2.0)
+
+    def test_validation(self):
+        bad: list[dict[str, Any]] = [
+            {"r": -0.1},
+            {"capacity": 0.5},
+            {"t": -1.0},
+            {"r": float("nan")},
+            {"deep_from": 0},
+            {"deep_cost": "cubic"},
+        ]
+        for kwargs in bad:
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                MixedRefillBudget(**kwargs)
 
 
 class TestTenantRetryQuota(unittest.TestCase):

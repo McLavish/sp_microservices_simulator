@@ -461,6 +461,98 @@ class TenantRetryQuota(RetryController):
             retries.pop()
 
 
+#: What a retry deep in a chain costs in `MixedRefillBudget`, by its attempt number.
+_DEEP_COSTS = {
+    "linear": lambda attempt: attempt,
+    "triangular": lambda attempt: attempt * (attempt - 1) // 2,
+    "quadratic": lambda attempt: attempt * attempt,
+}
+
+
+@dataclass
+class MixedRefillBudget(RetryController):
+    """One bucket of retries, refilled by successes AND by time (Arolla's prototype).
+
+    The retry admission of Arolla's Kubernetes prototype (ETH EASL,
+    https://github.com/eth-easl/Arolla, the Envoy filter `prototype/arolla-filter`,
+    "Algorithm 1" of their paper), ported: a bucket of `capacity` tokens, full at
+    the start; every attempt that ends in success deposits `r` of a token, and
+    `t` tokens arrive per second whatever happens; a retry takes one. One bucket
+    for everybody: no tenant has an account of its own. (`GoodputCoupledBudget`
+    is the rule of their SIMULATOR, which is another one: per tenant, a count
+    against a smoothed goodput.)
+
+    `deep_from` and `deep_cost` are their second filter (`arolla-filter-fairness`):
+    a retry whose attempt number is above `deep_from` costs more than one token
+    (`"linear"`: its attempt number; `"triangular"`: attempt x (attempt - 1) / 2;
+    `"quadratic"`: attempt squared), so that a caller deep in a chain of retries
+    pays for draining the bucket it shares. `None` (default): every retry costs one.
+
+    The balance is exact (integer token units); `r` and `capacity` are rounded
+    to 1e-18 of a token and `t` to 1e-9 of a token per second.
+    """
+
+    r: float = 0.1  # tokens per success
+    capacity: float = 20.0  # bucket size, and the opening balance
+    t: float = 1.0  # tokens per second
+    deep_from: int | None = None
+    deep_cost: str = "linear"
+
+    _deposit: int = field(init=False, repr=False)
+    _rate: int = field(init=False, repr=False)
+    _cap: int = field(init=False, repr=False)
+    _tokens: int = field(init=False, repr=False)
+    _last: TimePoint | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        for name in ("r", "capacity"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be a finite number >= 0, got {value!r}")
+        if self.capacity < 1:
+            raise ValueError(f"capacity must hold at least one retry, got {self.capacity!r}")
+        if self.deep_from is not None:
+            _positive_int(self.deep_from, "deep_from")
+        if self.deep_cost not in _DEEP_COSTS:
+            raise ValueError(
+                f"deep_cost must be one of {', '.join(_DEEP_COSTS)}; got {self.deep_cost!r}"
+            )
+        self._rate = _rate_units(self.t, "t")
+        self._deposit = round(Fraction(self.r).limit_denominator(_MAX_DENOMINATOR) * _TOKEN)
+        self._cap = round(Fraction(self.capacity).limit_denominator(_MAX_DENOMINATOR) * _TOKEN)
+        self._tokens = self._cap
+
+    def _refill(self, now: TimePoint) -> None:
+        last, self._last = self._last, now
+        if last is not None and now > last:
+            self._tokens = min(self._cap, self._tokens + self._rate * (now - last))
+
+    @property
+    def balance(self) -> float:
+        """Tokens in the bucket as of the last time it was looked at."""
+        return self._tokens / _TOKEN
+
+    def _cost(self, request: AdmissionRequest) -> int:
+        if self.deep_from is None or request.attempt <= self.deep_from:
+            return _TOKEN
+        return _DEEP_COSTS[self.deep_cost](request.attempt) * _TOKEN
+
+    def observe(self, outcome: AdmissionOutcome) -> None:
+        if outcome.success:
+            self._refill(outcome.now)
+            self._tokens = min(self._cap, self._tokens + self._deposit)
+
+    def admits_retry(self, request: AdmissionRequest) -> bool:
+        self._refill(request.now)
+        return self._tokens >= self._cost(request)
+
+    def spend(self, request: AdmissionRequest) -> None:
+        self._tokens -= self._cost(request)
+
+    def give_back(self, request: AdmissionRequest) -> None:
+        self._tokens = min(self._cap, self._tokens + self._cost(request))
+
+
 @dataclass
 class FailureRateGate(RetryController):
     """No retries while the server is failing: a breaker on retries alone.

@@ -10,11 +10,13 @@ import tempfile
 import unittest
 import warnings
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 from gymnasium.utils.env_checker import check_env
 
+from msim.admission import MixedRefillBudget
 from msim.compat.arolla import UnsupportedScenario
 from msim.rl import RetryEnv, evaluate
 from msim.rl.arolla import ArollaLimiterScenario, Variation, as_written
@@ -99,6 +101,34 @@ class TestTheLimiterAsAnEnvironment(unittest.TestCase):
     def test_a_file_with_no_limiter_has_no_gate_to_take_over(self):
         with self.assertRaisesRegex(UnsupportedScenario, "no gate for the agent"):
             _scenario(UNLIMITED)
+
+
+class TestAnotherRuleInTheirGate(unittest.TestCase):
+    """`as_written(..., limiter=)`: their file, their clients, a rule their format cannot name."""
+
+    def test_the_rule_given_decides_in_place_of_the_files(self):
+        seeds = [3, 4]
+        with tempfile.TemporaryDirectory() as folder:
+            path = _path(folder, TENANTS)
+            theirs = as_written(path, seeds)
+            # A bucket nothing can empty is no limiter at all ...
+            open_ = as_written(path, seeds, limiter=partial(MixedRefillBudget, capacity=1e6, t=1e6))
+            # ... and one that is never refilled gives out twenty retries and no more.
+            shut = as_written(path, seeds, limiter=partial(MixedRefillBudget, r=0.0, t=0.0))
+            unlimited = as_written(_path(folder, UNLIMITED), seeds)
+        np.testing.assert_equal(open_, unlimited)
+        for theirs_, shut_, open__ in zip(theirs, shut, open_, strict=True):
+            self.assertEqual(open__["failed_rejected"], 0)
+            self.assertGreater(shut_["failed_rejected"], 0)
+            self.assertNotEqual(shut_["success_rate"], theirs_["success_rate"])  # another rule
+            self.assertLess(shut_["fault_success_rate"], open__["fault_success_rate"])
+
+    def test_a_file_with_no_limiter_has_no_gate_for_it(self):
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            self.assertRaisesRegex(UnsupportedScenario, "no gate to give another rule"),
+        ):
+            as_written(_path(folder, UNLIMITED), [3], limiter=MixedRefillBudget)
 
 
 class TestWhatTheLimiterSees(unittest.TestCase):
