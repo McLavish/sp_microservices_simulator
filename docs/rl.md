@@ -254,6 +254,23 @@ an agent of this kind names its entries (`features`) and its agent object
 measures them (`Agent.measure`); `env.FEATURES` is what an agent on clients
 gets. `slow_s` and the knob levels are added as for any agent.
 
+What those counts do not say is whether the service has ROOM for the retries
+it lets in: a retry that succeeds looks the same whether or not it pushed the
+service past what it serves in time, and an agent shown only counts opens as
+far as the scenarios it was trained on had room. `QuotaGrid(in_flight=True)`
+(off by default) adds one entry for the gate as a whole, `in_flight`, built
+from the one further thing a proxy can count without being told anything: the
+attempts it has let in and not yet seen end. Their number, averaged over the
+window, per attempt let in during it is the time an attempt is in flight
+(Little's law, no request is timed); the entry is `1 - at rest / now`, where
+"at rest" is the lowest that time was in a window in which no retry asked,
+allowed to drift up by 2% a window. It is 0 while attempts are in flight no
+longer than when nothing fails and goes towards 1 as they pile up, whatever
+the service's own latency is, so nothing about the deployment is configured.
+An agent that never saw a window at rest has nothing to compare with and is
+shown 0. It is still not a queue length read from the service nor a latency
+measured by a client: the limiter counts it where it stands.
+
 So the scenario and `as_written` on the same file differ in the limiter and in
 nothing else: `tests/test_rl_limiter.py` checks that a quota which refuses
 nothing gives the file with no limiter, summary for summary.

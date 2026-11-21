@@ -271,7 +271,7 @@ mod filter {
                 let window_ms = limiter.borrow().settings.window_ms;
                 self.window_ends = (self.window_ends + window_ms).max(now + window_ms / 2);
                 let mut limiter = limiter.borrow_mut();
-                let own = limiter.take();
+                let own = limiter.take(now);
                 let own_firsts: u64 = own.iter().map(|seen| seen.firsts).sum();
                 let window_ms = limiter.settings.window_ms;
                 let counts = self.pooled(&own, now, window_ms).unwrap_or(own);
@@ -294,12 +294,16 @@ mod filter {
                     proxy_wasm::hostcalls::log(
                         LogLevel::Warn,
                         &format!(
-                            "learned-limiter: t={} plugin={} own={} firsts/ok/asked/admitted {:?} levels {:?}",
+                            "learned-limiter: t={} plugin={} own={} firsts/ok/asked/admitted {:?} levels {:?}{}",
                             now,
                             self.keys.trim_end_matches('/').rsplit(['/', '.']).next().unwrap_or(""),
                             own_firsts,
                             counts,
-                            levels
+                            levels,
+                            limiter
+                                .last_in_flight
+                                .map(|value| format!(" in_flight={:.2}", value))
+                                .unwrap_or_default()
                         ),
                     )
                     .ok();
@@ -415,7 +419,8 @@ mod filter {
             // or a refusal from a limiter further in.
             let success = status > 0 && status < 500 && status != self.config.reject_status;
             if let Some(limiter) = &self.limiter {
-                limiter.borrow_mut().ended(self.tenant, self.is_retry, success);
+                let now = millis(self.get_current_time());
+                limiter.borrow_mut().ended(self.tenant, self.is_retry, success, now);
             }
             Action::Continue
         }
@@ -435,7 +440,8 @@ mod filter {
             if self.admitted {
                 self.admitted = false;
                 if let Some(limiter) = &self.limiter {
-                    limiter.borrow_mut().ended(self.tenant, self.is_retry, false);
+                    let now = millis(self.get_current_time());
+                    limiter.borrow_mut().ended(self.tenant, self.is_retry, false, now);
                 }
             }
         }

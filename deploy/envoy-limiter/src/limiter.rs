@@ -22,6 +22,10 @@ use std::collections::VecDeque;
 /// well (`msim.rl.limiter.ATTEMPTS`, `GOODPUT`).
 const ATTEMPTS: f64 = 4.0;
 const GOODPUT: f64 = 2.0;
+/// `rl.limiter.DRIFT` and `AT_REST`: how fast the time in flight at rest may
+/// rise from one window to the next, and the attempts a window needs to move it.
+const DRIFT: f64 = 0.02;
+const AT_REST: u64 = 10;
 
 /// One dense layer: `w[out][in]`, `b[out]`.
 #[derive(Debug, Deserialize, Clone)]
@@ -123,6 +127,9 @@ pub struct Settings {
     /// while nothing fails earns nothing either way, and a failure should not
     /// start from wherever it happened to be.
     pub rest: bool,
+    /// Show the policy one entry more, after the tenants' own: how much longer
+    /// an attempt is in flight than while nothing fails (`rl.limiter.IN_FLIGHT`).
+    pub in_flight: bool,
     pub policy: Policy,
 }
 
@@ -139,6 +146,7 @@ impl Default for Settings {
             one_level: false,
             floor: 0,
             rest: false,
+            in_flight: false,
             policy: Policy::default(),
         }
     }
@@ -154,10 +162,13 @@ pub struct Seen {
     pub retries_admitted: u64,
     pub retries_ended: u64,
     pub retries_ok: u64,
+    /// Attempts in flight (let in, not yet ended) summed over the window's
+    /// time: attempts x ms.
+    pub flight: u64,
 }
 
 impl Seen {
-    const FIELDS: usize = 7;
+    const FIELDS: usize = 8;
 
     fn fields(&self) -> [u64; Self::FIELDS] {
         [
@@ -168,6 +179,7 @@ impl Seen {
             self.retries_admitted,
             self.retries_ended,
             self.retries_ok,
+            self.flight,
         ]
     }
 
@@ -179,6 +191,7 @@ impl Seen {
         self.retries_admitted += other.retries_admitted;
         self.retries_ended += other.retries_ended;
         self.retries_ok += other.retries_ok;
+        self.flight += other.flight;
     }
 }
 
@@ -214,6 +227,7 @@ pub fn decode(bytes: &[u8], tenants: usize) -> Option<(u64, Vec<Seen>)> {
             retries_admitted: next(),
             retries_ended: next(),
             retries_ok: next(),
+            flight: next(),
         });
     }
     Some((at, counts))
@@ -226,6 +240,18 @@ struct Tenant {
     retries: VecDeque<u64>,
     seen: Seen,
     level: usize,
+    /// Its attempts in flight, and the instant `seen.flight` is up to.
+    in_flight: u64,
+    flight_at: u64,
+}
+
+impl Tenant {
+    fn advance(&mut self, now: u64) {
+        if now > self.flight_at {
+            self.seen.flight += self.in_flight * (now - self.flight_at);
+            self.flight_at = now;
+        }
+    }
 }
 
 /// What one window held for one tenant, for a log line.
@@ -243,10 +269,15 @@ pub struct Limiter {
     tenants: Vec<Tenant>,
     slow: Option<Vec<f64>>,
     last_step: Option<u64>,
+    /// Time in flight per attempt let in while nothing fails (ms): the lowest
+    /// it was in a window in which no retry asked, drifting up by `DRIFT`.
+    flight_at_rest: Option<f64>,
     /// The observation the policy was last shown, for inspection.
     pub last_observation: Vec<f64>,
     /// The counts of the window that just ended, per tenant.
     pub last_counts: Vec<Counts>,
+    /// The in-flight entry of the window that just ended, when there is one.
+    pub last_in_flight: Option<f64>,
 }
 
 impl Limiter {
@@ -271,8 +302,10 @@ impl Limiter {
             tenants,
             slow: None,
             last_step: None,
+            flight_at_rest: None,
             last_observation: Vec::new(),
             last_counts: Vec::new(),
+            last_in_flight: None,
         })
     }
 
@@ -316,9 +349,11 @@ impl Limiter {
         self.trim(tenant, now);
         let share = self.share(tenant);
         let state = &mut self.tenants[tenant];
+        state.advance(now);
         if !is_retry {
             state.firsts.push_back(now);
             state.seen.firsts += 1;
+            state.in_flight += 1;
             return true;
         }
         state.seen.retries_asked += 1;
@@ -330,6 +365,7 @@ impl Limiter {
         {
             state.retries.push_back(now);
             state.seen.retries_admitted += 1;
+            state.in_flight += 1;
             true
         } else {
             false
@@ -337,8 +373,11 @@ impl Limiter {
     }
 
     /// An attempt that was let in has ended.
-    pub fn ended(&mut self, tenant: usize, is_retry: bool, success: bool) {
-        let seen = &mut self.tenants[tenant].seen;
+    pub fn ended(&mut self, tenant: usize, is_retry: bool, success: bool, now: u64) {
+        let state = &mut self.tenants[tenant];
+        state.advance(now);
+        state.in_flight = state.in_flight.saturating_sub(1);
+        let seen = &mut state.seen;
         seen.ended += 1;
         seen.goodput += success as u64;
         if is_retry {
@@ -350,14 +389,17 @@ impl Limiter {
     /// The end of a window, alone: this limiter's counts become the
     /// observation, the policy sets the levels of the next window.
     pub fn step(&mut self, now: u64) -> Vec<usize> {
-        let own = self.take();
+        let own = self.take(now);
         self.decide(&own, now)
     }
 
-    /// What this limiter counted for each tenant since the last call; the
-    /// counts start again from nothing.
-    pub fn take(&mut self) -> Vec<Seen> {
+    /// What this limiter counted for each tenant since the last call, up to
+    /// `now`; the counts start again from nothing.
+    pub fn take(&mut self, now: u64) -> Vec<Seen> {
         let known = self.known();
+        for tenant in self.tenants.iter_mut() {
+            tenant.advance(now);
+        }
         self.tenants[known].seen = Seen::default(); // nobody's: counted, never shown
         self.tenants[..known].iter_mut().map(|t| std::mem::take(&mut t.seen)).collect()
     }
@@ -396,7 +438,30 @@ impl Limiter {
             self.last_observation.clear();
             return self.levels();
         }
-        let resting = self.settings.rest && counts.iter().all(|seen| seen.retries_asked == 0);
+        let asked: u64 = counts.iter().map(|seen| seen.retries_asked).sum();
+        let resting = self.settings.rest && asked == 0;
+        // Attempts in flight, for the gate as a whole (`rl.limiter.IN_FLIGHT`):
+        // their sum over the window's time per attempt let in during it is the
+        // time an attempt is in flight (Little's law), and what is shown is how
+        // much longer that is than while nothing fails.
+        // Measured in every case (a log line shows it); shown to the policy
+        // only when it was trained with it.
+        let crowding = {
+            let admitted: u64 = counts.iter().map(|seen| seen.firsts + seen.retries_admitted).sum();
+            let flight: u64 = counts.iter().map(|seen| seen.flight).sum();
+            let in_flight = flight as f64 / admitted.max(1) as f64;
+            if in_flight > 0.0 && asked == 0 && admitted >= AT_REST {
+                self.flight_at_rest = Some(match self.flight_at_rest {
+                    None => in_flight,
+                    Some(at_rest) => in_flight.min(at_rest * (1.0 + DRIFT)),
+                });
+            }
+            match self.flight_at_rest {
+                Some(at_rest) if in_flight > 0.0 => (1.0 - at_rest / in_flight).max(0.0),
+                _ => 0.0,
+            }
+        };
+        self.last_in_flight = Some(crowding);
         // One level for everybody: the tenants' counts and rates added up, and
         // the policy shown them as one tenant's. Each tenant's quota is still
         // a share of ITS first attempts, so with one share for all of them the
@@ -424,9 +489,14 @@ impl Limiter {
                 0.0
             });
         }
+        if self.settings.in_flight {
+            measured.push(crowding);
+        }
         for value in measured.iter_mut() {
             *value = value.clamp(0.0, 1.0);
         }
+        // Per tenant shown, then the entry of the gate as a whole if there is one.
+        let extra = measured.len() - 5 * counts.len();
         let mut observation = measured.clone();
         if self.settings.slow_s > 0.0 {
             let weight = 1.0 - (-window_s / self.settings.slow_s).exp();
@@ -456,13 +526,16 @@ impl Limiter {
             // once per tenant, each time shown that tenant's entries alone
             // (the window's, the averaged ones, its level), against that
             // tenant's own rate.
-            let slow = if self.settings.slow_s > 0.0 { 5 * known } else { 0 };
+            let width = 5 * known + extra;
+            let slow = if self.settings.slow_s > 0.0 { width } else { 0 };
             for index in 0..known {
                 let mut one = observation[5 * index..5 * index + 5].to_vec();
+                one.extend_from_slice(&observation[5 * known..width]);
                 if slow > 0 {
-                    one.extend_from_slice(&observation[5 * known + 5 * index..5 * known + 5 * index + 5]);
+                    one.extend_from_slice(&observation[width + 5 * index..width + 5 * index + 5]);
+                    one.extend_from_slice(&observation[width + 5 * known..width + width]);
                 }
-                one.push(observation[5 * known + slow + index]);
+                one.push(observation[width + slow + index]);
                 if let Some(chosen) = self.settings.policy.act(&one, 1, levels) {
                     self.tenants[index].level = chosen[0];
                 }
@@ -545,7 +618,7 @@ mod tests {
         assert_eq!((other, l.tenant(Some("nobody"))), (2, 2));
         for i in 0..20 {
             l.admit(other, false, i);
-            l.ended(other, false, false);
+            l.ended(other, false, false, 0);
         }
         // 10% of 20 first attempts, whatever the tenants' level is.
         assert_eq!((0..10).filter(|_| l.admit(other, true, 30)).count(), 2);
@@ -563,11 +636,11 @@ mod tests {
         let mut l = limiter(vec![0.0, 0.5, 3.0], 1);
         for i in 0..40 {
             l.admit(0, false, i * 10);
-            l.ended(0, false, i % 2 == 0); // half of them succeed
+            l.ended(0, false, i % 2 == 0, 0); // half of them succeed
         }
         for i in 0..10 {
             if l.admit(0, true, 400 + i) {
-                l.ended(0, true, true);
+                l.ended(0, true, true, 0);
             }
         }
         let levels = l.step(1000);
@@ -585,7 +658,7 @@ mod tests {
         // A second, nearly empty window: the slow copy moves towards it.
         for i in 0..8 {
             l.admit(0, false, 1000 + i);
-            l.ended(0, false, true);
+            l.ended(0, false, true, 0);
         }
         l.step(2000);
         let weight = 1.0 - (-1.0f64 / 10.0).exp();
@@ -619,12 +692,12 @@ mod tests {
         .unwrap();
         for i in 0..40 {
             l.admit(0, false, i);
-            l.ended(0, false, true);
+            l.ended(0, false, true, 0);
         }
         assert_eq!(l.step(1000), vec![2, 1]); // goodput 0.5: tanh(1) > 0
         for i in 0..4 {
             l.admit(0, false, 1000 + i);
-            l.ended(0, false, false);
+            l.ended(0, false, false, 0);
         }
         assert_eq!(l.step(2000), vec![0, 1]); // nothing succeeded: tanh(-1) < 0
         assert_eq!(l.share(0), 0.0);
@@ -645,13 +718,13 @@ mod tests {
             (Limiter::new(settings.clone()).unwrap(), Limiter::new(settings).unwrap());
         for i in 0..95 {
             busy.admit(0, false, i);
-            busy.ended(0, false, true);
+            busy.ended(0, false, true, 0);
         }
         for i in 0..5 {
             idle.admit(0, false, i);
-            idle.ended(0, false, true);
+            idle.ended(0, false, true, 0);
         }
-        let (left, right) = (busy.take(), idle.take());
+        let (left, right) = (busy.take(0), idle.take(0));
         // As bytes and back: what one thread leaves for the other.
         let (at, read) = decode(&encode(1000, &left), 1).unwrap();
         assert_eq!((at, &read), (1000, &left));
@@ -664,7 +737,7 @@ mod tests {
         assert_eq!(busy.last_observation, idle.last_observation);
         assert!((busy.last_observation[0] - 0.25).abs() < 1e-6);
         // Their own counts are gone, and the quota is still each one's own.
-        assert_eq!(busy.take(), vec![Seen::default()]);
+        assert_eq!(busy.take(0), vec![Seen::default()]);
         // (a retry is let in while the count is below the share of the first attempts)
         assert_eq!((0..100).filter(|_| busy.admit(0, true, 500)).count(), 48); // 47.5 of 95
         assert_eq!((0..100).filter(|_| idle.admit(0, true, 500)).count(), 3); // 2.5 of 5
@@ -694,9 +767,9 @@ mod tests {
         // a: 40 of its 40 succeed; b: nothing; c: 40 of its 400 expected.
         for i in 0..40 {
             l.admit(0, false, i);
-            l.ended(0, false, true);
+            l.ended(0, false, true, 0);
             l.admit(2, false, i);
-            l.ended(2, false, true);
+            l.ended(2, false, true, 0);
         }
         assert_eq!(l.step(1000), vec![2, 0, 0]); // goodput 0.5, 0 and 0.05 of the scale
         assert_eq!(l.last_observation.len(), 3 * 11);
@@ -726,10 +799,10 @@ mod tests {
         for i in 0..90 {
             if i < 10 {
                 l.admit(0, false, i);
-                l.ended(0, false, true);
+                l.ended(0, false, true, 0);
             }
             l.admit(1, false, i);
-            l.ended(1, false, true);
+            l.ended(1, false, true, 0);
         }
         assert_eq!(l.step(1000), vec![2, 2]);
         assert_eq!(l.last_observation.len(), 11); // one tenant's worth of entries
@@ -793,7 +866,7 @@ mod tests {
         assert!(l.last_observation.is_empty());
         for i in 0..40 {
             l.admit(0, false, 1000 + i);
-            l.ended(0, false, false); // every one fails: low goodput
+            l.ended(0, false, false, 0); // every one fails: low goodput
         }
         assert_eq!(l.step(2000), vec![2, 0]);
         let first = l.last_observation[10]; // the average starts at this window
@@ -820,17 +893,78 @@ mod tests {
         .unwrap();
         for i in 0..40 {
             l.admit(0, false, i);
-            l.ended(0, false, true);
+            l.ended(0, false, true, 0);
         }
         assert_eq!(l.step(1000), vec![0]); // traffic, and no retry asked: at rest
         assert_eq!(l.last_observation.len(), 11); // the window is still what the averages see
         for i in 0..40 {
             l.admit(0, false, 1000 + i);
-            l.ended(0, false, false);
+            l.ended(0, false, false, 0);
         }
         assert!(!l.admit(0, true, 1050)); // a retry asks, and is refused at level 0
         assert_eq!(l.step(2000), vec![2]); // now the policy's answer is in force
         assert!((l.last_observation[10] - 0.0).abs() < 1e-9); // and it was shown level 0
+    }
+
+    #[test]
+    fn attempts_in_flight_are_shown_against_their_time_at_rest() {
+        // A policy that always answers level 1.
+        let policy = Policy {
+            hidden: vec![Layer { w: vec![vec![0.0; 13]], b: vec![0.0] }],
+            head: Some(Layer { w: vec![vec![0.0], vec![0.0]], b: vec![0.0, 1.0] }),
+        };
+        let mut l = Limiter::new(Settings {
+            tenants: vec!["a".into()],
+            rates: vec![40.0],
+            shares: vec![0.0, 3.0],
+            default_level: 0,
+            in_flight: true,
+            policy,
+            ..Settings::default()
+        })
+        .unwrap();
+        // At rest: forty attempts a second, each in flight for 10 ms.
+        for second in 0..3u64 {
+            for i in 0..40 {
+                let at = second * 1000 + i * 25;
+                l.admit(0, false, at);
+                l.ended(0, false, true, at + 10);
+            }
+            l.step((second + 1) * 1000);
+            assert_eq!(l.last_observation.len(), 13); // 5 + 1, the same averaged, the level
+            assert!(l.last_observation[5].abs() < 1e-9, "{:?}", l.last_observation);
+        }
+        // Half of them fail and retry; every attempt is now in flight for 40 ms.
+        // (time, a retry?, an end? and if so a success?), in the order of their times.
+        let mut events: Vec<(u64, bool, Option<bool>)> = Vec::new();
+        for i in 0..40u64 {
+            let at = 3000 + i * 25;
+            events.push((at, false, None));
+            events.push((at + 40, false, Some(i % 2 == 0)));
+            if i % 2 == 1 {
+                events.push((at + 40, true, None));
+                events.push((at + 80, true, Some(true)));
+            }
+        }
+        events.sort_by_key(|event| event.0);
+        for (at, is_retry, end) in events.into_iter().filter(|event| event.0 < 4000) {
+            match end {
+                None => assert!(l.admit(0, is_retry, at)),
+                Some(success) => l.ended(0, is_retry, success, at),
+            }
+        }
+        l.step(4000);
+        // 40 ms against 10 at rest: 1 - 10/40. (The last attempts end after the
+        // window does; what they add is in the next one.)
+        assert!((l.last_observation[5] - 0.75).abs() < 0.02, "{:?}", l.last_observation);
+        // A window with retries asking does not move the time at rest.
+        assert!((l.flight_at_rest.unwrap() - 10.0).abs() < 1e-9);
+        // The counts of the threads of a proxy are added, the time in flight with them.
+        let mut sum = Seen { firsts: 30, flight: 300, ..Seen::default() };
+        sum.add(&Seen { firsts: 10, flight: 500, ..Seen::default() });
+        assert_eq!((sum.firsts, sum.flight), (40, 800));
+        let bytes = encode(7, &[sum.clone()]);
+        assert_eq!(decode(&bytes, 1), Some((7, vec![sum])));
     }
 
     #[test]

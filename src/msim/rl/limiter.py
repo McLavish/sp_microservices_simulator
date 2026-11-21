@@ -14,6 +14,12 @@ request rate, its goodput, its retries in the window, the success of its
 retries). No queue length, no latency, nothing from inside a client, and no
 word of a fault.
 
+`QuotaGrid(in_flight=True)` adds the one thing more a proxy can count without
+being told anything: the attempts it has let in and not yet seen end. It is
+shown as how much longer an attempt is in flight than while nothing fails
+(`IN_FLIGHT`), which is where a limiter sees that the service has no room left
+for the retries it lets in.
+
     quota = QuotaGrid()
     agent = quota.install(gate, tenants, clients, rates)   # while building an episode
     scenario.knobs    = quota.knobs(tenants)
@@ -42,6 +48,17 @@ MEASURES = (
     "retries_admitted",  # ... and those let in
     "retry_success",  # share of the retries that ended which succeeded
 )
+#: Measured once for the whole gate, after every tenant's entries, with
+#: `QuotaGrid(in_flight=True)`: 1 - (time in flight at rest) / (time in flight
+#: now), so 0 while an attempt is in flight no longer than at rest and towards 1
+#: as attempts pile up. The time in flight is attempts in flight, averaged over
+#: the window, per attempt let in during it (what a proxy has without timing a
+#: single request), and "at rest" is the lowest it was in a window in which no
+#: retry asked, allowed to drift up by `DRIFT` a window.
+IN_FLIGHT = "in_flight"
+DRIFT = 0.02
+#: A window with fewer attempts let in than this does not move the level at rest.
+AT_REST = 10
 #: The scales, in requests of the tenant when all is well. A tenant that tries
 #: four times sends up to four attempts per request; goodput cannot pass the
 #: requests that arrive, and twice the expected rate leaves room for a heavy load.
@@ -83,6 +100,19 @@ class _GateTap(AdmissionController):
 
     def __init__(self) -> None:
         self.seen: dict[str | None, _Seen] = {}
+        self.in_flight = 0  # attempts let in whose end has not been seen
+        self._flight_ns = 0  # ... summed over time since it was last read (attempt x ns)
+        self._at = 0  # the instant the sum is up to
+
+    def _advance(self, now: int) -> None:
+        self._flight_ns += self.in_flight * (now - self._at)
+        self._at = now
+
+    def take_flight(self, now: int) -> int:
+        """Attempts in flight summed over time (attempt x ns) since the last call, up to `now`."""
+        self._advance(max(now, self._at))
+        flight, self._flight_ns = self._flight_ns, 0
+        return flight
 
     def of(self, tenant: str | None) -> _Seen:
         seen = self.seen.get(tenant)
@@ -100,6 +130,11 @@ class _GateTap(AdmissionController):
         return True
 
     def commit(self, request: AdmissionRequest) -> None:
+        self._advance(request.now)
+        if request.outstanding is not None:
+            # The gate's own count: a cancelled attempt leaves it without being observed.
+            self.in_flight = request.outstanding
+        self.in_flight += 1
         seen = self.of(request.tenant)
         if request.is_retry:
             seen.retries_admitted += 1
@@ -107,6 +142,8 @@ class _GateTap(AdmissionController):
             seen.firsts += 1
 
     def observe(self, outcome: AdmissionOutcome) -> None:
+        self._advance(outcome.now)
+        self.in_flight -= 1
         seen = self.of(outcome.tenant)
         seen.ended += 1
         seen.goodput += outcome.success
@@ -131,9 +168,14 @@ class LimiterKnobs:
         clients: Sequence[ClientRuntime],
         rates: Mapping[str, float],
         rest: float | None = None,
+        in_flight: bool = False,
     ) -> None:
         self.quota = quota
         self._tap = tap
+        #: Whether `IN_FLIGHT` is measured (`QuotaGrid.in_flight`).
+        self._in_flight = in_flight
+        self._now = 0  # the end of the last window measured, ns
+        self._flight_at_rest: float | None = None  # ns in flight per attempt, while nothing fails
         #: The share every tenant has while no retry asks (`QuotaGrid.rest`), or `None`.
         self._rest = rest
         self._asked = 1  # retries that asked in the last window measured (none measured yet)
@@ -166,13 +208,18 @@ class LimiterKnobs:
         return dict(values) if resting else None
 
     def measure(self, window_s: float) -> tuple[int, list[float]]:
-        """Requests that began in the window, and `MEASURES` for every tenant; resets the counts."""
+        """Requests that began in the window, and `MEASURES` for every tenant; resets the counts.
+
+        With `QuotaGrid(in_flight=True)` one more value follows them, `IN_FLIGHT`.
+        """
         started = 0
+        admitted = 0
         self._asked = 0
         values: list[float] = []
         for tenant in self.tenants:
             seen = self._tap.take(tenant)
             started += seen.firsts
+            admitted += seen.firsts + seen.retries_admitted
             self._asked += seen.retries_asked
             expected = self.rates[tenant] * window_s
             per_request = 1.0 / expected if expected > 0 else 0.0  # a warm-up of no length
@@ -183,7 +230,23 @@ class LimiterKnobs:
                 seen.retries_admitted * per_request / ATTEMPTS,
                 seen.retries_ok / seen.retries_ended if seen.retries_ended else 0.0,
             ]
+        self._now += s_to_ns(window_s)
+        flight_ns = self._tap.take_flight(self._now)
+        if self._in_flight:
+            values.append(self._crowding(flight_ns, admitted))
         return started, values
+
+    def _crowding(self, flight_ns: int, admitted: int) -> float:
+        """`IN_FLIGHT` for a window: its attempts in flight over time, and those let in."""
+        in_flight = flight_ns / max(admitted, 1)  # ns in flight per attempt let in (Little's law)
+        if in_flight > 0.0 and self._asked == 0 and admitted >= AT_REST:
+            at_rest = self._flight_at_rest
+            self._flight_at_rest = (
+                in_flight if at_rest is None else min(in_flight, at_rest * (1.0 + DRIFT))
+            )
+        if self._flight_at_rest is None or in_flight <= 0.0:
+            return 0.0
+        return max(0.0, 1.0 - self._flight_at_rest / in_flight)
 
 
 @dataclass(frozen=True)
@@ -208,6 +271,12 @@ class QuotaGrid:
     way, so what it learns to hold is arbitrary, it stays there (its own level
     is part of what it is shown), and a failure then starts from wherever that
     was. With `rest` every failure starts from the default.
+
+    `in_flight` (default `False`) shows the agent one entry more, for the gate
+    as a whole: `IN_FLIGHT`, how much longer an attempt is in flight than while
+    nothing fails. Counts tell a limiter whether retries succeed, not whether
+    the service has room for them, and without this entry the room is whatever
+    the scenarios it was trained on had.
     """
 
     shares: tuple[float, ...] = (0.0, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 3.0)
@@ -215,6 +284,7 @@ class QuotaGrid:
     window_s: float = 1.0
     floor: int = 0
     rest: bool = False
+    in_flight: bool = False
 
     def __post_init__(self) -> None:
         if self.default_share not in self.shares:
@@ -232,7 +302,8 @@ class QuotaGrid:
 
     def features(self, tenants: Sequence[str]) -> tuple[str, ...]:
         """The names of what `LimiterKnobs.measure` returns."""
-        return tuple(f"{tenant}:{measure}" for tenant in tenants for measure in MEASURES)
+        per_tenant = tuple(f"{tenant}:{measure}" for tenant in tenants for measure in MEASURES)
+        return per_tenant + ((IN_FLIGHT,) if self.in_flight else ())
 
     def install(
         self,
@@ -259,4 +330,6 @@ class QuotaGrid:
         tap = _GateTap()
         gate.controllers = (tap, quota)
         rest = self.default_share if self.rest else None
-        return LimiterKnobs(quota, tap, tenants, clients, rates, rest=rest)
+        return LimiterKnobs(
+            quota, tap, tenants, clients, rates, rest=rest, in_flight=self.in_flight
+        )

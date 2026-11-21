@@ -16,11 +16,20 @@ from pathlib import Path
 import numpy as np
 from gymnasium.utils.env_checker import check_env
 
-from msim.admission import MixedRefillBudget
+from msim.admission import AdmissionOutcome, AdmissionRequest, MixedRefillBudget
 from msim.compat.arolla import UnsupportedScenario
+from msim.core import DropReason
 from msim.rl import RetryEnv, evaluate
 from msim.rl.arolla import ArollaLimiterScenario, Variation, as_written
-from msim.rl.limiter import ATTEMPTS, GOODPUT, MEASURES, LimiterKnobs, QuotaGrid
+from msim.rl.limiter import (
+    ATTEMPTS,
+    GOODPUT,
+    IN_FLIGHT,
+    MEASURES,
+    LimiterKnobs,
+    QuotaGrid,
+    _GateTap,
+)
 from msim.rl.summary import of_records
 from tests.test_rl_arolla import TENANTS
 
@@ -204,6 +213,68 @@ class TestWhatTheLimiterSees(unittest.TestCase):
         for observation in seen:
             self.assertTrue(env.observation_space.contains(observation), observation)
         self.assertEqual(max(float(o.max()) for o in seen), 1.0)  # something did hit the bound
+
+
+class TestAttemptsInFlight(unittest.TestCase):
+    """`QuotaGrid(in_flight=True)`: the one entry that is not a count of the window."""
+
+    #: A queue long enough to hold a burst, and a burst the service cannot serve.
+    BURST = TENANTS.replace("queue_capacity: 100", "queue_capacity: 5000").replace(
+        "rps_multiplier: 2", "rps_multiplier: 8"
+    )
+
+    def test_the_gate_sums_its_attempts_in_flight_over_time(self):
+        tap = _GateTap()
+
+        def let_in(now: int, outstanding: int) -> None:
+            tap.commit(AdmissionRequest(now, "a", 1, False, outstanding, 0))
+
+        let_in(0, 0)
+        let_in(10, 1)
+        tap.observe(AdmissionOutcome(30, "a", 1, False, True, DropReason.NONE))
+        # One attempt for 10 ns, two for 20, one for the 20 that are left.
+        self.assertEqual(tap.take_flight(50), 1 * 10 + 2 * 20 + 1 * 20)
+        self.assertEqual(tap.take_flight(60), 10)  # read, it starts again; one is still in flight
+        # An attempt that was cancelled leaves the gate unobserved: its count is the gate's.
+        let_in(60, 0)
+        self.assertEqual(tap.in_flight, 1)
+
+    def test_it_is_one_entry_more_and_only_when_asked_for(self):
+        self.assertNotIn(IN_FLIGHT, RetryEnv(_scenario()).feature_names)
+        grid = QuotaGrid(in_flight=True)
+        env = RetryEnv(_scenario(grid=grid), slow_s=10.0)
+        self.assertEqual(grid.features(("a", "b"))[-1], IN_FLIGHT)
+        self.assertEqual(env.feature_names.count(IN_FLIGHT), 1)
+        self.assertIn(f"{IN_FLIGHT}~10s", env.feature_names)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            check_env(env, skip_render_check=True)
+
+    def test_it_is_near_zero_until_attempts_pile_up(self):
+        grid = replace(OPEN, in_flight=True)
+        env = RetryEnv(_scenario(self.BURST, grid=grid))
+        at = env.feature_names.index(IN_FLIGHT)
+        observation, _ = env.reset(options={"episode_seed": 1})
+        shown = [float(observation[at])]  # the warm-up, then a window a second
+        shown += [float(env.step((1, 1))[0][at]) for _ in range(env.episode_steps)]
+        # Seconds 5 to 15: all is well, then half the attempts fail and every
+        # retry is let in, which the service has room for.
+        self.assertLess(max(shown[:11]), 0.4, shown)
+        # Seconds 15 to 17: eight times the load, more than the service can serve.
+        self.assertGreater(max(shown[11:13]), 0.8, shown)
+
+    def test_without_a_window_at_rest_there_is_nothing_to_compare_with(self):
+        # Overloaded from the first second: retries ask in every window.
+        heavy = _scenario(
+            self.BURST,
+            grid=replace(OPEN, in_flight=True),
+            variation=Variation(load=(8.0, 8.0), p_fail=(0.5, 0.5)),
+        )
+        env = RetryEnv(heavy)
+        at = env.feature_names.index(IN_FLIGHT)
+        observation, _ = env.reset(options={"episode_seed": 1})
+        shown = [float(observation[at])] + [float(env.step((1, 1))[0][at]) for _ in range(5)]
+        self.assertEqual(shown, [0.0] * 6)
 
 
 class TestTheQuotaGrid(unittest.TestCase):
