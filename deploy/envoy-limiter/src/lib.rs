@@ -35,8 +35,8 @@ mod filter {
 
     proxy_wasm::main! {{
         proxy_wasm::set_log_level(LogLevel::Info);
-        proxy_wasm::set_root_context(|_| -> Box<dyn RootContext> {
-            Box::new(Root::default())
+        proxy_wasm::set_root_context(|id| -> Box<dyn RootContext> {
+            Box::new(Root { id, ..Root::default() })
         });
     }}
 
@@ -57,6 +57,11 @@ mod filter {
         log_windows: bool,
         /// Decide on the counts of every thread of this proxy together.
         pool_threads: bool,
+        /// How long the answer to a refused retry is held when its request has
+        /// a body, so that the request is complete and the connection survives
+        /// (the answer goes out one to two such periods later). 0: answer at
+        /// once, as Arolla's filter does, and lose the connection.
+        hold_refusal_ms: u64,
         limiter: Settings,
     }
 
@@ -69,6 +74,7 @@ mod filter {
                 reject_status: 429,
                 log_windows: false,
                 pool_threads: true,
+                hold_refusal_ms: 2,
                 limiter: Settings::default(),
             }
         }
@@ -102,6 +108,11 @@ mod filter {
         /// in the proxy's shared data, and this thread's number among them.
         keys: String,
         slot: Option<u32>,
+        id: u32,
+        refusals: Rc<RefCell<Refusals>>,
+        /// When the window that is running ends (the tick is faster than the
+        /// window when refusals are held).
+        window_ends: u64,
     }
 
     impl Context for Root {}
@@ -228,14 +239,37 @@ mod filter {
                 )
                 .unwrap_or(0),
             };
-            self.set_tick_period(Duration::from_millis(window));
+            let hold = self.config.hold_refusal_ms;
+            let tick = if hold > 0 { hold.min(window) } else { window };
+            self.window_ends = millis(self.get_current_time()) + window;
+            self.set_tick_period(Duration::from_millis(tick));
             proxy_wasm::hostcalls::log(LogLevel::Info, &described).ok();
             true
         }
 
         fn on_tick(&mut self) {
+            // The refusals that have waited a whole tick, each on its own stream.
+            let due = {
+                let mut refusals = self.refusals.borrow_mut();
+                let due = std::mem::take(&mut refusals.due);
+                refusals.due = std::mem::take(&mut refusals.fresh);
+                due
+            };
+            if !due.is_empty() {
+                for stream in due {
+                    if proxy_wasm::hostcalls::set_effective_context(stream).is_ok() {
+                        refuse(self.config.reject_status);
+                    }
+                }
+                let _ = proxy_wasm::hostcalls::set_effective_context(self.id);
+            }
+            let now = millis(self.get_current_time());
+            if now < self.window_ends {
+                return;
+            }
             if let Some(limiter) = &self.limiter {
-                let now = millis(self.get_current_time());
+                let window_ms = limiter.borrow().settings.window_ms;
+                self.window_ends = (self.window_ends + window_ms).max(now + window_ms / 2);
                 let mut limiter = limiter.borrow_mut();
                 let own = limiter.take();
                 let own_firsts: u64 = own.iter().map(|seen| seen.firsts).sum();
@@ -273,7 +307,7 @@ mod filter {
             }
         }
 
-        fn create_http_context(&self, _id: u32) -> Option<Box<dyn HttpContext>> {
+        fn create_http_context(&self, id: u32) -> Option<Box<dyn HttpContext>> {
             Some(Box::new(Http {
                 config: self.config.clone(),
                 limiter: self.limiter.clone(),
@@ -281,6 +315,9 @@ mod filter {
                 tenant: 0,
                 is_retry: false,
                 admitted: false,
+                refusing: false,
+                id,
+                refusals: self.refusals.clone(),
             }))
         }
 
@@ -297,12 +334,34 @@ mod filter {
         is_retry: bool,
         /// Whether this attempt was let in: only those are observed on the way back.
         admitted: bool,
+        /// A retry that is refused and not answered yet (`Refusals`).
+        refusing: bool,
+        id: u32,
+        refusals: Rc<RefCell<Refusals>>,
     }
 
     impl Context for Http {}
 
+    /// The answer to a refused retry, on the stream that is the effective context.
+    fn refuse(status: u32) {
+        let _ = proxy_wasm::hostcalls::send_http_response(
+            status,
+            vec![("x-learned-rejected", "1")],
+            Some(b"retry refused by the learned limiter\n"),
+        );
+    }
+
+    /// Streams whose retry is refused and whose request was still arriving.
+    /// `fresh` were refused since the last tick, `due` before it: a refusal is
+    /// answered at the second tick after it, one to two tick periods later.
+    #[derive(Default)]
+    struct Refusals {
+        fresh: Vec<u32>,
+        due: Vec<u32>,
+    }
+
     impl HttpContext for Http {
-        fn on_http_request_headers(&mut self, _n: usize, _eos: bool) -> Action {
+        fn on_http_request_headers(&mut self, _n: usize, eos: bool) -> Action {
             let Some(limiter) = self.limiter.clone() else {
                 return Action::Continue;
             };
@@ -327,11 +386,20 @@ mod filter {
                 Action::Continue
             } else {
                 let _ = proxy_wasm::hostcalls::increment_metric(self.metrics.rejected, 1);
-                self.send_http_response(
-                    self.config.reject_status,
-                    vec![("x-learned-rejected", "1")],
-                    Some(b"retry refused by the learned limiter\n"),
-                );
+                if eos || self.config.hold_refusal_ms == 0 {
+                    refuse(self.config.reject_status);
+                } else {
+                    // The request has a body that has not arrived. Envoy closes
+                    // an HTTP/1 connection it answers before the request is
+                    // complete, and a refusal that costs the caller its
+                    // connection turns a retry storm into a storm of new
+                    // connections (3500 a second were measured, and the callers
+                    // stalled for a minute). A paused filter is not shown the
+                    // body, so the answer is left to the next ticks, by when a
+                    // small body has arrived.
+                    self.refusals.borrow_mut().fresh.push(self.id);
+                    self.refusing = true;
+                }
                 Action::Pause
             }
         }
@@ -357,6 +425,13 @@ mod filter {
         /// too, as a failure: in the simulator the gate is told of every outcome,
         /// a deadline included.
         fn on_log(&mut self) {
+            if self.refusing {
+                // The stream is over (answered, or its caller went away first).
+                let mut refusals = self.refusals.borrow_mut();
+                refusals.fresh.retain(|id| *id != self.id);
+                refusals.due.retain(|id| *id != self.id);
+                self.refusing = false;
+            }
             if self.admitted {
                 self.admitted = false;
                 if let Some(limiter) = &self.limiter {

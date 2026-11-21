@@ -23,7 +23,7 @@ header says more than 1 (`x-envoy-attempt-count`, set by the mesh, or
 (a call inside the mesh) is kept apart: it is in no tenant's counts, the policy
 never sees it, and its retries get the fixed `other_share` (10%).
 
-Two things the simulator has no notion of:
+Three things the simulator has no notion of:
 
 - **Threads.** Every Envoy worker thread has a filter instance of its own, and
   Envoy does not spread connections evenly over them (one thread of a gateway
@@ -35,6 +35,15 @@ Two things the simulator has no notion of:
 - **Callers that give up.** An attempt whose caller went away before any
   response is counted as ended and failed when its stream closes, as the
   simulator's gate is told of a deadline.
+- **What a refusal costs the caller.** Envoy closes an HTTP/1 connection it
+  answers before the request is complete, and a filter decides at the request
+  headers, before a body has arrived. A 429 sent there costs the caller its
+  connection (Arolla's filter does this), and in a storm of refused retries
+  that is a storm of new connections: 3500 a second were measured, and after
+  a 30 s outage the callers' new connections hung for another half minute. So
+  the answer to a refused retry with a body is held for one to two ticks of
+  `hold_refusal_ms` (2 ms), by when a small body has arrived, and the
+  connection survives. `hold_refusal_ms: 0` answers at once.
 
 ## Build and test
 
@@ -64,6 +73,7 @@ pluginConfig:
   tenant_header: X-Retry-Client-Type
   reject_status: 429
   pool_threads: true
+  hold_refusal_ms: 2
   log_windows: false      # one warning line per instance and window, for a run being looked at
   limiter:                # export.py
     tenants: [checkout]
