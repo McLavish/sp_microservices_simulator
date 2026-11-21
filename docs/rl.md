@@ -372,8 +372,10 @@ python -m examples.rl_vs_arolla compare  --arolla ~/Arolla --out study --jobs 48
 the same four tenants, each with its own retry policy (four attempts for all;
 one backs off, one has a circuit breaker, one a client-side budget and no
 attempt timeout), and one admission gate in front of the service. The only
-thing that differs is the controller inside that gate: their rule, or a quota
-per tenant that an agent sets every second (`ArollaLimiterScenario`, above).
+thing that differs is the controller inside that gate: their rule (the one of
+their simulator, which that file names; the rule of their Kubernetes prototype
+is another one and is compared further down), or a quota per tenant that an
+agent sets every second (`ArollaLimiterScenario`, above).
 The agent sees what their rule runs on, per tenant: attempts and successes at
 the service, retries asked and let in. Situations: their file as it is; a
 varied one, where every episode draws the failure rate (0.1 to 0.9), its start
@@ -453,10 +455,59 @@ python -m examples.rl_vs_arolla train --arolla ~/Arolla --out study/runs/lc-100 
 
 an hour on twelve simulations and one learner.
 
-**What it does not show.** Anything about their prototype: this is their
-simulator's situation in this simulator, with Arolla's rule as
-`msim.admission` implements it from their files (their numbers are reproduced
-within noise on all their scenarios: [compat-arolla](compat-arolla.md)). That
+**The rule their prototype deploys.** "Arolla" above is the limiter of their
+simulator files (`arolla_retry_budget`: per tenant, the retries of a window
+against a share of a smoothed goodput). The limiter their paper evaluates on
+Kubernetes is another rule (`prototype/arolla-filter`, their Algorithm 1): ONE
+bucket for everybody, full at the start, a tenth of a token per success and
+one token per second, a retry takes one. `admission.MixedRefillBudget` is that
+filter, and `as_written(..., limiter=)` runs it in the same gate in front of
+the same clients: as their manifests deploy it (`r` 0.1, capacity 20, `t` 1),
+with their fairness filter (a fourth attempt costs six tokens), and at the
+best of the 125 settings their own grid walks on their testbed, chosen on the
+selection episodes. Same test episodes, same learned limiter:
+
+| Situation | Learned limiter | Simulator's rule | Prototype's rule, as deployed | with fairness filter | Prototype's rule, tuned | Learned - as deployed | Learned - tuned |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Their file | 88.57 | 85.54 | 85.47 | 85.46 | 85.89 | +3.10 ± 0.12 | +2.68 ± 0.12 |
+| Varied | 90.09 | 87.73 | 87.77 | 87.74 | 88.14 | +2.32 ± 0.31 | +1.95 ± 0.29 |
+| Failure rate 0.1 | 99.60 | 98.70 | 99.59 | 99.53 | 99.39 | +0.01 ± 0.01 | +0.22 ± 0.01 |
+| Failure rate 0.25 | 97.86 | 94.03 | 94.28 | 94.28 | 94.54 | +3.58 ± 0.12 | +3.32 ± 0.12 |
+| Failure rate 0.75 | 78.96 | 77.21 | 77.19 | 77.19 | 77.53 | +1.77 ± 0.07 | +1.44 ± 0.07 |
+| Failure rate 0.9 | 73.12 | 72.44 | 72.41 | 72.38 | 72.57 | +0.71 ± 0.04 | +0.55 ± 0.04 |
+| Failing for 5 s | 97.15 | 96.45 | 96.48 | 96.43 | 96.50 | +0.67 ± 0.05 | +0.64 ± 0.05 |
+| Failing for 10 s | 94.32 | 92.84 | 92.81 | 92.76 | 92.96 | +1.51 ± 0.08 | +1.36 ± 0.08 |
+| Failing for 35 s | 80.08 | 74.57 | 74.51 | 74.55 | 75.28 | +5.57 ± 0.14 | +4.80 ± 0.14 |
+| 0.7 times the load | 94.25 | 85.65 | 85.71 | 85.61 | 86.38 | +8.54 ± 0.06 | +7.86 ± 0.06 |
+| 0.85 times the load | 91.98 | 85.56 | 85.55 | 85.54 | 86.19 | +6.43 ± 0.17 | +5.79 ± 0.17 |
+| 1.15 times the load | 86.37 | 85.41 | 85.41 | 85.42 | 85.74 | +0.95 ± 0.07 | +0.63 ± 0.06 |
+| 1.3 times the load | 83.75 | 83.53 | 75.14 | 75.66 | 80.69 | +8.61 ± 1.20 | +3.06 ± 0.65 |
+
+Up to 1.15 times the load the two rules of theirs are the same limiter to
+within 0.3 points (0.9 at a failure rate of 0.1, which the bucket's refill
+just about covers), and the learned one leads both, except at that failure
+rate, where it and the bucket are level (+0.01 ± 0.01). At 1.3 times
+the load they part: the bucket keeps paying out a tenth of the successes and
+a retry a second into a service that has no room for either, and ends 8.3
+points BELOW refusing every retry (83.41%), where their simulator's rule holds
+83.53%. A plain success-funded budget does the same there (`policy-rb`:
+74.67%), which is what the bucket is without its time refill. The fairness
+filter changes little here: these tenants stop at four attempts.
+
+As to whether its settings are fitted to their testbed: on this situation,
+which they were not chosen on, the deployed settings are 0.35 points from the
+best of their own grid (86.19% against 86.54% on the selection episodes,
+at `r` 0.05, capacity 5, `t` 10), and no setting of the grid saves the rule at
+1.3 times the load (80.69% at best). So what does not carry over is not the
+choice of `r`, `t` and the capacity. It is that the rule admits in proportion
+to what succeeds and has no notion of how full the service is.
+
+**What it does not show.** Anything about their prototype itself: this is
+their simulator's situation in this simulator, not Online Boutique on their
+testbed, and both of their rules are `msim.admission`'s ports (the
+simulator's rule reproduces their simulator within noise on all their
+scenarios, [compat-arolla](compat-arolla.md); the prototype's rule is ported
+from the filter's source and has not been run against the filter). That
 the learned limiter carries over: it was trained on this service, 16 workers
 and 60 ms, and on this kind of failure, and what it has learned about load is
 this service's capacity. Their rule knows nothing about the service and needs
