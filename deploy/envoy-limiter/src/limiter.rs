@@ -148,6 +148,14 @@ pub struct Settings {
     /// (`QuotaGrid.asked_per_failure`): a caller that retries ten times does
     /// not read as a worse failure than one that retries three times.
     pub asked_per_failure: Option<f64>,
+    /// A retry beyond this attempt of its request is refused whatever the
+    /// level (`QuotaGrid.max_attempt`): with 4, a caller gets three retries
+    /// per request however often it asks. Not set: any.
+    pub max_attempt: Option<u32>,
+    /// No level rises until retries have asked in two windows running
+    /// (`QuotaGrid.confirm`): a failure begins inside a window, and that
+    /// window looks like a partial failure whatever follows.
+    pub confirm: bool,
     pub policy: Policy,
 }
 
@@ -169,6 +177,8 @@ impl Default for Settings {
             hold_above: None,
             in_flight_cap: None,
             asked_per_failure: None,
+            max_attempt: None,
+            confirm: false,
             policy: Policy::default(),
         }
     }
@@ -297,6 +307,8 @@ pub struct Limiter {
     /// The attempts this limiter let in during the window last taken, and the
     /// attempts in flight above which it refuses a retry (`in_flight_cap`).
     own_admitted: u64,
+    /// Whether retries asked in the window before the one last counted (`confirm`).
+    asked_before: bool,
     pub cap_limit: Option<f64>,
     /// Retries the cap refused since the filter started.
     pub cap_refused: u64,
@@ -334,6 +346,7 @@ impl Limiter {
             last_step: None,
             flight_at_rest: None,
             own_admitted: 0,
+            asked_before: false,
             cap_limit: None,
             cap_refused: 0,
             last_observation: Vec::new(),
@@ -376,6 +389,18 @@ impl Limiter {
                 times.pop_front();
             }
         }
+    }
+
+    /// An attempt arrives, with its number in its request. `true`: let it in.
+    pub fn admit_attempt(&mut self, tenant: usize, attempt: u32, now: u64) -> bool {
+        if let Some(most) = self.settings.max_attempt {
+            if attempt > most.max(1) && tenant < self.known() {
+                // It has asked all the same.
+                self.tenants[tenant].seen.retries_asked += 1;
+                return false;
+            }
+        }
+        self.admit(tenant, attempt > 1, now)
     }
 
     /// An attempt arrives. `true`: let it in.
@@ -478,6 +503,7 @@ impl Limiter {
         // traffic was seen to open every quota and stay open. Such a window is
         // the start of an episode instead: the default level, no averages yet.
         if counts.iter().all(|seen| seen.firsts == 0 && seen.ended == 0 && seen.retries_asked == 0) {
+            self.asked_before = false;
             let default = self.settings.default_level;
             for tenant in self.tenants[..known].iter_mut() {
                 tenant.level = default;
@@ -609,7 +635,9 @@ impl Limiter {
         }
         // No further up than `step_up` levels from where the tenant stood, and
         // not up at all while the service is crowded.
-        let held = self.settings.hold_above.is_some_and(|above| crowding > above);
+        let held = self.settings.hold_above.is_some_and(|above| crowding > above)
+            || (self.settings.confirm && !self.asked_before);
+        self.asked_before = asked > 0;
         if held || self.settings.step_up > 0 {
             let rise = if held { 0 } else { self.settings.step_up };
             for (tenant, was) in self.tenants[..known].iter_mut().zip(&before) {
@@ -1199,6 +1227,64 @@ mod tests {
         // 200 asks on a scale of 4 x 40 as counted (off the scale); 3 x 20 as shown.
         assert!((run(None) - 1.0).abs() < 1e-9);
         assert!((run(Some(3.0)) - 60.0 / 160.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn with_max_attempt_a_caller_gets_no_more_retries_per_request() {
+        let mut l = Limiter::new(Settings {
+            tenants: vec!["a".into()],
+            rates: vec![40.0],
+            shares: vec![3.0],
+            default_level: 0,
+            max_attempt: Some(4),
+            ..Settings::default()
+        })
+        .unwrap();
+        for i in 0..10 {
+            assert!(l.admit_attempt(0, 1, i));
+        }
+        // The fourth attempt is the last a caller is let in with, at a share
+        // that refuses nothing; the fifth has asked and is refused.
+        assert!(l.admit_attempt(0, 2, 20));
+        assert!(l.admit_attempt(0, 4, 21));
+        assert!(!l.admit_attempt(0, 5, 22));
+        assert!(!l.admit_attempt(0, 11, 23));
+        let seen = &l.take(100)[0];
+        assert_eq!((seen.retries_asked, seen.retries_admitted), (4, 2));
+    }
+
+    #[test]
+    fn with_confirm_a_level_rises_once_retries_asked_in_two_windows_running() {
+        // A policy that always answers the top level.
+        let policy = Policy {
+            hidden: Vec::new(),
+            head: Some(Layer { w: vec![vec![0.0; 11], vec![0.0; 11]], b: vec![0.0, 1.0] }),
+        };
+        let mut l = Limiter::new(Settings {
+            tenants: vec!["a".into()],
+            rates: vec![40.0],
+            shares: vec![0.0, 3.0],
+            default_level: 0,
+            rest: true,
+            confirm: true,
+            policy,
+            ..Settings::default()
+        })
+        .unwrap();
+        let mut levels = Vec::new();
+        for second in 0..5u64 {
+            for i in 0..40 {
+                l.admit(0, false, second * 1000 + i);
+                l.ended(0, false, second < 2, second * 1000 + i + 5);
+                if second >= 2 {
+                    l.admit(0, true, second * 1000 + i + 5);
+                }
+            }
+            levels.push(l.step((second + 1) * 1000)[0]);
+        }
+        // Retries first ask in the third window: at rest before, held after it
+        // (a first window of asking), open after the fourth.
+        assert_eq!(levels, vec![0, 0, 0, 1, 1]);
     }
 
     #[test]

@@ -177,6 +177,16 @@ class _FlightCap(RetryController):
         return False
 
 
+class _AttemptBound(RetryController):
+    """Refuses a retry beyond the `max_attempt`-th attempt of its request (`QuotaGrid.max_attempt`)."""
+
+    def __init__(self, max_attempt: int) -> None:
+        self.max_attempt = max_attempt
+
+    def admits_retry(self, request: AdmissionRequest) -> bool:
+        return request.attempt <= self.max_attempt
+
+
 class LimiterKnobs:
     """The quota of each tenant in one episode, and what the limiter counts.
 
@@ -201,6 +211,7 @@ class LimiterKnobs:
         cap: _FlightCap | None = None,
         cap_times: float = 0.0,
         asked_per_failure: float | None = None,
+        confirm: bool = False,
     ) -> None:
         self.quota = quota
         self._tap = tap
@@ -217,7 +228,10 @@ class LimiterKnobs:
         self._ladder = tuple(ladder)
         self._step_up = step_up
         self._hold_above = hold_above
-        self._bounded = bool(step_up) or hold_above is not None
+        #: `QuotaGrid.confirm`: no share rises until retries have asked in two windows running.
+        self._confirm = confirm
+        self._asked_before = 0  # retries that asked in the window before the last one measured
+        self._bounded = bool(step_up) or hold_above is not None or confirm
         self._place = (
             {tenant: self._ladder.index(start) for tenant in tenants} if self._bounded else {}
         )
@@ -259,7 +273,9 @@ class LimiterKnobs:
         elif self._bounded:
             # No further up than `step_up` levels from where the tenant stands,
             # and not up at all while the service is crowded.
-            held = self._hold_above is not None and self._entry > self._hold_above
+            held = (self._hold_above is not None and self._entry > self._hold_above) or (
+                self._confirm and self._asked_before == 0
+            )
             rise = 0 if held else (self._step_up or len(self._ladder))
             values = {
                 name: self._ladder[
@@ -281,6 +297,9 @@ class LimiterKnobs:
         """
         started = 0
         admitted = 0
+        self._asked_before = (
+            self._asked if self._now else 0
+        )  # nothing was measured before the first
         self._asked = 0
         values: list[float] = []
         for tenant in self.tenants:
@@ -387,6 +406,17 @@ class QuotaGrid:
     `asked_per_failure=ATTEMPTS - 1` a caller cannot move the quota by asking
     more often. Nothing but that entry changes (what rests, what is refused
     and the counts in `info` are the real ones).
+
+    `max_attempt` (default `None`: any) refuses a retry beyond that attempt of
+    its request, whatever the share: with 4, a caller gets the three retries
+    the scales assume and no more, so one that retries ten times is let in no
+    more often per request than one that retries three times.
+
+    `confirm` (default `False`): no share rises until retries have asked in
+    two windows running. A failure begins inside a window, and that window
+    looks like a partial failure whatever follows; an agent that opens on it
+    lets a share of the retries through at the start of a total failure. With
+    `confirm` it acts on a failure once it has seen a whole window of it.
     """
 
     shares: tuple[float, ...] = (0.0, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 3.0)
@@ -399,6 +429,8 @@ class QuotaGrid:
     hold_above: float | None = None
     in_flight_cap: float | None = None
     asked_per_failure: float | None = None
+    max_attempt: int | None = None
+    confirm: bool = False
 
     def __post_init__(self) -> None:
         if self.default_share not in self.shares:
@@ -409,6 +441,8 @@ class QuotaGrid:
             raise ValueError(f"step_up is a number of levels >= 0, got {self.step_up}")
         if self.hold_above is not None and not 0.0 <= self.hold_above <= 1.0:
             raise ValueError(f"hold_above is a value of the in-flight entry, got {self.hold_above}")
+        if self.max_attempt is not None and self.max_attempt < 2:
+            raise ValueError(f"max_attempt is an attempt number >= 2, got {self.max_attempt}")
         if self.in_flight_cap is not None and self.in_flight_cap < 1.0:
             raise ValueError(
                 f"in_flight_cap is a multiple >= 1 of the attempts in flight at rest, "
@@ -452,7 +486,11 @@ class QuotaGrid:
         )
         tap = _GateTap()
         cap = _FlightCap() if self.in_flight_cap is not None else None
-        gate.controllers = (tap, quota) if cap is None else (tap, cap, quota)
+        bound = _AttemptBound(self.max_attempt) if self.max_attempt is not None else None
+        # The tap first (a refused retry has still asked), the quota last.
+        gate.controllers = tuple(
+            controller for controller in (tap, bound, cap, quota) if controller is not None
+        )
         rest = self.default_share if self.rest else None
         return LimiterKnobs(
             quota,
@@ -469,4 +507,5 @@ class QuotaGrid:
             cap=cap,
             cap_times=self.in_flight_cap or 0.0,
             asked_per_failure=self.asked_per_failure,
+            confirm=self.confirm,
         )

@@ -305,6 +305,18 @@ on the former reads that as a far worse failure than it is, and with one level
 for all tenants it closes for everybody: on the deployment a limiter stayed
 closed through a failure of half the calls for exactly that reason. With
 `a = 3` how often a caller asks does not move the quota.
+`QuotaGrid(max_attempt=n)` is the same thought on what is let in: a retry
+beyond the `n`-th attempt of its request is refused whatever the share, so a
+caller that retries ten times gets no more retries per request than one that
+retries three times (their fairness filter also decides on the attempt
+number).
+
+`QuotaGrid(confirm=True)` holds every share where it is until retries have
+asked in two windows running. A failure begins inside a window, and that
+window looks like a partial failure whatever follows: an agent that opens on
+it lets a share of the retries through at the start of a total failure. With
+`confirm` it acts once it has seen a whole window of the failure, a second
+later.
 
 So the scenario and `as_written` on the same file differ in the limiter and in
 nothing else: `tests/test_rl_limiter.py` checks that a quota which refuses

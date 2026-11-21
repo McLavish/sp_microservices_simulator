@@ -2,13 +2,13 @@
 
     python deploy/envoy-limiter/export.py MODEL.zip OUT.json --rates R [R ...]
         [--tenants NAME [NAME ...]] [--one-level] [--rest] [--in-flight-cap C] [--step-up N]
-        [--asked-per-failure A] [--fixture FILE]
+        [--asked-per-failure A] [--max-attempt N] [--confirm] [--fixture FILE]
 
 Writes the `limiter` block of the filter's plugin configuration: the tenants in the policy's
 order, the requests per second each sends one PROXY when all is well (`--rates`, the scale of
 everything the policy is shown), the ladder of shares, the probe floor and the resting quota
-the model was trained with (`--rest`, `--in-flight-cap`, `--step-up` and `--asked-per-failure`
-turn those on for a model trained without them), the
+the model was trained with (`--rest`, `--in-flight-cap`, `--step-up`, `--asked-per-failure`,
+`--max-attempt` and `--confirm` turn those on for a model trained without them), the
 level held until the policy has spoken, the window, the time constant of the slow
 averages, and the policy's weights (`msim.rl.train.policy_weights`).
 
@@ -47,6 +47,8 @@ def limiter_block(
     in_flight_cap: float | None = None,
     step_up: int | None = None,
     asked_per_failure: float | None = None,
+    max_attempt: int | None = None,
+    confirm: bool = False,
 ) -> dict:
     sidecar = json.loads(model.with_suffix(".json").read_text("utf-8"))
     knobs = sidecar["knobs"]
@@ -74,6 +76,8 @@ def limiter_block(
         "hold_above": trained_grid(sidecar).get("hold_above"),
         "in_flight_cap": in_flight_cap or trained_grid(sidecar).get("in_flight_cap"),
         "asked_per_failure": asked_per_failure or trained_grid(sidecar).get("asked_per_failure"),
+        "max_attempt": max_attempt or trained_grid(sidecar).get("max_attempt"),
+        "confirm": bool(confirm or trained_grid(sidecar).get("confirm", False)),
         "shares": shares,
         "default_level": knobs[0]["default"],
         "window_ms": round(1000 * sidecar["step_s"]),
@@ -95,6 +99,8 @@ def main() -> None:
     parser.add_argument("--in-flight-cap", type=float, default=None)
     parser.add_argument("--step-up", type=int, default=None)
     parser.add_argument("--asked-per-failure", type=float, default=None)
+    parser.add_argument("--max-attempt", type=int, default=None)
+    parser.add_argument("--confirm", action="store_true")
     parser.add_argument("--fixture", type=Path)
     args = parser.parse_args()
 
@@ -107,6 +113,8 @@ def main() -> None:
         args.in_flight_cap,
         args.step_up,
         args.asked_per_failure,
+        args.max_attempt,
+        args.confirm,
     )
     args.out.write_text(json.dumps(limiter), "utf-8")
     entries = len(limiter["policy"]["hidden"][0]["w"][0])

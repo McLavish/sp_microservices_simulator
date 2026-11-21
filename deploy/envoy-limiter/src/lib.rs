@@ -382,7 +382,7 @@ mod filter {
             let mut limiter = limiter.borrow_mut();
             self.tenant = limiter.tenant(name.as_deref());
             self.is_retry = attempt > 1;
-            self.admitted = limiter.admit(self.tenant, self.is_retry, now);
+            self.admitted = limiter.admit_attempt(self.tenant, attempt, now);
             drop(limiter);
             if !self.is_retry {
                 let _ = proxy_wasm::hostcalls::increment_metric(self.metrics.first_attempts, 1);

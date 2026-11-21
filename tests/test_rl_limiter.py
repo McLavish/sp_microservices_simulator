@@ -28,6 +28,7 @@ from msim.rl.limiter import (
     MEASURES,
     LimiterKnobs,
     QuotaGrid,
+    _AttemptBound,
     _GateTap,
 )
 from msim.rl.summary import of_records
@@ -418,6 +419,42 @@ class TestTheQuotaGrid(unittest.TestCase):
         # Ten asks per failed request as counted (off the scale), three as shown.
         self.assertEqual(shown[None], 1.0)
         self.assertLess(shown[3.0], 0.6)
+
+    def test_with_confirm_a_quota_rises_once_a_whole_window_of_the_failure_was_seen(self):
+        # The failure begins at second 8: the window of step 3 (the warm-up is 5 s).
+        def first_open(grid: QuotaGrid) -> int:
+            env = RetryEnv(_scenario(grid=grid))
+            env.reset(options={"episode_seed": 1})
+            for step in range(env.episode_steps):
+                info = env.step((1, 1))[4]
+                if info["knob_quota:plain"] > 0:
+                    return step
+            return -1
+
+        ladder = QuotaGrid(shares=(0.0, 1000.0), rest=True)
+        # At rest until retries ask (they do in the window of step 3), then open ...
+        self.assertEqual(first_open(ladder), 4)
+        # ... and a window later when a second window of asking is waited for.
+        self.assertEqual(first_open(replace(ladder, confirm=True)), 5)
+
+    def test_with_max_attempt_a_caller_gets_no_more_retries_per_request(self):
+        bound = _AttemptBound(4)
+        self.assertTrue(bound.check(AdmissionRequest(0, "a", 1, False, 0, 0)))
+        self.assertTrue(bound.check(AdmissionRequest(0, "a", 4, True, 0, 0)))
+        self.assertFalse(bound.check(AdmissionRequest(0, "a", 5, True, 0, 0)))
+        # `plain` tries eleven times; every retry the quota is asked for is let in.
+        eager = TENANTS.replace("max_attempts: 4, delay_ms: 0", "max_attempts: 11, delay_ms: 0")
+        served = {}
+        for limit in (None, 4):
+            env = RetryEnv(_scenario(eager, grid=replace(OPEN, max_attempt=limit)))
+            env.reset(options={"episode_seed": 1})
+            info = {}
+            for _ in range(env.episode_steps):
+                info = env.step((1, 1))[4]
+            served[limit] = info["ep_retries_served"]
+        self.assertLess(served[4], served[None])
+        with self.assertRaisesRegex(ValueError, "max_attempt"):
+            QuotaGrid(max_attempt=1)
 
     def test_validation(self):
         with self.assertRaisesRegex(ValueError, "not one of its levels"):
