@@ -112,6 +112,9 @@ pub struct Settings {
     pub slow_s: f64,
     /// The share of the retries of requests that are no tenant's.
     pub other_share: f64,
+    /// One level for every tenant, decided from their counts added up, instead
+    /// of a level per tenant (`decide`).
+    pub one_level: bool,
     pub policy: Policy,
 }
 
@@ -125,6 +128,7 @@ impl Default for Settings {
             window_ms: 1000,
             slow_s: 10.0,
             other_share: 0.1,
+            one_level: false,
             policy: Policy::default(),
         }
     }
@@ -354,15 +358,31 @@ impl Limiter {
         };
         self.last_step = Some(now);
         let known = self.known();
-        let mut measured = Vec::with_capacity(5 * known);
-        self.last_counts.clear();
-        for (seen, rate) in counts.iter().zip(&self.settings.rates) {
-            self.last_counts.push(Counts {
+        self.last_counts = counts
+            .iter()
+            .map(|seen| Counts {
                 firsts: seen.firsts,
                 goodput: seen.goodput,
                 retries_asked: seen.retries_asked,
                 retries_admitted: seen.retries_admitted,
-            });
+            })
+            .collect();
+        // One level for everybody: the tenants' counts and rates added up, and
+        // the policy shown them as one tenant's. Each tenant's quota is still
+        // a share of ITS first attempts, so with one share for all of them the
+        // retries let in are in proportion to the requests each one sends.
+        let together = self.settings.one_level && known > 1;
+        let (counts, rates): (Vec<Seen>, Vec<f64>) = if together {
+            let mut sum = Seen::default();
+            for seen in counts {
+                sum.add(seen);
+            }
+            (vec![sum], vec![self.settings.rates.iter().sum()])
+        } else {
+            (counts.to_vec(), self.settings.rates.clone())
+        };
+        let mut measured = Vec::with_capacity(5 * counts.len());
+        for (seen, rate) in counts.iter().zip(&rates) {
             let per_request = 1.0 / (rate * window_s);
             measured.push(seen.ended as f64 * per_request / ATTEMPTS);
             measured.push(seen.goodput as f64 * per_request / GOODPUT);
@@ -388,13 +408,20 @@ impl Limiter {
             self.slow = Some(slow);
         }
         let top = (self.settings.shares.len() - 1).max(1) as f64;
-        observation.extend(self.tenants[..known].iter().map(|t| t.level as f64 / top));
+        let shown = if together { 1 } else { known };
+        observation.extend(self.tenants[..shown].iter().map(|t| t.level as f64 / top));
         // The policy was trained on 32-bit observations.
         for value in observation.iter_mut() {
             *value = ((*value as f32) as f64).clamp(0.0, 1.0);
         }
         let levels = self.settings.shares.len();
-        if self.settings.policy.tenants(levels) == Some(1) && known > 1 {
+        if together {
+            if let Some(chosen) = self.settings.policy.act(&observation, 1, levels) {
+                for tenant in self.tenants[..known].iter_mut() {
+                    tenant.level = chosen[0];
+                }
+            }
+        } else if self.settings.policy.tenants(levels) == Some(1) && known > 1 {
             // A policy trained for ONE tenant, in front of several: it is asked
             // once per tenant, each time shown that tenant's entries alone
             // (the window's, the averaged ones, its level), against that
@@ -627,6 +654,50 @@ mod tests {
         }
         assert_eq!(l.step(1000), vec![2, 0, 0]); // goodput 0.5, 0 and 0.05 of the scale
         assert_eq!(l.last_observation.len(), 3 * 11);
+    }
+
+    #[test]
+    fn one_level_for_every_tenant_from_their_counts_together() {
+        // The policy of the test above: level 2 when the goodput it is shown is
+        // above a quarter of the scale, level 0 below.
+        let mut hidden_w = vec![0.0; 11];
+        hidden_w[1] = 8.0;
+        let policy = Policy {
+            hidden: vec![Layer { w: vec![hidden_w], b: vec![-2.0] }],
+            head: Some(Layer { w: vec![vec![-1.0], vec![0.0], vec![1.0]], b: vec![0.0, -5.0, 0.0] }),
+        };
+        let mut l = Limiter::new(Settings {
+            tenants: vec!["small".into(), "large".into()],
+            rates: vec![10.0, 90.0],
+            shares: vec![0.0, 0.5, 3.0],
+            default_level: 0,
+            one_level: true,
+            policy,
+            ..Settings::default()
+        })
+        .unwrap();
+        // 10 and 90 requests succeed: 100 of the 100 expected together, half the scale.
+        for i in 0..90 {
+            if i < 10 {
+                l.admit(0, false, i);
+                l.ended(0, false, true);
+            }
+            l.admit(1, false, i);
+            l.ended(1, false, true);
+        }
+        assert_eq!(l.step(1000), vec![2, 2]);
+        assert_eq!(l.last_observation.len(), 11); // one tenant's worth of entries
+        assert!((l.last_observation[1] - 0.5).abs() < 1e-6);
+        // The same share for both, of each one's own first attempts: three
+        // retries per first attempt, 30 for the small tenant and 270 for the large.
+        for i in 0..90 {
+            if i < 10 {
+                l.admit(0, false, 1000 + i);
+            }
+            l.admit(1, false, 1000 + i);
+        }
+        assert_eq!((0..400).filter(|_| l.admit(0, true, 1100)).count(), 30);
+        assert_eq!((0..400).filter(|_| l.admit(1, true, 1100)).count(), 270);
     }
 
     #[test]

@@ -83,14 +83,21 @@ pluginConfig:
     window_ms: 1000
     slow_s: 10.0
     other_share: 0.1
+    one_level: false      # one level for every tenant, from their counts together
     policy: {hidden: [...], head: {...}}
 ```
 
 `rates` is the scale of everything the policy is shown: a model trained around
 a nominal rate reads twice that rate as twice the load. Give each proxy the
 tenant's nominal rate divided by the number of proxies that share it. A model
-trained for one tenant can be configured with several: the filter asks it once
-per tenant, each against its own rate.
+trained for one tenant can be configured with several. The filter then asks it
+once per tenant, each against its own rate; or, with `one_level: true`
+(`export.py --one-level`), once for all of them, on their counts and rates
+added up, and gives every tenant that level. A tenant's quota is a share of
+its own first attempts either way, so with one level for everybody the retries
+let in are in proportion to the requests each tenant sends, which a level per
+tenant does not give (a tenant that asks for many retries reads as trouble and
+is given a lower one).
 
 With Istio the module is a `WasmPlugin` (`url`, `sha256`, the configuration
 above); it exports the counters `learned_first_attempts_total`,

@@ -1,7 +1,7 @@
 """A trained limiter (`msim.rl.limiter`) as the configuration of the Envoy filter next to this file.
 
     python deploy/envoy-limiter/export.py MODEL.zip OUT.json --rates R [R ...]
-        [--tenants NAME [NAME ...]] [--fixture FILE]
+        [--tenants NAME [NAME ...]] [--one-level] [--fixture FILE]
 
 Writes the `limiter` block of the filter's plugin configuration: the tenants in the policy's
 order, the requests per second each sends one PROXY when all is well (`--rates`, the scale of
@@ -11,7 +11,9 @@ spoken, the window, the time constant of the slow averages, and the policy's wei
 
 `--tenants` names the tenants as the deployment's requests name them (the model knows them by
 position). A model trained for ONE tenant can be given several: the filter then asks it once
-per tenant, each with its own rate. `--fixture` also writes random observations with the
+per tenant, each with its own rate, or, with `--one-level`, once for all of them on their
+counts added up, and gives every tenant that level (retries are then let in in proportion to
+the requests each tenant sends). `--fixture` also writes random observations with the
 actions the model takes on them, which `cargo test` checks the filter's forward pass against.
 
 Needs the `train` extra (Stable-Baselines3), as training does.
@@ -26,7 +28,9 @@ import numpy as np
 from msim.rl import train
 
 
-def limiter_block(model: Path, tenants: list[str] | None, rates: list[float]) -> dict:
+def limiter_block(
+    model: Path, tenants: list[str] | None, rates: list[float], one_level: bool = False
+) -> dict:
     sidecar = json.loads(model.with_suffix(".json").read_text("utf-8"))
     knobs = sidecar["knobs"]
     trained = [knob["name"].removeprefix("quota:") for knob in knobs]
@@ -40,9 +44,12 @@ def limiter_block(model: Path, tenants: list[str] | None, rates: list[float]) ->
         raise SystemExit(f"the model decides for {len(trained)} tenants, {len(tenants)} were named")
     if len(rates) != len(tenants):
         raise SystemExit(f"{len(tenants)} tenants need as many rates, got {len(rates)}")
+    if one_level and len(trained) != 1:
+        raise SystemExit("one level for every tenant needs a model that decides for one tenant")
     return {
         "tenants": tenants,
         "rates": rates,
+        "one_level": one_level,
         "shares": shares,
         "default_level": knobs[0]["default"],
         "window_ms": round(1000 * sidecar["step_s"]),
@@ -59,10 +66,11 @@ def main() -> None:
     parser.add_argument("out", type=Path)
     parser.add_argument("--rates", nargs="+", type=float, required=True)
     parser.add_argument("--tenants", nargs="+")
+    parser.add_argument("--one-level", action="store_true")
     parser.add_argument("--fixture", type=Path)
     args = parser.parse_args()
 
-    limiter = limiter_block(args.model, args.tenants, args.rates)
+    limiter = limiter_block(args.model, args.tenants, args.rates, args.one_level)
     args.out.write_text(json.dumps(limiter), "utf-8")
     entries = len(limiter["policy"]["hidden"][0]["w"][0])
     print(
