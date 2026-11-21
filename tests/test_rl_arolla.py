@@ -18,7 +18,7 @@ from gymnasium.utils.env_checker import check_env
 from msim.admission import AdmissionGate
 from msim.compat.arolla import UnsupportedScenario, build, parse
 from msim.retry_policies import FixedBackoffRetryPolicy, RetryBudgetPolicy, policy_layers
-from msim.rl import RetryEnv, RetryGrid, evaluate
+from msim.rl import Episode, RetryEnv, RetryGrid, RetryKnobs, evaluate
 from msim.rl.arolla import ArollaScenario, Variation, agent_part, as_written, file_grid
 
 #: The shape of their post-mortem files: one arm per service, the same fault on each.
@@ -131,6 +131,12 @@ clients:
 """
 
 
+def _knobs(episode: Episode) -> RetryKnobs:
+    """The agent's side of an episode whose agent is on clients."""
+    assert isinstance(episode.agent, RetryKnobs)
+    return episode.agent
+
+
 def _scenario(text: str, agent, **kwargs) -> ArollaScenario:
     """`ArollaScenario.from_file` on a scenario written here."""
     with tempfile.TemporaryDirectory() as folder:
@@ -169,7 +175,7 @@ class TestOneArmOfAFile(unittest.TestCase):
         self.assertEqual(len(episode.agent.clients), 3)  # every replica
         self.assertEqual(len(episode.clients), 3)
         self.assertEqual(episode.expected_rps, 90)
-        self.assertEqual(episode.agent.agent_rps, 90)
+        self.assertEqual(_knobs(episode).agent_rps, 90)
         self.assertEqual(episode.fault_windows, [(8, 11)])
         self.assertEqual(scenario.horizon_s, 20)
 
@@ -241,7 +247,7 @@ class TestTenantsBehindALimiter(unittest.TestCase):
         self.assertEqual(len(scenario.experiment.clients), 2)  # the other shares the service
         self.assertEqual(len(episode.agent.clients), 1)
         self.assertEqual(len(episode.reward_clients), 2)
-        self.assertEqual((episode.agent.agent_rps, episode.expected_rps), (40, 80))
+        self.assertEqual((_knobs(episode).agent_rps, episode.expected_rps), (40, 80))
         (other,) = [c for c in episode.clients if c is not episode.agent.clients[0]]
         layers = list(policy_layers(other.cfg.retry))
         self.assertFalse(any(isinstance(layer, RetryBudgetPolicy) for layer in layers))  # untouched
@@ -274,7 +280,7 @@ class TestServicesThatRetryTheirOwnCalls(unittest.TestCase):
         self.assertEqual(len(episode.agent.clients), 2)
         self.assertEqual({c.service.cfg.name for c in episode.agent.clients}, {"gw", "app"})
         self.assertEqual(len(episode.reward_clients), 1)  # the client that enters
-        self.assertEqual((episode.agent.agent_rps, episode.expected_rps), (100, 50))
+        self.assertEqual((_knobs(episode).agent_rps, episode.expected_rps), (100, 50))
         self.assertEqual(scenario.grid.max_attempts, (1, 2, 3, 4, 5))
         self.assertEqual(scenario.grid.default_max_attempts, 5)
         self.assertIsNone(scenario.grid.attempt_timeout_ms)  # 500 ms and 300 ms: each its own
@@ -398,7 +404,7 @@ class TestEpisodesThatVary(unittest.TestCase):
                 TENANTS, ["plain", "untimed"], variation=Variation(load=(load, load))
             )
             episode = scenario.build(1)
-            self.assertEqual(episode.agent.agent_rps, 80)
+            self.assertEqual(_knobs(episode).agent_rps, 80)
             self.assertAlmostEqual(episode.expected_rps, load * 80)
             env = RetryEnv(scenario)
             env.reset(options={"episode_seed": 1})

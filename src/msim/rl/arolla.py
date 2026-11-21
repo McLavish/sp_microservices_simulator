@@ -37,6 +37,7 @@ from msim.compat.arolla import build as build_file
 from msim.compat.arolla.importer import IMPLICIT_CLIENT
 from msim.compat.arolla.importer import Scenario as Built
 from msim.retry_policies import RetryAllowancePolicy, policy_layers
+from msim.rl.limiter import QuotaGrid
 from msim.rl.scenario import Episode, Knob, RetryGrid
 from msim.rl.summary import of_records
 
@@ -309,6 +310,101 @@ class ArollaScenario:
         for client in built.clients:
             client.workload.drive(built.sim, client.runtime.start_request)
         roots = [client.runtime for client in built.clients]
+        return Episode(
+            sim=built.sim,
+            workloads=[client.workload for client in built.clients],
+            agent=agent,
+            reward_clients=roots,
+            clients=[*roots, *built.loops.values()],
+            expected_rps=expected_rps(experiment),
+            fault_windows=fault_windows(experiment),
+            services=dict(built.stations),
+        )
+
+
+@dataclass(frozen=True)
+class ArollaLimiterScenario:
+    """An Arolla scenario with the agent AS the limiter of one of its services.
+
+    The file is built as it is written: every client keeps its own retry
+    policy, its timeout and its tenant. The one thing replaced is what the
+    reader put inside the gate in front of `service` (their rule, or whichever
+    limiter the file names): it becomes a `TenantRetryQuota` whose shares are
+    the agent's knobs, one per tenant. So this and `as_written` on the same file
+    differ in the limiter and in nothing else. Make it with `from_file`.
+    """
+
+    experiment: Experiment
+    #: The service whose limiter the agent is.
+    service: str
+    #: The client entries in front of it, in the file's order: its tenants.
+    tenants: tuple[str, ...]
+    grid: QuotaGrid
+    variation: Variation | None = None
+
+    @classmethod
+    def from_file(
+        cls,
+        path: str | Path,
+        service: str | None = None,
+        *,
+        point: int = 0,
+        grid: QuotaGrid | None = None,
+        variation: Variation | None = None,
+    ) -> "ArollaLimiterScenario":
+        """The scenario of `path` (its sweep point `point`), the agent in its gate.
+
+        `service` may be left out when the file has one service. The file has
+        to give that service a limiter and clients that retry, or the reader
+        builds no gate and there is nothing for the agent to take over.
+        """
+        experiment = parse(read(path)[point].config)
+        if service is None:
+            if len(experiment.services) != 1:
+                names = [s.name for s in experiment.services]
+                raise ValueError(f"{experiment.name!r} has several services, name one: {names}")
+            service = experiment.services[0].name
+        tenants = tuple(
+            entry.name for entry in _entries(experiment) if _target(experiment, entry) == service
+        )
+        scenario = cls(experiment, service, tenants, grid or QuotaGrid(), variation)
+        # A scenario that cannot be built fails here, not in a worker.
+        scenario.build(experiment.seed)
+        return scenario
+
+    @property
+    def knobs(self) -> tuple[Knob, ...]:
+        return self.grid.knobs(self.tenants)
+
+    @property
+    def features(self) -> tuple[str, ...]:
+        """What the agent is shown: the limiter's own counts, tenant by tenant."""
+        return self.grid.features(self.tenants)
+
+    @property
+    def horizon_s(self) -> float:
+        """The length the file gives its workloads."""
+        return horizon_s(self.experiment)
+
+    def build(self, seed: int) -> Episode:
+        experiment = self.experiment
+        if self.variation is not None:
+            experiment = self.variation.apply(experiment, seed)
+        built = build_file(experiment, seed=seed, arrivals=seed)
+        gate = built.gates.get(self.service)
+        if gate is None or not self.tenants:
+            raise UnsupportedScenario(
+                f"{experiment.name!r} puts no limiter in front of {self.service!r} for clients "
+                "that retry, so there is no gate for the agent to take over"
+            )
+        roots = [client.runtime for client in built.clients]
+        in_front = [rt for name in self.tenants for rt in _runtimes(experiment, built, name)]
+        # Against the FILE's rates, not this episode's: a load that is drawn
+        # must show in what the limiter counts.
+        rates = {name: _rps(self.experiment, name) for name in self.tenants}
+        agent = self.grid.install(gate, self.tenants, in_front, rates)
+        for client in built.clients:
+            client.workload.drive(built.sim, client.runtime.start_request)
         return Episode(
             sim=built.sim,
             workloads=[client.workload for client in built.clients],

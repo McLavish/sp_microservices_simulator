@@ -28,7 +28,7 @@ import numpy as np
 
 from msim.caller import ClientRuntime
 from msim.core import RootRequest, TimePoint, ns_to_s, s_to_ns
-from msim.rl.scenario import Episode, Knob, Scenario
+from msim.rl.scenario import Episode, Knob, RetryKnobs, Scenario
 from msim.rl.summary import Effort, Tally, WindowCount, summary
 
 try:
@@ -131,8 +131,17 @@ class RetryEnv(gymnasium.Env):
         self.knob_names = tuple(knob.name for knob in self._knobs)
         self.knob_levels = tuple(len(knob.values) for knob in self._knobs)
         #: What each entry of the observation is.
-        slow = () if slow_s is None else tuple(f"{name}~{slow_s:g}s" for name in FEATURES)
-        self.feature_names = FEATURES + slow + tuple(f"knob:{name}" for name in self.knob_names)
+        # What is measured: `FEATURES`, at the agent's clients, unless the scenario
+        # names entries of its own (`features`), which its agent then supplies
+        # (`Agent.measure`): a limiter measures at the server, not at a client.
+        own = getattr(scenario, "features", None)
+        self._measured: tuple[str, ...] = FEATURES if own is None else tuple(own)
+        if len(set(self._measured)) != len(self._measured) or not self._measured:
+            raise ValueError(f"the scenario's entries need distinct names: {self._measured}")
+        slow = () if slow_s is None else tuple(f"{name}~{slow_s:g}s" for name in self._measured)
+        self.feature_names = (
+            self._measured + slow + tuple(f"knob:{name}" for name in self.knob_names)
+        )
         self._slow_weight = 0.0 if slow_s is None else 1.0 - math.exp(-step_s / slow_s)
         self._slow: np.ndarray | None = None  # the averaged copy, once there is a window
         self.action_space = spaces.MultiDiscrete(list(self.knob_levels))
@@ -282,10 +291,41 @@ class RetryEnv(gymnasium.Env):
         return tally
 
     def _observe(self, window_s: float) -> np.ndarray:
-        """What the agent's clients measured in the window just run; resets the window."""
+        """What the agent measured in the window just run; resets its counts."""
         episode = self._episode
         assert episode is not None
+        if self._measured is FEATURES:
+            values = self._measure_clients(episode, window_s)
+        else:
+            # The scenario's own entries, from wherever its agent sits.
+            started, values = episode.agent.measure(window_s)  # ty: ignore[unresolved-attribute]
+            self._started += started
+            values = [float(value) for value in values]
+            if len(values) != len(self._measured):
+                raise ValueError(
+                    f"the scenario names {len(self._measured)} entries, "
+                    f"its agent measured {len(values)}"
+                )
+        if self.slow_s is not None:
+            # Of the entries as the agent is shown them, clipped; the warm-up is
+            # where the average starts.
+            measured = np.clip(np.asarray(values, dtype=np.float64), 0.0, 1.0)
+            if self._slow is None:
+                self._slow = measured
+            else:
+                self._slow = self._slow + self._slow_weight * (measured - self._slow)
+            values += self._slow.tolist()
+        values += [
+            level / (len(knob.values) - 1)
+            for knob, level in zip(self._knobs, self._levels, strict=True)
+        ]
+        # A new array every call, clipped: the declared bounds are the real ones.
+        return np.clip(np.asarray(values, dtype=np.float32), 0.0, 1.0)
+
+    def _measure_clients(self, episode: Episode, window_s: float) -> list[float]:
+        """`FEATURES`: what the agent's clients measured in the window; resets the window."""
         agent = episode.agent
+        assert isinstance(agent, RetryKnobs), "FEATURES are measured at an agent's clients"
         window = agent.window
         self._started += window.requests
 
@@ -313,22 +353,8 @@ class RetryEnv(gymnasium.Env):
             latency_p95,
             agent.budget_balance(),
         ]
-        if self.slow_s is not None:
-            # Of the entries as the agent is shown them, clipped; the warm-up is
-            # where the average starts.
-            measured = np.clip(np.asarray(values, dtype=np.float64), 0.0, 1.0)
-            if self._slow is None:
-                self._slow = measured
-            else:
-                self._slow = self._slow + self._slow_weight * (measured - self._slow)
-            values += self._slow.tolist()
-        values += [
-            level / (len(knob.values) - 1)
-            for knob, level in zip(self._knobs, self._levels, strict=True)
-        ]
         window.reset()
-        # A new array every call, clipped: the declared bounds are the real ones.
-        return np.clip(np.asarray(values, dtype=np.float32), 0.0, 1.0)
+        return values
 
     def _step_info(self, tally: Tally) -> dict[str, Any]:
         episode = self._episode

@@ -351,6 +351,26 @@ class RetryGrid:
         return max(known) if known else ms_to_ns(1000)
 
 
+class Agent(Protocol):
+    """The agent's side of an episode, as the environment uses it.
+
+    `RetryKnobs` is the stock one: the settings of a group of clients, measured
+    at those clients and shown as `env.FEATURES`. An agent that sits elsewhere
+    (the limiter in front of a service: `rl/limiter.py`) also offers
+    `measure(window_s)`, which returns the requests that began in the window and
+    the entries its scenario names in `features`, each in [0, 1].
+    """
+
+    @property
+    def clients(self) -> Sequence[ClientRuntime]:
+        """The clients whose requests the agent's settings govern."""
+        ...
+
+    def apply(self, values: Mapping[str, float]) -> None:
+        """Put each named setting to its value."""
+        ...
+
+
 @dataclass
 class Episode:
     """One fresh simulation, wired and ready to run, as the environment needs to see it."""
@@ -358,8 +378,9 @@ class Episode:
     sim: Simulator
     #: Every arrival process, already driving its client.
     workloads: list[Workload]
-    #: The agent's clients, their settings and what they measure.
-    agent: RetryKnobs
+    #: The agent's side: its settings and what it measures (`RetryKnobs` for an
+    #: agent on clients).
+    agent: Agent
     #: The clients whose finished requests are the reward: the scenario's roots.
     reward_clients: list[ClientRuntime]
     #: Every client of the simulation. The environment drops the records it has
