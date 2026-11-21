@@ -178,11 +178,18 @@ class QuotaGrid:
     The last level is out of reach of a caller that tries four times: it refuses
     nothing. The default is what holds until the agent's first action, the
     warm-up included, and 0 leaves the service to its first attempts.
+
+    `floor` (default 0) is `TenantRetryQuota.floor`: retries per tenant and
+    window that are let in whatever the level. An agent whose only view of a
+    failure is what its retries do keeps a level above zero to go on seeing,
+    and pays for it in retries that cannot succeed; with a floor of 1 the
+    lowest level is no longer blind.
     """
 
     shares: tuple[float, ...] = (0.0, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 3.0)
     default_share: float = 0.0
     window_s: float = 1.0
+    floor: int = 0
 
     def __post_init__(self) -> None:
         if self.default_share not in self.shares:
@@ -221,7 +228,9 @@ class QuotaGrid:
         missing = [tenant for tenant in tenants if tenant not in rates]
         if missing:
             raise ValueError(f"no rate given for {missing}")
-        quota = TenantRetryQuota(share=self.default_share, window=s_to_ns(self.window_s))
+        quota = TenantRetryQuota(
+            share=self.default_share, window=s_to_ns(self.window_s), floor=self.floor
+        )
         tap = _GateTap()
         gate.controllers = (tap, quota)
         return LimiterKnobs(quota, tap, tenants, clients, rates)

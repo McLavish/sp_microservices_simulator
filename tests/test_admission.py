@@ -882,6 +882,22 @@ class TestTenantRetryQuota(unittest.TestCase):
         self.assertEqual(_drain(closed, 20 * MS, "a"), 0)
         self.assertEqual(_drain(wide, 20 * MS, "a"), 30)  # three retries per first attempt
 
+    def test_a_floor_lets_that_many_retries_in_whatever_the_share(self):
+        # A share of 0 with a probe: one retry per tenant and window, no more.
+        quota = TenantRetryQuota(share=0.0, floor=1)
+        self.assertTrue(_take(quota, 0, "a"))  # even before any first attempt
+        self._firsts(quota, 10)
+        self.assertEqual(_drain(quota, 20 * MS, "a"), 0)
+        self.assertEqual(_drain(quota, 20 * MS, "b"), 1)  # each tenant its own
+        self.assertEqual(_drain(quota, S + MS, "a"), 1)  # and the next window its own
+        # Above the floor the share counts as it does without one.
+        wide = TenantRetryQuota(share=0.5, floor=1)
+        self._firsts(wide, 10)
+        self.assertEqual(_drain(wide, 20 * MS, "a"), 5)
+        for bad in (-1, 1.5, True):
+            with self.subTest(floor=bad), self.assertRaisesRegex(ValueError, "floor"):
+                TenantRetryQuota(floor=bad)
+
     def test_each_tenant_has_its_own_share_and_its_own_counts(self):
         quota = TenantRetryQuota(share=0.1)
         quota.set_share("b", 0.5)

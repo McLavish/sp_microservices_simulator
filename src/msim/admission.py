@@ -399,6 +399,12 @@ class TenantRetryQuota(RetryController):
     changed while a run is in progress: it is read at each retry that asks, and
     changing it draws nothing and schedules nothing.
 
+    `floor` (default 0) is a number of retries per tenant and window that are
+    let in whatever the share: a probe. With a share of 0 no retry is let in,
+    and whoever sets the shares from what the retries do (`rl.limiter`) can no
+    longer see whether a retry would succeed again; a floor of 1 shows it once
+    a window, at the price of one retry.
+
     For a gate, which shows it the first attempts too. Behind a
     `ControlledRetryPolicy`, which is only asked about retries, it would count
     no first attempt and refuse every retry.
@@ -406,6 +412,7 @@ class TenantRetryQuota(RetryController):
 
     share: float = 0.1  # retries per first attempt, for a tenant with no share of its own
     window: TimeDuration = S_TO_NS
+    floor: int = 0  # retries per tenant and window let in whatever the share
 
     _default: Fraction = field(init=False, repr=False)
     _shares: dict[str | None, Fraction] = field(default_factory=dict, init=False, repr=False)
@@ -414,6 +421,8 @@ class TenantRetryQuota(RetryController):
     def __post_init__(self) -> None:
         self._default = self._exact(self.share)
         _positive_duration(self.window, "window")
+        if isinstance(self.floor, bool) or not isinstance(self.floor, int) or self.floor < 0:
+            raise ValueError(f"floor is a whole number of retries >= 0, got {self.floor!r}")
 
     @staticmethod
     def _exact(share: float) -> Fraction:
@@ -452,6 +461,8 @@ class TenantRetryQuota(RetryController):
     def admits_retry(self, request: AdmissionRequest) -> bool:
         state = self._state(request.tenant, request.now)
         share = self._shares.get(request.tenant, self._default)
+        if len(state.retries) < self.floor:
+            return True  # the probe
         # len(retries) < share x len(firsts), in whole numbers.
         return len(state.retries) * share.denominator < share.numerator * len(state.firsts)
 

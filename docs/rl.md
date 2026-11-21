@@ -224,7 +224,11 @@ are one share per tenant (`quota:<tenant>`): how many of that tenant's retries
 are let in, per first attempt of the tenant, over the last second. `QuotaGrid`
 holds the ladder (0, 2%, 5%, 10%, 20%, 30%, 50%, 75%, 100%, and 300%, which
 refuses nothing a caller of four attempts sends) and the default, 0, which
-holds through the warm-up.
+holds through the warm-up. `QuotaGrid(floor=1)` lets one retry per tenant and
+window in whatever the level (`TenantRetryQuota.floor`): much of what the
+agent is shown is what its retries do, so at a level of 0 it is blind to a
+failure ending, and an agent without the floor learns to hold a few percent
+through a total failure just to go on seeing.
 
 Such an agent is shown what a limiter can count where it stands and nothing
 else, per tenant and window (`limiter.MEASURES`, as `<tenant>:<measure>`):

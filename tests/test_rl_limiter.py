@@ -219,6 +219,17 @@ class TestTheQuotaGrid(unittest.TestCase):
         with self.assertRaisesRegex(KeyError, "no quota named"):
             _limiter(env).apply({"quota:nobody": 0.1})
 
+    def test_a_floor_keeps_the_lowest_level_from_being_blind(self):
+        # Every retry refused: no retry ends, and their success share says nothing.
+        (blind,) = evaluate.rollout(RetryEnv(_scenario()), evaluate.constant((0, 0)), [3])
+        self.assertEqual(blind["retries_served"], 0)
+        # With a floor of one, a retry per tenant and second gets through at level 0.
+        probing = RetryEnv(_scenario(grid=QuotaGrid(floor=1)))
+        (seen,) = evaluate.rollout(probing, evaluate.constant((0, 0)), [3])
+        self.assertGreater(seen["retries_served"], 0)
+        self.assertLess(seen["retries_served"], 2 * 2 * _scenario().horizon_s)  # two tenants
+        self.assertEqual(_limiter(probing).quota.floor, 1)
+
     def test_validation(self):
         with self.assertRaisesRegex(ValueError, "not one of its levels"):
             QuotaGrid(default_share=0.07)
