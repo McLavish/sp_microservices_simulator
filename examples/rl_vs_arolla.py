@@ -25,7 +25,8 @@ made on their file as it is, on that varied situation, and along each axis.
 Everything is paired: for a seed, every row faces the same failure and the
 same arrivals. Whatever is chosen is chosen on other episodes than it is
 reported on: the fixed setting, the trained model among the runs and their
-snapshots, and the `alpha` of the row that gives their limiter its best value.
+snapshots (`--select`), and the `alpha` of the row that gives their limiter
+its best value.
 `informed` adds a yardstick that is no contender: per condition, the fixed
 setting that is best for that condition alone.
 
@@ -236,6 +237,29 @@ def compare(args: argparse.Namespace) -> None:
     for score, model in ranked:
         print(f"selection success {score:6.2f}%  {_name(out, model)}")
     chosen = ranked[0][1]
+    leads: dict[str, dict[str, Any]] = {}
+    if args.select == "lead":
+        # Among the best of those, the one that is nowhere far behind: the
+        # largest SMALLEST lead over their limiter, over every condition, still
+        # on the selection episodes. A mean over the varied situation hardly
+        # sees its ends, and the ends are where a client policy has least room.
+        shortlist = [model for _, model in ranked[: args.shortlist]]
+        where = conditions()
+        tasks = [("written", "arolla", arolla, v, args.selection) for v in where.values()]
+        tasks += [
+            ("model", model, arolla, v, args.selection)
+            for model in shortlist
+            for v in where.values()
+        ]
+        done = iter(evaluate.in_parallel(_episodes, tasks, args.jobs))
+        theirs = {name: _success(next(done)) for name in where}
+        for model in shortlist:
+            lead = {name: _success(next(done)) - theirs[name] for name in where}
+            worst = min(lead, key=lambda name: lead[name])
+            leads[_name(out, model)] = {"smallest": lead[worst], "at": worst, "model": model}
+        for name, found in sorted(leads.items(), key=lambda item: -item[1]["smallest"]):
+            print(f"smallest lead {found['smallest']:6.2f} points at {found['at']:12s}  {name}")
+        chosen = max(leads.values(), key=lambda found: found["smallest"])["model"]
 
     rows: dict[str, tuple[str, Any]] = {"ppo": ("model", chosen)}
     rows["best fixed setting"] = ("constant", best_static)
@@ -323,7 +347,12 @@ def compare(args: argparse.Namespace) -> None:
 
     summary = {
         "chosen": _name(out, chosen),
+        "chosen_by": args.select,
         "selection": {_name(out, model): score for score, model in ranked},
+        "smallest_lead": {
+            name: {"points": found["smallest"], "at": found["at"]} for name, found in leads.items()
+        },
+        "test_seeds": [args.test[0], args.test[-1]],
         "best_fixed_setting": env.setting(best_static),
         "arolla_alpha": {
             "selection": {f"{a:g}": s for a, s in by_alpha.items()},
@@ -364,6 +393,14 @@ def main(arguments: Sequence[str] | None = None) -> None:
     parser.add_argument(
         "--test-from", type=int, default=2_000, help="the first of the episodes reported on"
     )
+    parser.add_argument(
+        "--select",
+        choices=("varied", "lead"),
+        default="varied",
+        help="choose the trained model by its success on the varied situation, or among the "
+        "best of those by its smallest lead over their limiter across the conditions",
+    )
+    parser.add_argument("--shortlist", type=int, default=24, help="how many `--select lead` weighs")
     parser.add_argument(
         "--train-load",
         type=float,
