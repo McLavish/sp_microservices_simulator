@@ -515,9 +515,9 @@ at `r` 0.05, capacity 5, `t` 10), and no setting of the grid saves the rule at
 choice of `r`, `t` and the capacity. It is that the rule admits in proportion
 to what succeeds and has no notion of how full the service is.
 
-**What it does not show.** Anything about their prototype itself: this is
-their simulator's situation in this simulator, not Online Boutique on their
-testbed, and both of their rules are `msim.admission`'s ports (the
+**What it does not show.** Anything about their prototype itself (the next
+section is about that): this is their simulator's situation in this
+simulator, and both of their rules are `msim.admission`'s ports (the
 simulator's rule reproduces their simulator within noise on all their
 scenarios, [compat-arolla](compat-arolla.md); the prototype's rule is ported
 from the filter's source and has not been run against the filter). That
@@ -528,6 +528,292 @@ no training; on another service the learned limiter has to be trained again,
 and on a fault it has not seen (a slowdown, a load spike) it has not been
 tried. And the reward was the pooled goodput: a limiter judged on something
 else (the latency of what succeeds, one tenant's share) is another agent.
+
+### On their Kubernetes prototype (`deploy/envoy-limiter`)
+
+Everything above is one simulator against a port of their rules. This is their
+prototype itself: Online Boutique behind Istio, their manifests, their load
+generator, their fault manifests, their harness (`run-experiment.sh`) and their
+analysis, with their Wasm filter as they build it, on another cluster than
+theirs. The learned limiter is a fifth policy of their harness: the same two
+`WasmPlugin`s as `arolla.yaml` and `arolla-gateway.yaml` (every sidecar of the
+namespace, and the gateway; same phase, same fail strategy, same headers, a 429
+for a refused retry), with another module and another configuration. Nothing
+else differs between the two arms of a cell: same pods restarted the same way,
+same clients, same fault.
+
+**The deployment.** Kubernetes 1.36 with Cilium, three nodes for the application
+and one for the load generators, Istio 1.27.5, Online Boutique v0.10.4 with
+their `2-replica` profile. One thing of theirs was changed for every policy
+alike: the frontend's CPU limit, 1 core instead of 4. On these nodes their
+profile serves 7000 `POST /cart` per second (5000 with a Wasm filter in every
+proxy), and their headline load of 1200 is no stress at all: with a ten-second
+outage of the cart service, no control, circuit breaker, retry budget and
+Arolla all recover within three seconds. With the frontend at one core the
+application serves 2000 per second cleanly and saturates near 3000, so their
+loads stress it.
+
+**What the benchmarks are.** Their artifact reproduces three figures: the
+effectiveness of the four policies under a sustained failure at 1200 requests
+per second (Figure 4: success rate, latency, retries received), the recovery
+time across load, failure rate and fault duration (Figure 5), and the fairness
+of retry admission across clients of different aggressiveness (Figure 6).
+Each cell below is one run of their harness with their phases (30 s warm-up,
+60 s before the fault, the fault, 60 s after, 10 s cool-down; their sweeps
+watch 100 to 200 s after the fault), one run per cell where their paper
+aggregates ten.
+
+**The limiter that was deployed.** `deploy/envoy-limiter`: the quota of
+`TenantRetryQuota` and the counts of `rl.limiter` as a Proxy-Wasm filter, the
+trained policy as weights in its configuration, evaluated once a second in the
+proxy. It was trained on a model of this deployment and of nothing else: one
+station whose capacity is 1.5 times a nominal rate (3000 against 2000 requests
+per second, as measured), in front of it their load generator's client (four
+attempts, no backoff, a 3 s timeout), the fault a share of failing attempts.
+An episode draws the load (0.2 to 1.1 of the nominal rate), the share (0.1 to
+1), the length (5 to 35 s) and the capacity (0.7 to 1.4 of the measured one:
+a ramp measures it to within some tens of percent, and a policy trained on one
+capacity knows it by heart). PPO as above with a discount of 0.97, the slow
+averages of 10 s, and a reward that counts only the requests served within
+half a second (`reward_within_s`); 700000 steps, twelve simulations. The model
+was chosen on the simulator alone, among the 25 models of that wave (five
+runs, final and copies on the way): the largest SMALLEST lead over the better
+of "no retry let in" and "every retry let in" across 36 cells (three
+capacities, failures of 10 and 20 s, three loads, half and all attempts
+failing), the mean deciding between leads closer than the noise. Its
+configuration gives every proxy the nominal rate it serves (1000 requests per
+second: two gateway pods, two frontend pods). Every run made on the cluster is
+reported here, the discarded ones too. The harness side (their repository as
+it was pointed at this cluster, the profiles at other rates, the fault
+manifests at 25% and 75%) is not in this repository; what it needs from here
+is `deploy/envoy-limiter` and the two reward options.
+
+Four things had to be learned on the way, each of which a simulator-only study
+would not have shown:
+
+- **A short discount learns to flood.** The discount that won on their
+  simulator file (0.5) learns here to let every retry in: on a service with a
+  3 s timeout the queue a storm fills pays its bill seconds later. 0.95 to
+  0.97 learns to hold back.
+- **Goodput alone learns to queue.** With no limiter at all this deployment
+  serves MORE requests than with Arolla (97.7% against 91.8% over the run of
+  their headline experiment): the generator's requests wait up to 3 s in the
+  frontend and are served when the failure ends, at a latency of seconds. A
+  limiter paid for goodput learns exactly that. The first model deployed did
+  (with its counts still per thread, the next point), and lost to Arolla on
+  what their figures measure: 91.9% of requests but a p99 of 3.7 s and 34 s to
+  recover, where Arolla has 9 ms and 3 s. Hence
+  `reward_within_s`: the model reported was paid only for requests served
+  within half a second.
+- **An Envoy thread is not a proxy.** A filter instance lives in one worker
+  thread, and Envoy does not spread connections evenly over its threads: one
+  thread of a gateway pod was seen with 95% of the traffic. A policy that reads
+  the load off its own counts then sees twice the load in one thread and none
+  in the other. The threads of a proxy now pool their counts (shared data) and
+  decide on the sum.
+- **A refusal must not cost the caller its connection.** Both filters answer a
+  refused retry at the request headers, and Envoy closes an HTTP/1 connection
+  it answers before the body has arrived. Under a total failure that is 3500
+  closed connections a second. After 30 s of it part of the generator's new
+  connections hang for a while; Arolla, whose bucket refills slowly, rides that
+  out with a few dips, and the learned limiter, which reopens its quota within
+  two seconds of the first successes, fed it for half a minute (70% of the
+  requests after the failure, 46 s to recover). The filter now holds such an
+  answer for 2 to 4 ms, until the request is complete, and the connection
+  survives: 99.5% after the same failure. Both are reported below, because the
+  second is a gain of the filter and not of the policy.
+
+**What a cell reports.** From the load generator's own records: the share of
+the requests of the measured run that succeeded (a request has succeeded when
+one of its attempts did), the same for the requests that started while the
+fault was on, and the p99 latency of the attempts that succeeded. From their
+analysis: the recovery time, in whole seconds from the end of the fault to the
+first second at 95% of the goodput before it (it includes the second or two
+the fault's removal takes to reach the proxies).
+
+Their headline cell (Figure 4): 1200 requests per second, the cart service
+failing every call for 10 s.
+
+| Policy | Succeeded % | Started in the fault % | p99 ms | Recovery s |
+| --- | --- | --- | --- | --- |
+| No control | 97.69 | 56.2 | 2259 | 4 |
+| Circuit breaker | 98.08 | 59.9 | 2157 | 3 |
+| Envoy retry budget | 98.33 | 65.4 | 2453 | 4 |
+| Arolla (four runs) | 92.18 | 7.4 | 9 | 2 to 3 |
+| Learned limiter | 92.56 | 3.5 | 9 | 2 |
+
+The three policies without a limiter in the proxies serve MORE requests than
+either limiter, late: the frontend queues what the generator sends for up to
+the generator's 3 s timeout and serves it when the cart service is back.
+Nothing here is metastable (the generator's connection pool bounds what is in
+flight), so the failure their headline figure is about, a storm that outlasts
+the fault, is not this deployment's. Between the two limiters the cell is a tie, in the run
+that had them back to back (92.57% and 92.56%, p99 9.4 ms both, frontend p50
+4.0 ms both in their analysis, 2 s to recover both). On their third panel
+Arolla is ahead: of some 18000 retries that arrived at each gateway pod during
+the outage, 103 reached the frontend pod their analysis samples under Arolla
+and 568 under the learned limiter. It holds its quota at 5% through a total
+failure, where nothing in its reward made it hold it at zero (`retry_cost` is
+there for that; the models trained with it did not pass the selection). And a
+retry it refuses is answered in 4 ms where Arolla's is answered in 1 ms, which
+is the price of the caller's connection (below).
+
+Recovery across their three axes (Figure 5), Arolla and the learned limiter.
+"Their filter's refusal" is the learned policy in a filter that answers a
+refused retry at once, as Arolla's does; "learned limiter" is the same policy
+in the filter that holds the answer until the request is complete.
+
+| Cell | | Succeeded % | Started in the fault % | After the fault % | p99 ms | Recovery s |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Load**, total failure of 10 s: 600 req/s | Arolla | 92.55 | 5.5 | 99.6 | 9 | 2 |
+| | Learned limiter | 92.48 | 2.2 | 100.0 | 9 | 2 |
+| 1200 req/s | Arolla | 92.57 | 4.7 | 99.8 | 9 | 2 |
+| | Learned limiter | 92.56 | 3.5 | 100.0 | 9 | 2 |
+| 1800 req/s | Arolla | 92.68 | 6.8 | 99.7 | 74 | 3 |
+| | Learned limiter | 92.66 | 5.3 | 99.9 | 131 | 3 |
+| **Failure rate** at 1200 req/s, 10 s: 25% | Arolla | 98.59 | 82.0 | 99.9 | 8 | 1 |
+| | Learned limiter | 99.79 | 97.3 | 100.0 | 9 | 0 |
+| 50% | Arolla | 96.52 | 56.3 | 99.7 | 9 | 2 |
+| | Learned limiter | 97.69 | 75.0 | 99.6 | 349 | 3 |
+| | with their filter's refusal | 97.20 | 66.0 | 99.6 | 9 | 2 |
+| 75% | Arolla | 93.90 | 30.7 | 99.5 | 9 | 3 |
+| | Learned limiter | 94.14 | 33.3 | 99.5 | 9 | 3 |
+| **Duration** of a total failure at 1200 req/s: 30 s | Arolla | 77.80 | 1.8 | 93.5 | 12 | 3 |
+| | Learned limiter | 80.15 | 1.8 | 99.5 | 9 | 3 |
+| | with their filter's refusal | 68.51 | 1.4 | 70.1 | 2556 | 46 |
+| 60 s | Arolla | 67.38 | 1.1 | 82.6 | 2112 | 19 |
+| | Learned limiter | 66.75 | 1.0 | 99.3 | 8 | 3 |
+| | with their filter's refusal | 67.78 | 3.8 | 84.3 | 2568 | 26 |
+
+At a total failure of 10 s nothing separates the two at any load: no retry can
+succeed, both refuse nearly all of them, and both are back within the 2 to 3 s
+the removal of the fault takes. Where retries can succeed, the learned limiter
+lets more of them in and more requests succeed, by 1 point of the run at a
+quarter of the calls failing (97% against 82% of the requests that met the
+fault, and no second below 95%) down to a quarter of a point at three quarters.
+At 50% the run with the final filter let in more than the service had room
+for on one of the two gateway pods (a quota of 100% there, 30% on the other):
+three quarters of the requests that met the fault succeeded, the tail latency
+rose to 350 ms, where Arolla's stays at 9 ms, and by their count it took a
+second longer to recover.
+
+The long failures are the filter's doing, in both directions. After 60 s of
+refusing 3500 retries a second with a closed connection each, Arolla's
+deployment needs 19 s to recover and serves 83% of the requests of the minute
+after (the generator's connections hang; its 67.4% of the run is higher than
+the learned limiter's 66.8% only because requests the stalled generator sent
+late succeeded late). The learned policy behind the same kind of refusal does
+no better at 60 s and worse at 30 s: it reopens its quota within two seconds
+of the first successes and feeds the trouble. With the refusal held until the
+request is complete there is no trouble to feed: 99.3% and 99.5% after the
+failure, 3 s to recover.
+
+A failure of half the calls for 20 s, across the load (the second number is
+the requests that started during the fault):
+
+| Load | No control | Arolla | Learned limiter |
+| --- | --- | --- | --- |
+| 600 req/s | 99.17 (94.2), p99 8 ms | 93.00 (54.7), p99 10 ms | 99.06 (93.6), p99 8 ms |
+| 1200 req/s | 99.24 (94.7), p99 1099 ms | 93.13 (54.6), p99 8 to 70 ms | 94.98 (66.8), p99 8 ms |
+| 2000 req/s | 99.49 (95.4), p99 2711 ms | 93.15 (52.4), p99 344 ms | 93.24 (53.3), p99 297 ms |
+
+This is what the limiter was trained to do and Arolla's rule cannot: at 600
+requests per second there is room for every retry, and it lets them all in
+(the quota at 100% before the fault starts) and matches no control at no
+control's latency; at 1200 it holds 30%; at 2000 it tries 30% for a few
+seconds and falls back to 5%, which is about what Arolla admits.
+Arolla admits a tenth of the successes plus one a second at every load. (The
+600 and 2000 rows of the learned limiter are from the filter with their kind
+of refusal; the 1200 row was run with both and gave 94.96 and 94.98.)
+
+Fairness (Figure 6): their six clients, three that retry three times and three
+that retry ten times ("polite" and "aggressive"), all at 200 requests per
+second or at 50 and 350, half the calls failing for 20 s. The learned limiter
+here is the SAME one-tenant model, asked once per client with that client's
+counts; nothing was trained for six tenants. Their figure counts the retries
+admitted to each group during the fault; share over demand is a group's share
+of them over its share of the requests (1 is proportional).
+
+| Run | Limiter | Retries admitted, polite / aggressive | Share over demand | Succeeded in the fault %, polite / aggressive | Succeeded % |
+| --- | --- | --- | --- | --- | --- |
+| Same rate | Arolla | 548 / 750 | 0.84 / 1.16 | 55.1 / 55.7 | 93.04 |
+| | Arolla, fairness filter | 665 / 575 | 1.07 / 0.93 | 55.1 / 54.4 | 92.97 |
+| | Learned limiter | 3467 / 1814 | 1.31 / 0.69 | 65.9 / 60.3 | 94.34 |
+| Different rates | Arolla | 84 / 1190 | 0.54 / 1.06 | 54.4 / 54.8 | 92.97 |
+| | Arolla, fairness filter | 164 / 1067 | 1.10 / 0.99 | 55.0 / 56.7 | 93.39 |
+| | Learned limiter | 902 / 2990 | 1.91 / 0.87 | 68.6 / 59.5 | 94.11 |
+
+Both groups get more retries and more of their requests through under the
+learned limiter than under either of theirs, and the polite clients are not
+crowded out, which is what their fairness filter is for. It is not the most
+proportional of the three: each client's quota is set from that client's own
+counts, a client that asks for ten retries per request reads as trouble, and
+its quota is set lower, so the polite clients end with up to twice their share
+where plain Arolla gives them half and the fairness filter very nearly their
+own.
+
+**A second model.** Two more training waves followed the one the deployed
+model is from (one twice as long; one with a price on retries and the capacity
+drawn within 15% of the measured one), and the 90 models of the three were
+ranked by a stricter rule than the first: never behind their prototype's rule
+in any simulated cell, no more retries than it at a total failure, then the
+largest mean lead. None passes it, the deployed model included (below). The model it ranks first
+lets nearly every retry in at low and middle load and none at high load. It
+was run on five cells with the same filter (succeeded %, in brackets the
+requests that started during the fault, and the p99):
+
+| Cell | Arolla | Learned limiter | Second model |
+| --- | --- | --- | --- |
+| 600 req/s, half failing for 20 s | 93.00 (54.7), 10 ms | 99.06 (93.6), 8 ms | 99.03 (93.2), 9 ms |
+| 1200 req/s, half failing for 20 s | 93.13 (54.6), 8 to 70 ms | 94.98 (66.8), 8 ms | 97.03 (79.2), 924 ms |
+| 1200 req/s, half failing for 10 s | 96.52 (56.3), 9 ms | 97.69 (75.0), 349 ms | 98.89 (85.4), 1250 ms |
+| 2000 req/s, half failing for 20 s | 93.15 (52.4), 344 ms | 93.24 (53.3), 297 ms | 91.87 (43.1), 403 ms |
+| 1200 req/s, all failing for 10 s | 92.57 (4.7), 9 ms | 92.56 (3.5), 9 ms | 92.52 (3.1), 8 ms |
+
+It buys its goodput at 1200 requests per second with a tail latency of a
+second, and at 2000 it is behind Arolla, which still admits its tenth where
+the model admits nothing. The bolder of the two, not the better.
+
+**What it shows.** On their benchmarks, on a deployment that is not theirs:
+the learned limiter is level with Arolla where no retry can succeed (their
+headline cell, the load axis), ahead wherever some can (the failure-rate axis,
+by more the fewer calls fail, and every cell with half the calls failing below
+2000 requests per second), ahead on recovery after a long failure (3 s against
+19 s at 60 s) because of how its filter refuses, and it serves both groups of
+their fairness runs better while leaning towards the polite one. Arolla is
+ahead on the retries that reach the service during a total failure (a fifth
+as many), and the fairness variant of their filter is the more proportional.
+As to whether Arolla was fitted to its testbed: nothing here says its settings
+were. It does on this cluster what it is built to do, keep a failing
+dependency from costing latency (a p99 of 9 ms through the outage, against
+more than 2 s for the three policies with no limiter in the proxies), with the
+settings of their manifests. What does not carry over is the premise of their
+headline figure, that unlimited retries do not recover: with a load generator
+whose connection pool is bounded they are not metastable here, and no control
+ends with MORE requests served than Arolla, late. And two properties of their
+filter cost it on this cluster where they presumably do not on theirs: it
+admits the same tenth at every load, and it answers a refused retry by closing
+the caller's connection.
+
+**What it does not show.** One run per cell, where their paper aggregates ten:
+Arolla's four runs of the headline cell spread over 0.8 points (91.79% to
+92.57%), so a difference below a point of the run between two cells run at
+different times is not a finding, and the differences above are the ones in
+the requests that met the fault and in what follows it. One deployment, with
+the frontend capped to make their loads stress it; uncapped, this cluster
+saturates at the frontend's proxy, far above their loads, and that was only
+ramped, not run. The model was trained for this deployment's capacity
+and nominal rate, which Arolla's rule does not need, and in the simulator it
+falls behind Arolla's rule in one corner it was not run in on the cluster: a
+capacity a fifth below the measured one at the full nominal rate with part of
+the calls failing (by 2 points at 10 s, 16 to 19 at 20 s; ahead or level in the
+other 66 cells of that grid). The fixed 10%
+quota the filter gives retries that name no tenant (calls inside the mesh) was
+never exercised: their faults are injected in the caller's proxy, and the
+gateway does not retry a 500. And the two changes to the filter that the long
+failures and the uneven threads forced (holding a refusal, pooling the counts)
+are the filter's, not the policy's: Arolla's rule in such a filter would gain
+from the first as well.
 
 ### The side study: a learned policy on the clients, with no limiter
 
