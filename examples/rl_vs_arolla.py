@@ -44,9 +44,11 @@ import json
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from typing import Any
 
+from msim.admission import MixedRefillBudget
 from msim.compat.arolla import build, parse, read
 from msim.core import RootOutcome, classify_root, root_completed_at, s_to_ns
 from msim.rl import evaluate
@@ -74,6 +76,19 @@ TUNED = "their clients, arolla tuned"
 ALPHAS = (0.01, 0.05, 0.1, 0.2, 0.5)
 BETAS_DOWN = (0.1, 0.3, 0.6)
 BETAS_UP = (0.05, 0.15, 0.4)
+#: The rule of their Kubernetes prototype, which is another one than their
+#: simulator's (`admission.MixedRefillBudget`: one bucket for everybody, refilled
+#: by successes and by time): at the settings its manifests deploy, with its
+#: fairness filter, and at the best of the grid their own
+#: `prototype/experiments/sweeps/arolla-grid.yaml` walks on their testbed.
+DEPLOYED = "their clients, prototype rule"
+DEPLOYED_FAIR = "their clients, prototype rule (fairness)"
+DEPLOYED_TUNED = "their clients, prototype rule tuned"
+DEPLOYED_SETTINGS = {"r": 0.1, "capacity": 20.0, "t": 1.0}
+FAIRNESS = {"deep_from": 3, "deep_cost": "triangular"}
+RS = (0.01, 0.05, 0.1, 0.5, 1.0)
+TS = (0.0, 0.5, 1.0, 2.0, 10.0)
+CAPACITIES = (1.0, 5.0, 20.0, 50.0, 100.0)
 #: The yardstick: per condition, the fixed setting best for it alone.
 INFORMED = "fixed, told the fault"
 
@@ -173,6 +188,10 @@ def _episodes(task: tuple[str, Any, Study, Variation, tuple[int, ...]]) -> list[
     if kind == "written":  # one of their files by its policy's name, or a file of ours
         path = what if isinstance(what, Path) else folder(study.arolla) / f"policy-{what}.yaml"
         return as_written(path, seeds, variation=variation)
+    if kind == "gate":  # their file and clients, their PROTOTYPE's rule in the gate
+        path = folder(study.arolla) / "policy-arolla.yaml"
+        rule = partial(MixedRefillBudget, **what)
+        return as_written(path, seeds, variation=variation, limiter=rule)
     scenario = situation(study, variation)
     if kind == "model":
         from msim.rl.train import evaluate_model
@@ -194,11 +213,16 @@ def _by_tenant(task: tuple[str, Any, Study, Variation, tuple[int, ...]]) -> dict
                     tally[0] += 1
                     tally[1] += classify_root(root) is RootOutcome.SUCCESS
 
-    if kind == "written":
-        path = what if isinstance(what, Path) else folder(study.arolla) / f"policy-{what}.yaml"
-        written = parse(read(path)[0].config)
+    if kind in ("written", "gate"):
+        path = folder(study.arolla) / (
+            "policy-arolla.yaml" if kind == "gate" else f"policy-{what}.yaml"
+        )
+        written = parse(read(what if isinstance(what, Path) else path)[0].config)
         for seed in seeds:
             built = build(variation.apply(written, seed), seed=seed, arrivals=seed)
+            if kind == "gate":
+                for gate in built.gates.values():
+                    gate.controllers = (MixedRefillBudget(**what),)
             built.run()
             count([client.runtime for client in built.clients])
         return counts
@@ -342,7 +366,10 @@ def compare(args: argparse.Namespace) -> None:
     candidates = models + sorted((out / "runs").glob("*/snapshots/model-*.zip"))
 
     # Which trained model to report: the best on the SELECTION episodes of the
-    # varied situation. The test episodes play no part in the choice.
+    # varied situation. The test episodes play no part in the choice. (`--chosen`
+    # names the model an earlier comparison chose, to add rows without choosing again.)
+    if args.chosen is not None:
+        candidates = [out / "runs" / args.chosen / "model.zip"]
     tasks = [("model", model, study, TRAINING, args.selection) for model in candidates]
     scores = [_success(e) for e in evaluate.in_parallel(_episodes, tasks, args.jobs)]
     ranked = sorted(zip(scores, candidates, strict=True), reverse=True)
@@ -350,7 +377,7 @@ def compare(args: argparse.Namespace) -> None:
         print(f"selection success {score:6.2f}%  {_name(out, model)}")
     chosen = ranked[0][1]
     leads: dict[str, dict[str, Any]] = {}
-    if args.select == "lead":
+    if args.select == "lead" and args.chosen is None:
         # Among the best of those, the one that is nowhere far behind: the
         # largest SMALLEST lead over their limiter, over every condition, still
         # on the selection episodes. A mean over the varied situation hardly
@@ -395,6 +422,25 @@ def compare(args: argparse.Namespace) -> None:
     print(f"selection success {as_file:6.2f}%  their clients, arolla as their file sets it")
     rows[TUNED] = ("written", files[best_theirs])
 
+    # The rule their prototype deploys, in front of the same clients: as its
+    # manifests set it, with its fairness filter, and at the best of their own
+    # grid, chosen like everything else on the selection episodes.
+    rows[DEPLOYED] = ("gate", DEPLOYED_SETTINGS)
+    rows[DEPLOYED_FAIR] = ("gate", DEPLOYED_SETTINGS | FAIRNESS)
+    grid = [
+        {"r": r, "capacity": capacity, "t": t}
+        for r, t, capacity in itertools.product(RS, TS, CAPACITIES)
+    ]
+    tasks = [("gate", setting, study, TRAINING, args.selection) for setting in grid]
+    scores = [_success(e) for e in evaluate.in_parallel(_episodes, tasks, args.jobs)]
+    by_bucket = sorted(zip(scores, range(len(grid)), strict=True), reverse=True)
+    for score, index in by_bucket[:5] + by_bucket[-2:]:
+        print(f"selection success {score:6.2f}%  their clients, prototype rule with {grid[index]}")
+    deployed = scores[grid.index(DEPLOYED_SETTINGS)]
+    print(f"selection success {deployed:6.2f}%  their clients, prototype rule as deployed")
+    best_bucket = grid[by_bucket[0][1]]
+    rows[DEPLOYED_TUNED] = ("gate", best_bucket)
+
     # The yardstick, when `informed` has been run: per condition, the fixed
     # setting that is best for that condition alone.
     told = out / "informed.json"
@@ -411,38 +457,55 @@ def compare(args: argparse.Namespace) -> None:
     ]
     done = iter(evaluate.in_parallel(_episodes, tasks, args.jobs))
     results: dict[str, list[dict[str, Any]]] = {}
-    against_tuned: dict[str, dict[str, float]] = {}
+    # The learned policy against each other limiter, paired: points and standard error.
+    others = (TUNED, DEPLOYED, DEPLOYED_FAIR, DEPLOYED_TUNED)
+    against: dict[str, dict[str, dict[str, float]]] = {other: {} for other in others}
     for name in where:
         runs = {row: next(done) for row in rows_of(name)}
         results[name] = evaluate.compare(runs, reference=REFERENCE)
-        tuned = {row["policy"]: row for row in evaluate.compare(runs, reference=TUNED)}
-        against_tuned[name] = {
-            row: tuned[row]["vs_reference"] for row in ("ppo", "best fixed setting")
-        } | {"ppo_se": tuned["ppo"]["vs_reference_se"]}
+        for other in others:
+            paired = {row["policy"]: row for row in evaluate.compare(runs, reference=other)}
+            against[other][name] = {
+                "ppo": paired["ppo"]["vs_reference"],
+                "ppo_se": paired["ppo"]["vs_reference_se"],
+                "best fixed setting": paired["best fixed setting"]["vs_reference"],
+            }
         print(f"\n== {name}")
         print(evaluate.table(results[name], reference=REFERENCE))
+    against_tuned = against[TUNED]
 
-    print(f"\nsuccess of all requests, %; alpha, beta_down, beta_up = {best_theirs} when tuned")
+    print(
+        f"\nsuccess of all requests, %; tuned: alpha, beta_down, beta_up = {best_theirs}, "
+        f"prototype rule {best_bucket}"
+    )
     header = ("ppo", "best fixed setting", INFORMED, "no retries", REFERENCE, TUNED)
-    header += ("their clients, none",)
+    header += (DEPLOYED, DEPLOYED_FAIR, DEPLOYED_TUNED, "their clients, none")
+    short = {
+        DEPLOYED: "prototype",
+        DEPLOYED_FAIR: "prototype fair",
+        DEPLOYED_TUNED: "prototype tuned",
+    }
     print(
         f"{'':24s}"
-        + "".join(f"{h.replace('their clients, ', ''):>20s}" for h in header)
-        + f"{'ppo - arolla':>18s}{'ppo - tuned':>18s}"
+        + "".join(f"{short.get(h, h.replace('their clients, ', '')):>20s}" for h in header)
+        + f"{'ppo - arolla':>18s}{'ppo - tuned':>18s}{'ppo - prototype':>18s}{'ppo - proto tuned':>18s}"
     )
     for name, table in results.items():
         by_row = {row["policy"]: row for row in table}
-        gap, tuned_gap = by_row["ppo"], against_tuned[name]
+        gap = by_row["ppo"]
         cells = [by_row[h]["success_rate"] if h in by_row else math.nan for h in header]
         print(
             f"{name:24s}"
             + "".join(f"{100 * cell:20.2f}" for cell in cells)
             + f"{100 * gap['vs_reference']:11.2f} ± {100 * gap['vs_reference_se']:4.2f}"
-            + f"{100 * tuned_gap['ppo']:11.2f} ± {100 * tuned_gap['ppo_se']:4.2f}"
+            + "".join(
+                f"{100 * against[other][name]['ppo']:11.2f} ± {100 * against[other][name]['ppo_se']:4.2f}"
+                for other in (TUNED, DEPLOYED, DEPLOYED_TUNED)
+            )
         )
 
     # Tenant by tenant: a limiter is also judged by whom it lets down.
-    shown = ("ppo", REFERENCE, TUNED, "their clients, none")
+    shown = ("ppo", REFERENCE, TUNED, DEPLOYED, DEPLOYED_FAIR, "their clients, none")
     tenants: dict[str, dict[str, dict[str, float]]] = {}
     for name in ("their file", "varied"):
         tasks = [(*rows[row], study, where[name], args.test) for row in shown]
@@ -478,7 +541,7 @@ def compare(args: argparse.Namespace) -> None:
     summary = {
         "agent": study.agent,
         "chosen": _name(out, chosen),
-        "chosen_by": args.select,
+        "chosen_by": args.select if args.chosen is None else "an earlier comparison",
         "selection": {_name(out, model): score for score, model in ranked},
         "smallest_lead": {
             name: {"points": found["smallest"], "at": found["at"]} for name, found in leads.items()
@@ -489,7 +552,13 @@ def compare(args: argparse.Namespace) -> None:
             "selection": {repr(setting): score for setting, score in by_setting.items()},
             "best": list(best_theirs),
         },
+        "their_prototype_rule": {
+            "selection": {json.dumps(grid[index]): score for score, index in by_bucket},
+            "deployed": DEPLOYED_SETTINGS,
+            "best": best_bucket,
+        },
         "against_tuned": against_tuned,
+        "against": against,
         "conditions": {
             name: [{k: plain(v) for k, v in row.items()} for row in table]
             for name, table in results.items()
@@ -541,6 +610,9 @@ def main(arguments: Sequence[str] | None = None) -> None:
         "best of those by its smallest lead over their limiter across the conditions",
     )
     parser.add_argument("--shortlist", type=int, default=24, help="how many `--select lead` weighs")
+    parser.add_argument(
+        "--chosen", help="the run an earlier comparison chose: report it without choosing again"
+    )
     parser.add_argument(
         "--train-load",
         type=float,
