@@ -484,6 +484,7 @@ def as_written(
     warmup_s: float = 5.0,
     step_s: float = 1.0,
     limiter: Callable[[], AdmissionController] | None = None,
+    within_s: float | None = None,
 ) -> list[dict[str, float]]:
     """The file run as it is written, with nobody taken over: one summary per seed.
 
@@ -503,6 +504,9 @@ def as_written(
     That is how a limiter their file format cannot name (the bucket of their
     Kubernetes prototype, `admission.MixedRefillBudget`) is run in front of the
     same clients. The file has to give some service a limiter for a gate to exist.
+
+    `within_s` scores the run with the latency bound of
+    `RetryEnv(reward_within_s=...)` (`on_time_rate`, and `return` on it).
     """
     written = parse(read(path)[point].config)
     if part_of is not None:
@@ -531,6 +535,7 @@ def as_written(
             warmup_s=warmup_s,
             step_s=step_s,
             effort_clients=spent,
+            within_s=within_s,
         )
         episodes.append({"seed": float(seed), **scored})
     return episodes

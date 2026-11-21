@@ -281,6 +281,45 @@ class TestRewardAndSummary(unittest.TestCase):
         self.assertEqual(steps[-1][4]["ep_requests"], in_time)
         self.assertEqual(steps[-1][4]["ep_return"], info["ep_return"])
 
+    def test_a_latency_bound_pays_only_the_requests_served_inside_it(self):
+        # Four attempts with a backoff: a request a retry rescued is a late one.
+        scenario = Small()
+        slow = [3, 2, 2, 4]  # 4 attempts, 80 ms timeout, 50 ms backoff, budget 1.0
+        bound = 0.05
+        env, steps = self._episode(scenario, slow, reward_within_s=bound)
+        _, plain = self._episode(scenario, slow)
+        client = env.episode.clients[0]
+        begin, end = s_to_ns(env.warmup_s), s_to_ns(scenario.horizon_s)
+        ok = [
+            r
+            for r in client.roots
+            if begin < root_completed_at(r) <= end and classify_root(r) is RootOutcome.SUCCESS
+        ]
+        on_time = [
+            r for r in ok if root_completed_at(r) - r.attempts[0].interval.begin <= s_to_ns(bound)
+        ]
+        self.assertTrue(0 < len(on_time) < len(ok))  # the bound cuts some of them, not all
+        rewards = [reward for _, reward, _, _, _ in steps[1:]]
+        self.assertAlmostEqual(sum(rewards) * scenario.rps * env.step_s, len(on_time), places=6)
+        info, unbounded = steps[-1][4], plain[-1][4]
+        # The bound is on what is paid and on one line of the summary: what
+        # succeeded is what succeeded, and the simulation is the same one.
+        self.assertLess(info["ep_on_time_rate"], info["ep_success_rate"])
+        self.assertLess(info["ep_return"], unbounded["ep_return"])
+        for name, value in unbounded.items():
+            if name not in ("ep_return", "ep_on_time_rate"):
+                np.testing.assert_equal(info[name], value)
+        # Without a bound every success is on time.
+        self.assertEqual(unbounded["ep_on_time_rate"], unbounded["ep_success_rate"])
+
+    def test_a_latency_bound_is_a_time(self):
+        for bad in (0.0, -1.0, math.inf):
+            with (
+                self.subTest(reward_within_s=bad),
+                self.assertRaisesRegex(ValueError, "reward_within_s"),
+            ):
+                RetryEnv(Small(), reward_within_s=bad)
+
     def test_recovery_time(self):
         _, steps = self._episode(Small())
         self.assertEqual(steps[-1][4]["ep_recovery_s"], 0.0)  # failures stop with the fault

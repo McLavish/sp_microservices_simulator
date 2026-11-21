@@ -207,6 +207,7 @@ def train(
     snapshots: int = 0,
     slow_s: float | None = None,
     lr_decay: bool = False,
+    reward_within_s: float | None = None,
 ) -> dict[str, Any]:
     """Train PPO on the scenario and save `model.zip` and `model.json` in `out`.
 
@@ -218,7 +219,11 @@ def train(
     (`snapshots/model-<steps>.zip`, each with a sidecar of its own). `slow_s`
     is the environment's (`RetryEnv.slow_s`). `lr_decay` lets the learning rate
     fall linearly to zero over the run, so that the policy settles at the end
-    instead of moving as much as on the first day. Returns the sidecar.
+    instead of moving as much as on the first day. `reward_within_s` is the
+    environment's latency bound on what the reward counts
+    (`RetryEnv.reward_within_s`); it is written to the sidecar and is no part
+    of what a model is matched against, since it changes neither what the
+    agent is shown nor what its actions mean. Returns the sidecar.
     """
     import stable_baselines3
     import torch
@@ -227,7 +232,7 @@ def train(
 
     out.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(torch_threads)  # the cores are for the simulations
-    probe = RetryEnv(scenario, step_s=step_s, slow_s=slow_s)
+    probe = RetryEnv(scenario, step_s=step_s, slow_s=slow_s, reward_within_s=reward_within_s)
     n_steps = n_steps or 2 * probe.episode_steps
     batch_size = batch_size or max(32, n_steps * n_envs // 12)
 
@@ -239,6 +244,7 @@ def train(
         reward_offset=reward_offset,
         step_s=step_s,
         slow_s=slow_s,
+        reward_within_s=reward_within_s,
     )
     model = PPO(
         "MlpPolicy",
@@ -267,6 +273,7 @@ def train(
                     "scenario": scenario_name,
                     "scenario_settings": _settings(scenario),
                     **_describe(probe),
+                    "reward_within_s": reward_within_s,
                     "timesteps_asked": timesteps,
                     "timesteps_trained": steps,
                     "episodes_trained": steps // probe.episode_steps,
@@ -361,11 +368,14 @@ def evaluate_model(
     *,
     scenario: Scenario | None = None,
     jobs: int = 1,
+    reward_within_s: float | None = None,
 ) -> list[dict[str, float]]:
     """The saved model on the given episodes, acting greedily: one summary per episode.
 
     The scenario is the one named in the model's sidecar unless given (a model
     trained on a scenario object that has no name needs it given).
+    `reward_within_s` is the latency bound the episodes are SCORED with
+    (`return`, `on_time_rate`), whatever the model was trained with.
     """
     sidecar = json.loads(model.with_suffix(".json").read_text("utf-8"))
     if scenario is None:
@@ -378,6 +388,7 @@ def evaluate_model(
         "step_s": sidecar["step_s"],
         "warmup_s": sidecar["warmup_s"],
         "slow_s": sidecar.get("slow_s"),
+        "reward_within_s": reward_within_s,
     }
     seeds = tuple(seeds)
     chunks = [seeds[i::jobs] for i in range(max(1, min(jobs, len(seeds))))]

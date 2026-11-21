@@ -158,6 +158,23 @@ class TestTheRecordsGiveTheSameSummary(unittest.TestCase):
                 del by_env["seed"]
                 np.testing.assert_equal(by_records, by_env)  # every entry, nan for nan
 
+    def test_with_a_latency_bound_on_what_is_paid(self):
+        scenario = Small()
+        env = RetryEnv(scenario, reward_within_s=0.02)
+        (by_env,) = ev.rollout(env, ev.constant([2, 1, 1, 2]), [21])
+        episode = scenario.build(21)  # the same episode, left alone
+        episode.sim.run()
+        by_records = of_records(
+            episode.reward_clients,
+            expected_rps=episode.expected_rps,
+            fault_windows=episode.fault_windows,
+            horizon_s=scenario.horizon_s,
+            within_s=0.02,
+        )
+        del by_env["seed"]
+        self.assertLess(by_env["on_time_rate"], by_env["success_rate"])
+        np.testing.assert_equal(by_records, by_env)
+
     def test_on_the_retry_storm(self):
         failures = FaultRanges(kinds=("failure",), onset_s=(8.0, 10.0), length_s=(6.0, 8.0))
         scenario = RetryStorm(horizon_s=25.0, faults=failures)

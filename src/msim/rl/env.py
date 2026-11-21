@@ -81,6 +81,7 @@ class RetryEnv(gymnasium.Env):
         drain: bool = True,
         keep_records: bool = False,
         slow_s: float | None = None,
+        reward_within_s: float | None = None,
     ) -> None:
         if not math.isfinite(step_s) or step_s <= 0:
             raise ValueError(f"step_s must be > 0, got {step_s}")
@@ -88,6 +89,10 @@ class RetryEnv(gymnasium.Env):
             raise ValueError(f"warmup_s must be >= 0, got {warmup_s}")
         if slow_s is not None and (not math.isfinite(slow_s) or slow_s <= 0):
             raise ValueError(f"slow_s must be > 0 or None, got {slow_s}")
+        if reward_within_s is not None and (
+            not math.isfinite(reward_within_s) or reward_within_s <= 0
+        ):
+            raise ValueError(f"reward_within_s must be > 0 or None, got {reward_within_s}")
         self.scenario = scenario
         self.step_s = step_s
         self.warmup_s = warmup_s
@@ -98,6 +103,13 @@ class RetryEnv(gymnasium.Env):
         #: rate to within 8%. An agent that has to know its load, or whether a
         #: failure is a blip, needs the longer look as well, and has no memory.
         self.slow_s = slow_s
+        #: `None`, or a latency bound in seconds on what the reward counts: a
+        #: request that succeeded later than this after its first attempt is a
+        #: success in the summary and pays nothing. Without it a limiter is paid
+        #: the same for a request served in 10 ms and for one that waited out a
+        #: failure in a queue for three seconds, and learns to fill the queue.
+        self.reward_within_s = reward_within_s
+        self._within = None if reward_within_s is None else s_to_ns(reward_within_s)
         #: Whether the requests in flight at the horizon are run to their end for
         #: the summary. Off: the summary covers what finished inside the horizon.
         self.drain = drain
@@ -216,7 +228,8 @@ class RetryEnv(gymnasium.Env):
         self._in_horizon.add(tally)
         self._windows.append((begin, tally.requests, tally.succeeded))
         observation = self._observe(self.step_s)
-        reward = tally.succeeded / (episode.expected_rps * self.step_s)
+        # `on_time` is `succeeded` unless a latency bound is set.
+        reward = tally.on_time / (episode.expected_rps * self.step_s)
         self._return += reward
         info = self._step_info(tally)
 
@@ -287,7 +300,7 @@ class RetryEnv(gymnasium.Env):
                 if scored:
                     self._effort.count(fresh)
             if id(client) in rewarded:
-                tally.count(fresh, self._faults)
+                tally.count(fresh, self._faults, self._within)
         return tally
 
     def _observe(self, window_s: float) -> np.ndarray:

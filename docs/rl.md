@@ -45,6 +45,12 @@ observation, reward, terminated, truncated, info = env.step(env.action_space.sam
   window, over the number expected to arrive in a window. A healthy window pays
   about 1. It is counted on requests with a scale that is fixed for the episode,
   so the rewards of an episode add up to its successes whatever the windows.
+  `RetryEnv(reward_within_s=...)` (default `None`) pays only the requests that
+  succeeded within that many seconds of their first attempt. Without it a
+  request served in 10 ms and one that waited three seconds in a queue pay the
+  same, and where a queue can carry requests past a failure, a limiter learns
+  to fill it (see "On their Kubernetes prototype"). The bound changes what is
+  paid and one line of the summary (`ep_on_time_rate`), never the simulation.
 - **An episode never terminates.** It is cut at the scenario's horizon
   (`truncated`), so a learner bootstraps over the cut and gains nothing by
   pushing failures past it. After the cut the arrivals stop and what is in
@@ -97,6 +103,7 @@ run that had none (`summary.of_records`).
 | --- | --- |
 | `ep_return` | the rewards, added up |
 | `ep_success_rate` | requests that succeeded, of all that finished after the warm-up, the tail included |
+| `ep_on_time_rate` | those that succeeded within `reward_within_s` of their first attempt (`ep_success_rate` when there is no bound) |
 | `ep_horizon_success_rate` | the same, of what finished inside the horizon (what the rewards count) |
 | `ep_fault_success_rate` | of the requests that started inside a fault window |
 | `ep_amplification` | attempts per request of the agent's clients |
