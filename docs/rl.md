@@ -201,6 +201,41 @@ Checked on the four post-mortem scenarios and on
 the same definitions: their clients, behind their limiter. That is the row a
 learned policy on that file is put next to.
 
+### An agent that is the limiter (`rl/limiter.py`)
+
+The agent need not sit on clients. `ArollaLimiterScenario.from_file(path)`
+builds a file as it is written, every client with its own retry policy and
+timeout, and replaces one thing: the controller inside the `AdmissionGate` in
+front of a service. It becomes an `admission.TenantRetryQuota`, and the knobs
+are one share per tenant (`quota:<tenant>`): how many of that tenant's retries
+are let in, per first attempt of the tenant, over the last second. `QuotaGrid`
+holds the ladder (0, 2%, 5%, 10%, 20%, 30%, 50%, 75%, 100%, and 300%, which
+refuses nothing a caller of four attempts sends) and the default, 0, which
+holds through the warm-up.
+
+Such an agent is shown what a limiter can count where it stands and nothing
+else, per tenant and window (`limiter.MEASURES`, as `<tenant>:<measure>`):
+
+| Entry | Meaning |
+| --- | --- |
+| `ended` | the tenant's attempts that ended at the service, over four times its expected request rate |
+| `goodput` | those that succeeded, over twice its expected request rate |
+| `retries_asked` | its retries that asked to be let in, over four times its expected request rate |
+| `retries_admitted` | those let in |
+| `retry_success` | share of its retries that ended which succeeded |
+
+These are the quantities Arolla's rule runs on (a tenant's request rate, its
+goodput, its retries in the window, the success of its retries). There is no
+queue length, no latency, nothing from inside a client. The rates are the
+FILE's, so a load that an episode draws shows in the counts. A scenario with
+an agent of this kind names its entries (`features`) and its agent object
+measures them (`Agent.measure`); `env.FEATURES` is what an agent on clients
+gets. `slow_s` and the knob levels are added as for any agent.
+
+So the scenario and `as_written` on the same file differ in the limiter and in
+nothing else: `tests/test_rl_limiter.py` checks that a quota which refuses
+nothing gives the file with no limiter, summary for summary.
+
 ### Writing one
 
 ```python
@@ -316,24 +351,128 @@ into an overloaded station takes several times the median (p99 is 46 ms against
 a median of 13 on the single service). Collecting whole episodes per process,
 with no waiting between steps, is what would recover the rest.
 
-## A learned client policy against Arolla's limiter (`examples/rl_vs_arolla.py`)
+## A learned limiter against Arolla's (`examples/rl_vs_arolla.py`)
 
 [Arolla](https://github.com/eth-easl/Arolla) protects a service from its
-callers' retries at the server: it admits retries up to a share of the
-goodput. Its simulator ships one situation under each server-side policy,
-`snowflake/policy-{none,cb,rb,aimd,arolla}.yaml`: a 16-worker service, four
-tenants of 40 requests per second with four different client retry policies,
-and half the calls failing from 20 s to 40 s. The study asks the question
-from the other side: with NO server-side policy (`policy-none`) and one
-learned retry policy on all four tenants, is the service better off than
-with their tenants behind their limiter?
+callers' retries at the server: it admits each tenant's retries up to a share
+of that tenant's goodput. Its simulator ships one situation under each
+server-side policy, `snowflake/policy-{none,cb,rb,aimd,arolla}.yaml`: a
+16-worker service, four tenants of 40 requests per second with four different
+client retry policies, and half the calls failing from 20 s to 40 s. Can a
+learned limiter do better than theirs, in front of the same clients?
 
 ```bash
-python -m examples.rl_vs_arolla static   --arolla ~/Arolla --out study --jobs 48   # every fixed setting
+python -m examples.rl_vs_arolla static   --arolla ~/Arolla --out study --jobs 48   # the fixed quotas
 python -m examples.rl_vs_arolla informed --arolla ~/Arolla --out study --jobs 48   # the best one per situation
 python -m examples.rl_vs_arolla train    --arolla ~/Arolla --out study/runs/a-100 --seed 100 --slow-s 10
 python -m examples.rl_vs_arolla compare  --arolla ~/Arolla --out study --jobs 48 --select lead
 ```
+
+**What is compared.** Both sides are `policy-arolla.yaml` as it is written:
+the same four tenants, each with its own retry policy (four attempts for all;
+one backs off, one has a circuit breaker, one a client-side budget and no
+attempt timeout), and one admission gate in front of the service. The only
+thing that differs is the controller inside that gate: their rule, or a quota
+per tenant that an agent sets every second (`ArollaLimiterScenario`, above).
+The agent sees what their rule runs on, per tenant: attempts and successes at
+the service, retries asked and let in. Situations: their file as it is; a
+varied one, where every episode draws the failure rate (0.1 to 0.9), its start
+and length (5 to 35 s) and the load (0.7 to 1.3 times the file's); and each of
+those three axes walked alone. For a seed every row faces the same failure and
+the same arrivals, so the differences are paired. Whatever is chosen is chosen
+on other episodes than the ones reported: the fixed quota, the trained model,
+and the settings of their limiter when it is tuned (`alpha`, `beta_down`,
+`beta_up`, 45 combinations around their file's values).
+
+**Result.** Success of all requests in %, on 64 episodes that nothing had been
+chosen on (seeds 4000 to 4063), and the paired difference to their limiter
+with its standard error:
+
+| Situation | Learned limiter | Arolla | Learned - Arolla | Arolla, tuned | Best fixed quota for the situation | One fixed quota | Every retry refused | No limiter |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Their file | 88.57 | 85.54 | +3.04 ± 0.12 | 85.68 | 88.51 | 86.04 | 84.00 | 36.71 |
+| Varied | 90.09 | 87.73 | +2.36 ± 0.32 | 87.85 | | 88.01 | 86.10 | 52.47 |
+| Failure rate 0.1 | 99.60 | 98.70 | +0.90 ± 0.02 | 98.84 | 99.64 | 98.89 | 96.17 | 99.66 |
+| Failure rate 0.25 | 97.86 | 94.03 | +3.83 ± 0.12 | 94.18 | 98.00 | 94.41 | 91.58 | 85.14 |
+| Failure rate 0.75 | 78.96 | 77.21 | +1.75 ± 0.07 | 77.39 | 78.98 | 77.70 | 76.36 | 34.15 |
+| Failure rate 0.9 | 73.12 | 72.44 | +0.68 ± 0.04 | 72.47 | 73.15 | 72.60 | 71.73 | 33.01 |
+| Failing for 5 s | 97.15 | 96.45 | +0.70 ± 0.05 | 96.51 | 97.17 | 96.54 | 95.44 | 38.91 |
+| Failing for 10 s | 94.32 | 92.84 | +1.48 ± 0.08 | 92.95 | 94.27 | 93.02 | 91.60 | 37.68 |
+| Failing for 35 s | 80.08 | 74.57 | +5.51 ± 0.14 | 74.83 | 79.91 | 75.62 | 72.59 | 35.10 |
+| 0.7 times the load | 94.25 | 85.65 | +8.60 ± 0.07 | 85.78 | 94.38 | 86.16 | 84.01 | 94.37 |
+| 0.85 times the load | 91.98 | 85.56 | +6.42 ± 0.17 | 85.82 | 92.09 | 86.15 | 83.98 | 53.66 |
+| 1.15 times the load | 86.37 | 85.41 | +0.95 ± 0.07 | 85.58 | 86.63 | 85.93 | 83.87 | 34.30 |
+| 1.3 times the load | 83.75 | 83.53 | +0.21 ± 0.20 | 83.11 | 83.88 | 81.45 | 83.41 | 27.07 |
+
+The learned limiter is ahead of their limiter in every situation, by more
+than two standard errors in twelve of the thirteen; at 1.3 times the load,
+where the service runs at 88% before any retry, the two are level. Against
+their limiter at its best it is ahead in all thirteen (+0.63 ± 0.25 at 1.3
+times the load): tuning theirs gains 0.15 points on the selection episodes,
+with `alpha` staying at the file's 0.1, and `alpha` = 0.5 loses 14.
+
+Their rule lets through a tenth of the goodput as retries whatever the load,
+and holds 85% to 86% from 0.7 to 1.15 times the file's load. The learned
+limiter follows the load, which it has to read off its own counts. Shares it
+gives while calls fail, as retries per first attempt of the tenant, in the
+tenants' order (four immediate attempts; backoff; circuit breaker; client
+budget):
+
+| Load | The shares | What that is |
+| --- | --- | --- |
+| 0.7 | 2.9, 2.9, 3.0, 2.9 | nothing refused: the service has room, and the result is the one with no limiter (94.37%), which their limiter costs 8.7 points |
+| 1.0 (their file) | 0.27, 0.52, 1.89, 2.77 | the two tenants that retry without restraint are held to a quarter and a half of their first attempts; the two that restrain themselves get what they ask |
+| 1.15 | 0.09, 0.03, 0.31, 1.98 | the same, tighter |
+| 1.3 | 0, 0.01, 0, 0.35 | next to nothing, and outside the failure nothing |
+
+(Means over the seconds of the failure, six selection episodes.)
+
+Nobody is let down for it. By tenant, on their file: 86.7%, 90.8%, 87.2% and
+89.5% behind the learned limiter against 85.5%, 85.6%, 85.3% and 85.7% behind
+theirs; on the varied situation 89.6%, 90.3%, 88.4% and 91.0% against 87.6%,
+87.8%, 87.4% and 88.1%.
+
+No fixed quota does this: the best single one (10% for everybody) is 0.3
+points ahead of their limiter on the varied situation and 2.1 behind it at 1.3
+times the load. The learned limiter is within 0.3 points of the best fixed
+quota for each situation, which was chosen knowing the situation.
+
+The row does not hang on the one model. Each of the 40 models shortlisted (of
+60 scored, from 20 runs) is ahead of their limiter on their file (86.94% to
+88.79%) and on the varied situation (89.24% to 90.11%), and 13 of the 20
+runs' final models were ahead in every situation scored on the selection
+episodes. The one reported was chosen with `--select lead` on 64 selection
+episodes (largest smallest lead over the thirteen situations). It is seed 100
+of
+
+```bash
+python -m examples.rl_vs_arolla train --arolla ~/Arolla --out study/runs/lc-100 --seed 100 \
+    --timesteps 1500000 --gamma 0.5 --gae-lambda 0.9 --ent-coef 0.003 --slow-s 10 \
+    --train-load 0.6 1.4 --lr-decay --snapshots 5
+```
+
+an hour on twelve simulations and one learner.
+
+**What it does not show.** Anything about their prototype: this is their
+simulator's situation in this simulator, with Arolla's rule as
+`msim.admission` implements it from their files (their numbers are reproduced
+within noise on all their scenarios: [compat-arolla](compat-arolla.md)). That
+the learned limiter carries over: it was trained on this service, 16 workers
+and 60 ms, and on this kind of failure, and what it has learned about load is
+this service's capacity. Their rule knows nothing about the service and needs
+no training; on another service the learned limiter has to be trained again,
+and on a fault it has not seen (a slowdown, a load spike) it has not been
+tried. And the reward was the pooled goodput: a limiter judged on something
+else (the latency of what succeeds, one tenant's share) is another agent.
+
+### The side study: a learned policy on the clients, with no limiter
+
+The first version of this study put the agent on the other side. It takes the
+server-side policy away (`policy-none`) and gives all four tenants ONE learned
+retry policy (`--agent clients`). That changes the clients, so it says what
+coordinated clients can reach and not which limiter is better: the
+comparison above is the one of limiters. What it found, and what it took to
+find it, is kept here.
 
 **What is compared.** The agent sets max attempts (1 to 4), backoff (0 to
 100 ms) and the retry budget (5% to 100% of the requests) of all four
@@ -394,16 +533,19 @@ chosen with `--select lead` on 64 selection episodes: the largest smallest
 lead over the thirteen situations. It is seed 400 of
 
 ```bash
-python -m examples.rl_vs_arolla train --arolla ~/Arolla --out study/runs/w-400 --seed 400 \
-    --timesteps 2000000 --gamma 0.7 --gae-lambda 0.9 --slow-s 10 --train-load 0.6 1.4 --snapshots 7
+python -m examples.rl_vs_arolla train --agent clients --arolla ~/Arolla --out study/runs/w-400 \
+    --seed 400 --timesteps 2000000 --gamma 0.7 --gae-lambda 0.9 --slow-s 10 --train-load 0.6 1.4 \
+    --snapshots 7
 ```
 
 after 1.75 million steps (an hour on twelve simulations and one learner).
 
-**What it does not show.** That their limiter is unnecessary: the agent sets
-the policy of EVERY caller, and a server-side limiter is there for the callers
-nobody controls. One tenant that keeps retrying freely is not in this
-comparison. Nor anything about their prototype: this is their simulator's
+**What it does not show.** Which limiter is better: the two sides differ in
+their clients, not only in what stands in front of the service. Nor that their
+limiter is unnecessary: the agent sets the policy of EVERY caller, and a
+server-side limiter is there for the callers nobody controls. One tenant that
+keeps retrying freely is not in this comparison. Nor anything about their
+prototype: this is their simulator's
 situation in this simulator, with Arolla's rule as `msim.admission` implements
 it from their files. And the agent has one setting for four tenants, although
 the tenant without an attempt timeout gains from retries at a load where the
