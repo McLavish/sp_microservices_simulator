@@ -130,6 +130,9 @@ pub struct Settings {
     /// Show the policy one entry more, after the tenants' own: how much longer
     /// an attempt is in flight than while nothing fails (`rl.limiter.IN_FLIGHT`).
     pub in_flight: bool,
+    /// The levels a tenant's quota may rise from one window to the next
+    /// (`QuotaGrid.step_up`); it may fall as far as the policy says. 0: any.
+    pub step_up: usize,
     pub policy: Policy,
 }
 
@@ -147,6 +150,7 @@ impl Default for Settings {
             floor: 0,
             rest: false,
             in_flight: false,
+            step_up: 0,
             policy: Policy::default(),
         }
     }
@@ -276,8 +280,10 @@ pub struct Limiter {
     pub last_observation: Vec<f64>,
     /// The counts of the window that just ended, per tenant.
     pub last_counts: Vec<Counts>,
-    /// The in-flight entry of the window that just ended, when there is one.
+    /// The in-flight entry of the window that just ended, and the time in
+    /// flight it was made from (ms per attempt let in).
     pub last_in_flight: Option<f64>,
+    pub last_flight_ms: f64,
 }
 
 impl Limiter {
@@ -306,6 +312,7 @@ impl Limiter {
             last_observation: Vec::new(),
             last_counts: Vec::new(),
             last_in_flight: None,
+            last_flight_ms: 0.0,
         })
     }
 
@@ -450,6 +457,7 @@ impl Limiter {
             let admitted: u64 = counts.iter().map(|seen| seen.firsts + seen.retries_admitted).sum();
             let flight: u64 = counts.iter().map(|seen| seen.flight).sum();
             let in_flight = flight as f64 / admitted.max(1) as f64;
+            self.last_flight_ms = in_flight;
             if in_flight > 0.0 && asked == 0 && admitted >= AT_REST {
                 self.flight_at_rest = Some(match self.flight_at_rest {
                     None => in_flight,
@@ -515,6 +523,7 @@ impl Limiter {
             *value = ((*value as f32) as f64).clamp(0.0, 1.0);
         }
         let levels = self.settings.shares.len();
+        let before = self.levels();
         if together {
             if let Some(chosen) = self.settings.policy.act(&observation, 1, levels) {
                 for tenant in self.tenants[..known].iter_mut() {
@@ -543,6 +552,12 @@ impl Limiter {
         } else if let Some(chosen) = self.settings.policy.act(&observation, known, levels) {
             for (tenant, level) in self.tenants[..known].iter_mut().zip(chosen) {
                 tenant.level = level;
+            }
+        }
+        if self.settings.step_up > 0 {
+            // No further up than `step_up` levels from where the tenant stood.
+            for (tenant, was) in self.tenants[..known].iter_mut().zip(&before) {
+                tenant.level = tenant.level.min(was + self.settings.step_up);
             }
         }
         if resting {
@@ -965,6 +980,41 @@ mod tests {
         assert_eq!((sum.firsts, sum.flight), (40, 800));
         let bytes = encode(7, &[sum.clone()]);
         assert_eq!(decode(&bytes, 1), Some((7, vec![sum])));
+    }
+
+    #[test]
+    fn with_step_up_a_quota_climbs_a_level_a_window() {
+        // A policy that answers the top level while it is shown a level below
+        // the top, and level 0 once it is shown the top (the level is the last
+        // of the 11 entries: 5 counts, the same averaged, the level).
+        let mut bottom = vec![0.0; 11];
+        bottom[10] = 30.0;
+        let policy = Policy {
+            hidden: Vec::new(),
+            head: Some(Layer {
+                w: vec![bottom, vec![0.0; 11], vec![0.0; 11], vec![0.0; 11]],
+                b: vec![-25.0, -100.0, -100.0, 0.0],
+            }),
+        };
+        let mut l = Limiter::new(Settings {
+            tenants: vec!["a".into()],
+            rates: vec![40.0],
+            shares: vec![0.0, 0.1, 0.2, 0.4],
+            default_level: 0,
+            step_up: 1,
+            policy,
+            ..Settings::default()
+        })
+        .unwrap();
+        let mut climbed = Vec::new();
+        for second in 0..5u64 {
+            for i in 0..40 {
+                l.admit(0, false, second * 1000 + i);
+            }
+            climbed.push(l.step((second + 1) * 1000)[0]);
+        }
+        // Up a level a window whatever it asks for; down at once.
+        assert_eq!(climbed, vec![1, 2, 3, 0, 1]);
     }
 
     #[test]

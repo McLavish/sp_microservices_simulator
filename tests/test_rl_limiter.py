@@ -327,6 +327,28 @@ class TestTheQuotaGrid(unittest.TestCase):
         _, _, _, _, info = plain.step(wide)
         self.assertEqual(info["knob_quota:plain"], 3.0)
 
+    def test_with_step_up_the_quota_climbs_a_level_a_window(self):
+        grid = QuotaGrid(shares=(0.0, 0.1, 0.2, 0.4), step_up=1)
+        env = RetryEnv(_scenario(grid=grid))
+        env.reset(options={"episode_seed": 1})
+        top = (3, 3)
+        climbed = []
+        for _ in range(4):
+            observation, _, _, _, info = env.step(top)
+            climbed.append(info["knob_quota:plain"])
+            # The agent is shown where it stands, not what it asked for.
+            shown = dict(zip(env.feature_names, observation, strict=True))
+            self.assertAlmostEqual(shown["knob:quota:plain"], grid.shares.index(climbed[-1]) / 3)
+            self.assertEqual(_limiter(env).quota.share_of("untimed"), climbed[-1])
+        self.assertEqual(climbed, [0.1, 0.2, 0.4, 0.4])
+        # Down as far as it likes, at once; and one tenant's place is its own.
+        _, _, _, _, info = env.step((0, 3))
+        self.assertEqual((info["knob_quota:plain"], info["knob_quota:untimed"]), (0.0, 0.4))
+        _, _, _, _, info = env.step((3, 1))
+        self.assertEqual((info["knob_quota:plain"], info["knob_quota:untimed"]), (0.1, 0.1))
+        with self.assertRaisesRegex(ValueError, "step_up"):
+            QuotaGrid(step_up=-1)
+
     def test_validation(self):
         with self.assertRaisesRegex(ValueError, "not one of its levels"):
             QuotaGrid(default_share=0.07)

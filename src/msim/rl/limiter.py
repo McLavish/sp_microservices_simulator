@@ -169,9 +169,17 @@ class LimiterKnobs:
         rates: Mapping[str, float],
         rest: float | None = None,
         in_flight: bool = False,
+        ladder: Sequence[float] = (),
+        step_up: int = 0,
+        start: float = 0.0,
     ) -> None:
         self.quota = quota
         self._tap = tap
+        #: `QuotaGrid.step_up`: the levels of `ladder` a share may rise per window (0: any),
+        #: and each tenant's place on it now (it starts at `start`).
+        self._ladder = tuple(ladder)
+        self._step_up = step_up
+        self._place = {tenant: self._ladder.index(start) for tenant in tenants} if step_up else {}
         #: Whether `IN_FLIGHT` is measured (`QuotaGrid.in_flight`).
         self._in_flight = in_flight
         self._now = 0  # the end of the last window measured, ns
@@ -191,7 +199,9 @@ class LimiterKnobs:
 
         With `QuotaGrid(rest=True)`, when no retry asked in the window last
         measured, every tenant gets the default share instead, whatever is
-        given, and that is what is returned (the shares in force).
+        given. With `QuotaGrid(step_up=n)` a share rises by at most `n` levels
+        of the ladder from what the tenant had. In both cases the shares in
+        force are returned.
         """
         for name in values:
             tenant = name.removeprefix(_PREFIX)
@@ -203,9 +213,23 @@ class LimiterKnobs:
         resting = self._rest is not None and self._asked == 0
         if resting:
             values = {_PREFIX + tenant: self._rest for tenant in self.tenants}
+        elif self._step_up:
+            # No further up than `step_up` levels from where the tenant stands.
+            values = {
+                name: self._ladder[
+                    min(
+                        self._ladder.index(share),
+                        self._place[name.removeprefix(_PREFIX)] + self._step_up,
+                    )
+                ]
+                for name, share in values.items()
+            }
         for name, share in values.items():
-            self.quota.set_share(name.removeprefix(_PREFIX), share)
-        return dict(values) if resting else None
+            tenant = name.removeprefix(_PREFIX)
+            self.quota.set_share(tenant, share)
+            if self._step_up:
+                self._place[tenant] = self._ladder.index(share)
+        return dict(values) if resting or self._step_up else None
 
     def measure(self, window_s: float) -> tuple[int, list[float]]:
         """Requests that began in the window, and `MEASURES` for every tenant; resets the counts.
@@ -277,6 +301,14 @@ class QuotaGrid:
     nothing fails. Counts tell a limiter whether retries succeed, not whether
     the service has room for them, and without this entry the room is whatever
     the scenarios it was trained on had.
+
+    `step_up` (default 0: any) is how many levels a tenant's share may rise
+    from one window to the next; it may fall as far as the agent likes. A
+    limiter that lets in more than the service has room for learns of it a
+    window later, and a deployed service was seen to stay congested for the
+    rest of a failure after one such window: with `step_up=1` the agent climbs
+    the ladder a level at a time and is shown each level's effect before the
+    next. The agent is shown the level in force, as with `rest`.
     """
 
     shares: tuple[float, ...] = (0.0, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 3.0)
@@ -285,12 +317,15 @@ class QuotaGrid:
     floor: int = 0
     rest: bool = False
     in_flight: bool = False
+    step_up: int = 0
 
     def __post_init__(self) -> None:
         if self.default_share not in self.shares:
             raise ValueError(
                 f"default_share = {self.default_share!r} is not one of its levels {self.shares}"
             )
+        if self.step_up < 0:
+            raise ValueError(f"step_up is a number of levels >= 0, got {self.step_up}")
         if any(share < 0 for share in self.shares) or self.window_s <= 0:
             raise ValueError("shares are >= 0 and the window is > 0")
 
@@ -331,5 +366,14 @@ class QuotaGrid:
         gate.controllers = (tap, quota)
         rest = self.default_share if self.rest else None
         return LimiterKnobs(
-            quota, tap, tenants, clients, rates, rest=rest, in_flight=self.in_flight
+            quota,
+            tap,
+            tenants,
+            clients,
+            rates,
+            rest=rest,
+            in_flight=self.in_flight,
+            ladder=self.shares,
+            step_up=self.step_up,
+            start=self.default_share,
         )

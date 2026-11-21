@@ -271,6 +271,17 @@ An agent that never saw a window at rest has nothing to compare with and is
 shown 0. It is still not a queue length read from the service nor a latency
 measured by a client: the limiter counts it where it stands.
 
+`QuotaGrid(step_up=n)` (default 0: any) bounds what the agent can do with that:
+a tenant's share rises by at most `n` levels of the ladder from one window to
+the next, and falls as far as the agent says. A limiter learns that it let in
+more than the service has room for a window after it did, and on the deployed
+application one such window was enough: a quota that went from closed to 30%
+at once pushed it past what it serves, and it stayed congested for the rest of
+the failure with the quota closed again. A simulated queue drains as soon as
+the load is back under its capacity, so an agent trained here does not learn
+to fear that step; with `step_up=1` it cannot take it, and is shown each
+level's effect before the next. The agent is shown the level in force.
+
 So the scenario and `as_written` on the same file differ in the limiter and in
 nothing else: `tests/test_rl_limiter.py` checks that a quota which refuses
 nothing gives the file with no limiter, summary for summary.

@@ -302,7 +302,10 @@ mod filter {
                             levels,
                             limiter
                                 .last_in_flight
-                                .map(|value| format!(" in_flight={:.2}", value))
+                                .map(|value| format!(
+                                    " in_flight={:.2} flight_ms={:.2}",
+                                    value, limiter.last_flight_ms
+                                ))
                                 .unwrap_or_default()
                         ),
                     )
