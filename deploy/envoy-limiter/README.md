@@ -1,0 +1,88 @@
+# A learned retry limiter as an Envoy filter
+
+`msim.rl.limiter` trains a limiter in simulation: a retry quota per tenant, as a
+share of that tenant's first attempts over the last second, set once a second
+by a small policy from what the limiter itself counted. This directory is that
+limiter outside the simulator: a Proxy-Wasm HTTP filter in Rust (about 240 KB)
+that an Envoy proxy loads, and the script that turns a trained model into its
+configuration. `docs/rl.md` ("On their Kubernetes prototype") has the
+deployment it was written for and what it measured there.
+
+## What it does
+
+| Piece | Where | In the simulator |
+| --- | --- | --- |
+| The quota: a retry is let in while the tenant's retries of the last window are fewer than `share x` its first attempts of that window | `src/limiter.rs`, `Limiter::admit` | `admission.TenantRetryQuota` |
+| The counts per tenant and window: attempts that ended, those that succeeded, retries that asked, retries let in, success share of the retries; their slow averages; the tenant's level | `Limiter::take`, `Limiter::decide` | `rl.limiter.LimiterKnobs.measure`, `RetryEnv(slow_s=...)` |
+| The policy: tanh layers and a linear head, the largest logit per tenant | `Policy::act` | the PPO model, acting greedily (`rl.train.policy_weights`) |
+| Envoy: attempt number and tenant from request headers, outcome from the response status, a 429 for a refused retry, a tick per window | `src/lib.rs` | `rl.limiter._GateTap` in an `AdmissionGate` |
+
+A first attempt is never refused. A request is a retry when either attempt
+header says more than 1 (`x-envoy-attempt-count`, set by the mesh, or
+`X-Attempt-Number`, set by a client). A request that names no configured tenant
+(a call inside the mesh) is kept apart: it is in no tenant's counts, the policy
+never sees it, and its retries get the fixed `other_share` (10%).
+
+Two things the simulator has no notion of:
+
+- **Threads.** Every Envoy worker thread has a filter instance of its own, and
+  Envoy does not spread connections evenly over them (one thread of a gateway
+  was measured with 95% of the traffic). The policy reads the load off the
+  counts, so the threads of a proxy pool them (`pool_threads`, on by default):
+  each leaves its last window in the proxy's shared data and decides on the
+  sum. `rates` are therefore requests per second per PROXY. The quota needs no
+  pooling: it is a share of a thread's own first attempts.
+- **Callers that give up.** An attempt whose caller went away before any
+  response is counted as ended and failed when its stream closes, as the
+  simulator's gate is told of a deadline.
+
+## Build and test
+
+```bash
+cargo test                                     # the limiter natively (no Envoy needed)
+cargo build --target wasm32-wasip1 --release   # target/wasm32-wasip1/release/learned_filter.wasm
+```
+
+`rust-toolchain.toml` pins the toolchain and the target. `tests/fixture.rs`
+checks the filter's forward pass against the trained model on 64 observations;
+it needs `tests/fixture.json`, which `export.py --fixture` writes (it is not in
+the repository: it holds a model's weights) and is skipped without it.
+
+## Configure
+
+```bash
+uv run --extra train python deploy/envoy-limiter/export.py MODEL.zip limiter.json \
+    --rates 1000 --tenants checkout --fixture deploy/envoy-limiter/tests/fixture.json
+```
+
+`limiter.json` is the `limiter` block of the plugin configuration:
+
+```yaml
+pluginConfig:
+  attempt_header: x-envoy-attempt-count      # the defaults, as in Arolla's filter
+  attempt_header_secondary: X-Attempt-Number
+  tenant_header: X-Retry-Client-Type
+  reject_status: 429
+  pool_threads: true
+  log_windows: false      # one warning line per instance and window, for a run being looked at
+  limiter:                # export.py
+    tenants: [checkout]
+    rates: [1000.0]       # requests per second per proxy when all is well
+    shares: [0.0, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 3.0]
+    default_level: 0
+    window_ms: 1000
+    slow_s: 10.0
+    other_share: 0.1
+    policy: {hidden: [...], head: {...}}
+```
+
+`rates` is the scale of everything the policy is shown: a model trained around
+a nominal rate reads twice that rate as twice the load. Give each proxy the
+tenant's nominal rate divided by the number of proxies that share it. A model
+trained for one tenant can be configured with several: the filter asks it once
+per tenant, each against its own rate.
+
+With Istio the module is a `WasmPlugin` (`url`, `sha256`, the configuration
+above); it exports the counters `learned_first_attempts_total`,
+`learned_retries_admitted_total`, `learned_retries_rejected_total` and the
+gauge `learned_level_sum`.

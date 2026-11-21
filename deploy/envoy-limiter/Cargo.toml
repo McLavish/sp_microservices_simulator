@@ -1,0 +1,22 @@
+[package]
+name = "learned-filter"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Envoy HTTP filter: a retry quota per tenant, set once a second by a small learned policy from the filter's own counts"
+
+[lib]
+name = "learned_filter"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+proxy-wasm = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+lto = true
+opt-level = "s"
+codegen-units = 1
+panic = "abort"
+strip = true
