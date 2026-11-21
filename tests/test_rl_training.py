@@ -189,6 +189,27 @@ class TestSnapshots(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "trained with features"):
                 tr.load_policy(out / "model.zip", RetryEnv(TINY))
 
+    def test_an_agent_that_is_a_limiter_trains_and_is_tied_to_what_it_counts(self):
+        """`rl/limiter.py`: the scenario names its own entries, and the sidecar keeps them."""
+        from msim.rl.limiter import QuotaGrid
+        from tests.test_rl_limiter import _scenario
+
+        limiter = _scenario()
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder)
+            sidecar = tr.train(limiter, out, timesteps=60, n_envs=2, seed=3, verbose=0, slow_s=5.0)
+            self.assertEqual(
+                [k["name"] for k in sidecar["knobs"]], ["quota:plain", "quota:untimed"]
+            )
+            self.assertEqual(sidecar["features"][:2], ["plain:ended", "plain:goodput"])
+            self.assertIn("untimed:goodput~5s", sidecar["features"])
+            (episode,) = tr.evaluate_model(out / "model.zip", [2000], scenario=limiter)
+            self.assertGreater(episode["success_rate"], 0.3)
+            # Another ladder of shares is another meaning of the same action: refused.
+            other = replace(limiter, grid=QuotaGrid(shares=tuple(reversed(QuotaGrid().shares))))
+            with self.assertRaisesRegex(ValueError, "trained with knobs"):
+                tr.load_policy(out / "model.zip", RetryEnv(other, slow_s=5.0))
+
     def test_a_learning_rate_that_falls_to_zero_over_the_run(self):
         with tempfile.TemporaryDirectory() as folder:
             out = Path(folder)
