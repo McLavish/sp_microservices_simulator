@@ -297,6 +297,15 @@ and the cap whether the service has room for them now. It is a concurrency
 limit on retries of the kind proxies have, with the limit measured instead of
 configured.
 
+`QuotaGrid(asked_per_failure=a)` bounds one entry of what the agent is shown:
+the retries a tenant asked are counted as at most `a` per first attempt of its
+that failed in the window. The scales assume a caller of four attempts. One
+that tries eleven times asks ten retries per failed request, an agent trained
+on the former reads that as a far worse failure than it is, and with one level
+for all tenants it closes for everybody: on the deployment a limiter stayed
+closed through a failure of half the calls for exactly that reason. With
+`a = 3` how often a caller asks does not move the quota.
+
 So the scenario and `as_written` on the same file differ in the limiter and in
 nothing else: `tests/test_rl_limiter.py` checks that a quota which refuses
 nothing gives the file with no limiter, summary for summary.

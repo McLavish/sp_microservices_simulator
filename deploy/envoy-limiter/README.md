@@ -97,6 +97,7 @@ pluginConfig:
     step_up: 0            # levels a quota may rise per window, 0: any (`QuotaGrid.step_up`)
     hold_above: null      # no quota rises while the in-flight entry is above this (`QuotaGrid.hold_above`)
     in_flight_cap: null   # a retry is refused above this multiple of the attempts in flight at rest (`QuotaGrid.in_flight_cap`)
+    asked_per_failure: null  # the policy is shown at most this many asking retries per failed first attempt (`QuotaGrid.asked_per_failure`)
     policy: {hidden: [...], head: {...}}
 ```
 

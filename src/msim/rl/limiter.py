@@ -200,6 +200,7 @@ class LimiterKnobs:
         hold_above: float | None = None,
         cap: _FlightCap | None = None,
         cap_times: float = 0.0,
+        asked_per_failure: float | None = None,
     ) -> None:
         self.quota = quota
         self._tap = tap
@@ -207,6 +208,9 @@ class LimiterKnobs:
         #: service is crowded, and how many times the attempts in flight at rest it allows.
         self.cap = cap
         self._cap_times = cap_times
+        #: `QuotaGrid.asked_per_failure`: the retries a tenant is SHOWN to have asked
+        #: are at most this many per first attempt of its that failed in the window.
+        self._asked_per_failure = asked_per_failure
         #: `QuotaGrid.step_up`: the levels of `ladder` a share may rise per window (0: any);
         #: `QuotaGrid.hold_above`: no rise at all while `IN_FLIGHT` is above it. Each
         #: tenant's place on the ladder now (it starts at `start`) is kept for both.
@@ -286,10 +290,14 @@ class LimiterKnobs:
             self._asked += seen.retries_asked
             expected = self.rates[tenant] * window_s
             per_request = 1.0 / expected if expected > 0 else 0.0  # a warm-up of no length
+            asked: float = seen.retries_asked
+            if self._asked_per_failure is not None:
+                failed_firsts = (seen.ended - seen.retries_ended) - (seen.goodput - seen.retries_ok)
+                asked = min(asked, self._asked_per_failure * max(failed_firsts, 0))
             values += [
                 seen.ended * per_request / ATTEMPTS,
                 seen.goodput * per_request / GOODPUT,
-                seen.retries_asked * per_request / ATTEMPTS,
+                asked * per_request / ATTEMPTS,
                 seen.retries_admitted * per_request / ATTEMPTS,
                 seen.retries_ok / seen.retries_ended if seen.retries_ended else 0.0,
             ]
@@ -369,6 +377,16 @@ class QuotaGrid:
     agent decides whether retries are worth letting in, this decides whether
     the service has room for them now. Until there has been a window at rest
     it refuses nothing.
+
+    `asked_per_failure` (default `None`: as counted) bounds what the agent is
+    SHOWN of the retries that asked: at most that many per first attempt of
+    the tenant that failed in the window. The scales assume a caller that
+    tries `ATTEMPTS` times; one that tries eleven times asks for ten retries
+    per failed request, which an agent trained on the former reads as a far
+    worse failure than it is, and closes for everybody. With
+    `asked_per_failure=ATTEMPTS - 1` a caller cannot move the quota by asking
+    more often. Nothing but that entry changes (what rests, what is refused
+    and the counts in `info` are the real ones).
     """
 
     shares: tuple[float, ...] = (0.0, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 3.0)
@@ -380,6 +398,7 @@ class QuotaGrid:
     step_up: int = 0
     hold_above: float | None = None
     in_flight_cap: float | None = None
+    asked_per_failure: float | None = None
 
     def __post_init__(self) -> None:
         if self.default_share not in self.shares:
@@ -449,4 +468,5 @@ class QuotaGrid:
             hold_above=self.hold_above,
             cap=cap,
             cap_times=self.in_flight_cap or 0.0,
+            asked_per_failure=self.asked_per_failure,
         )

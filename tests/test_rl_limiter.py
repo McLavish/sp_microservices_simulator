@@ -399,6 +399,26 @@ class TestTheQuotaGrid(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "in_flight_cap"):
             QuotaGrid(in_flight_cap=0.5)
 
+    def test_a_caller_that_asks_more_often_is_not_shown_to_ask_more(self):
+        # `plain` tries eleven times instead of four, every retry refused (a share of 0).
+        eager = TENANTS.replace("max_attempts: 4, delay_ms: 0", "max_attempts: 11, delay_ms: 0")
+        shown = {}
+        for bound in (None, 3.0):
+            grid = QuotaGrid(asked_per_failure=bound)
+            env = RetryEnv(_scenario(eager, grid=grid))
+            env.reset(options={"episode_seed": 1})
+            names = env.feature_names
+            windows = [dict(zip(names, env.step((0, 0))[0], strict=True)) for _ in range(8)]
+            shown[bound] = max(window["plain:retries_asked"] for window in windows)
+            failing = max(windows, key=lambda window: window["plain:retries_asked"])
+            # What `plain` sends when all is well is 40 a second; the scale is 4 x 40.
+            failed = failing["plain:ended"] * 160 - failing["plain:goodput"] * 80
+            if bound is not None:
+                self.assertLessEqual(failing["plain:retries_asked"] * 160, 3 * failed + 1e-3)
+        # Ten asks per failed request as counted (off the scale), three as shown.
+        self.assertEqual(shown[None], 1.0)
+        self.assertLess(shown[3.0], 0.6)
+
     def test_validation(self):
         with self.assertRaisesRegex(ValueError, "not one of its levels"):
             QuotaGrid(default_share=0.07)

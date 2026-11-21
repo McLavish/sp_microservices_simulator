@@ -143,6 +143,11 @@ pub struct Settings {
     /// have in flight at rest (`QuotaGrid.in_flight_cap`): the one rule that
     /// acts within a window. Not set: no such rule.
     pub in_flight_cap: Option<f64>,
+    /// The retries a tenant is SHOWN to have asked are at most this many per
+    /// first attempt of its that failed in the window
+    /// (`QuotaGrid.asked_per_failure`): a caller that retries ten times does
+    /// not read as a worse failure than one that retries three times.
+    pub asked_per_failure: Option<f64>,
     pub policy: Policy,
 }
 
@@ -163,6 +168,7 @@ impl Default for Settings {
             step_up: 0,
             hold_above: None,
             in_flight_cap: None,
+            asked_per_failure: None,
             policy: Policy::default(),
         }
     }
@@ -530,7 +536,13 @@ impl Limiter {
             let per_request = 1.0 / (rate * window_s);
             measured.push(seen.ended as f64 * per_request / ATTEMPTS);
             measured.push(seen.goodput as f64 * per_request / GOODPUT);
-            measured.push(seen.retries_asked as f64 * per_request / ATTEMPTS);
+            let mut asked = seen.retries_asked as f64;
+            if let Some(bound) = self.settings.asked_per_failure {
+                let firsts_ended = seen.ended.saturating_sub(seen.retries_ended);
+                let firsts_ok = seen.goodput.saturating_sub(seen.retries_ok);
+                asked = asked.min(bound * firsts_ended.saturating_sub(firsts_ok) as f64);
+            }
+            measured.push(asked * per_request / ATTEMPTS);
             measured.push(seen.retries_admitted as f64 * per_request / ATTEMPTS);
             measured.push(if seen.retries_ended > 0 {
                 seen.retries_ok as f64 / seen.retries_ended as f64
@@ -1157,6 +1169,36 @@ mod tests {
         }
         quiet.step(1000);
         assert_eq!(quiet.cap_limit, Some(8.0));
+    }
+
+    #[test]
+    fn a_caller_that_asks_more_often_is_not_shown_to_ask_more() {
+        let run = |asked_per_failure: Option<f64>| {
+            let mut l = Limiter::new(Settings {
+                tenants: vec!["a".into()],
+                rates: vec![40.0],
+                shares: vec![0.0, 3.0],
+                default_level: 0,
+                asked_per_failure,
+                ..Settings::default()
+            })
+            .unwrap();
+            // Forty requests, half of them failing, each failure asking ten times.
+            for i in 0..40 {
+                l.admit(0, false, i * 25);
+                l.ended(0, false, i % 2 == 0, i * 25 + 5);
+                if i % 2 == 1 {
+                    for k in 0..10 {
+                        assert!(!l.admit(0, true, i * 25 + 5 + k));
+                    }
+                }
+            }
+            l.step(1000);
+            l.last_observation[2]
+        };
+        // 200 asks on a scale of 4 x 40 as counted (off the scale); 3 x 20 as shown.
+        assert!((run(None) - 1.0).abs() < 1e-9);
+        assert!((run(Some(3.0)) - 60.0 / 160.0).abs() < 1e-6);
     }
 
     #[test]
