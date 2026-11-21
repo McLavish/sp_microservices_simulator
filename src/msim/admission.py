@@ -376,6 +376,92 @@ class SuccessFundedBudget(RetryController):
 
 
 @dataclass
+class _QuotaState:
+    #: When each first attempt, and each retry, of the last window was let in.
+    firsts: deque[TimePoint] = field(default_factory=deque)
+    retries: deque[TimePoint] = field(default_factory=deque)
+
+
+@dataclass
+class TenantRetryQuota(RetryController):
+    """Retries as a share of the first attempts, tenant by tenant.
+
+    A retry of a tenant is let in while its retries let in during the last
+    `window` are fewer than `share x n`, where `n` is the number of ITS first
+    attempts let in during that window. Both are counted and the share is an
+    exact fraction, so there is no balance to drift and none to spend down: a
+    share of 0 lets no retry in, from the next one on, and a share of 3 never
+    refuses a caller that tries four times. The count is compared with the
+    product as it is, fractions included, the way `GoodputCoupledBudget`
+    compares it with its allowance: 3.5 lets a fourth retry in.
+
+    Each tenant has the share `set_share` gave it, or `share`. A share can be
+    changed while a run is in progress: it is read at each retry that asks, and
+    changing it draws nothing and schedules nothing.
+
+    For a gate, which shows it the first attempts too. Behind a
+    `ControlledRetryPolicy`, which is only asked about retries, it would count
+    no first attempt and refuse every retry.
+    """
+
+    share: float = 0.1  # retries per first attempt, for a tenant with no share of its own
+    window: TimeDuration = S_TO_NS
+
+    _default: Fraction = field(init=False, repr=False)
+    _shares: dict[str | None, Fraction] = field(default_factory=dict, init=False, repr=False)
+    _tenants: dict[str | None, _QuotaState] = field(default_factory=dict, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._default = self._exact(self.share)
+        _positive_duration(self.window, "window")
+
+    @staticmethod
+    def _exact(share: float) -> Fraction:
+        if isinstance(share, bool) or not math.isfinite(share) or share < 0:
+            raise ValueError(f"a share must be a finite number >= 0, got {share!r}")
+        return Fraction(share).limit_denominator(_MAX_DENOMINATOR)
+
+    def set_share(self, tenant: str | None, share: float) -> None:
+        """Give `tenant` a share of its own, from its next retry on."""
+        self._shares[tenant] = self._exact(share)  # raises before anything is touched
+
+    def share_of(self, tenant: str | None) -> float:
+        """Retries per first attempt `tenant` may have."""
+        return float(self._shares.get(tenant, self._default))
+
+    def _state(self, tenant: str | None, now: TimePoint) -> _QuotaState:
+        """The tenant's counts, with what has left the window dropped."""
+        state = self._tenants.get(tenant)
+        if state is None:
+            state = self._tenants[tenant] = _QuotaState()
+        cutoff = now - self.window
+        for times in (state.firsts, state.retries):
+            while times and times[0] < cutoff:
+                times.popleft()
+        return state
+
+    def in_window(self, tenant: str | None, now: TimePoint) -> tuple[int, int]:
+        """`(first attempts, retries)` of `tenant` let in during the window ending now."""
+        state = self._state(tenant, now)
+        return len(state.firsts), len(state.retries)
+
+    def commit(self, request: AdmissionRequest) -> None:
+        state = self._state(request.tenant, request.now)
+        (state.retries if request.is_retry else state.firsts).append(request.now)
+
+    def admits_retry(self, request: AdmissionRequest) -> bool:
+        state = self._state(request.tenant, request.now)
+        share = self._shares.get(request.tenant, self._default)
+        # len(retries) < share x len(firsts), in whole numbers.
+        return len(state.retries) * share.denominator < share.numerator * len(state.firsts)
+
+    def give_back(self, request: AdmissionRequest) -> None:
+        retries = self._state(request.tenant, request.now).retries
+        if retries:
+            retries.pop()
+
+
+@dataclass
 class FailureRateGate(RetryController):
     """No retries while the server is failing: a breaker on retries alone.
 

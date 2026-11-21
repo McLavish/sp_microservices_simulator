@@ -258,8 +258,8 @@ uncapped half-open probe admission noted above is one code path, not two.
 A controller outside the event loop can re-tune a client between two events: it
 pauses the run at an instant (`sim.run(until=t)` returns with every event up to
 `t` done; resuming changes nothing), sets what it wants, and lets the run go on.
-Four settings are meant for this, and `tests/test_policy_changes_mid_run.py` pins
-when each takes effect:
+Four settings of a client and one of a limiter are meant for this, and
+`tests/test_policy_changes_mid_run.py` pins when each takes effect:
 
 | Setting | Read | So a new value applies |
 | --- | --- | --- |
@@ -267,13 +267,14 @@ when each takes effect:
 | `StaticTimeoutController.attempt_timeout` | when an attempt starts | to attempts that start afterwards. An attempt in flight keeps its deadline |
 | `StaticTimeoutController.global_timeout` | when a request starts | to requests that start afterwards |
 | `RetryBudgetPolicy.set_budget_ratio(ratio)` | at each deposit | to the requests admitted afterwards. The balance keeps its value in retries (rounded down by less than one token), a full budget stays full, and the same ratio again is an exact no-op |
+| `TenantRetryQuota.set_share(tenant, share)` (at an `AdmissionGate`) | at each retry that asks to be let in | to the tenant's next retry. What was let in stays in, and still counts against the new share for the rest of its window |
 
 Assign the first three; the budget's ratio has a method because the ratio is
 turned into integer token units when the policy is built, so assigning
 `budget_ratio` does nothing. The same holds for other parameters that are
 converted or sized at construction (a limiter's period, a breaker's window
 sizes): changing those means building a new policy and replacing
-`client.cfg`, which starts its state afresh. None of the four draws from the
+`client.cfg`, which starts its state afresh. None of the five draws from the
 simulator's RNG or schedules an event, so a run in which nothing is changed is
 the run it always was.
 
@@ -797,6 +798,7 @@ that have left, and a tandem chain node holds no worker while it waits.
 | `FailureRateGate(failure_threshold, min_requests, window, open_delay)` | unless more than the threshold of the last window's outcomes failed; closes again when the success rate is back and `open_delay` has passed | global |
 | `GoodputCoupledBudget(alpha, beta_down, beta_up, window, ...)` | while the tenant has fewer than `alpha x goodput` retries in the window, its goodput being its smoothed rate of successes here (quick to fall, slow to recover) | **per tenant** |
 | `ConcurrencyRetryBudget(budget_percent, min_retry_concurrency)` | while the retries in flight are less than a share of all attempts in flight (Envoy's retry budget) | the gate's account |
+| `TenantRetryQuota(share, window)` | while the tenant has fewer than `share x n` retries in the window, `n` being ITS first attempts let in during that window; each tenant can be given a share of its own, while a run is in progress (`set_share`) | **per tenant** |
 
 All of them only ever refuse retries (`RetryController`): a first attempt passes
 untouched and uncharged. Balances are exact (integer token units, rational

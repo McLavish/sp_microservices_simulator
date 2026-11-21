@@ -33,7 +33,12 @@ from pathlib import Path
 
 import pytest
 
-from msim.admission import AdmissionGate, GoodputCoupledBudget, TokenBucketBudget
+from msim.admission import (
+    AdmissionGate,
+    GoodputCoupledBudget,
+    TenantRetryQuota,
+    TokenBucketBudget,
+)
 from msim.caller import ClientConfig, ClientRuntime, RetryLayer
 from msim.chain import DownstreamEdge, ServiceNodeRuntime
 from msim.core import DropReason, TimeInterval, ms_to_ns, s_to_ns
@@ -660,6 +665,50 @@ def _admission(seed: int = 6161):
     return sim, clients, [station], [counts, gate.outstanding, gate.outstanding_retries]
 
 
+def _tenant_quota(seed: int = 7171, changes: bool = True):
+    """Three tenants behind a gate that gives each a share of its own first attempts.
+
+    The station of `_admission`, failing for a second. The shares are moved
+    while the run is paused, as a controller outside the event loop moves them:
+    one tenant is closed off during the failure and opened again, one is opened
+    wide, one keeps the default. `changes=False` pauses at the same instants and
+    sets nothing.
+    """
+    sim = Simulator(seed=seed)
+    station = ServiceRuntime(
+        cfg=ServiceConfig(
+            name="svc",
+            latency_median=ms_to_ns(8),
+            latency_lognorm_sigma=0.5,
+            workers=3,
+            queue_capacity=6,
+            partial_failures=[PartialFailure(TimeInterval(s_to_ns(1), s_to_ns(2)), p_fail=0.6)],
+        )
+    ).bind()
+    quota = TenantRetryQuota(share=0.2)
+    gate = AdmissionGate(station, [quota])
+    clients = []
+    for index, tenant in enumerate(("steady", "closed", "wide")):
+        client = ClientRuntime(
+            cfg=ClientConfig(retry=_fixed(4, 2), timeout_controller=_static(40), tenant=tenant),
+            service=gate,
+        )
+        Workload(base_rps=150.0, duration_s=3.0, load_spikes=[], rng_seed=seed + index).drive(
+            sim, client.start_request
+        )
+        clients.append(client)
+    for at_s, tenant, share in ((1.2, "closed", 0.0), (1.5, "wide", 3.0), (2.4, "closed", 0.5)):
+        sim.run(until=s_to_ns(at_s))
+        if changes:
+            quota.set_share(tenant, share)
+    sim.run()
+    counts = sorted(
+        (tenant, c.attempts, c.rejected, c.retries_asked, c.retries_admitted)
+        for tenant, c in gate.counts.items()
+    )
+    return sim, clients, [station], [counts, gate.outstanding, gate.outstanding_retries]
+
+
 def _dependencies(seed: int = 2718):
     """A handler that gathers before it works: calls first, local work last.
 
@@ -1090,6 +1139,12 @@ _ADMISSION: Trace = (
     "25279339ffb61af8812524331fe3b4e6d15c056142b22b5d8e4e3ff3faae7fe3",
 )
 
+_TENANT_QUOTA: Trace = (
+    "dc527bdec21dac92b21142da5b46a0f6ae3ecbd1d523157e8d145d4e415a2397",
+    5329,
+    "70ce80371627852e4f4dc9d1dd9ccdbadf1e2cb1e79cf24513ff6f95f76f0f75",
+)
+
 
 # `_queue_order(QueueDiscipline.FCFS, server_deadline=...)`: the attempt timeout
 # stays with the client, and the stations serve the orphans it leaves behind.
@@ -1220,6 +1275,28 @@ class TestTraceGoldens(unittest.TestCase):
             self.assertGreater(attempts, asked)
         self.assertEqual((outstanding, outstanding_retries), (0, 0))
         self.assertEqual(_trace(sim, clients, services, extra=gate_state), _ADMISSION)
+
+    def test_tenant_quota_trace(self):
+        """`TenantRetryQuota` switched on, its shares moved while the run is paused."""
+        sim, clients, services, gate_state = _tenant_quota()
+        reasons = _reasons(clients)
+        for reason in ("NONE", "QUEUE_FULL", "DEADLINE", "SERVER_FAILURE", "REJECTED"):
+            self.assertGreater(reasons[reason], 0, reason)
+        counts, outstanding, outstanding_retries = gate_state
+        admitted = {}
+        for tenant, attempts, rejected, asked, let_in in counts:
+            self.assertEqual(asked, let_in + rejected)
+            self.assertGreater(attempts, asked)
+            admitted[tenant] = let_in
+        self.assertEqual((outstanding, outstanding_retries), (0, 0))
+        # The tenant opened wide got several times the retries of the one left alone.
+        self.assertGreater(admitted["wide"], 3 * admitted["steady"])
+        self.assertEqual(_trace(sim, clients, services, extra=gate_state), _TENANT_QUOTA)
+        # Pausing at the same instants and setting nothing is another run: the
+        # shares are what made the difference, not the pauses.
+        _, _, _, (untouched, _, _) = _tenant_quota(changes=False)
+        left_alone = {tenant: let_in for tenant, _, _, _, let_in in untouched}
+        self.assertLess(left_alone["wide"], 2 * admitted["steady"])
 
     def test_retry_by_cause_trace(self):
         sim, clients, services, policy_state = _retry_by_cause()

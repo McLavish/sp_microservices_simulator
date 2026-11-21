@@ -30,6 +30,7 @@ from msim.admission import (
     FailureRateGate,
     GoodputCoupledBudget,
     SuccessFundedBudget,
+    TenantRetryQuota,
     TokenBucketBudget,
 )
 from msim.caller import ClientConfig, ClientRuntime
@@ -426,6 +427,7 @@ class TestFirstAttemptsAreNeverCharged(unittest.TestCase):
             FailureRateGate(failure_threshold=0.5, min_requests=1, window=S, open_delay=0),
             GoodputCoupledBudget(),
             ConcurrencyRetryBudget(),
+            TenantRetryQuota(share=0.0),
         ]
         for controller in controllers:
             with self.subTest(controller=type(controller).__name__):
@@ -768,6 +770,88 @@ class TestGoodputCoupledBudget(unittest.TestCase):
         for kwargs in bad:
             with self.subTest(**kwargs), self.assertRaises(ValueError):
                 GoodputCoupledBudget(**kwargs)
+
+
+class TestTenantRetryQuota(unittest.TestCase):
+    def _firsts(self, quota, n: int, start: int = 0, tenant: str | None = "a", step: int = MS):
+        for i in range(n):
+            quota.commit(_first(start + i * step, tenant))
+
+    def test_retries_are_a_share_of_the_first_attempts_of_the_window(self):
+        quota = TenantRetryQuota(share=0.1)
+        self.assertFalse(_take(quota, 0, "a"))  # nothing has arrived: nothing is owed
+        self._firsts(quota, 30)
+        self.assertEqual(_drain(quota, 40 * MS, "a"), 3)
+        self.assertEqual(quota.in_window("a", 40 * MS), (30, 3))
+        # The count is compared with the product as it is, as Arolla's rule does:
+        # 35 first attempts are 3.5 retries, and a fourth is let in while 3 < 3.5.
+        self._firsts(quota, 5, start=40 * MS)
+        self.assertEqual(_drain(quota, 50 * MS, "a"), 1)
+
+    def test_a_first_attempt_and_a_retry_leave_the_window_a_second_later(self):
+        quota = TenantRetryQuota(share=0.5)
+        self._firsts(quota, 2)  # at 0 and 1 ms
+        self.assertTrue(_take(quota, 2 * MS, "a"))
+        self.assertFalse(_take(quota, 3 * MS, "a"))
+        # At 1 s the first attempt of t = 0 is still inside; a moment later it is gone,
+        # and so is half a retry of allowance, while the retry of 2 ms still counts.
+        self.assertEqual(quota.in_window("a", S), (2, 1))
+        self.assertEqual(quota.in_window("a", S + MS // 2), (1, 1))
+        self._firsts(quota, 4, start=S + MS)
+        self.assertTrue(_take(quota, S + 5 * MS, "a"))  # the old retry has left as well
+
+    def test_a_share_of_zero_lets_no_retry_in_and_a_large_one_refuses_nobody(self):
+        closed, wide = TenantRetryQuota(share=0.0), TenantRetryQuota(share=3.0)
+        for quota in (closed, wide):
+            self._firsts(quota, 10)
+        self.assertEqual(_drain(closed, 20 * MS, "a"), 0)
+        self.assertEqual(_drain(wide, 20 * MS, "a"), 30)  # three retries per first attempt
+
+    def test_each_tenant_has_its_own_share_and_its_own_counts(self):
+        quota = TenantRetryQuota(share=0.1)
+        quota.set_share("b", 0.5)
+        self.assertEqual((quota.share_of("a"), quota.share_of("b")), (0.1, 0.5))
+        self._firsts(quota, 10, tenant="a")
+        self._firsts(quota, 10, tenant="b")
+        self.assertEqual(_drain(quota, 20 * MS, "b"), 5)
+        self.assertEqual(_drain(quota, 20 * MS, "a"), 1)  # b spent nothing of a's
+        self.assertEqual(_drain(quota, 20 * MS, "c"), 0)  # and c has sent nothing
+
+    def test_a_share_with_many_decimals_is_not_rounded_down(self):
+        quota = TenantRetryQuota(share=0.0867)
+        self._firsts(quota, 12)
+        self.assertEqual(_drain(quota, 20 * MS, "a"), 2)  # 12 x 0.0867 = 1.04: a second one fits
+
+    def test_a_refund_takes_the_retry_out_of_the_window(self):
+        quota = TenantRetryQuota(share=0.1)
+        self._firsts(quota, 10)
+        request = _retry(20 * MS, "a")
+        self.assertTrue(quota.check(request))
+        quota.commit(request)
+        self.assertFalse(quota.check(_retry(21 * MS, "a")))
+        quota.refund(request)
+        self.assertTrue(quota.check(_retry(21 * MS, "a")))
+
+    def test_checking_alone_spends_nothing(self):
+        quota = TenantRetryQuota(share=0.1)
+        self._firsts(quota, 10)
+        for _ in range(5):
+            self.assertTrue(quota.check(_retry(20 * MS, "a")))
+        self.assertEqual(quota.in_window("a", 20 * MS), (10, 0))
+
+    def test_validation(self):
+        for bad in (-0.1, float("nan"), float("inf"), True):
+            with self.subTest(share=bad), self.assertRaises(ValueError):
+                TenantRetryQuota(share=bad)
+            with self.subTest(set_share=bad), self.assertRaises(ValueError):
+                TenantRetryQuota().set_share("a", bad)
+        with self.assertRaises(ValueError):
+            TenantRetryQuota(window=0)
+        quota = TenantRetryQuota(share=0.2)
+        quota.set_share("a", 0.4)
+        with self.assertRaises(ValueError):
+            quota.set_share("a", -1.0)
+        self.assertEqual(quota.share_of("a"), 0.4)  # a refused share changes nothing
 
 
 class TestConcurrencyRetryBudget(unittest.TestCase):

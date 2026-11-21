@@ -1,15 +1,17 @@
 """What a controller may change on a client between two events, and when it takes effect.
 
 `docs/request-handling.md` ("Changing a policy while a run is in progress")
-names four settings that can be re-tuned while a run is paused. The three that
-are plain attributes are pinned here, on a station whose timing is known to the
-millisecond; the fourth, `RetryBudgetPolicy.set_budget_ratio`, has its
+names the settings that can be re-tuned while a run is paused. The three of a
+client that are plain attributes are pinned here, on a station whose timing is
+known to the millisecond, and so is the one of a limiter
+(`TenantRetryQuota.set_share`); `RetryBudgetPolicy.set_budget_ratio` has its
 arithmetic in `test_retry_policies.py` and a seeded run in
 `test_trace_goldens.py`.
 """
 
 import unittest
 
+from msim.admission import AdmissionGate, TenantRetryQuota
 from msim.caller import ClientConfig, ClientRuntime
 from msim.core import DropReason, RootRequest, TimeInterval, ms_to_ns, ns_to_ms, s_to_ns
 from msim.faults import PartialFailure
@@ -103,6 +105,87 @@ class TestChangesBetweenEvents(unittest.TestCase):
         self.assertEqual(len(first.attempts), 3)
         self.assertEqual(second.global_deadline, ms_to_ns(25))
         self.assertEqual(len(second.attempts), 1)  # the retry at 30 ms is past its deadline
+
+
+class TestALimitersShareBetweenEvents(unittest.TestCase):
+    """One tenant whose every call fails, behind a gate with a retry quota.
+
+    A request every 10 ms from t = 0, up to three attempts each, no backoff: an
+    attempt ends 10 ms after it started and the next one asks at once.
+    """
+
+    def _run(self, change_at_ms: float | None = None, share: float = 0.0):
+        sim = Simulator(seed=5)
+        station = ServiceRuntime(
+            cfg=ServiceConfig(
+                name="svc",
+                latency_median=ms_to_ns(10),
+                latency_lognorm_sigma=0.0,
+                workers=64,
+                partial_failures=[PartialFailure(TimeInterval(0, s_to_ns(10)), p_fail=1.0)],
+            )
+        ).bind()
+        quota = TenantRetryQuota(share=1.0)
+        gate = AdmissionGate(station, [quota])
+        client = ClientRuntime(
+            cfg=ClientConfig(
+                retry=FixedBackoffRetryPolicy(max_attempts=3, delay=0),
+                timeout_controller=StaticTimeoutController(
+                    global_timeout=None, attempt_timeout=None
+                ),
+                tenant="a",
+            ),
+            service=gate,
+        )
+        roots: list[RootRequest] = []
+        for index in range(20):  # at 0, 10, ..., 190 ms
+            sim.schedule(ms_to_ns(10 * index), lambda: roots.append(client.start_request(sim)))
+        if change_at_ms is not None:
+            sim.run(until=ms_to_ns(change_at_ms))
+            quota.set_share("a", share)
+        sim.run()
+        return roots, gate, sim
+
+    def _retries(self, roots: list[RootRequest], *, since_ms: float = 0.0):
+        """`(asked at, ms; how it ended)` of every retry from `since_ms` on."""
+        return sorted(
+            (round(ns_to_ms(attempt.interval.begin)), attempt.drop_reason.name)
+            for root in roots
+            for attempt in root.attempts[1:]
+            if attempt.interval.begin >= ms_to_ns(since_ms)
+        )
+
+    def test_a_share_of_one_lets_in_as_many_retries_as_first_attempts(self):
+        roots, gate, _ = self._run()
+        counts = gate.counts["a"]
+        self.assertEqual(counts.attempts - counts.retries_asked, 20)  # the first attempts
+        self.assertEqual(counts.retries_asked, counts.retries_admitted + counts.rejected)
+        self.assertGreater(counts.rejected, 0)  # a third attempt is one retry too many
+        self.assertLessEqual(counts.retries_admitted, 20)
+        self.assertEqual(gate.outstanding, 0)
+
+    def test_a_new_share_applies_to_the_next_retry_that_asks(self):
+        untouched, _, sim = self._run()
+        closed, gate, closed_sim = self._run(95, share=0.0)
+        # Up to 95 ms the two runs are one run ...
+        early = [r for r in self._retries(untouched) if r[0] < 95]
+        self.assertEqual([r for r in self._retries(closed) if r[0] < 95], early)
+        self.assertIn("SERVER_FAILURE", {reason for _, reason in early})  # some were let in
+        # ... and from then on every retry that asks is refused, the first at 100 ms.
+        late = self._retries(closed, since_ms=95)
+        self.assertEqual(late[0][0], 100)
+        self.assertEqual({reason for _, reason in late}, {"REJECTED"})
+        # The retry let in at 90 ms was at the station when the share changed, and stayed.
+        self.assertIn((90, "SERVER_FAILURE"), early)
+        self.assertEqual(gate.outstanding, 0)
+        self.assertLess(closed_sim._seq, sim._seq)  # fewer attempts, nothing else
+
+    def test_setting_the_share_a_tenant_has_changes_nothing(self):
+        untouched, _, sim = self._run()
+        same, _, same_sim = self._run(95, share=1.0)
+        self.assertEqual(self._retries(same), self._retries(untouched))
+        self.assertEqual(same_sim._seq, sim._seq)
+        self.assertEqual(same_sim.rng().getstate(), sim.rng().getstate())
 
 
 if __name__ == "__main__":
