@@ -21,7 +21,7 @@ doing, or would any sensible fixed client setting do as well?
 
 Training episodes vary the failure the way Arolla's paper varies it in its
 evaluation (failure rate, how long it lasts, offered load); the comparison is
-made on their file as it is, on that distribution, and along each axis.
+made on their file as it is, on that varied situation, and along each axis.
 Everything is paired: for a seed, every row faces the same failure and the
 same arrivals. Whatever is chosen is chosen on other episodes than it is
 reported on: the fixed setting, the trained model among the runs and their
@@ -57,8 +57,9 @@ ALPHAS = (0.01, 0.05, 0.1, 0.2, 0.5)
 #: The yardstick: per condition, the fixed client setting best for it alone.
 INFORMED = "fixed, told the fault"
 
-#: What a training episode draws. Their file is the middle of it: half the calls
-#: failing from 20 s for 20 s, at the file's load.
+#: The varied situation: what an episode draws, in training and in the "varied"
+#: row of the comparison. Their file is the middle of it: half the calls failing
+#: from 20 s for 20 s, at the file's load.
 TRAINING = Variation(p_fail=(0.1, 0.9), onset_s=(10.0, 20.0), length_s=(5.0, 35.0), load=(0.7, 1.3))
 #: The axes of their evaluation, each walked with the others at the file's values.
 AXES: dict[str, tuple[float, ...]] = {
@@ -76,8 +77,8 @@ def point(**values: float) -> Variation:
 
 
 def conditions() -> dict[str, Variation]:
-    """Where policies are compared: their file, the training distribution, each axis."""
-    found = {"their file": point(), "training distribution": TRAINING}
+    """Where policies are compared: their file, the varied situation, each axis."""
+    found = {"their file": point(), "varied": TRAINING}
     for axis, values in AXES.items():
         for value in values:
             if value != FILE[axis]:  # the file's own value is "their file"
@@ -147,7 +148,7 @@ def with_alpha(arolla: Path, out: Path) -> dict[float, Path]:
 
 
 def static(args: argparse.Namespace) -> None:
-    """Every fixed client setting on the training distribution, ranked."""
+    """Every fixed client setting on the varied situation, ranked."""
     search = evaluate.static_search(
         situation(args.arolla, TRAINING), args.selection, jobs=args.jobs
     )
@@ -190,11 +191,15 @@ def informed(args: argparse.Namespace) -> None:
 
 
 def train(args: argparse.Namespace) -> None:
-    """One PPO run on the training distribution."""
+    """One PPO run on the varied situation (or on a wider range of loads, `--train-load`)."""
     from msim.rl.train import train as train_ppo
 
+    # What the comparison calls the varied situation is fixed; what a run trains
+    # on may reach further, so that the ends of the range are not the ends of
+    # what the policy has seen.
+    training = TRAINING if args.train_load is None else replace(TRAINING, load=args.train_load)
     sidecar = train_ppo(
-        situation(args.arolla, TRAINING),
+        situation(args.arolla, training),
         args.out,
         timesteps=args.timesteps,
         n_envs=args.n_envs,
@@ -224,7 +229,7 @@ def compare(args: argparse.Namespace) -> None:
     candidates = models + sorted((out / "runs").glob("*/snapshots/model-*.zip"))
 
     # Which trained model to report: the best on the SELECTION episodes of the
-    # training distribution. The test episodes play no part in the choice.
+    # varied situation. The test episodes play no part in the choice.
     tasks = [("model", model, arolla, TRAINING, args.selection) for model in candidates]
     scores = [_success(e) for e in evaluate.in_parallel(_episodes, tasks, args.jobs)]
     ranked = sorted(zip(scores, candidates, strict=True), reverse=True)
@@ -241,7 +246,7 @@ def compare(args: argparse.Namespace) -> None:
         rows[f"their clients, {policy}"] = ("written", policy)
 
     # Their limiter at its best, chosen the way our rows are: on the selection
-    # episodes of the training distribution.
+    # episodes of the varied situation.
     files = with_alpha(arolla, out)
     tasks = [("written", path, arolla, TRAINING, args.selection) for path in files.values()]
     scores = [_success(e) for e in evaluate.in_parallel(_episodes, tasks, args.jobs)]
@@ -298,9 +303,9 @@ def compare(args: argparse.Namespace) -> None:
         )
 
     # How much rides on the run that was chosen: every run, on their file and
-    # on the training distribution.
+    # on the varied situation.
     every: dict[str, dict[str, float]] = {}
-    for name in ("their file", "training distribution"):
+    for name in ("their file", "varied"):
         tasks = [("model", model, arolla, where[name], args.test) for model in models]
         runs = evaluate.in_parallel(_episodes, tasks, args.jobs)
         every[name] = {
@@ -356,9 +361,21 @@ def main(arguments: Sequence[str] | None = None) -> None:
     parser.add_argument(
         "--test-seeds", type=int, default=64, help="episodes results are reported on"
     )
+    parser.add_argument(
+        "--test-from", type=int, default=2_000, help="the first of the episodes reported on"
+    )
+    parser.add_argument(
+        "--train-load",
+        type=float,
+        nargs=2,
+        metavar=("LOW", "HIGH"),
+        help="train on loads drawn from this range instead of the comparison's 0.7 to 1.3",
+    )
     args = parser.parse_args(arguments)
+    if args.train_load is not None:
+        args.train_load = tuple(args.train_load)
     args.selection = tuple(range(1_000, 1_000 + args.selection_seeds))
-    args.test = tuple(range(2_000, 2_000 + args.test_seeds))
+    args.test = tuple(range(args.test_from, args.test_from + args.test_seeds))
     commands = {"static": static, "informed": informed, "train": train, "compare": compare}
     commands[args.command](args)
 
