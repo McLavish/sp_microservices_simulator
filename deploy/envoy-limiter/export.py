@@ -5,9 +5,9 @@
 
 Writes the `limiter` block of the filter's plugin configuration: the tenants in the policy's
 order, the requests per second each sends one PROXY when all is well (`--rates`, the scale of
-everything the policy is shown), the ladder of shares, the level held until the policy has
-spoken, the window, the time constant of the slow averages, and the policy's weights
-(`msim.rl.train.policy_weights`).
+everything the policy is shown), the ladder of shares, the probe floor the model was trained
+with, the level held until the policy has spoken, the window, the time constant of the slow
+averages, and the policy's weights (`msim.rl.train.policy_weights`).
 
 `--tenants` names the tenants as the deployment's requests name them (the model knows them by
 position). A model trained for ONE tenant can be given several: the filter then asks it once
@@ -26,6 +26,13 @@ from pathlib import Path
 import numpy as np
 
 from msim.rl import train
+
+
+def trained_floor(sidecar: dict) -> int:
+    """`QuotaGrid.floor` of the scenario the model was trained on (0 when it had none)."""
+    settings = sidecar.get("scenario_settings") or {}
+    first = (settings.get("scenarios") or [settings])[0]  # one of several, or the only one
+    return int((first.get("grid") or {}).get("floor", 0))
 
 
 def limiter_block(
@@ -50,6 +57,7 @@ def limiter_block(
         "tenants": tenants,
         "rates": rates,
         "one_level": one_level,
+        "floor": trained_floor(sidecar),
         "shares": shares,
         "default_level": knobs[0]["default"],
         "window_ms": round(1000 * sidecar["step_s"]),

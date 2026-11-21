@@ -115,6 +115,9 @@ pub struct Settings {
     /// One level for every tenant, decided from their counts added up, instead
     /// of a level per tenant (`decide`).
     pub one_level: bool,
+    /// Retries per tenant and window let in whatever the level: a probe, so
+    /// that a level of 0 still shows whether a retry succeeds again.
+    pub floor: usize,
     pub policy: Policy,
 }
 
@@ -129,6 +132,7 @@ impl Default for Settings {
             slow_s: 10.0,
             other_share: 0.1,
             one_level: false,
+            floor: 0,
             policy: Policy::default(),
         }
     }
@@ -312,8 +316,12 @@ impl Limiter {
             return true;
         }
         state.seen.retries_asked += 1;
-        // retries < share x firsts, the count against the product as it is.
-        if (state.retries.len() as f64) < share * state.firsts.len() as f64 {
+        // The probe, then: retries < share x firsts, the count against the
+        // product as it is.
+        let floor = if tenant < self.settings.tenants.len() { self.settings.floor } else { 0 };
+        if state.retries.len() < floor
+            || (state.retries.len() as f64) < share * state.firsts.len() as f64
+        {
             state.retries.push_back(now);
             state.seen.retries_admitted += 1;
             true
@@ -698,6 +706,27 @@ mod tests {
         }
         assert_eq!((0..400).filter(|_| l.admit(0, true, 1100)).count(), 30);
         assert_eq!((0..400).filter(|_| l.admit(1, true, 1100)).count(), 270);
+    }
+
+    #[test]
+    fn a_floor_lets_one_retry_a_window_in_at_a_share_of_zero() {
+        let mut l = Limiter::new(Settings {
+            tenants: vec!["a".into(), "b".into()],
+            rates: vec![40.0, 40.0],
+            shares: vec![0.0],
+            floor: 1,
+            ..Settings::default()
+        })
+        .unwrap();
+        for i in 0..20 {
+            l.admit(0, false, i);
+        }
+        assert_eq!((0..10).filter(|_| l.admit(0, true, 30)).count(), 1);
+        assert_eq!((0..10).filter(|_| l.admit(1, true, 30)).count(), 1); // each tenant its own
+        assert_eq!((0..10).filter(|_| l.admit(0, true, 1100)).count(), 1); // and each window
+        // Not for requests that are nobody's: theirs is the fixed share.
+        let other = l.tenant(None);
+        assert_eq!((0..10).filter(|_| l.admit(other, true, 30)).count(), 0);
     }
 
     #[test]

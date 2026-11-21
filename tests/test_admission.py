@@ -896,7 +896,7 @@ class TestTenantRetryQuota(unittest.TestCase):
         self.assertEqual(_drain(wide, 20 * MS, "a"), 5)
         for bad in (-1, 1.5, True):
             with self.subTest(floor=bad), self.assertRaisesRegex(ValueError, "floor"):
-                TenantRetryQuota(floor=bad)
+                TenantRetryQuota(floor=bad)  # ty: ignore[invalid-argument-type]
 
     def test_each_tenant_has_its_own_share_and_its_own_counts(self):
         quota = TenantRetryQuota(share=0.1)
