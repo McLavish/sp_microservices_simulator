@@ -12,7 +12,7 @@ deployment it was written for and what it measured there.
 
 | Piece | Where | In the simulator |
 | --- | --- | --- |
-| The quota: a retry is let in while the tenant's retries of the last window are fewer than `share x` its first attempts of that window | `src/limiter.rs`, `Limiter::admit` | `admission.TenantRetryQuota` |
+| The quota: a retry is let in while the tenant's retries of the last window are fewer than `share x` its first attempts of that window, or fewer than `floor` | `src/limiter.rs`, `Limiter::admit` | `admission.TenantRetryQuota` |
 | The counts per tenant and window: attempts that ended, those that succeeded, retries that asked, retries let in, success share of the retries; their slow averages; the tenant's level | `Limiter::take`, `Limiter::decide` | `rl.limiter.LimiterKnobs.measure`, `RetryEnv(slow_s=...)` |
 | The policy: tanh layers and a linear head, the largest logit per tenant | `Policy::act` | the PPO model, acting greedily (`rl.train.policy_weights`) |
 | Envoy: attempt number and tenant from request headers, outcome from the response status, a 429 for a refused retry, a tick per window | `src/lib.rs` | `rl.limiter._GateTap` in an `AdmissionGate` |
@@ -84,6 +84,7 @@ pluginConfig:
     slow_s: 10.0
     other_share: 0.1
     one_level: false      # one level for every tenant, from their counts together
+    floor: 0              # retries per tenant, window and thread let in whatever the level (a probe)
     policy: {hidden: [...], head: {...}}
 ```
 
