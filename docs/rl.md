@@ -315,3 +315,129 @@ vector waits for its slowest simulation, and a window in which a client retries
 into an overloaded station takes several times the median (p99 is 46 ms against
 a median of 13 on the single service). Collecting whole episodes per process,
 with no waiting between steps, is what would recover the rest.
+
+## A learned client policy against Arolla's limiter (`examples/rl_vs_arolla.py`)
+
+[Arolla](https://github.com/eth-easl/Arolla) protects a service from its
+callers' retries at the server: it admits retries up to a share of the
+goodput. Its simulator ships one situation under each server-side policy,
+`snowflake/policy-{none,cb,rb,aimd,arolla}.yaml`: a 16-worker service, four
+tenants of 40 requests per second with four different client retry policies,
+and half the calls failing from 20 s to 40 s. The study asks the question
+from the other side: with NO server-side policy (`policy-none`) and one
+learned retry policy on all four tenants, is the service better off than
+with their tenants behind their limiter?
+
+```bash
+python -m examples.rl_vs_arolla static   --arolla ~/Arolla --out study --jobs 48   # every fixed setting
+python -m examples.rl_vs_arolla informed --arolla ~/Arolla --out study --jobs 48   # the best one per situation
+python -m examples.rl_vs_arolla train    --arolla ~/Arolla --out study/runs/a-100 --seed 100 --slow-s 10
+python -m examples.rl_vs_arolla compare  --arolla ~/Arolla --out study --jobs 48 --select lead
+```
+
+**What is compared.** The agent sets max attempts (1 to 4), backoff (0 to
+100 ms) and the retry budget (5% to 100% of the requests) of all four
+tenants alike, every second; each tenant keeps the attempt timeout its file
+gives it. Their rows are their files as written, behind each server-side
+policy. Situations: their file as it is; a varied one, where every episode
+draws the failure rate (0.1 to 0.9), its start and length (5 to 35 s) and the
+load (0.7 to 1.3 times the file's); and each of those three axes walked alone.
+For a seed every row faces the same failure and the same arrivals, so the
+differences are paired. Whatever is chosen is chosen on other episodes than
+the ones reported: the fixed setting, the trained model, and the `alpha` of
+their limiter (their file's own 0.1 turned out to be its best of 0.01 to 0.5
+on the varied situation; 0.5 collapses above the file's load).
+
+**Result.** Success of all requests in %, on 64 episodes that nothing had been
+chosen on (seeds 3000 to 3063), and the paired difference to their clients
+behind Arolla's limiter with its standard error:
+
+| Situation | Learned policy | Arolla | Learned - Arolla | Best fixed setting for the situation | One fixed setting | No retries |
+| --- | --- | --- | --- | --- | --- | --- |
+| Their file | 89.00 | 85.54 | +3.46 ± 0.10 | 88.78 | 86.33 | 84.00 |
+| Varied | 88.78 | 86.57 | +2.21 ± 0.41 | | 86.49 | 84.95 |
+| Failure rate 0.1 | 99.79 | 98.69 | +1.11 ± 0.02 | 100.00 | 99.61 | 96.15 |
+| Failure rate 0.25 | 98.47 | 94.02 | +4.45 ± 0.08 | 98.68 | 94.94 | 91.58 |
+| Failure rate 0.75 | 78.97 | 77.28 | +1.69 ± 0.06 | 78.91 | 77.76 | 76.40 |
+| Failure rate 0.9 | 73.19 | 72.45 | +0.74 ± 0.03 | 73.20 | 72.71 | 71.81 |
+| Failing for 5 s | 97.28 | 96.46 | +0.82 ± 0.06 | 97.10 | 96.79 | 95.42 |
+| Failing for 10 s | 94.53 | 92.84 | +1.69 ± 0.08 | 94.30 | 93.32 | 91.65 |
+| Failing for 35 s | 80.51 | 74.54 | +5.97 ± 0.12 | 80.41 | 75.82 | 72.52 |
+| 0.7 times the load | 97.35 | 85.67 | +11.69 ± 0.10 | 96.64 | 86.65 | 84.02 |
+| 0.85 times the load | 92.36 | 85.51 | +6.84 ± 0.16 | 92.03 | 86.40 | 84.05 |
+| 1.15 times the load | 85.90 | 85.44 | +0.46 ± 0.12 | 85.59 | 85.53 | 83.86 |
+| 1.3 times the load | 83.34 | 82.96 | +0.38 ± 0.30 | 83.34 | 72.21 | 83.34 |
+
+The learned policy is ahead in every situation, by more than two standard
+errors in twelve of the thirteen. What it has learned is to follow the load:
+at 0.7 times the file's load it retries freely (1.27 attempts per request),
+at the file's load it allows two attempts under a budget of about a third
+while calls fail, and at 1.3 times the load, where the service runs at 88%
+without a single retry, it sends exactly one attempt per request. There its row IS
+the row of never retrying, and any retry budget is a loss (0.5% of the
+requests costs 0.45 ± 0.21 points). It does as well as the best fixed setting
+for each situation, which was chosen knowing the situation, and with fewer
+attempts than their clients issue: 1.11 per request on their file against
+1.29, most of which their limiter refuses.
+
+No fixed setting does this. The best single one (two attempts, 10 ms, a 10%
+budget) is level with their limiter on the varied situation (-0.09 ± 0.33) and
+10.8 points behind it at 1.3 times the load. Their limiter holds 85% to 86%
+at every load up to 1.15: it protects the service and, at 0.7 times the load,
+costs its own clients the 8.7 points they get with nothing in front of them
+(94.39%).
+
+The row does not hang on the one model: each of the 40 models shortlisted
+(from 212 scored, of 60 runs) beats their limiter on their file (88.07% to
+89.33%) and on the varied situation (88.56% to 89.05%). The one reported was
+chosen with `--select lead` on 64 selection episodes: the largest smallest
+lead over the thirteen situations. It is seed 400 of
+
+```bash
+python -m examples.rl_vs_arolla train --arolla ~/Arolla --out study/runs/w-400 --seed 400 \
+    --timesteps 2000000 --gamma 0.7 --gae-lambda 0.9 --slow-s 10 --train-load 0.6 1.4 --snapshots 7
+```
+
+after 1.75 million steps (an hour on twelve simulations and one learner).
+
+**What it does not show.** That their limiter is unnecessary: the agent sets
+the policy of EVERY caller, and a server-side limiter is there for the callers
+nobody controls. One tenant that keeps retrying freely is not in this
+comparison. Nor anything about their prototype: this is their simulator's
+situation in this simulator, with Arolla's rule as `msim.admission` implements
+it from their files. And the agent has one setting for four tenants, although
+the tenant without an attempt timeout gains from retries at a load where the
+others lose.
+
+**What had to be right first.** Three things about the environment, none of
+them about the learner, each worth more than any learner setting:
+
+- *The agent has to see its load.* With the request rate measured against
+  the episode's own drawn load, every load read 0.5 (fixed in
+  `ArollaScenario.build`), and the best retry setting depends on the load
+  more than on anything else.
+- *The warm-up runs on the default setting.* The grid taken from a file
+  defaults to the file's own clients, four attempts with nothing in the way:
+  from 1.15 times the load on, every episode began in a retry storm that no
+  policy had chosen, and at that load a backlog takes most of an episode to
+  drain. Clients that never retry scored 80.7% at 1.3 times the load through
+  the environment and 83.3% once the warm-up did not retry either. A scenario
+  for training should default to a setting that leaves the system standing.
+  With this and the first point wrong, the first agents still beat their
+  limiter on their file by 1.9 points, reading the load off the latency, and
+  were 5.1 behind it at 1.3 times the load.
+- *One second is a noisy look at the load.* `slow_s=10` (the measurements
+  again, averaged over about ten seconds) is what lets a policy without
+  memory retry freely at 0.7 times the load (97% instead of 96%) and learn
+  in a sixth of the steps what it otherwise needs a full run for.
+
+About the learner: a short horizon works best (discount 0.5 to 0.8 against
+the usual 0.99: what a setting does is over within seconds), and the reward
+offset of the training section is what makes the value function fit at all.
+
+Training on loads drawn a little past both ends of the comparison's range
+(`--train-load 0.6 1.4`), for two million steps, is what settled the top end:
+at 1.3 times the load a policy trained on 0.7 to 1.3 stops retrying while
+calls fail and still retries a little in between, which is free on a calm
+second and costs a point over an episode. Taking the entropy bonus away does
+not change that.
