@@ -95,6 +95,7 @@ pluginConfig:
     rest: false           # the default level while no retry asks (`QuotaGrid.rest`)
     in_flight: false      # show the policy the attempts in flight (`QuotaGrid.in_flight`)
     step_up: 0            # levels a quota may rise per window, 0: any (`QuotaGrid.step_up`)
+    hold_above: null      # no quota rises while the in-flight entry is above this (`QuotaGrid.hold_above`)
     policy: {hidden: [...], head: {...}}
 ```
 

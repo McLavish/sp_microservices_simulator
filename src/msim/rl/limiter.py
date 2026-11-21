@@ -172,14 +172,21 @@ class LimiterKnobs:
         ladder: Sequence[float] = (),
         step_up: int = 0,
         start: float = 0.0,
+        hold_above: float | None = None,
     ) -> None:
         self.quota = quota
         self._tap = tap
-        #: `QuotaGrid.step_up`: the levels of `ladder` a share may rise per window (0: any),
-        #: and each tenant's place on it now (it starts at `start`).
+        #: `QuotaGrid.step_up`: the levels of `ladder` a share may rise per window (0: any);
+        #: `QuotaGrid.hold_above`: no rise at all while `IN_FLIGHT` is above it. Each
+        #: tenant's place on the ladder now (it starts at `start`) is kept for both.
         self._ladder = tuple(ladder)
         self._step_up = step_up
-        self._place = {tenant: self._ladder.index(start) for tenant in tenants} if step_up else {}
+        self._hold_above = hold_above
+        self._bounded = bool(step_up) or hold_above is not None
+        self._place = (
+            {tenant: self._ladder.index(start) for tenant in tenants} if self._bounded else {}
+        )
+        self._entry = 0.0  # `IN_FLIGHT` of the last window measured
         #: Whether `IN_FLIGHT` is measured (`QuotaGrid.in_flight`).
         self._in_flight = in_flight
         self._now = 0  # the end of the last window measured, ns
@@ -200,8 +207,9 @@ class LimiterKnobs:
         With `QuotaGrid(rest=True)`, when no retry asked in the window last
         measured, every tenant gets the default share instead, whatever is
         given. With `QuotaGrid(step_up=n)` a share rises by at most `n` levels
-        of the ladder from what the tenant had. In both cases the shares in
-        force are returned.
+        of the ladder from what the tenant had, and with `hold_above` not at
+        all while attempts are in flight that much longer than at rest. In
+        these cases the shares in force are returned.
         """
         for name in values:
             tenant = name.removeprefix(_PREFIX)
@@ -213,23 +221,23 @@ class LimiterKnobs:
         resting = self._rest is not None and self._asked == 0
         if resting:
             values = {_PREFIX + tenant: self._rest for tenant in self.tenants}
-        elif self._step_up:
-            # No further up than `step_up` levels from where the tenant stands.
+        elif self._bounded:
+            # No further up than `step_up` levels from where the tenant stands,
+            # and not up at all while the service is crowded.
+            held = self._hold_above is not None and self._entry > self._hold_above
+            rise = 0 if held else (self._step_up or len(self._ladder))
             values = {
                 name: self._ladder[
-                    min(
-                        self._ladder.index(share),
-                        self._place[name.removeprefix(_PREFIX)] + self._step_up,
-                    )
+                    min(self._ladder.index(share), self._place[name.removeprefix(_PREFIX)] + rise)
                 ]
                 for name, share in values.items()
             }
         for name, share in values.items():
             tenant = name.removeprefix(_PREFIX)
             self.quota.set_share(tenant, share)
-            if self._step_up:
+            if self._bounded:
                 self._place[tenant] = self._ladder.index(share)
-        return dict(values) if resting or self._step_up else None
+        return dict(values) if resting or self._bounded else None
 
     def measure(self, window_s: float) -> tuple[int, list[float]]:
         """Requests that began in the window, and `MEASURES` for every tenant; resets the counts.
@@ -255,9 +263,9 @@ class LimiterKnobs:
                 seen.retries_ok / seen.retries_ended if seen.retries_ended else 0.0,
             ]
         self._now += s_to_ns(window_s)
-        flight_ns = self._tap.take_flight(self._now)
+        self._entry = self._crowding(self._tap.take_flight(self._now), admitted)
         if self._in_flight:
-            values.append(self._crowding(flight_ns, admitted))
+            values.append(self._entry)
         return started, values
 
     def _crowding(self, flight_ns: int, admitted: int) -> float:
@@ -309,6 +317,11 @@ class QuotaGrid:
     rest of a failure after one such window: with `step_up=1` the agent climbs
     the ladder a level at a time and is shown each level's effect before the
     next. The agent is shown the level in force, as with `rest`.
+
+    `hold_above` (default `None`: no such rule) is a value of `IN_FLIGHT`
+    above which no share rises, whatever the agent says: while attempts are in
+    flight that much longer than at rest, the quota holds or falls. It is
+    measured whether or not the agent is shown it.
     """
 
     shares: tuple[float, ...] = (0.0, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 3.0)
@@ -318,6 +331,7 @@ class QuotaGrid:
     rest: bool = False
     in_flight: bool = False
     step_up: int = 0
+    hold_above: float | None = None
 
     def __post_init__(self) -> None:
         if self.default_share not in self.shares:
@@ -326,6 +340,8 @@ class QuotaGrid:
             )
         if self.step_up < 0:
             raise ValueError(f"step_up is a number of levels >= 0, got {self.step_up}")
+        if self.hold_above is not None and not 0.0 <= self.hold_above <= 1.0:
+            raise ValueError(f"hold_above is a value of the in-flight entry, got {self.hold_above}")
         if any(share < 0 for share in self.shares) or self.window_s <= 0:
             raise ValueError("shares are >= 0 and the window is > 0")
 
@@ -376,4 +392,5 @@ class QuotaGrid:
             ladder=self.shares,
             step_up=self.step_up,
             start=self.default_share,
+            hold_above=self.hold_above,
         )

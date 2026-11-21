@@ -349,6 +349,26 @@ class TestTheQuotaGrid(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "step_up"):
             QuotaGrid(step_up=-1)
 
+    def test_with_hold_above_no_quota_rises_while_the_service_is_crowded(self):
+        grid = QuotaGrid(shares=(0.0, 0.5, 1000.0), default_share=0.5, hold_above=0.5)
+        env = RetryEnv(_scenario(grid=grid))
+        env.reset(options={"episode_seed": 1})
+        limiter = _limiter(env)
+        # Crowded (the entry is measured whether or not the agent is shown it):
+        # nothing rises, a share may still fall, and the agent is shown the level in force.
+        limiter._entry = 0.9
+        observation, _, _, _, info = env.step((2, 0))
+        self.assertEqual((info["knob_quota:plain"], info["knob_quota:untimed"]), (0.5, 0.0))
+        shown = dict(zip(env.feature_names, observation, strict=True))
+        self.assertEqual((shown["knob:quota:plain"], shown["knob:quota:untimed"]), (0.5, 0.0))
+        self.assertNotIn(IN_FLIGHT, env.feature_names)
+        # Calm again (this scenario has room for every retry): it rises.
+        self.assertLess(limiter._entry, 0.5)
+        _, _, _, _, info = env.step((2, 1))
+        self.assertEqual((info["knob_quota:plain"], info["knob_quota:untimed"]), (1000.0, 0.5))
+        with self.assertRaisesRegex(ValueError, "hold_above"):
+            QuotaGrid(hold_above=1.5)
+
     def test_validation(self):
         with self.assertRaisesRegex(ValueError, "not one of its levels"):
             QuotaGrid(default_share=0.07)

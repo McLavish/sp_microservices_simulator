@@ -66,6 +66,7 @@ def limiter_block(
         "rest": bool(rest or trained_grid(sidecar).get("rest", False)),
         "in_flight": bool(trained_grid(sidecar).get("in_flight", False)),
         "step_up": int(trained_grid(sidecar).get("step_up", 0)),
+        "hold_above": trained_grid(sidecar).get("hold_above"),
         "shares": shares,
         "default_level": knobs[0]["default"],
         "window_ms": round(1000 * sidecar["step_s"]),

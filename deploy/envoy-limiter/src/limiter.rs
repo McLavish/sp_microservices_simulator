@@ -133,6 +133,9 @@ pub struct Settings {
     /// The levels a tenant's quota may rise from one window to the next
     /// (`QuotaGrid.step_up`); it may fall as far as the policy says. 0: any.
     pub step_up: usize,
+    /// A value of the in-flight entry above which no quota rises, whatever
+    /// the policy says (`QuotaGrid.hold_above`). Not set: no such rule.
+    pub hold_above: Option<f64>,
     pub policy: Policy,
 }
 
@@ -151,6 +154,7 @@ impl Default for Settings {
             rest: false,
             in_flight: false,
             step_up: 0,
+            hold_above: None,
             policy: Policy::default(),
         }
     }
@@ -554,10 +558,13 @@ impl Limiter {
                 tenant.level = level;
             }
         }
-        if self.settings.step_up > 0 {
-            // No further up than `step_up` levels from where the tenant stood.
+        // No further up than `step_up` levels from where the tenant stood, and
+        // not up at all while the service is crowded.
+        let held = self.settings.hold_above.is_some_and(|above| crowding > above);
+        if held || self.settings.step_up > 0 {
+            let rise = if held { 0 } else { self.settings.step_up };
             for (tenant, was) in self.tenants[..known].iter_mut().zip(&before) {
-                tenant.level = tenant.level.min(was + self.settings.step_up);
+                tenant.level = tenant.level.min(was + rise);
             }
         }
         if resting {
@@ -1015,6 +1022,49 @@ mod tests {
         }
         // Up a level a window whatever it asks for; down at once.
         assert_eq!(climbed, vec![1, 2, 3, 0, 1]);
+    }
+
+    #[test]
+    fn with_hold_above_no_quota_rises_while_attempts_pile_up() {
+        // A policy that always answers the top level.
+        let policy = Policy {
+            hidden: Vec::new(),
+            head: Some(Layer { w: vec![vec![0.0; 11], vec![0.0; 11]], b: vec![0.0, 1.0] }),
+        };
+        let mut l = Limiter::new(Settings {
+            tenants: vec!["a".into()],
+            rates: vec![40.0],
+            shares: vec![0.0, 3.0],
+            default_level: 0,
+            rest: true,
+            hold_above: Some(0.5),
+            policy,
+            ..Settings::default()
+        })
+        .unwrap();
+        // At rest, 10 ms in flight. Then every attempt fails, retries ask, and
+        // attempts take 100 ms: crowded, so the quota does not rise.
+        for i in 0..40 {
+            l.admit(0, false, i * 25);
+            l.ended(0, false, true, i * 25 + 10);
+        }
+        assert_eq!(l.step(1000), vec![0]);
+        for i in 0..9 {
+            l.admit(0, false, 1000 + i * 100);
+            l.ended(0, false, false, 1000 + i * 100 + 99);
+            assert!(!l.admit(0, true, 1000 + i * 100 + 99));
+        }
+        l.admit(0, false, 1900);
+        assert_eq!(l.step(2000), vec![0]);
+        assert!(l.last_in_flight.unwrap() > 0.5);
+        // Calm again while retries still ask: now it rises.
+        l.ended(0, false, false, 2000);
+        for i in 0..40 {
+            l.admit(0, false, 2001 + i * 20);
+            l.ended(0, false, false, 2001 + i * 20 + 10);
+            l.admit(0, true, 2001 + i * 20 + 10);
+        }
+        assert_eq!(l.step(3000), vec![1]);
     }
 
     #[test]

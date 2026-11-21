@@ -281,6 +281,9 @@ the failure with the quota closed again. A simulated queue drains as soon as
 the load is back under its capacity, so an agent trained here does not learn
 to fear that step; with `step_up=1` it cannot take it, and is shown each
 level's effect before the next. The agent is shown the level in force.
+`QuotaGrid(hold_above=x)` is the second bound: no share rises while `in_flight`
+is above `x`, whatever the agent says (the entry is measured for this rule
+whether or not the agent is shown it).
 
 So the scenario and `as_written` on the same file differ in the limiter and in
 nothing else: `tests/test_rl_limiter.py` checks that a quota which refuses
