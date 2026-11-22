@@ -1264,10 +1264,27 @@ load leaves no room. The rule decides the rest: the cap is why an open quota
 does not cost latency, the step and the second window are why the start of a
 total failure lets through its probes and nothing else, the bound on attempts
 is why the split is fair. The filter's way of refusing (an answer held until
-the request is complete) is the whole of the gain after long failures. A rule
-written by hand that raised a quota while retries succeed and attempts do not
-pile up was not built, so what these cells do not say is how much of the lead
-needs a learned policy; the rules around this one carry a good part of it.
+the request is complete) is the whole of the gain after long failures.
+
+How much of the lead needs a LEARNED policy was then asked of the simulator
+alone. The policy was replaced by three lines written by hand on the same
+thirteen entries (closed while fewer than 5% of the attempts that end succeed;
+a level down while the in-flight entry is above 0.5; otherwise up), inside the
+same rules, and ranked on the same 72 cells against their prototype's rule:
+
+| Mean lead over their prototype's rule, points of an episode (worst cell) | Within 500 ms | Within 150 ms |
+| --- | --- | --- |
+| Three hand-written lines | 1.94 (-0.01) | 0.85 (-2.38) |
+| The same, holding its level while the entry is between 0.3 and 0.5 | 1.89 (-0.11) | 0.99 (-1.20) |
+| The cap-trained model | 1.70 (-0.01) | 0.67 (-4.98) |
+| The model kept | 1.36 (-0.56) | 0.96 (-0.52) |
+
+In the simulator the learned policy adds nothing that three lines do not, once
+the limiter has the entry for attempts in flight and the rules: ahead of both
+models on the bound they were trained with, level with the model kept on the
+stricter one. What the study found is the signal and the rule, not the policy.
+The hand-written rule was not run on the cluster; at 2000 requests per second
+it would open as the cap-trained model does.
 
 As to whether Arolla was fitted to its testbed: nothing here says its settings
 were. It does on this cluster what it is built to do, keep a failing
