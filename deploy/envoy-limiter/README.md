@@ -101,6 +101,7 @@ pluginConfig:
     asked_per_failure: null  # the policy is shown at most this many asking retries per failed first attempt (`QuotaGrid.asked_per_failure`)
     max_attempt: null     # a retry beyond this attempt of its request is refused (`QuotaGrid.max_attempt`)
     confirm: false        # no level rises until retries asked in two windows running (`QuotaGrid.confirm`)
+    hand_rule: null       # {alive, down_above, hold_above}: `rl.limiter.hand_rule` decides instead of the policy
     policy: {hidden: [...], head: {...}}
 ```
 

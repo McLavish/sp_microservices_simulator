@@ -2,7 +2,8 @@
 
     python deploy/envoy-limiter/export.py MODEL.zip OUT.json --rates R [R ...]
         [--tenants NAME [NAME ...]] [--one-level] [--rest] [--in-flight-cap C] [--step-up N]
-        [--asked-per-failure A] [--max-attempt N] [--confirm] [--fixture FILE]
+        [--asked-per-failure A] [--max-attempt N] [--confirm]
+        [--hand-rule ALIVE DOWN_ABOVE [HOLD_ABOVE]] [--fixture FILE]
 
 Writes the `limiter` block of the filter's plugin configuration: the tenants in the policy's
 order, the requests per second each sends one PROXY when all is well (`--rates`, the scale of
@@ -49,6 +50,7 @@ def limiter_block(
     asked_per_failure: float | None = None,
     max_attempt: int | None = None,
     confirm: bool = False,
+    hand_rule: list[float] | None = None,
 ) -> dict:
     sidecar = json.loads(model.with_suffix(".json").read_text("utf-8"))
     knobs = sidecar["knobs"]
@@ -78,6 +80,14 @@ def limiter_block(
         "asked_per_failure": asked_per_failure or trained_grid(sidecar).get("asked_per_failure"),
         "max_attempt": max_attempt or trained_grid(sidecar).get("max_attempt"),
         "confirm": bool(confirm or trained_grid(sidecar).get("confirm", False)),
+        # `rl.limiter.hand_rule` in place of the policy: ALIVE DOWN_ABOVE [HOLD_ABOVE].
+        "hand_rule": None
+        if hand_rule is None
+        else {
+            "alive": hand_rule[0],
+            "down_above": hand_rule[1],
+            "hold_above": hand_rule[2] if len(hand_rule) > 2 else None,
+        },
         "shares": shares,
         "default_level": knobs[0]["default"],
         "window_ms": round(1000 * sidecar["step_s"]),
@@ -101,6 +111,13 @@ def main() -> None:
     parser.add_argument("--asked-per-failure", type=float, default=None)
     parser.add_argument("--max-attempt", type=int, default=None)
     parser.add_argument("--confirm", action="store_true")
+    parser.add_argument(
+        "--hand-rule",
+        type=float,
+        nargs="+",
+        metavar="X",
+        help="decide by the hand-written rule instead of the policy: ALIVE DOWN_ABOVE [HOLD_ABOVE]",
+    )
     parser.add_argument("--fixture", type=Path)
     args = parser.parse_args()
 
@@ -115,6 +132,7 @@ def main() -> None:
         args.asked_per_failure,
         args.max_attempt,
         args.confirm,
+        args.hand_rule,
     )
     args.out.write_text(json.dumps(limiter), "utf-8")
     entries = len(limiter["policy"]["hidden"][0]["w"][0])

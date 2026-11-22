@@ -96,6 +96,24 @@ impl Policy {
     }
 }
 
+/// The policy written by hand (`rl.limiter.hand_rule`), in place of the
+/// trained one: level 0 while fewer than `alive` of a tenant's attempts that
+/// ended succeeded; a level down while the in-flight entry is above
+/// `down_above`; held above `hold_above`, if given; otherwise the top level.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(default)]
+pub struct HandRule {
+    pub alive: f64,
+    pub down_above: f64,
+    pub hold_above: Option<f64>,
+}
+
+impl Default for HandRule {
+    fn default() -> Self {
+        Self { alive: 0.05, down_above: 0.5, hold_above: None }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct Settings {
@@ -156,6 +174,8 @@ pub struct Settings {
     /// (`QuotaGrid.confirm`): a failure begins inside a window, and that
     /// window looks like a partial failure whatever follows.
     pub confirm: bool,
+    /// Decide by the hand-written rule instead of the policy. Not set: the policy.
+    pub hand_rule: Option<HandRule>,
     pub policy: Policy,
 }
 
@@ -179,6 +199,7 @@ impl Default for Settings {
             asked_per_failure: None,
             max_attempt: None,
             confirm: false,
+            hand_rule: None,
             policy: Policy::default(),
         }
     }
@@ -603,7 +624,35 @@ impl Limiter {
         }
         let levels = self.settings.shares.len();
         let before = self.levels();
-        if together {
+        if let Some(rule) = self.settings.hand_rule.clone() {
+            // Per tenant shown (the pooled one with one level for all): its
+            // entries `ended` and `goodput` of the window, and the entry of the
+            // gate as a whole.
+            let shown = if together { 1 } else { known };
+            let crowded = crowding.clamp(0.0, 1.0);
+            for index in 0..shown {
+                let attempts = observation[5 * index] * ATTEMPTS;
+                let succeeded =
+                    if attempts > 0.0 { observation[5 * index + 1] * GOODPUT / attempts } else { 0.0 };
+                let level = before[index];
+                let chosen = if succeeded < rule.alive {
+                    0
+                } else if crowded > rule.down_above {
+                    level.saturating_sub(1)
+                } else if rule.hold_above.is_some_and(|above| crowded > above) {
+                    level
+                } else {
+                    levels - 1
+                };
+                if together {
+                    for tenant in self.tenants[..known].iter_mut() {
+                        tenant.level = chosen;
+                    }
+                } else {
+                    self.tenants[index].level = chosen;
+                }
+            }
+        } else if together {
             if let Some(chosen) = self.settings.policy.act(&observation, 1, levels) {
                 for tenant in self.tenants[..known].iter_mut() {
                     tenant.level = chosen[0];
@@ -1285,6 +1334,59 @@ mod tests {
         // Retries first ask in the third window: at rest before, held after it
         // (a first window of asking), open after the fourth.
         assert_eq!(levels, vec![0, 0, 0, 1, 1]);
+    }
+
+    #[test]
+    fn the_hand_written_rule_decides_in_place_of_the_policy() {
+        let mut l = Limiter::new(Settings {
+            tenants: vec!["a".into()],
+            rates: vec![40.0],
+            shares: vec![0.0, 0.1, 0.3, 0.6, 1.0, 3.0],
+            default_level: 0,
+            hand_rule: Some(HandRule::default()),
+            ..Settings::default()
+        })
+        .unwrap();
+        // All is well, 10 ms in flight: the top level (nothing bounds the rise here).
+        for i in 0..40 {
+            l.admit(0, false, i * 25);
+            l.ended(0, false, true, i * 25 + 10);
+        }
+        assert_eq!(l.step(1000), vec![5]);
+        // Half the attempts fail and attempts take four times as long: a level down.
+        for i in 0..24 {
+            l.admit(0, false, 1000 + i * 40);
+            l.ended(0, false, i % 2 == 0, 1000 + i * 40 + 39);
+        }
+        assert_eq!(l.step(2000), vec![4]);
+        assert!(l.last_in_flight.unwrap() > 0.5);
+        // Nothing succeeds: closed, whatever the level was.
+        for i in 0..40 {
+            l.admit(0, false, 2000 + i * 25);
+            l.ended(0, false, false, 2000 + i * 25 + 10);
+        }
+        assert_eq!(l.step(3000), vec![0]);
+        // With a band, it holds where the plain rule would climb.
+        let mut held = Limiter::new(Settings {
+            tenants: vec!["a".into()],
+            rates: vec![40.0],
+            shares: vec![0.0, 0.1, 0.3, 0.6, 1.0, 3.0],
+            default_level: 2,
+            hand_rule: Some(HandRule { hold_above: Some(0.3), ..HandRule::default() }),
+            ..Settings::default()
+        })
+        .unwrap();
+        for i in 0..40 {
+            held.admit(0, false, i * 25);
+            held.ended(0, false, true, i * 25 + 10);
+        }
+        assert_eq!(held.step(1000), vec![5]);
+        for i in 0..40 {
+            held.admit(0, false, 1000 + i * 25);
+            held.ended(0, false, true, 1000 + i * 25 + 16); // 1 - 10/16 = 0.375: in the band
+        }
+        assert_eq!(held.step(2000), vec![5]);
+        assert!((held.last_in_flight.unwrap() - 0.375).abs() < 0.02);
     }
 
     #[test]
