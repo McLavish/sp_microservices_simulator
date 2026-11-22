@@ -1337,6 +1337,55 @@ flight, closes when nothing succeeds, climbs a level a window while nothing
 piles up and refuses retries while it does. A policy trained in the simulator
 arrives at the same behaviour and no further.
 
+**Scale-free inputs.** Everything above runs on a policy that is shown counts
+against a nominal rate, which had to be written into the filter's
+configuration for every proxy (and the incident above is what that costs when
+a proxy drops out). `QuotaGrid(scale_free=True)` shows it ratios of the
+window's own counts instead, and the filter then takes no rate at all. Two
+runs were trained on them: one as the model kept was trained, one inside the
+rule (the step, the cap, the second window, the wait for a window at rest).
+Ranked as before, with the rules on (mean lead over their prototype's rule in
+points of an episode, worst cell in brackets):
+
+| | Mean lead | Retries at a total failure, per request, more than their rule |
+| --- | --- | --- |
+| Three hand-written lines, on scale-free entries | 1.94 (-0.01) | none |
+| the same on counts | 1.94 (-0.01) | none |
+| Learned on scale-free entries, after 1.1 million steps | 1.21 (-0.22) | none |
+| the same run at its end | 1.71 (-0.02) | 0.34 |
+| Learned on scale-free entries inside the rule | 2.05 (+0.08) | 0.41 |
+| The model kept (counts) | 1.36 (-0.56) | none |
+
+The hand-written rule loses nothing (it only ever used a ratio). The run
+trained inside the rule has the largest lead and is behind nowhere, and it got
+there by never asking for less than a 30% quota, whatever it is shown, and
+leaving the rest to the rule, so it climbs to a full quota through a total
+failure too: it fails the line on retries, as the later copies of the other
+run do. The pick among the learned
+ones is the copy after 1.1 million steps. On the cluster, capped profile, the
+SAME configuration at every load and no rate in it (requests that started in
+the fault and succeeded, %, and the p99 in ms; Arolla's runs of the tables
+above):
+
+| Cell | Arolla | Learned, scale-free | Hand-written rule, scale-free |
+| --- | --- | --- | --- |
+| All failing for 10 s (succeeded over the run) | 92.5 to 93.3 | 93.27, 9 ms | 93.31, 9 ms |
+| retries reaching the frontend pod over the run | 90 to 154 | 13 | 13 |
+| A quarter failing for 10 s | 82.0 to 83.0 | 94.3, 9 ms | 94.1, 9 ms |
+| Half failing for 10 s | 56.3 to 57.1 | 73.0, 10 ms | 73.3, 10 ms |
+| Three quarters failing for 10 s | 27.9 to 30.8 | 38.1, 10 ms | 37.0, 10 ms |
+| Half failing for 20 s at 600 req/s | 54.7 | 87.2, 9 ms | 86.4, 10 ms |
+| at 1200 req/s | 54.3 to 54.9 | 85.5, 11 ms | 82.4, 19 ms |
+| at 2000 req/s | 42.6 to 53.3, 34 to 633 ms | 44.1, 554 ms | 40.4, 453 ms |
+| Fairness, same rates: split, and succeeded | 1.07 / 0.93, 55.1 / 54.4 | 0.99 / 1.01, 72.7 / 72.0 | |
+| Fairness, different rates | 1.10 / 0.99, 55.0 / 56.7 | 0.91 / 1.01, 78.2 / 78.4 | |
+
+Nothing is lost against the configuration with a rate: the same cells, the same
+picture, at 600, 1200 and 2000 requests per second with one configuration. At
+2000 the deployment congests again, under both. What a limiter still needs
+from where it stands is one window at rest, to have a time in flight to
+compare with; it measures that itself, and until it has it lets in its probes.
+
 One more run belongs here, the first of the model at 2000 requests per second,
 which is what `await_rest` above is for: the limiter started while the
 application was still cold, had never seen a window at rest and so nothing to
@@ -1390,9 +1439,10 @@ the fault and in what follows it. And of the limiter itself:
 - At 2000 requests per second it tipped the deployment into congestion in
   four of its five runs (the clean one was before the last two rules), as
   Arolla did in three of four.
-- It is still configured with a nominal rate per proxy, and with the number of
-  proxies that share a tenant's traffic; the incident above is what that costs
-  when one of them drops out.
+- The model kept is configured with a nominal rate per proxy, and with the
+  number of proxies that share a tenant's traffic; the incident above is what
+  that costs when one of them drops out. The scale-free model and the
+  hand-written rule are not (one run per cell).
 - The fixed 10% quota the filter gives retries that name no tenant (calls
   inside the mesh) was never exercised: their faults are injected in the
   caller's proxy, and the gateway does not retry a 500.
