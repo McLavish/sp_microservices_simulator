@@ -240,19 +240,34 @@ else, per tenant and window (`limiter.MEASURES`, as `<tenant>:<measure>`):
 
 | Entry | Meaning |
 | --- | --- |
-| `ended` | the tenant's attempts that ended at the service, over four times its expected request rate |
-| `goodput` | those that succeeded, over twice its expected request rate |
-| `retries_asked` | its retries that asked to be let in, over four times its expected request rate |
-| `retries_admitted` | those let in |
+| `succeeded` | share of the tenant's attempts that ended at the service which succeeded |
+| `first_success` | the same of its FIRST attempts |
+| `asked_per_first` | its retries that asked to be let in, per first attempt let in, over three |
+| `admitted_share` | share of those retries that were let in |
 | `retry_success` | share of its retries that ended which succeeded |
 
-These are the quantities Arolla's rule runs on (a tenant's request rate, its
-goodput, its retries in the window, the success of its retries). There is no
-queue length, no latency, nothing from inside a client. The rates are the
-FILE's, so a load that an episode draws shows in the counts. A scenario with
-an agent of this kind names its entries (`features`) and its agent object
-measures them (`Agent.measure`); `env.FEATURES` is what an agent on clients
-gets. `slow_s` and the knob levels are added as for any agent.
+They are built from the quantities Arolla's rule runs on (a tenant's requests,
+its goodput, its retries in the window, the success of its retries), and
+there is no queue length, no latency, nothing from inside a client. Every
+entry is a RATIO of the window's own counts. Nothing is measured against a
+rate the tenant "should" send: such a rate has to be known, written into a
+deployed limiter's configuration for every proxy, and is wrong the day a
+proxy drops out and another carries its traffic. So a limiter of this kind
+takes nothing about its deployment: the quota is a share of the tenant's own
+first attempts, and what the agent is shown has no unit. What it does not see
+this way is the load itself (twice the traffic with the same share failing
+reads the same); whether the service has room is what `in_flight`, below, is
+for. A scenario with an agent of this kind names its entries (`features`) and
+its agent object measures them (`Agent.measure`); `env.FEATURES` is what an
+agent on clients gets. `slow_s` and the knob levels are added as for any
+agent.
+
+(Until 2026-11-22 the entries were counts over a nominal rate: `ended`,
+`goodput`, `retries_asked`, `retries_admitted` and the same `retry_success`.
+The limiter study on their simulator file and the cells of "On their
+Kubernetes prototype" up to "Scale-free inputs" were run with models trained
+on those; such a model no longer matches the environment, and
+`deploy/envoy-limiter/export.py` refuses it.)
 
 What those counts do not say is whether the service has ROOM for the retries
 it lets in: a retry that succeeds looks the same whether or not it pushed the
@@ -317,19 +332,6 @@ window looks like a partial failure whatever follows: an agent that opens on
 it lets a share of the retries through at the start of a total failure. With
 `confirm` it acts once it has seen a whole window of the failure, a second
 later.
-
-`QuotaGrid(scale_free=True)` changes what the agent is shown, not what it does:
-instead of counts against the rate a tenant sends when all is well, ratios of
-the window's own counts (`limiter.SCALE_FREE`: the share of the attempts that
-succeeded, of the first attempts, the retries asked per first attempt over
-three, the share of the asking retries let in, the share of the retries that
-succeeded). The counts need that rate, per proxy, in a limiter's
-configuration, and it is wrong the day a proxy drops out and another carries
-its traffic. With the ratios nothing about the deployment is configured: the
-quota is already a share of the tenant's own first attempts, the cap a
-multiple of the limiter's own attempts in flight at rest. What the agent
-loses is the load itself; whether the service has room it reads off
-`in_flight`.
 
 `QuotaGrid(await_rest=True)` keeps every share at its default until there has
 been a window at rest, that is until the limiter has a time in flight to
@@ -1340,9 +1342,10 @@ arrives at the same behaviour and no further.
 **Scale-free inputs.** Everything above runs on a policy that is shown counts
 against a nominal rate, which had to be written into the filter's
 configuration for every proxy (and the incident above is what that costs when
-a proxy drops out). `QuotaGrid(scale_free=True)` shows it ratios of the
-window's own counts instead, and the filter then takes no rate at all. Two
-runs were trained on them: one as the model kept was trained, one inside the
+a proxy drops out). The entries are ratios of the window's own counts now
+(`limiter.MEASURES`; for a day they were an option, `scale_free`, and since
+nothing speaks for the counts they are the only form), and the filter takes
+no rate at all. Two runs were trained on them: one as the model kept was trained, one inside the
 rule (the step, the cap, the second window, the wait for a window at rest).
 Ranked as before, with the rules on (mean lead over their prototype's rule in
 points of an episode, worst cell in brackets):

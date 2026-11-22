@@ -18,10 +18,10 @@
 use serde::Deserialize;
 use std::collections::VecDeque;
 
-/// What a count is measured against, in requests of the tenant when all is
-/// well (`msim.rl.limiter.ATTEMPTS`, `GOODPUT`).
+/// The attempts of a request the scale of `asked_per_first` assumes
+/// (`msim.rl.limiter.ATTEMPTS`): a caller that tries four times asks up to
+/// three retries per first attempt.
 const ATTEMPTS: f64 = 4.0;
-const GOODPUT: f64 = 2.0;
 /// `rl.limiter.DRIFT` and `AT_REST`: how fast the time in flight at rest may
 /// rise from one window to the next, and the attempts a window needs to move it.
 const DRIFT: f64 = 0.02;
@@ -122,10 +122,6 @@ pub struct Settings {
     /// kept apart: it is in no tenant's counts, the policy never sees it, and
     /// its retries get the fixed `other_share`.
     pub tenants: Vec<String>,
-    /// Requests per second each tenant sends when all is well, to whatever the
-    /// counts given to `decide` are the counts of (one limiter, or the limiters
-    /// of every thread of a proxy together): the scale of what is measured.
-    pub rates: Vec<f64>,
     /// The ladder of shares a level stands for.
     pub shares: Vec<f64>,
     /// The level every tenant has until the policy has spoken.
@@ -178,10 +174,6 @@ pub struct Settings {
     /// (`QuotaGrid.await_rest`): before that there is no time in flight to
     /// compare with, the entry reads 0 and the cap refuses nothing.
     pub await_rest: bool,
-    /// Show the policy ratios of the window's own counts (`rl.limiter.SCALE_FREE`)
-    /// instead of counts against `rates`, which are then not needed: nothing
-    /// about the deployment is configured.
-    pub scale_free: bool,
     /// Decide by the hand-written rule instead of the policy. Not set: the policy.
     pub hand_rule: Option<HandRule>,
     pub policy: Policy,
@@ -191,7 +183,6 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             tenants: vec!["default".to_string()],
-            rates: vec![100.0],
             shares: vec![0.0, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 3.0],
             default_level: 0,
             window_ms: 1000,
@@ -208,7 +199,6 @@ impl Default for Settings {
             max_attempt: None,
             confirm: false,
             await_rest: false,
-            scale_free: false,
             hand_rule: None,
             policy: Policy::default(),
         }
@@ -354,20 +344,16 @@ pub struct Limiter {
 }
 
 impl Limiter {
-    pub fn new(mut settings: Settings) -> Result<Self, String> {
+    pub fn new(settings: Settings) -> Result<Self, String> {
         let n = settings.tenants.len();
-        if settings.scale_free && settings.rates.len() != n {
-            // Not used: the entries have no unit.
-            settings.rates = vec![1.0; n];
-        }
-        if n == 0 || settings.rates.len() != n {
-            return Err(format!("{} tenants need as many rates, got {}", n, settings.rates.len()));
+        if n == 0 {
+            return Err("a limiter needs at least one tenant".to_string());
         }
         if settings.shares.is_empty() || settings.default_level >= settings.shares.len() {
             return Err("the default level is not on the ladder of shares".to_string());
         }
-        if settings.rates.iter().any(|rate| !(*rate > 0.0)) || settings.window_ms == 0 {
-            return Err("rates and the window must be > 0".to_string());
+        if settings.window_ms == 0 {
+            return Err("the window must be > 0".to_string());
         }
         if !(settings.other_share >= 0.0) {
             return Err("the share of the others must be >= 0".to_string());
@@ -512,8 +498,8 @@ impl Limiter {
         self.tenants[..known].iter_mut().map(|t| std::mem::take(&mut t.seen)).collect()
     }
 
-    /// The end of a window: `counts` (this limiter's, or the sum over every
-    /// limiter the configured rates are the rates of) become the observation,
+    /// The end of a window: `counts` (this limiter's, or the sum over the
+    /// limiters of every thread of its proxy) become the observation,
     /// the policy sets the levels of the next window. Returns the levels.
     pub fn decide(&mut self, counts: &[Seen], now: u64) -> Vec<usize> {
         let window_s = match self.last_step {
@@ -578,54 +564,42 @@ impl Limiter {
             let in_flight_at_rest = self.own_admitted as f64 / (window_s * 1000.0) * at_rest;
             self.cap_limit = Some((times * in_flight_at_rest).max(CAP_FLOOR));
         }
-        // One level for everybody: the tenants' counts and rates added up, and
+        // One level for everybody: the tenants' counts added up, and
         // the policy shown them as one tenant's. Each tenant's quota is still
         // a share of ITS first attempts, so with one share for all of them the
         // retries let in are in proportion to the requests each one sends.
         let together = self.settings.one_level && known > 1;
-        let (counts, rates): (Vec<Seen>, Vec<f64>) = if together {
+        let counts: Vec<Seen> = if together {
             let mut sum = Seen::default();
             for seen in counts {
                 sum.add(seen);
             }
-            (vec![sum], vec![self.settings.rates.iter().sum()])
+            vec![sum]
         } else {
-            (counts.to_vec(), self.settings.rates.clone())
+            counts.to_vec()
         };
         let mut measured = Vec::with_capacity(5 * counts.len());
-        for (seen, rate) in counts.iter().zip(&rates) {
-            let per_request = 1.0 / (rate * window_s);
+        // `rl.limiter.MEASURES`: ratios of the window's own counts. Nothing here
+        // is measured against a rate, so nothing about the deployment is configured.
+        let share = |part: f64, whole: f64| if whole > 0.0 { part / whole } else { 0.0 };
+        for seen in counts.iter() {
             let firsts_ended = seen.ended.saturating_sub(seen.retries_ended);
             let firsts_ok = seen.goodput.saturating_sub(seen.retries_ok);
             let mut asked = seen.retries_asked as f64;
             if let Some(bound) = self.settings.asked_per_failure {
                 asked = asked.min(bound * firsts_ended.saturating_sub(firsts_ok) as f64);
             }
-            if self.settings.scale_free {
-                // `rl.limiter.SCALE_FREE`, in the same five places.
-                let share = |part: f64, whole: f64| if whole > 0.0 { part / whole } else { 0.0 };
-                measured.push(share(seen.goodput as f64, seen.ended as f64));
-                measured.push(share(firsts_ok as f64, firsts_ended as f64));
-                measured.push(if seen.firsts > 0 {
-                    asked / ((ATTEMPTS - 1.0) * seen.firsts as f64)
-                } else if asked > 0.0 {
-                    1.0
-                } else {
-                    0.0
-                });
-                measured.push(share(seen.retries_admitted as f64, seen.retries_asked as f64));
-                measured.push(share(seen.retries_ok as f64, seen.retries_ended as f64));
-                continue;
-            }
-            measured.push(seen.ended as f64 * per_request / ATTEMPTS);
-            measured.push(seen.goodput as f64 * per_request / GOODPUT);
-            measured.push(asked * per_request / ATTEMPTS);
-            measured.push(seen.retries_admitted as f64 * per_request / ATTEMPTS);
-            measured.push(if seen.retries_ended > 0 {
-                seen.retries_ok as f64 / seen.retries_ended as f64
+            measured.push(share(seen.goodput as f64, seen.ended as f64));
+            measured.push(share(firsts_ok as f64, firsts_ended as f64));
+            measured.push(if seen.firsts > 0 {
+                asked / ((ATTEMPTS - 1.0) * seen.firsts as f64)
+            } else if asked > 0.0 {
+                1.0
             } else {
                 0.0
             });
+            measured.push(share(seen.retries_admitted as f64, seen.retries_asked as f64));
+            measured.push(share(seen.retries_ok as f64, seen.retries_ended as f64));
         }
         if self.settings.in_flight {
             measured.push(crowding);
@@ -661,14 +635,7 @@ impl Limiter {
             let shown = if together { 1 } else { known };
             let crowded = crowding.clamp(0.0, 1.0);
             for index in 0..shown {
-                let attempts = observation[5 * index] * ATTEMPTS;
-                let succeeded = if self.settings.scale_free {
-                    observation[5 * index] // the share that succeeded is an entry of its own
-                } else if attempts > 0.0 {
-                    observation[5 * index + 1] * GOODPUT / attempts
-                } else {
-                    0.0
-                };
+                let succeeded = observation[5 * index]; // the share of its attempts that succeeded
                 let level = before[index];
                 let chosen = if succeeded < rule.alive {
                     0
@@ -747,7 +714,6 @@ mod tests {
     fn limiter(shares: Vec<f64>, default_level: usize) -> Limiter {
         Limiter::new(Settings {
             tenants: vec!["a".into(), "b".into()],
-            rates: vec![40.0, 40.0],
             shares,
             default_level,
             ..Settings::default()
@@ -830,32 +796,33 @@ mod tests {
         let levels = l.step(1000);
         assert_eq!(levels, vec![1, 1]); // no policy: the levels stay
         let o = &l.last_observation;
-        // tenant a: 50 attempts ended (40 + 10 retries) of 40 expected, over 4;
-        // 30 succeeded, over 2; 10 retries asked and let in, over 4; all succeeded.
+        // tenant a: 30 of its 50 attempts succeeded (40 first attempts, 10
+        // retries); 20 of the 40 first attempts; 10 retries asked for 40 first
+        // attempts, on a scale of three each; all were let in and succeeded.
         let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
-        assert!(near(o[0], 50.0 / 40.0 / 4.0) && near(o[1], 30.0 / 40.0 / 2.0));
-        assert!(near(o[2], 10.0 / 40.0 / 4.0) && near(o[3], 10.0 / 40.0 / 4.0) && near(o[4], 1.0));
+        assert!(near(o[0], 30.0 / 50.0) && near(o[1], 20.0 / 40.0));
+        assert!(near(o[2], 10.0 / 120.0) && near(o[3], 1.0) && near(o[4], 1.0));
         assert!(o[5..10].iter().all(|v| *v == 0.0)); // tenant b
         assert_eq!(o.len(), 10 + 10 + 2);
         assert!(near(o[10], o[0])); // the average starts at the first window
         assert!(near(o[20], 0.5) && near(o[21], 0.5)); // level 1 of 0..2
-        // A second, nearly empty window: the slow copy moves towards it.
+        // A second window in which all is well: the slow copy moves towards it.
         for i in 0..8 {
             l.admit(0, false, 1000 + i);
             l.ended(0, false, true, 0);
         }
         l.step(2000);
         let weight = 1.0 - (-1.0f64 / 10.0).exp();
-        let (was, is) = (50.0 / 160.0, 8.0 / 160.0);
+        let (was, is) = (0.6, 1.0);
         assert!(near(l.last_observation[0], is));
         assert!(near(l.last_observation[10], was + weight * (is - was)));
     }
 
     #[test]
     fn the_policy_picks_a_level_per_tenant() {
-        // One hidden unit that copies tenant a's goodput; a head that prefers
-        // level 2 for tenant a when the goodput is high and level 0 otherwise,
-        // and always level 1 for tenant b.
+        // One hidden unit that copies the share of tenant a's first attempts
+        // that succeeded; a head that prefers level 2 for tenant a when it is
+        // high and level 0 otherwise, and always level 1 for tenant b.
         let mut hidden_w = vec![0.0; 22];
         hidden_w[1] = 4.0;
         let policy = Policy {
@@ -867,7 +834,6 @@ mod tests {
         };
         let mut l = Limiter::new(Settings {
             tenants: vec!["a".into(), "b".into()],
-            rates: vec![40.0, 40.0],
             shares: vec![0.0, 0.5, 3.0],
             default_level: 0,
             policy,
@@ -878,7 +844,7 @@ mod tests {
             l.admit(0, false, i);
             l.ended(0, false, true, 0);
         }
-        assert_eq!(l.step(1000), vec![2, 1]); // goodput 0.5: tanh(1) > 0
+        assert_eq!(l.step(1000), vec![2, 1]); // all succeed: tanh(3) > 0
         for i in 0..4 {
             l.admit(0, false, 1000 + i);
             l.ended(0, false, false, 0);
@@ -890,10 +856,9 @@ mod tests {
     #[test]
     fn the_threads_of_a_proxy_decide_on_their_counts_together() {
         // Two limiters, as two Envoy threads have them: one gets nearly all of
-        // the traffic. Each decides on the SUM, and the rates are the proxy's.
+        // the traffic, and the other the attempts that fail. Each decides on the SUM.
         let settings = Settings {
             tenants: vec!["a".into()],
-            rates: vec![100.0],
             shares: vec![0.0, 0.5, 3.0],
             default_level: 1,
             ..Settings::default()
@@ -906,7 +871,7 @@ mod tests {
         }
         for i in 0..5 {
             idle.admit(0, false, i);
-            idle.ended(0, false, true, 0);
+            idle.ended(0, false, false, 0);
         }
         let (left, right) = (busy.take(0), idle.take(0));
         // As bytes and back: what one thread leaves for the other.
@@ -917,9 +882,10 @@ mod tests {
         total[0].add(&right[0]);
         busy.decide(&total, 1000);
         idle.decide(&total, 1000);
-        // 100 attempts ended of 100 expected, over 4: both see the proxy's load.
+        // 95 of the proxy's 100 attempts succeeded: both see that, where one
+        // alone would see all succeed and the other none.
         assert_eq!(busy.last_observation, idle.last_observation);
-        assert!((busy.last_observation[0] - 0.25).abs() < 1e-6);
+        assert!((busy.last_observation[0] - 0.95).abs() < 1e-6);
         // Their own counts are gone, and the quota is still each one's own.
         assert_eq!(busy.take(0), vec![Seen::default()]);
         // (a retry is let in while the count is below the share of the first attempts)
@@ -930,8 +896,8 @@ mod tests {
     #[test]
     fn a_policy_for_one_tenant_is_asked_once_per_tenant() {
         // Entries of one tenant: 5 of the window, 5 averaged, its level. The
-        // policy looks at the window's goodput (entry 1): level 2 when it is
-        // above a quarter of the scale, level 0 below.
+        // policy looks at the share of the first attempts that succeeded
+        // (entry 1): level 2 when it is above a quarter, level 0 below.
         let mut hidden_w = vec![0.0; 11];
         hidden_w[1] = 8.0;
         let policy = Policy {
@@ -941,28 +907,27 @@ mod tests {
         assert_eq!(policy.tenants(3), Some(1));
         let mut l = Limiter::new(Settings {
             tenants: vec!["a".into(), "b".into(), "c".into()],
-            rates: vec![40.0, 40.0, 400.0],
             shares: vec![0.0, 0.5, 3.0],
             default_level: 1,
             policy,
             ..Settings::default()
         })
         .unwrap();
-        // a: 40 of its 40 succeed; b: nothing; c: 40 of its 400 expected.
+        // a: all 40 succeed; b: no traffic; c: 4 of its 40 succeed.
         for i in 0..40 {
             l.admit(0, false, i);
             l.ended(0, false, true, 0);
             l.admit(2, false, i);
-            l.ended(2, false, true, 0);
+            l.ended(2, false, i % 10 == 0, 0);
         }
-        assert_eq!(l.step(1000), vec![2, 0, 0]); // goodput 0.5, 0 and 0.05 of the scale
+        assert_eq!(l.step(1000), vec![2, 0, 0]); // 1, nothing and 0.1 of the first attempts
         assert_eq!(l.last_observation.len(), 3 * 11);
     }
 
     #[test]
     fn one_level_for_every_tenant_from_their_counts_together() {
-        // The policy of the test above: level 2 when the goodput it is shown is
-        // above a quarter of the scale, level 0 below.
+        // The policy of the test above: level 2 when more than a quarter of the
+        // first attempts it is shown succeeded, level 0 below.
         let mut hidden_w = vec![0.0; 11];
         hidden_w[1] = 8.0;
         let policy = Policy {
@@ -971,7 +936,6 @@ mod tests {
         };
         let mut l = Limiter::new(Settings {
             tenants: vec!["small".into(), "large".into()],
-            rates: vec![10.0, 90.0],
             shares: vec![0.0, 0.5, 3.0],
             default_level: 0,
             one_level: true,
@@ -979,18 +943,20 @@ mod tests {
             ..Settings::default()
         })
         .unwrap();
-        // 10 and 90 requests succeed: 100 of the 100 expected together, half the scale.
+        // The small tenant's 10 requests fail and the large one's 90 succeed:
+        // 90 of 100 together, and one level for both (alone, the small tenant
+        // would get level 0).
         for i in 0..90 {
             if i < 10 {
                 l.admit(0, false, i);
-                l.ended(0, false, true, 0);
+                l.ended(0, false, false, 0);
             }
             l.admit(1, false, i);
             l.ended(1, false, true, 0);
         }
         assert_eq!(l.step(1000), vec![2, 2]);
         assert_eq!(l.last_observation.len(), 11); // one tenant's worth of entries
-        assert!((l.last_observation[1] - 0.5).abs() < 1e-6);
+        assert!((l.last_observation[1] - 0.9).abs() < 1e-6);
         // The same share for both, of each one's own first attempts: three
         // retries per first attempt, 30 for the small tenant and 270 for the large.
         for i in 0..90 {
@@ -1007,7 +973,6 @@ mod tests {
     fn a_floor_lets_one_retry_a_window_in_at_a_share_of_zero() {
         let mut l = Limiter::new(Settings {
             tenants: vec!["a".into(), "b".into()],
-            rates: vec![40.0, 40.0],
             shares: vec![0.0],
             floor: 1,
             ..Settings::default()
@@ -1039,7 +1004,6 @@ mod tests {
         };
         let mut l = Limiter::new(Settings {
             tenants: vec!["a".into(), "b".into()],
-            rates: vec![40.0, 40.0],
             shares: vec![0.0, 0.5, 3.0],
             default_level: 1,
             policy,
@@ -1067,7 +1031,6 @@ mod tests {
         };
         let mut l = Limiter::new(Settings {
             tenants: vec!["a".into()],
-            rates: vec![40.0],
             shares: vec![0.0, 0.5, 3.0],
             default_level: 0,
             rest: true,
@@ -1099,7 +1062,6 @@ mod tests {
         };
         let mut l = Limiter::new(Settings {
             tenants: vec!["a".into()],
-            rates: vec![40.0],
             shares: vec![0.0, 3.0],
             default_level: 0,
             in_flight: true,
@@ -1167,7 +1129,6 @@ mod tests {
         };
         let mut l = Limiter::new(Settings {
             tenants: vec!["a".into()],
-            rates: vec![40.0],
             shares: vec![0.0, 0.1, 0.2, 0.4],
             default_level: 0,
             step_up: 1,
@@ -1195,7 +1156,6 @@ mod tests {
         };
         let mut l = Limiter::new(Settings {
             tenants: vec!["a".into()],
-            rates: vec![40.0],
             shares: vec![0.0, 3.0],
             default_level: 0,
             rest: true,
@@ -1233,7 +1193,6 @@ mod tests {
     fn with_an_in_flight_cap_retries_are_refused_while_attempts_pile_up() {
         let mut l = Limiter::new(Settings {
             tenants: vec!["a".into()],
-            rates: vec![1000.0],
             shares: vec![3.0],
             default_level: 0,
             in_flight_cap: Some(2.5),
@@ -1269,7 +1228,6 @@ mod tests {
         // A limiter with little traffic never refuses below the floor.
         let mut quiet = Limiter::new(Settings {
             tenants: vec!["a".into()],
-            rates: vec![10.0],
             shares: vec![3.0],
             default_level: 0,
             in_flight_cap: Some(2.5),
@@ -1289,7 +1247,6 @@ mod tests {
         let run = |asked_per_failure: Option<f64>| {
             let mut l = Limiter::new(Settings {
                 tenants: vec!["a".into()],
-                rates: vec![40.0],
                 shares: vec![0.0, 3.0],
                 default_level: 0,
                 asked_per_failure,
@@ -1309,16 +1266,16 @@ mod tests {
             l.step(1000);
             l.last_observation[2]
         };
-        // 200 asks on a scale of 4 x 40 as counted (off the scale); 3 x 20 as shown.
+        // 200 asks for 40 first attempts on a scale of three each as counted
+        // (off the scale); three for each of the 20 that failed as shown.
         assert!((run(None) - 1.0).abs() < 1e-9);
-        assert!((run(Some(3.0)) - 60.0 / 160.0).abs() < 1e-6);
+        assert!((run(Some(3.0)) - 60.0 / 120.0).abs() < 1e-6);
     }
 
     #[test]
     fn with_max_attempt_a_caller_gets_no_more_retries_per_request() {
         let mut l = Limiter::new(Settings {
             tenants: vec!["a".into()],
-            rates: vec![40.0],
             shares: vec![3.0],
             default_level: 0,
             max_attempt: Some(4),
@@ -1347,7 +1304,6 @@ mod tests {
         };
         let mut l = Limiter::new(Settings {
             tenants: vec!["a".into()],
-            rates: vec![40.0],
             shares: vec![0.0, 3.0],
             default_level: 0,
             rest: true,
@@ -1376,7 +1332,6 @@ mod tests {
     fn the_hand_written_rule_decides_in_place_of_the_policy() {
         let mut l = Limiter::new(Settings {
             tenants: vec!["a".into()],
-            rates: vec![40.0],
             shares: vec![0.0, 0.1, 0.3, 0.6, 1.0, 3.0],
             default_level: 0,
             hand_rule: Some(HandRule::default()),
@@ -1405,7 +1360,6 @@ mod tests {
         // With a band, it holds where the plain rule would climb.
         let mut held = Limiter::new(Settings {
             tenants: vec!["a".into()],
-            rates: vec![40.0],
             shares: vec![0.0, 0.1, 0.3, 0.6, 1.0, 3.0],
             default_level: 2,
             hand_rule: Some(HandRule { hold_above: Some(0.3), ..HandRule::default() }),
@@ -1434,7 +1388,6 @@ mod tests {
         };
         let mut l = Limiter::new(Settings {
             tenants: vec!["a".into()],
-            rates: vec![40.0],
             shares: vec![0.0, 3.0],
             default_level: 0,
             await_rest: true,
@@ -1467,44 +1420,36 @@ mod tests {
     }
 
     #[test]
-    fn scale_free_entries_are_ratios_and_need_no_rate() {
-        let run = |rates: Vec<f64>| {
-            let mut l = Limiter::new(Settings {
-                tenants: vec!["a".into()],
-                rates,
-                shares: vec![3.0],
-                default_level: 0,
-                scale_free: true,
-                ..Settings::default()
-            })
-            .unwrap();
-            // Forty first attempts, half failing; thirty retries ask, all are
-            // let in (a share of 3), twenty have ended, five of them well.
-            for i in 0..40 {
-                l.admit(0, false, i);
-                l.ended(0, false, i % 2 == 0, i + 1);
-            }
-            for i in 0..30 {
-                assert!(l.admit(0, true, 100 + i));
-                if i < 20 {
-                    l.ended(0, true, i < 5, 101 + i);
-                }
-            }
-            l.step(1000);
-            l.last_observation[..5].to_vec()
-        };
-        let shown = run(Vec::new()); // no rate given at all
-        let expect = [25.0 / 60.0, 20.0 / 40.0, 30.0 / 120.0, 1.0, 5.0 / 20.0];
-        for (value, wanted) in shown.iter().zip(expect) {
-            assert!((value - wanted).abs() < 1e-6, "{:?}", shown);
+    fn the_entries_are_ratios_of_the_windows_own_counts() {
+        let mut l = Limiter::new(Settings {
+            tenants: vec!["a".into()],
+            shares: vec![3.0],
+            default_level: 0,
+            ..Settings::default()
+        })
+        .unwrap();
+        // Forty first attempts, half failing; thirty retries ask, all are let
+        // in (a share of 3), twenty have ended, five of them well.
+        for i in 0..40 {
+            l.admit(0, false, i);
+            l.ended(0, false, i % 2 == 0, i + 1);
         }
-        assert_eq!(shown, run(vec![4000.0])); // and a rate changes nothing
+        for i in 0..30 {
+            assert!(l.admit(0, true, 100 + i));
+            if i < 20 {
+                l.ended(0, true, i < 5, 101 + i);
+            }
+        }
+        l.step(1000);
+        let expect = [25.0 / 60.0, 20.0 / 40.0, 30.0 / 120.0, 1.0, 5.0 / 20.0];
+        for (value, wanted) in l.last_observation[..5].iter().zip(expect) {
+            assert!((value - wanted).abs() < 1e-6, "{:?}", l.last_observation);
+        }
         // The hand-written rule reads the share that succeeded off its entry.
         let mut ruled = Limiter::new(Settings {
             tenants: vec!["a".into()],
             shares: vec![0.0, 3.0],
             default_level: 1,
-            scale_free: true,
             hand_rule: Some(HandRule::default()),
             ..Settings::default()
         })
@@ -1524,9 +1469,9 @@ mod tests {
     #[test]
     fn settings_that_make_no_sense_are_refused() {
         let bad = |s: Settings| Limiter::new(s).is_err();
-        assert!(bad(Settings { rates: vec![1.0, 2.0], ..Settings::default() }));
+        assert!(bad(Settings { tenants: Vec::new(), ..Settings::default() }));
         assert!(bad(Settings { default_level: 99, ..Settings::default() }));
-        assert!(bad(Settings { rates: vec![0.0], ..Settings::default() }));
+        assert!(bad(Settings { window_ms: 0, ..Settings::default() }));
         assert!(bad(Settings { other_share: -1.0, ..Settings::default() }));
     }
 }

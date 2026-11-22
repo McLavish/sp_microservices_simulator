@@ -27,11 +27,8 @@ from msim.core import DropReason
 from msim.rl import RetryEnv, evaluate
 from msim.rl.arolla import ArollaLimiterScenario, Variation, as_written
 from msim.rl.limiter import (
-    ATTEMPTS,
-    GOODPUT,
     IN_FLIGHT,
     MEASURES,
-    SCALE_FREE,
     LimiterKnobs,
     QuotaGrid,
     _AttemptBound,
@@ -78,7 +75,7 @@ class TestTheLimiterAsAnEnvironment(unittest.TestCase):
         self.assertEqual(env.knob_levels, (10, 10))
         self.assertEqual(env.observation_space.shape, (2 * 5 + 2 * 5 + 2,))
         self.assertEqual(env.feature_names[:10], scenario.features)
-        self.assertEqual(env.feature_names[10], "plain:ended~5s")
+        self.assertEqual(env.feature_names[10], "plain:succeeded~5s")
         self.assertEqual(env.feature_names[-2:], ("knob:quota:plain", "knob:quota:untimed"))
         self.assertEqual(pickle.loads(pickle.dumps(scenario)), scenario)
 
@@ -162,56 +159,48 @@ class TestWhatTheLimiterSees(unittest.TestCase):
     def _named(self, env: RetryEnv, observation: np.ndarray) -> dict[str, float]:
         return dict(zip(env.feature_names, observation.tolist(), strict=True))
 
-    def test_its_counts_are_what_passed_the_gate(self):
-        """The successes it counts in a window are the requests the reward counts there."""
+    def test_its_ratios_are_of_what_passed_the_gate(self):
+        """Every entry is a share of the window's own counts, in [0, 1]."""
         env = RetryEnv(_scenario())
         env.reset(options={"episode_seed": 9})
-        rates = _limiter(env).rates
-        self.assertEqual(rates, {"plain": 40.0, "untimed": 40.0})
-        asked = admitted = 0.0
-        compared = 0
-        for _ in range(env.episode_steps):
-            observation, _, _, _, info = env.step((4, 4))  # a fifth of the first attempts
+        turned_away = 0
+        for step in range(env.episode_steps):
+            observation, _, _, _, _ = env.step((4, 4))  # a fifth of the first attempts
             named = self._named(env, observation)
             self.assertTrue(env.observation_space.contains(observation))
-            goodput = sum(named[f"{t}:goodput"] * GOODPUT * rates[t] for t in rates)
-            if max(named[f"{t}:goodput"] for t in rates) < 1.0:  # not at its bound (the spike)
-                self.assertAlmostEqual(goodput, info["succeeded"], places=3)
-                compared += 1
-            asked += sum(named[f"{t}:retries_asked"] * ATTEMPTS * rates[t] for t in rates)
-            admitted += sum(named[f"{t}:retries_admitted"] * ATTEMPTS * rates[t] for t in rates)
-        self.assertGreater(compared, 10)
-        self.assertGreater(admitted, 20)
-        self.assertGreater(asked, 2 * admitted)  # most retries were turned away
+            if step < 3:  # seconds 5 to 8: all is well
+                self.assertEqual(named["plain:succeeded"], 1.0)
+                self.assertEqual(named["plain:first_success"], 1.0)
+                self.assertEqual(named["plain:asked_per_first"], 0.0)
+            if 4 <= step < 8:  # seconds 9 to 13: half the calls fail
+                self.assertAlmostEqual(named["plain:first_success"], 0.5, delta=0.3)
+                self.assertGreater(named["plain:asked_per_first"], 0.1)
+                turned_away += named["plain:admitted_share"] < 0.9
+        self.assertGreater(turned_away, 2)  # most retries do not fit a fifth
 
     def test_a_share_of_zero_lets_no_retry_in(self):
         env = RetryEnv(_scenario())
         env.reset(options={"episode_seed": 9})
         seen = [self._named(env, env.step((0, 0))[0]) for _ in range(env.episode_steps)]
         self.assertEqual(
-            sum(o["plain:retries_admitted"] + o["untimed:retries_admitted"] for o in seen), 0
+            sum(o["plain:admitted_share"] + o["untimed:admitted_share"] for o in seen), 0
         )
-        self.assertGreater(sum(o["plain:retries_asked"] for o in seen), 0)
+        self.assertGreater(sum(o["plain:asked_per_first"] for o in seen), 0)
         failing = seen[5]  # 10 s to 11 s: half the calls fail, nothing is retried
-        self.assertAlmostEqual(
-            failing["plain:goodput"] / failing["plain:ended"], 2 * 0.5, delta=0.5
-        )
+        self.assertAlmostEqual(failing["plain:succeeded"], 0.5, delta=0.25)
         self.assertEqual(failing["plain:retry_success"], 0.0)
 
-    def test_the_load_it_was_given_shows(self):
-        """Counts are measured against the file's rate, not the episode's own."""
+    def test_the_load_it_was_given_does_not_show(self):
+        """Ratios of the window's own counts: the same at 0.7 and at 1.3 times the load."""
         seen = {}
         for load in (0.7, 1.3):
             scenario = _scenario(variation=Variation(load=(load, load)))
             env = RetryEnv(scenario)
             env.reset(options={"episode_seed": 1})
-            self.assertEqual(_limiter(env).rates["plain"], 40.0)
             rows = [self._named(env, env.step((0, 0))[0]) for _ in range(3)]  # before the failure
-            seen[load] = (
-                float(np.mean([r["plain:goodput"] + r["untimed:goodput"] for r in rows])) / 2
-            )
-        self.assertAlmostEqual(seen[0.7], 0.35, delta=0.06)
-        self.assertAlmostEqual(seen[1.3], 0.65, delta=0.06)
+            seen[load] = [(r["plain:succeeded"], r["plain:asked_per_first"]) for r in rows]
+        self.assertEqual(seen[0.7], seen[1.3])
+        self.assertEqual(seen[0.7], [(1.0, 0.0)] * 3)
 
     def test_it_stays_inside_its_space_under_a_storm(self):
         heavy = _scenario(grid=OPEN, variation=Variation(load=(6.0, 6.0), p_fail=(0.9, 0.9)))
@@ -220,7 +209,7 @@ class TestWhatTheLimiterSees(unittest.TestCase):
         seen = [observation] + [env.step((1, 1))[0] for _ in range(env.episode_steps)]
         for observation in seen:
             self.assertTrue(env.observation_space.contains(observation), observation)
-        self.assertEqual(max(float(o.max()) for o in seen), 1.0)  # something did hit the bound
+        self.assertEqual(max(float(o.max()) for o in seen), 1.0)  # something is at its bound
 
 
 class TestAttemptsInFlight(unittest.TestCase):
@@ -285,16 +274,14 @@ class TestAttemptsInFlight(unittest.TestCase):
         self.assertEqual(shown, [0.0] * 6)
 
 
-class TestScaleFreeEntries(unittest.TestCase):
-    """`QuotaGrid(scale_free=True)`: nothing about the deployment is configured."""
+class TestTheEntriesHaveNoUnit(unittest.TestCase):
+    """What a limiter is shown is ratios of its own counts: nothing about the deployment."""
 
     @staticmethod
-    def _window(rate: float, scale_free: bool) -> list[float]:
+    def _window() -> list[float]:
         """Forty first attempts, half of them failing, 30 retries asking, 20 let in, 5 succeeding."""
         tap = _GateTap()
-        knobs = LimiterKnobs(
-            TenantRetryQuota(share=3.0), tap, ("a",), [], {"a": rate}, scale_free=scale_free
-        )
+        knobs = LimiterKnobs(TenantRetryQuota(share=3.0), tap, ("a",), [])
         for i in range(40):
             tap.check(AdmissionRequest(i, "a", 1, False, 0, 0))
             tap.commit(AdmissionRequest(i, "a", 1, False, 0, 0))
@@ -308,28 +295,21 @@ class TestScaleFreeEntries(unittest.TestCase):
         return knobs.measure(1.0)[1]
 
     def test_the_entries_are_ratios_of_the_windows_own_counts(self):
-        shown = dict(zip(SCALE_FREE, self._window(40.0, scale_free=True), strict=True))
+        shown = dict(zip(MEASURES, self._window(), strict=True))
         self.assertAlmostEqual(shown["succeeded"], 25 / 60)  # 20 first attempts and 5 retries of 60
         self.assertAlmostEqual(shown["first_success"], 20 / 40)
         self.assertAlmostEqual(shown["asked_per_first"], 30 / (3 * 40))
         self.assertAlmostEqual(shown["admitted_share"], 20 / 30)
         self.assertAlmostEqual(shown["retry_success"], 5 / 20)
 
-    def test_the_rate_configured_does_not_enter_them(self):
-        self.assertEqual(self._window(40.0, scale_free=True), self._window(4000.0, scale_free=True))
-        # ... as it does the counts an agent is shown otherwise.
-        self.assertNotEqual(
-            self._window(40.0, scale_free=False), self._window(4000.0, scale_free=False)
-        )
+    def test_an_empty_window_is_all_zeros(self):
+        knobs = LimiterKnobs(TenantRetryQuota(share=3.0), _GateTap(), ("a",), [])
+        self.assertEqual(knobs.measure(1.0), (0, [0.0] * 5))
 
-    def test_an_environment_with_them(self):
-        grid = QuotaGrid(scale_free=True, in_flight=True)
-        env = RetryEnv(_scenario(grid=grid), slow_s=10.0)
-        self.assertEqual(env.feature_names[:5], tuple(f"plain:{name}" for name in SCALE_FREE))
+    def test_an_environment_at_rest(self):
+        env = RetryEnv(_scenario(grid=QuotaGrid(in_flight=True)), slow_s=10.0)
+        self.assertEqual(env.feature_names[:5], tuple(f"plain:{name}" for name in MEASURES))
         self.assertIn(IN_FLIGHT, env.feature_names)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            check_env(env, skip_render_check=True)
         # At rest every first attempt succeeds and no retry asks.
         observation, _ = env.reset(options={"episode_seed": 1})
         shown = dict(zip(env.feature_names, observation, strict=True))
@@ -374,20 +354,6 @@ class TestTheHandWrittenRule(unittest.TestCase):
         env = RetryEnv(_scenario())
         with self.assertRaisesRegex(ValueError, "in-flight"):
             hand_rule(env.feature_names, env.knob_levels[0])
-
-    def test_it_decides_the_same_on_scale_free_entries(self):
-        scenario = _scenario(
-            grid=replace(self.GRID, scale_free=True), variation=Variation(p_fail=(0.5, 0.5))
-        )
-        env = RetryEnv(scenario, slow_s=10.0)
-        rule = hand_rule(env.feature_names, env.knob_levels[0])
-        observation, info = env.reset(options={"episode_seed": 1})
-        in_force = []
-        for _ in range(env.episode_steps):
-            observation, _, _, _, info = env.step(rule(observation))
-            in_force.append(info["knob_quota:plain"])
-        counted, _ = self._episode(0.5)
-        self.assertEqual(in_force, counted)
 
 
 class TestTheQuotaGrid(unittest.TestCase):
@@ -522,15 +488,17 @@ class TestTheQuotaGrid(unittest.TestCase):
             env.reset(options={"episode_seed": 1})
             names = env.feature_names
             windows = [dict(zip(names, env.step((0, 0))[0], strict=True)) for _ in range(8)]
-            shown[bound] = max(window["plain:retries_asked"] for window in windows)
-            failing = max(windows, key=lambda window: window["plain:retries_asked"])
-            # What `plain` sends when all is well is 40 a second; the scale is 4 x 40.
-            failed = failing["plain:ended"] * 160 - failing["plain:goodput"] * 80
+            shown[bound] = max(window["plain:asked_per_first"] for window in windows)
             if bound is not None:
-                self.assertLessEqual(failing["plain:retries_asked"] * 160, 3 * failed + 1e-3)
+                # Three asks per failed first attempt, on a scale of three per first
+                # attempt: the share of the first attempts that failed (those that
+                # end in a window are not exactly those let in during it).
+                for window in windows:
+                    failed = 1.0 - window["plain:first_success"]
+                    self.assertLessEqual(window["plain:asked_per_first"], failed + 0.15)
         # Ten asks per failed request as counted (off the scale), three as shown.
         self.assertEqual(shown[None], 1.0)
-        self.assertLess(shown[3.0], 0.6)
+        self.assertLess(shown[3.0], 0.85)
 
     def test_with_confirm_a_quota_rises_once_a_whole_window_of_the_failure_was_seen(self):
         # The failure begins at second 8: the window of step 3 (the warm-up is 5 s).

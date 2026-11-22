@@ -14,12 +14,11 @@
 //! Like their filter, the state belongs to one Wasm VM: every Envoy worker
 //! thread has a limiter of its own, with its own quota. Envoy does not spread
 //! connections evenly over its threads (one thread of a gateway was seen with
-//! 95% of the traffic), and the policy reads the load off the counts, so the
-//! threads of a proxy POOL their counts (`pool_threads`, on by default): each
-//! leaves the counts of its last window in the proxy's shared data and decides
-//! on the sum. The configured rates are then the requests per second the whole
-//! proxy sees when all is well. The quota needs no such care: it is a share of
-//! a thread's own first attempts.
+//! 95% of the traffic), and a thread with a handful of requests a second has
+//! nothing to take a ratio of, so the threads of a proxy POOL their counts
+//! (`pool_threads`, on by default): each leaves the counts of its last window
+//! in the proxy's shared data and decides on the sum. The quota needs no such
+//! care: it is a share of a thread's own first attempts.
 
 pub mod limiter;
 
@@ -193,10 +192,9 @@ mod filter {
             let settings = std::mem::take(&mut config.limiter);
             let window = settings.window_ms;
             let described = format!(
-                "learned-limiter: {} tenant(s) {:?}, rates {:?}, policy {}",
+                "learned-limiter: {} tenant(s) {:?}, policy {}",
                 settings.tenants.len(),
                 settings.tenants,
-                settings.rates,
                 if settings.policy.head.is_some() { "loaded" } else { "none" },
             );
             let pool = config.pool_threads;

@@ -399,10 +399,7 @@ class ArollaLimiterScenario:
             )
         roots = [client.runtime for client in built.clients]
         in_front = [rt for name in self.tenants for rt in _runtimes(experiment, built, name)]
-        # Against the FILE's rates, not this episode's: a load that is drawn
-        # must show in what the limiter counts.
-        rates = {name: _rps(self.experiment, name) for name in self.tenants}
-        agent = self.grid.install(gate, self.tenants, in_front, rates)
+        agent = self.grid.install(gate, self.tenants, in_front)
         for client in built.clients:
             client.workload.drive(built.sim, client.runtime.start_request)
         return Episode(

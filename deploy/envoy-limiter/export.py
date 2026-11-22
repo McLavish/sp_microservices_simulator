@@ -1,14 +1,12 @@
 """A trained limiter (`msim.rl.limiter`) as the configuration of the Envoy filter next to this file.
 
-    python deploy/envoy-limiter/export.py MODEL.zip OUT.json [--rates R [R ...]]
+    python deploy/envoy-limiter/export.py MODEL.zip OUT.json
         [--tenants NAME [NAME ...]] [--one-level] [--rest] [--in-flight-cap C] [--step-up N]
         [--asked-per-failure A] [--max-attempt N] [--confirm] [--await-rest]
         [--hand-rule ALIVE DOWN_ABOVE [HOLD_ABOVE]] [--fixture FILE]
 
 Writes the `limiter` block of the filter's plugin configuration: the tenants in the policy's
-order, the requests per second each sends one PROXY when all is well (`--rates`: not needed, and
-ignored, for a model trained on scale-free entries, `QuotaGrid(scale_free=True)`; otherwise the scale of
-everything the policy is shown), the ladder of shares, the probe floor and the resting quota
+order, the ladder of shares, the probe floor and the resting quota
 the model was trained with (`--rest`, `--in-flight-cap`, `--step-up`, `--asked-per-failure`,
 `--max-attempt` and `--confirm` turn those on for a model trained without them), the
 level held until the policy has spoken, the window, the time constant of the slow
@@ -16,7 +14,7 @@ averages, and the policy's weights (`msim.rl.train.policy_weights`).
 
 `--tenants` names the tenants as the deployment's requests name them (the model knows them by
 position). A model trained for ONE tenant can be given several: the filter then asks it once
-per tenant, each with its own rate, or, with `--one-level`, once for all of them on their
+per tenant, or, with `--one-level`, once for all of them on their
 counts added up, and gives every tenant that level (retries are then let in in proportion to
 the requests each tenant sends). `--fixture` also writes random observations with the
 actions the model takes on them, which `cargo test` checks the filter's forward pass against.
@@ -43,7 +41,6 @@ def trained_grid(sidecar: dict) -> dict:
 def limiter_block(
     model: Path,
     tenants: list[str] | None,
-    rates: list[float],
     one_level: bool = False,
     rest: bool = False,
     in_flight_cap: float | None = None,
@@ -65,17 +62,15 @@ def limiter_block(
     tenants = tenants or trained
     if len(trained) not in (1, len(tenants)):
         raise SystemExit(f"the model decides for {len(trained)} tenants, {len(tenants)} were named")
-    scale_free = bool(trained_grid(sidecar).get("scale_free", False))
-    if scale_free:
-        rates = []  # the entries have no unit: nothing about the deployment is configured
-    elif len(rates) != len(tenants):
-        raise SystemExit(f"{len(tenants)} tenants need as many rates, got {len(rates)}")
+    if "succeeded" not in sidecar["features"][0]:
+        raise SystemExit(
+            f"{model} was trained on counts against a nominal rate; the limiter and the filter "
+            "show a policy ratios of the window's own counts now (msim.rl.limiter.MEASURES)"
+        )
     if one_level and len(trained) != 1:
         raise SystemExit("one level for every tenant needs a model that decides for one tenant")
     return {
         "tenants": tenants,
-        "rates": rates,
-        "scale_free": scale_free,
         "one_level": one_level,
         "floor": int(trained_grid(sidecar).get("floor", 0)),
         "rest": bool(rest or trained_grid(sidecar).get("rest", False)),
@@ -109,7 +104,6 @@ def main() -> None:
     )
     parser.add_argument("model", type=Path)
     parser.add_argument("out", type=Path)
-    parser.add_argument("--rates", nargs="+", type=float, default=[])
     parser.add_argument("--tenants", nargs="+")
     parser.add_argument("--one-level", action="store_true")
     parser.add_argument("--rest", action="store_true")
@@ -132,7 +126,6 @@ def main() -> None:
     limiter = limiter_block(
         args.model,
         args.tenants,
-        args.rates,
         args.one_level,
         args.rest,
         args.in_flight_cap,

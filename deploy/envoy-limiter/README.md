@@ -13,7 +13,7 @@ deployment it was written for and what it measured there.
 | Piece | Where | In the simulator |
 | --- | --- | --- |
 | The quota: a retry is let in while the tenant's retries of the last window are fewer than `share x` its first attempts of that window, or fewer than `floor` | `src/limiter.rs`, `Limiter::admit` | `admission.TenantRetryQuota` |
-| The counts per tenant and window: attempts that ended, those that succeeded, retries that asked, retries let in, success share of the retries; their slow averages; the tenant's level | `Limiter::take`, `Limiter::decide` | `rl.limiter.LimiterKnobs.measure`, `RetryEnv(slow_s=...)` |
+| What the policy is shown per tenant and window, as ratios of the window's own counts: the share of the attempts that succeeded, of the first attempts, the retries asked per first attempt, the share of them let in, the share of the retries that succeeded; their slow averages; the tenant's level | `Limiter::take`, `Limiter::decide` | `rl.limiter.LimiterKnobs.measure`, `RetryEnv(slow_s=...)` |
 | Attempts in flight (with `in_flight`): let in and not yet answered, summed over the window's time per attempt let in, against the lowest that was in a window with no retry asking (an attempt is in flight until its response headers, or until its stream ends without any) | `Limiter::admit`, `ended`, `decide` | `rl.limiter.IN_FLIGHT` (`_GateTap`, `LimiterKnobs._crowding`) |
 | The rule around the policy: the level at its default while no retry asks (`rest`), up at most `step_up` levels a window, no retry let in while more attempts are in flight than `in_flight_cap` times their number at rest (per Envoy thread, never below 8), the retries shown as asked at most `asked_per_failure` per failed first attempt | `Limiter::admit`, `Limiter::decide` | `QuotaGrid(rest, step_up, in_flight_cap, asked_per_failure)`, `rl.limiter._FlightCap` |
 | The policy: tanh layers and a linear head, the largest logit per tenant | `Policy::act` | the PPO model, acting greedily (`rl.train.policy_weights`) |
@@ -29,11 +29,11 @@ Four things the simulator has no notion of:
 
 - **Threads.** Every Envoy worker thread has a filter instance of its own, and
   Envoy does not spread connections evenly over them (one thread of a gateway
-  was measured with 95% of the traffic). The policy reads the load off the
-  counts, so the threads of a proxy pool them (`pool_threads`, on by default):
-  each leaves its last window in the proxy's shared data and decides on the
-  sum. `rates` are therefore requests per second per PROXY. The quota needs no
-  pooling: it is a share of a thread's own first attempts.
+  was measured with 95% of the traffic). A thread with a handful of requests a
+  second has nothing to take a ratio of, so the threads of a proxy pool their
+  counts (`pool_threads`, on by default): each leaves its last window in the
+  proxy's shared data and decides on the sum. The quota needs no pooling: it
+  is a share of a thread's own first attempts.
 - **No traffic.** A simulated service always has some; a proxy starts before
   its traffic does. A window in which nothing arrived and nothing ended is not
   something the policy was trained on, and what it answers there sticks (its
@@ -69,7 +69,7 @@ the repository: it holds a model's weights) and is skipped without it.
 
 ```bash
 uv run --extra train python deploy/envoy-limiter/export.py MODEL.zip limiter.json \
-    --rates 1000 --tenants checkout --fixture deploy/envoy-limiter/tests/fixture.json
+    --tenants checkout --fixture deploy/envoy-limiter/tests/fixture.json
 ```
 
 `limiter.json` is the `limiter` block of the plugin configuration:
@@ -85,7 +85,6 @@ pluginConfig:
   log_windows: false      # one warning line per instance and window, for a run being looked at
   limiter:                # export.py
     tenants: [checkout]
-    rates: [1000.0]       # requests per second per proxy when all is well
     shares: [0.0, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 3.0]
     default_level: 0
     window_ms: 1000
@@ -102,26 +101,22 @@ pluginConfig:
     max_attempt: null     # a retry beyond this attempt of its request is refused (`QuotaGrid.max_attempt`)
     confirm: false        # no level rises until retries asked in two windows running (`QuotaGrid.confirm`)
     await_rest: false     # every level at its default until a window at rest was seen (`QuotaGrid.await_rest`)
-    scale_free: false     # the policy is shown ratios of the window's own counts; `rates` is then not needed
     hand_rule: null       # {alive, down_above, hold_above}: `rl.limiter.hand_rule` decides instead of the policy
     policy: {hidden: [...], head: {...}}
 ```
 
-With `scale_free` there is no `rates`: the policy is shown ratios of what the
-filter counted in the window (the share of attempts that succeeded, of first
-attempts, the retries asked per first attempt, the share of them let in, the
-share of retries that succeeded), the quota is a share of a tenant's own first
-attempts and the cap a multiple of the filter's own attempts in flight at
-rest, so nothing about the deployment is written into the configuration.
+Nothing about the deployment is in it: no request rate, no capacity, no
+latency. The policy is shown ratios of what the filter counted in the window,
+the quota is a share of a tenant's own first attempts and the cap a multiple
+of the filter's own attempts in flight at rest. What the filter needs from
+where it stands is one window in which no retry asks, to have a time in
+flight to compare with; it measures that itself (`await_rest` keeps it closed
+until then).
 
-Without it, `rates` is the scale of everything the policy is shown: a model
-trained around a nominal rate reads twice that rate as twice the load. Give
-each proxy the tenant's nominal rate divided by the number of proxies that
-share it. A model
-trained for one tenant can be configured with several. The filter then asks it
-once per tenant, each against its own rate; or, with `one_level: true`
-(`export.py --one-level`), once for all of them, on their counts and rates
-added up, and gives every tenant that level. A tenant's quota is a share of
+A model trained for one tenant can be configured with several. The filter
+then asks it once per tenant; or, with `one_level: true` (`export.py
+--one-level`), once for all of them, on their counts added up, and gives
+every tenant that level. A tenant's quota is a share of
 its own first attempts either way, so with one level for everybody the retries
 let in are in proportion to the requests each tenant sends, which a level per
 tenant does not give (a tenant that asks for many retries reads as trouble and

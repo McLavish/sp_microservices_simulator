@@ -229,8 +229,8 @@ class TestSnapshots(unittest.TestCase):
             self.assertEqual(
                 [k["name"] for k in sidecar["knobs"]], ["quota:plain", "quota:untimed"]
             )
-            self.assertEqual(sidecar["features"][:2], ["plain:ended", "plain:goodput"])
-            self.assertIn("untimed:goodput~5s", sidecar["features"])
+            self.assertEqual(sidecar["features"][:2], ["plain:succeeded", "plain:first_success"])
+            self.assertIn("untimed:first_success~5s", sidecar["features"])
             (episode,) = tr.evaluate_model(out / "model.zip", [2000], scenario=limiter)
             self.assertGreater(episode["success_rate"], 0.3)
             # Another ladder of shares is another meaning of the same action: refused.
