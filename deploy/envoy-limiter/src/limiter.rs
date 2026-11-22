@@ -178,6 +178,10 @@ pub struct Settings {
     /// (`QuotaGrid.await_rest`): before that there is no time in flight to
     /// compare with, the entry reads 0 and the cap refuses nothing.
     pub await_rest: bool,
+    /// Show the policy ratios of the window's own counts (`rl.limiter.SCALE_FREE`)
+    /// instead of counts against `rates`, which are then not needed: nothing
+    /// about the deployment is configured.
+    pub scale_free: bool,
     /// Decide by the hand-written rule instead of the policy. Not set: the policy.
     pub hand_rule: Option<HandRule>,
     pub policy: Policy,
@@ -204,6 +208,7 @@ impl Default for Settings {
             max_attempt: None,
             confirm: false,
             await_rest: false,
+            scale_free: false,
             hand_rule: None,
             policy: Policy::default(),
         }
@@ -349,8 +354,12 @@ pub struct Limiter {
 }
 
 impl Limiter {
-    pub fn new(settings: Settings) -> Result<Self, String> {
+    pub fn new(mut settings: Settings) -> Result<Self, String> {
         let n = settings.tenants.len();
+        if settings.scale_free && settings.rates.len() != n {
+            // Not used: the entries have no unit.
+            settings.rates = vec![1.0; n];
+        }
         if n == 0 || settings.rates.len() != n {
             return Err(format!("{} tenants need as many rates, got {}", n, settings.rates.len()));
         }
@@ -586,14 +595,30 @@ impl Limiter {
         let mut measured = Vec::with_capacity(5 * counts.len());
         for (seen, rate) in counts.iter().zip(&rates) {
             let per_request = 1.0 / (rate * window_s);
-            measured.push(seen.ended as f64 * per_request / ATTEMPTS);
-            measured.push(seen.goodput as f64 * per_request / GOODPUT);
+            let firsts_ended = seen.ended.saturating_sub(seen.retries_ended);
+            let firsts_ok = seen.goodput.saturating_sub(seen.retries_ok);
             let mut asked = seen.retries_asked as f64;
             if let Some(bound) = self.settings.asked_per_failure {
-                let firsts_ended = seen.ended.saturating_sub(seen.retries_ended);
-                let firsts_ok = seen.goodput.saturating_sub(seen.retries_ok);
                 asked = asked.min(bound * firsts_ended.saturating_sub(firsts_ok) as f64);
             }
+            if self.settings.scale_free {
+                // `rl.limiter.SCALE_FREE`, in the same five places.
+                let share = |part: f64, whole: f64| if whole > 0.0 { part / whole } else { 0.0 };
+                measured.push(share(seen.goodput as f64, seen.ended as f64));
+                measured.push(share(firsts_ok as f64, firsts_ended as f64));
+                measured.push(if seen.firsts > 0 {
+                    asked / ((ATTEMPTS - 1.0) * seen.firsts as f64)
+                } else if asked > 0.0 {
+                    1.0
+                } else {
+                    0.0
+                });
+                measured.push(share(seen.retries_admitted as f64, seen.retries_asked as f64));
+                measured.push(share(seen.retries_ok as f64, seen.retries_ended as f64));
+                continue;
+            }
+            measured.push(seen.ended as f64 * per_request / ATTEMPTS);
+            measured.push(seen.goodput as f64 * per_request / GOODPUT);
             measured.push(asked * per_request / ATTEMPTS);
             measured.push(seen.retries_admitted as f64 * per_request / ATTEMPTS);
             measured.push(if seen.retries_ended > 0 {
@@ -637,8 +662,13 @@ impl Limiter {
             let crowded = crowding.clamp(0.0, 1.0);
             for index in 0..shown {
                 let attempts = observation[5 * index] * ATTEMPTS;
-                let succeeded =
-                    if attempts > 0.0 { observation[5 * index + 1] * GOODPUT / attempts } else { 0.0 };
+                let succeeded = if self.settings.scale_free {
+                    observation[5 * index] // the share that succeeded is an entry of its own
+                } else if attempts > 0.0 {
+                    observation[5 * index + 1] * GOODPUT / attempts
+                } else {
+                    0.0
+                };
                 let level = before[index];
                 let chosen = if succeeded < rule.alive {
                     0
@@ -1434,6 +1464,61 @@ mod tests {
             l.admit(0, true, 4000 + i * 25 + 10);
         }
         assert_eq!(l.step(5000), vec![1]);
+    }
+
+    #[test]
+    fn scale_free_entries_are_ratios_and_need_no_rate() {
+        let run = |rates: Vec<f64>| {
+            let mut l = Limiter::new(Settings {
+                tenants: vec!["a".into()],
+                rates,
+                shares: vec![3.0],
+                default_level: 0,
+                scale_free: true,
+                ..Settings::default()
+            })
+            .unwrap();
+            // Forty first attempts, half failing; thirty retries ask, all are
+            // let in (a share of 3), twenty have ended, five of them well.
+            for i in 0..40 {
+                l.admit(0, false, i);
+                l.ended(0, false, i % 2 == 0, i + 1);
+            }
+            for i in 0..30 {
+                assert!(l.admit(0, true, 100 + i));
+                if i < 20 {
+                    l.ended(0, true, i < 5, 101 + i);
+                }
+            }
+            l.step(1000);
+            l.last_observation[..5].to_vec()
+        };
+        let shown = run(Vec::new()); // no rate given at all
+        let expect = [25.0 / 60.0, 20.0 / 40.0, 30.0 / 120.0, 1.0, 5.0 / 20.0];
+        for (value, wanted) in shown.iter().zip(expect) {
+            assert!((value - wanted).abs() < 1e-6, "{:?}", shown);
+        }
+        assert_eq!(shown, run(vec![4000.0])); // and a rate changes nothing
+        // The hand-written rule reads the share that succeeded off its entry.
+        let mut ruled = Limiter::new(Settings {
+            tenants: vec!["a".into()],
+            shares: vec![0.0, 3.0],
+            default_level: 1,
+            scale_free: true,
+            hand_rule: Some(HandRule::default()),
+            ..Settings::default()
+        })
+        .unwrap();
+        for i in 0..40 {
+            ruled.admit(0, false, i);
+            ruled.ended(0, false, false, i + 1);
+        }
+        assert_eq!(ruled.step(1000), vec![0]); // nothing succeeds: closed
+        for i in 0..40 {
+            ruled.admit(0, false, 1000 + i);
+            ruled.ended(0, false, i % 2 == 0, 1001 + i);
+        }
+        assert_eq!(ruled.step(2000), vec![1]); // half succeeds: up
     }
 
     #[test]

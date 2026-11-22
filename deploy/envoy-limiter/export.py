@@ -1,12 +1,13 @@
 """A trained limiter (`msim.rl.limiter`) as the configuration of the Envoy filter next to this file.
 
-    python deploy/envoy-limiter/export.py MODEL.zip OUT.json --rates R [R ...]
+    python deploy/envoy-limiter/export.py MODEL.zip OUT.json [--rates R [R ...]]
         [--tenants NAME [NAME ...]] [--one-level] [--rest] [--in-flight-cap C] [--step-up N]
         [--asked-per-failure A] [--max-attempt N] [--confirm] [--await-rest]
         [--hand-rule ALIVE DOWN_ABOVE [HOLD_ABOVE]] [--fixture FILE]
 
 Writes the `limiter` block of the filter's plugin configuration: the tenants in the policy's
-order, the requests per second each sends one PROXY when all is well (`--rates`, the scale of
+order, the requests per second each sends one PROXY when all is well (`--rates`: not needed, and
+ignored, for a model trained on scale-free entries, `QuotaGrid(scale_free=True)`; otherwise the scale of
 everything the policy is shown), the ladder of shares, the probe floor and the resting quota
 the model was trained with (`--rest`, `--in-flight-cap`, `--step-up`, `--asked-per-failure`,
 `--max-attempt` and `--confirm` turn those on for a model trained without them), the
@@ -64,13 +65,17 @@ def limiter_block(
     tenants = tenants or trained
     if len(trained) not in (1, len(tenants)):
         raise SystemExit(f"the model decides for {len(trained)} tenants, {len(tenants)} were named")
-    if len(rates) != len(tenants):
+    scale_free = bool(trained_grid(sidecar).get("scale_free", False))
+    if scale_free:
+        rates = []  # the entries have no unit: nothing about the deployment is configured
+    elif len(rates) != len(tenants):
         raise SystemExit(f"{len(tenants)} tenants need as many rates, got {len(rates)}")
     if one_level and len(trained) != 1:
         raise SystemExit("one level for every tenant needs a model that decides for one tenant")
     return {
         "tenants": tenants,
         "rates": rates,
+        "scale_free": scale_free,
         "one_level": one_level,
         "floor": int(trained_grid(sidecar).get("floor", 0)),
         "rest": bool(rest or trained_grid(sidecar).get("rest", False)),
@@ -104,7 +109,7 @@ def main() -> None:
     )
     parser.add_argument("model", type=Path)
     parser.add_argument("out", type=Path)
-    parser.add_argument("--rates", nargs="+", type=float, required=True)
+    parser.add_argument("--rates", nargs="+", type=float, default=[])
     parser.add_argument("--tenants", nargs="+")
     parser.add_argument("--one-level", action="store_true")
     parser.add_argument("--rest", action="store_true")

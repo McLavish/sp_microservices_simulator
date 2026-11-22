@@ -318,6 +318,19 @@ it lets a share of the retries through at the start of a total failure. With
 `confirm` it acts once it has seen a whole window of the failure, a second
 later.
 
+`QuotaGrid(scale_free=True)` changes what the agent is shown, not what it does:
+instead of counts against the rate a tenant sends when all is well, ratios of
+the window's own counts (`limiter.SCALE_FREE`: the share of the attempts that
+succeeded, of the first attempts, the retries asked per first attempt over
+three, the share of the asking retries let in, the share of the retries that
+succeeded). The counts need that rate, per proxy, in a limiter's
+configuration, and it is wrong the day a proxy drops out and another carries
+its traffic. With the ratios nothing about the deployment is configured: the
+quota is already a share of the tenant's own first attempts, the cap a
+multiple of the limiter's own attempts in flight at rest. What the agent
+loses is the load itself; whether the service has room it reads off
+`in_flight`.
+
 `QuotaGrid(await_rest=True)` keeps every share at its default until there has
 been a window at rest, that is until the limiter has a time in flight to
 compare with. Before that the in-flight entry reads 0 and the cap refuses

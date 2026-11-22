@@ -102,13 +102,22 @@ pluginConfig:
     max_attempt: null     # a retry beyond this attempt of its request is refused (`QuotaGrid.max_attempt`)
     confirm: false        # no level rises until retries asked in two windows running (`QuotaGrid.confirm`)
     await_rest: false     # every level at its default until a window at rest was seen (`QuotaGrid.await_rest`)
+    scale_free: false     # the policy is shown ratios of the window's own counts; `rates` is then not needed
     hand_rule: null       # {alive, down_above, hold_above}: `rl.limiter.hand_rule` decides instead of the policy
     policy: {hidden: [...], head: {...}}
 ```
 
-`rates` is the scale of everything the policy is shown: a model trained around
-a nominal rate reads twice that rate as twice the load. Give each proxy the
-tenant's nominal rate divided by the number of proxies that share it. A model
+With `scale_free` there is no `rates`: the policy is shown ratios of what the
+filter counted in the window (the share of attempts that succeeded, of first
+attempts, the retries asked per first attempt, the share of them let in, the
+share of retries that succeeded), the quota is a share of a tenant's own first
+attempts and the cap a multiple of the filter's own attempts in flight at
+rest, so nothing about the deployment is written into the configuration.
+
+Without it, `rates` is the scale of everything the policy is shown: a model
+trained around a nominal rate reads twice that rate as twice the load. Give
+each proxy the tenant's nominal rate divided by the number of proxies that
+share it. A model
 trained for one tenant can be configured with several. The filter then asks it
 once per tenant, each against its own rate; or, with `one_level: true`
 (`export.py --one-level`), once for all of them, on their counts and rates
