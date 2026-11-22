@@ -16,7 +16,12 @@ from pathlib import Path
 import numpy as np
 from gymnasium.utils.env_checker import check_env
 
-from msim.admission import AdmissionOutcome, AdmissionRequest, MixedRefillBudget
+from msim.admission import (
+    AdmissionOutcome,
+    AdmissionRequest,
+    MixedRefillBudget,
+    TenantRetryQuota,
+)
 from msim.compat.arolla import UnsupportedScenario
 from msim.core import DropReason
 from msim.rl import RetryEnv, evaluate
@@ -26,6 +31,7 @@ from msim.rl.limiter import (
     GOODPUT,
     IN_FLIGHT,
     MEASURES,
+    SCALE_FREE,
     LimiterKnobs,
     QuotaGrid,
     _AttemptBound,
@@ -279,6 +285,58 @@ class TestAttemptsInFlight(unittest.TestCase):
         self.assertEqual(shown, [0.0] * 6)
 
 
+class TestScaleFreeEntries(unittest.TestCase):
+    """`QuotaGrid(scale_free=True)`: nothing about the deployment is configured."""
+
+    @staticmethod
+    def _window(rate: float, scale_free: bool) -> list[float]:
+        """Forty first attempts, half of them failing, 30 retries asking, 20 let in, 5 succeeding."""
+        tap = _GateTap()
+        knobs = LimiterKnobs(
+            TenantRetryQuota(share=3.0), tap, ("a",), [], {"a": rate}, scale_free=scale_free
+        )
+        for i in range(40):
+            tap.check(AdmissionRequest(i, "a", 1, False, 0, 0))
+            tap.commit(AdmissionRequest(i, "a", 1, False, 0, 0))
+            tap.observe(AdmissionOutcome(i + 1, "a", 1, False, i % 2 == 0, DropReason.NONE))
+        for i in range(30):
+            retry = AdmissionRequest(100 + i, "a", 2, True, 0, 0)
+            tap.check(retry)  # it has asked
+            if i < 20:
+                tap.commit(retry)
+                tap.observe(AdmissionOutcome(101 + i, "a", 2, True, i < 5, DropReason.NONE))
+        return knobs.measure(1.0)[1]
+
+    def test_the_entries_are_ratios_of_the_windows_own_counts(self):
+        shown = dict(zip(SCALE_FREE, self._window(40.0, scale_free=True), strict=True))
+        self.assertAlmostEqual(shown["succeeded"], 25 / 60)  # 20 first attempts and 5 retries of 60
+        self.assertAlmostEqual(shown["first_success"], 20 / 40)
+        self.assertAlmostEqual(shown["asked_per_first"], 30 / (3 * 40))
+        self.assertAlmostEqual(shown["admitted_share"], 20 / 30)
+        self.assertAlmostEqual(shown["retry_success"], 5 / 20)
+
+    def test_the_rate_configured_does_not_enter_them(self):
+        self.assertEqual(self._window(40.0, scale_free=True), self._window(4000.0, scale_free=True))
+        # ... as it does the counts an agent is shown otherwise.
+        self.assertNotEqual(
+            self._window(40.0, scale_free=False), self._window(4000.0, scale_free=False)
+        )
+
+    def test_an_environment_with_them(self):
+        grid = QuotaGrid(scale_free=True, in_flight=True)
+        env = RetryEnv(_scenario(grid=grid), slow_s=10.0)
+        self.assertEqual(env.feature_names[:5], tuple(f"plain:{name}" for name in SCALE_FREE))
+        self.assertIn(IN_FLIGHT, env.feature_names)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            check_env(env, skip_render_check=True)
+        # At rest every first attempt succeeds and no retry asks.
+        observation, _ = env.reset(options={"episode_seed": 1})
+        shown = dict(zip(env.feature_names, observation, strict=True))
+        self.assertGreater(shown["plain:first_success"], 0.95)
+        self.assertEqual(shown["plain:asked_per_first"], 0.0)
+
+
 class TestTheHandWrittenRule(unittest.TestCase):
     """`limiter.hand_rule`: the policy a learned one is measured against."""
 
@@ -316,6 +374,20 @@ class TestTheHandWrittenRule(unittest.TestCase):
         env = RetryEnv(_scenario())
         with self.assertRaisesRegex(ValueError, "in-flight"):
             hand_rule(env.feature_names, env.knob_levels[0])
+
+    def test_it_decides_the_same_on_scale_free_entries(self):
+        scenario = _scenario(
+            grid=replace(self.GRID, scale_free=True), variation=Variation(p_fail=(0.5, 0.5))
+        )
+        env = RetryEnv(scenario, slow_s=10.0)
+        rule = hand_rule(env.feature_names, env.knob_levels[0])
+        observation, info = env.reset(options={"episode_seed": 1})
+        in_force = []
+        for _ in range(env.episode_steps):
+            observation, _, _, _, info = env.step(rule(observation))
+            in_force.append(info["knob_quota:plain"])
+        counted, _ = self._episode(0.5)
+        self.assertEqual(in_force, counted)
 
 
 class TestTheQuotaGrid(unittest.TestCase):

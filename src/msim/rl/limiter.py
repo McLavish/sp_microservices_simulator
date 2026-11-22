@@ -63,6 +63,16 @@ DRIFT = 0.02
 AT_REST = 10
 #: `QuotaGrid(in_flight_cap=c)` never refuses a retry while fewer attempts than this are in flight.
 CAP_FLOOR = 8.0
+#: What is measured for every tenant with `QuotaGrid(scale_free=True)`, in the
+#: same five places: ratios of the window's own counts, so nothing about the
+#: deployment (no rate a tenant sends "when all is well") is configured.
+SCALE_FREE = (
+    "succeeded",  # share of the attempts that ended which succeeded
+    "first_success",  # ... of the FIRST attempts that ended
+    "asked_per_first",  # retries that asked per first attempt let in, over ATTEMPTS - 1
+    "admitted_share",  # share of the retries that asked which were let in
+    "retry_success",  # share of the retries that ended which succeeded
+)
 #: The scales, in requests of the tenant when all is well. A tenant that tries
 #: four times sends up to four attempts per request; goodput cannot pass the
 #: requests that arrive, and twice the expected rate leaves room for a heavy load.
@@ -214,6 +224,7 @@ class LimiterKnobs:
         asked_per_failure: float | None = None,
         confirm: bool = False,
         await_rest: bool = False,
+        scale_free: bool = False,
     ) -> None:
         self.quota = quota
         self._tap = tap
@@ -235,6 +246,8 @@ class LimiterKnobs:
         self._confirm = confirm
         #: `QuotaGrid.await_rest`: every share at its default until there has been a window at rest.
         self._await_rest = await_rest
+        #: `QuotaGrid.scale_free`: `SCALE_FREE` is measured instead of `MEASURES`.
+        self._scale_free = scale_free
         self._asked_before = 0  # retries that asked in the window before the last one measured
         self._bounded = bool(step_up) or hold_above is not None or confirm
         self._place = (
@@ -324,6 +337,17 @@ class LimiterKnobs:
             if self._asked_per_failure is not None:
                 failed_firsts = (seen.ended - seen.retries_ended) - (seen.goodput - seen.retries_ok)
                 asked = min(asked, self._asked_per_failure * max(failed_firsts, 0))
+            if self._scale_free:
+                firsts_ended = seen.ended - seen.retries_ended
+                firsts_ok = seen.goodput - seen.retries_ok
+                values += [
+                    seen.goodput / seen.ended if seen.ended else 0.0,
+                    firsts_ok / firsts_ended if firsts_ended > 0 else 0.0,
+                    asked / ((ATTEMPTS - 1.0) * seen.firsts) if seen.firsts else float(asked > 0),
+                    seen.retries_admitted / seen.retries_asked if seen.retries_asked else 0.0,
+                    seen.retries_ok / seen.retries_ended if seen.retries_ended else 0.0,
+                ]
+                continue
             values += [
                 seen.ended * per_request / ATTEMPTS,
                 seen.goodput * per_request / GOODPUT,
@@ -384,10 +408,13 @@ def hand_rule(
         )
     crowding = names.index(IN_FLIGHT)
     tenants = [name.removeprefix("knob:" + _PREFIX) for name in names if name.startswith("knob:")]
+    # With scale-free entries the share that succeeded is an entry of its own.
+    scale_free = bool(tenants) and f"{tenants[0]}:succeeded" in names
+    first, second = ("succeeded", "succeeded") if scale_free else ("ended", "goodput")
     where = [
         (
-            names.index(f"{tenant}:ended"),
-            names.index(f"{tenant}:goodput"),
+            names.index(f"{tenant}:{first}"),
+            names.index(f"{tenant}:{second}"),
             names.index(f"knob:{_PREFIX}{tenant}"),
         )
         for tenant in tenants
@@ -398,8 +425,13 @@ def hand_rule(
         action = []
         for ended, goodput, knob in where:
             level = round(float(observation[knob]) * top)
-            attempts = float(observation[ended]) * ATTEMPTS
-            succeeded = float(observation[goodput]) * GOODPUT / attempts if attempts > 0 else 0.0
+            if scale_free:
+                succeeded = float(observation[ended])
+            else:
+                attempts = float(observation[ended]) * ATTEMPTS
+                succeeded = (
+                    float(observation[goodput]) * GOODPUT / attempts if attempts > 0 else 0.0
+                )
             if succeeded < alive:
                 action.append(0)
             elif float(observation[crowding]) > down_above:
@@ -496,6 +528,19 @@ class QuotaGrid:
     a high load, opened level by level into the congestion and kept it going
     for the whole run. With `await_rest` it lets in its probes until it has
     seen the service well once.
+
+    `scale_free` (default `False`): the agent is shown `SCALE_FREE` instead of
+    `MEASURES`, ratios of the window's own counts (the share of the attempts
+    that succeeded, of the first attempts, the retries asked per first
+    attempt, the share of them let in, the share of the retries that
+    succeeded). `MEASURES` are counts against the rate a tenant sends when all
+    is well, which somebody has to know and write into a limiter's
+    configuration, per proxy, and which is wrong the day a proxy drops out and
+    another carries its traffic. With `scale_free` nothing of the kind is
+    configured: the quota is a share of the tenant's own first attempts, the
+    cap a multiple of the limiter's own attempts in flight at rest, and what
+    the agent is shown has no unit. What it loses is the load itself; whether
+    the service has room it reads off `IN_FLIGHT`, if it is shown it.
     """
 
     shares: tuple[float, ...] = (0.0, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 3.0)
@@ -511,6 +556,7 @@ class QuotaGrid:
     max_attempt: int | None = None
     confirm: bool = False
     await_rest: bool = False
+    scale_free: bool = False
 
     def __post_init__(self) -> None:
         if self.default_share not in self.shares:
@@ -539,7 +585,8 @@ class QuotaGrid:
 
     def features(self, tenants: Sequence[str]) -> tuple[str, ...]:
         """The names of what `LimiterKnobs.measure` returns."""
-        per_tenant = tuple(f"{tenant}:{measure}" for tenant in tenants for measure in MEASURES)
+        measures = SCALE_FREE if self.scale_free else MEASURES
+        per_tenant = tuple(f"{tenant}:{measure}" for tenant in tenants for measure in measures)
         return per_tenant + ((IN_FLIGHT,) if self.in_flight else ())
 
     def install(
@@ -589,4 +636,5 @@ class QuotaGrid:
             asked_per_failure=self.asked_per_failure,
             confirm=self.confirm,
             await_rest=self.await_rest,
+            scale_free=self.scale_free,
         )
