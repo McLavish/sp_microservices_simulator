@@ -1248,12 +1248,13 @@ can and the service has room:
   at the frontend (17 to 21 against 90 to 154 over the run, 15 to 19 against
   45 to 61 during the fault).
 - **Figure 5**: level across the load at a total failure. Ahead at a quarter
-  of the calls failing (94% of the requests that met the fault against 82 to
-  83%) and at half (76% against 56 to 57%); at three quarters 31% against 28
-  to 31%, which is level. Back in 3 s after a failure of a minute where
-  Arolla's deployment takes 19 s.
+  of the calls failing (94 to 95% of the requests that met the fault against
+  82 to 83%) and at half (75 to 76% against 56 to 57%); at three quarters 31,
+  36 and 41% in three runs against 28 to 31%, ahead on average and not in
+  every run. Back in 3 s after a failure of a minute where Arolla's deployment
+  takes 19 s.
 - **Half the calls failing for 20 s**: 86% against 55% at 600 requests per
-  second, 73% against 55% at 1200 (86% against 55% on their own profile, back
+  second, 73 and 78% against 55% at 1200 (86% against 55% on their own profile, back
   to back, at the same 9 ms of p99 and with no second of recovery against
   three). At 2000 it is the deployment that gives way, under either limiter.
 - **Figure 6**: the retries split in proportion to the requests (1.00 / 1.00
@@ -1294,9 +1295,45 @@ against their prototype's rule:
 In the simulator the learned policy adds nothing that three lines do not, once
 the limiter has the entry for attempts in flight and the rules: ahead of both
 models on the bound they were trained with, level with the model kept on the
-stricter one. What the study found is the signal and the rule, not the policy.
-The hand-written rule was not run on the cluster; at 2000 requests per second
-it would open as the cap-trained model does.
+stricter one.
+
+The same question on the cluster: the model kept and the hand-written rule in
+the same filter (`hand_rule`), with the same rules, in alternating runs on the
+capped profile (requests that started in the fault and succeeded, %, and the
+p99 in ms):
+
+| Cell | The model kept | Three hand-written lines |
+| --- | --- | --- |
+| All failing for 10 s (succeeded over the run) | 93.32, 9 ms | 93.29, 9 ms |
+| retries reaching the frontend pod during the fault | 13 | 17 |
+| A quarter failing for 10 s | 94.6, 9 ms | 94.6, 9 ms |
+| Half failing for 10 s | 75.0, 11 ms | 74.4, 10 ms |
+| Three quarters failing for 10 s, two pairs | 41.2 and 36.3, 10 and 9 ms | 33.4 and 31.6, 44 and 10 ms |
+| Half failing for 20 s at 1200 req/s | 77.9, 29 ms | 83.1, 17 ms |
+| Half failing for 20 s at 2000 req/s, three runs each | 42.5, 49.6, 44.8; 450 to 460 ms | 44.6, 47.1, 47.5; 430 to 500 ms |
+| the same with the hold band, two runs | | 44.8 and 53.2; 462 and 48 ms |
+
+They cannot be told apart. The model is ahead at three quarters of the calls
+failing in both pairs (by 8 and 5 points; its own run of that cell in the pass
+above had 31%), the rule at half for 20 s in the one pair, and the rest is
+level; at 2000 requests per second the deployment congests under either, as
+it does under Arolla in three runs of four, and the one clean run of the
+eight is the rule's with the band. So what this study found is the signal and the
+rule around the policy, not the policy: a limiter that counts its attempts in
+flight, closes when nothing succeeds, climbs a level a window while nothing
+piles up and refuses retries while it does. A policy trained in the simulator
+arrives at the same behaviour and no further.
+
+One more run belongs here, the first of the model at 2000 requests per second,
+which is what `await_rest` above is for: the limiter started while the
+application was still cold, had never seen a window at rest and so nothing to
+compare the time in flight with, read no crowding at a second in flight, and
+opened a level a second into the congestion of the cold start. Every retry was
+let in, the application never left that state, and 62.5% of the run's requests
+were served, at a median of 1.2 s. It is the limiter's doing, model and
+hand-written rule alike; Arolla, whose budget is fed by successes, cannot do
+it. The runs after it had `await_rest` on, and in one of them a cold start of
+5 s passed with the quota closed.
 
 As to whether Arolla was fitted to its testbed: nothing here says its settings
 were. It does on this cluster what it is built to do, keep a failing
@@ -1317,6 +1354,8 @@ between runs of either limiter, so a difference below a point of the run is
 not a finding, and the differences above are the ones in the requests that met
 the fault and in what follows it. And of the limiter itself:
 
+- A learned policy is not what carries the result: three hand-written lines
+  in its place do the same in the simulator and on the cluster (above).
 - The model was not trained inside the rule it runs in. Models trained with
   the step are worse (they learn to stay closed), and the one trained with the
   cap leans on it where the deployment has a congested state the simulator
@@ -1331,12 +1370,13 @@ the fault and in what follows it. And of the limiter itself:
   from the run that showed the need, and not searched.
 - `confirm` costs a second at the start of every partial failure, and the
   model closes fully on a crowded window and has to climb again: at three
-  quarters of the calls failing for 10 s that leaves it level with Arolla,
-  where a model of the same family without the step and the second window
-  was 16 points ahead (and let a thousand retries through at the start of a
-  total failure).
-- At 2000 requests per second it tipped the deployment into congestion in one
-  of its two runs, as Arolla did in three of four.
+  quarters of the calls failing for 10 s that leaves it between level with
+  Arolla and 10 points ahead, run by run, where a model of the same family
+  without the step and the second window was 16 points ahead (and let a
+  thousand retries through at the start of a total failure).
+- At 2000 requests per second it tipped the deployment into congestion in
+  four of its five runs (the clean one was before the last two rules), as
+  Arolla did in three of four.
 - It is still configured with a nominal rate per proxy, and with the number of
   proxies that share a tenant's traffic; the incident above is what that costs
   when one of them drops out.
