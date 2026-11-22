@@ -2,7 +2,7 @@
 
     python deploy/envoy-limiter/export.py MODEL.zip OUT.json --rates R [R ...]
         [--tenants NAME [NAME ...]] [--one-level] [--rest] [--in-flight-cap C] [--step-up N]
-        [--asked-per-failure A] [--max-attempt N] [--confirm]
+        [--asked-per-failure A] [--max-attempt N] [--confirm] [--await-rest]
         [--hand-rule ALIVE DOWN_ABOVE [HOLD_ABOVE]] [--fixture FILE]
 
 Writes the `limiter` block of the filter's plugin configuration: the tenants in the policy's
@@ -51,6 +51,7 @@ def limiter_block(
     max_attempt: int | None = None,
     confirm: bool = False,
     hand_rule: list[float] | None = None,
+    await_rest: bool = False,
 ) -> dict:
     sidecar = json.loads(model.with_suffix(".json").read_text("utf-8"))
     knobs = sidecar["knobs"]
@@ -80,6 +81,7 @@ def limiter_block(
         "asked_per_failure": asked_per_failure or trained_grid(sidecar).get("asked_per_failure"),
         "max_attempt": max_attempt or trained_grid(sidecar).get("max_attempt"),
         "confirm": bool(confirm or trained_grid(sidecar).get("confirm", False)),
+        "await_rest": bool(await_rest or trained_grid(sidecar).get("await_rest", False)),
         # `rl.limiter.hand_rule` in place of the policy: ALIVE DOWN_ABOVE [HOLD_ABOVE].
         "hand_rule": None
         if hand_rule is None
@@ -111,6 +113,7 @@ def main() -> None:
     parser.add_argument("--asked-per-failure", type=float, default=None)
     parser.add_argument("--max-attempt", type=int, default=None)
     parser.add_argument("--confirm", action="store_true")
+    parser.add_argument("--await-rest", action="store_true")
     parser.add_argument(
         "--hand-rule",
         type=float,
@@ -133,6 +136,7 @@ def main() -> None:
         args.max_attempt,
         args.confirm,
         args.hand_rule,
+        args.await_rest,
     )
     args.out.write_text(json.dumps(limiter), "utf-8")
     entries = len(limiter["policy"]["hidden"][0]["w"][0])

@@ -477,6 +477,23 @@ class TestTheQuotaGrid(unittest.TestCase):
         # ... and a window later when a second window of asking is waited for.
         self.assertEqual(first_open(replace(ladder, confirm=True)), 5)
 
+    def test_with_await_rest_nothing_opens_before_the_service_was_seen_well(self):
+        # Overloaded and failing from the first second: retries ask in every window,
+        # so there is never a window at rest and nothing to compare the time in flight with.
+        heavy = TestAttemptsInFlight.BURST
+        trouble = Variation(load=(8.0, 8.0), p_fail=(0.5, 0.5))
+        ladder = QuotaGrid(shares=(0.0, 1000.0), in_flight_cap=2.5)
+
+        def opened(grid: QuotaGrid, variation: Variation | None) -> float:
+            env = RetryEnv(_scenario(heavy, grid=grid, variation=variation))
+            env.reset(options={"episode_seed": 1})
+            return max(env.step((1, 1))[4]["knob_quota:plain"] for _ in range(6))
+
+        self.assertEqual(opened(ladder, trouble), 1000.0)  # blind, and open
+        self.assertEqual(opened(replace(ladder, await_rest=True), trouble), 0.0)
+        # A service that was well during the warm-up: the same from the first step.
+        self.assertEqual(opened(replace(ladder, await_rest=True), None), 1000.0)
+
     def test_with_max_attempt_a_caller_gets_no_more_retries_per_request(self):
         bound = _AttemptBound(4)
         self.assertTrue(bound.check(AdmissionRequest(0, "a", 1, False, 0, 0)))

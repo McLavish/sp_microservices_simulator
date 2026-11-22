@@ -213,6 +213,7 @@ class LimiterKnobs:
         cap_times: float = 0.0,
         asked_per_failure: float | None = None,
         confirm: bool = False,
+        await_rest: bool = False,
     ) -> None:
         self.quota = quota
         self._tap = tap
@@ -227,10 +228,13 @@ class LimiterKnobs:
         #: `QuotaGrid.hold_above`: no rise at all while `IN_FLIGHT` is above it. Each
         #: tenant's place on the ladder now (it starts at `start`) is kept for both.
         self._ladder = tuple(ladder)
+        self._start = self._ladder.index(start) if self._ladder else 0
         self._step_up = step_up
         self._hold_above = hold_above
         #: `QuotaGrid.confirm`: no share rises until retries have asked in two windows running.
         self._confirm = confirm
+        #: `QuotaGrid.await_rest`: every share at its default until there has been a window at rest.
+        self._await_rest = await_rest
         self._asked_before = 0  # retries that asked in the window before the last one measured
         self._bounded = bool(step_up) or hold_above is not None or confirm
         self._place = (
@@ -268,9 +272,15 @@ class LimiterKnobs:
                     f"no quota named {name!r}; there are "
                     f"{[_PREFIX + tenant for tenant in self.tenants]}"
                 )
-        resting = self._rest is not None and self._asked == 0
-        if resting:
-            values = {_PREFIX + tenant: self._rest for tenant in self.tenants}
+        rest = self._rest
+        resting = rest is not None and self._asked == 0
+        waiting = self._await_rest and self._flight_at_rest is None
+        if waiting:
+            # Nothing to compare the attempts in flight with yet: the default, as at the start.
+            resting = True
+            values = {_PREFIX + tenant: self._ladder[self._start] for tenant in self.tenants}
+        elif rest is not None and self._asked == 0:
+            values = {_PREFIX + tenant: rest for tenant in self.tenants}
         elif self._bounded:
             # No further up than `step_up` levels from where the tenant stands,
             # and not up at all while the service is crowded.
@@ -476,6 +486,16 @@ class QuotaGrid:
     looks like a partial failure whatever follows; an agent that opens on it
     lets a share of the retries through at the start of a total failure. With
     `confirm` it acts on a failure once it has seen a whole window of it.
+
+    `await_rest` (default `False`): every share stays at its default until
+    there has been a window at rest (one in which no retry asked), that is
+    until the limiter has a time in flight to compare with. Before that the
+    in-flight entry reads 0 and `in_flight_cap` refuses nothing, so a limiter
+    that starts in the middle of trouble is blind to how crowded the service
+    is: on a deployment one that started while its service was still cold, at
+    a high load, opened level by level into the congestion and kept it going
+    for the whole run. With `await_rest` it lets in its probes until it has
+    seen the service well once.
     """
 
     shares: tuple[float, ...] = (0.0, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 3.0)
@@ -490,6 +510,7 @@ class QuotaGrid:
     asked_per_failure: float | None = None
     max_attempt: int | None = None
     confirm: bool = False
+    await_rest: bool = False
 
     def __post_init__(self) -> None:
         if self.default_share not in self.shares:
@@ -567,4 +588,5 @@ class QuotaGrid:
             cap_times=self.in_flight_cap or 0.0,
             asked_per_failure=self.asked_per_failure,
             confirm=self.confirm,
+            await_rest=self.await_rest,
         )

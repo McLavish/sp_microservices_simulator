@@ -174,6 +174,10 @@ pub struct Settings {
     /// (`QuotaGrid.confirm`): a failure begins inside a window, and that
     /// window looks like a partial failure whatever follows.
     pub confirm: bool,
+    /// Every level stays at its default until there has been a window at rest
+    /// (`QuotaGrid.await_rest`): before that there is no time in flight to
+    /// compare with, the entry reads 0 and the cap refuses nothing.
+    pub await_rest: bool,
     /// Decide by the hand-written rule instead of the policy. Not set: the policy.
     pub hand_rule: Option<HandRule>,
     pub policy: Policy,
@@ -199,6 +203,7 @@ impl Default for Settings {
             asked_per_failure: None,
             max_attempt: None,
             confirm: false,
+            await_rest: false,
             hand_rule: None,
             policy: Policy::default(),
         }
@@ -693,7 +698,8 @@ impl Limiter {
                 tenant.level = tenant.level.min(was + rise);
             }
         }
-        if resting {
+        let waiting = self.settings.await_rest && self.flight_at_rest.is_none();
+        if resting || waiting {
             let default = self.settings.default_level;
             for tenant in self.tenants[..known].iter_mut() {
                 tenant.level = default;
@@ -1387,6 +1393,47 @@ mod tests {
         }
         assert_eq!(held.step(2000), vec![5]);
         assert!((held.last_in_flight.unwrap() - 0.375).abs() < 0.02);
+    }
+
+    #[test]
+    fn with_await_rest_nothing_opens_before_a_window_at_rest() {
+        // A policy that always answers the top level.
+        let policy = Policy {
+            hidden: Vec::new(),
+            head: Some(Layer { w: vec![vec![0.0; 11], vec![0.0; 11]], b: vec![0.0, 1.0] }),
+        };
+        let mut l = Limiter::new(Settings {
+            tenants: vec!["a".into()],
+            rates: vec![40.0],
+            shares: vec![0.0, 3.0],
+            default_level: 0,
+            await_rest: true,
+            policy,
+            ..Settings::default()
+        })
+        .unwrap();
+        // Trouble from the first window on: retries ask in every one.
+        for second in 0..3u64 {
+            for i in 0..40 {
+                l.admit(0, false, second * 1000 + i * 25);
+                l.ended(0, false, false, second * 1000 + i * 25 + 10);
+                l.admit(0, true, second * 1000 + i * 25 + 10);
+            }
+            assert_eq!(l.step((second + 1) * 1000), vec![0]);
+        }
+        // One window in which nothing asks: there is a time at rest now ...
+        for i in 0..40 {
+            l.admit(0, false, 3000 + i * 25);
+            l.ended(0, false, true, 3000 + i * 25 + 10);
+        }
+        assert_eq!(l.step(4000), vec![1]);
+        // ... and the policy's answer holds from then on.
+        for i in 0..40 {
+            l.admit(0, false, 4000 + i * 25);
+            l.ended(0, false, false, 4000 + i * 25 + 10);
+            l.admit(0, true, 4000 + i * 25 + 10);
+        }
+        assert_eq!(l.step(5000), vec![1]);
     }
 
     #[test]

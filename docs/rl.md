@@ -318,6 +318,17 @@ it lets a share of the retries through at the start of a total failure. With
 `confirm` it acts once it has seen a whole window of the failure, a second
 later.
 
+`QuotaGrid(await_rest=True)` keeps every share at its default until there has
+been a window at rest, that is until the limiter has a time in flight to
+compare with. Before that the in-flight entry reads 0 and the cap refuses
+nothing, so a limiter that starts in the middle of trouble is blind to how
+crowded its service is. On the deployment one did: started at 2000 requests
+per second while the application was still cold, it opened a level a second
+into the congestion of the cold start, let every retry in, and kept the
+application congested for the whole run (62% of the requests served where a
+cold start otherwise costs one second). With `await_rest` it lets in its
+probes until it has seen the service well once.
+
 So the scenario and `as_written` on the same file differ in the limiter and in
 nothing else: `tests/test_rl_limiter.py` checks that a quota which refuses
 nothing gives the file with no limiter, summary for summary.
