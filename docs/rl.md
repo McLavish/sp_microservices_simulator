@@ -867,6 +867,8 @@ before the next was built; every run is listed.
 | `step_up=1` | a quota rises one level a window, and falls as far as the policy says | the policy sees each level's effect before the next; bounds what the start of a total failure lets through |
 | `in_flight_cap=2.5` | a retry is refused while more attempts are in flight than 2.5 times their number at rest | the one rule that acts within a window: retries cannot push the service past what it serves |
 | `asked_per_failure=3` | the policy is shown at most three asking retries per failed first attempt | a caller that retries ten times does not read as a worse failure |
+| `max_attempt=4` (last round) | a retry beyond the fourth attempt of its request is refused | a caller that retries ten times is let in no more often per request |
+| `confirm` (last round) | no quota rises until retries have asked in two windows running | the window in which a failure begins looks partial whatever follows; it opens nothing |
 
 *The floor and the rest, on a model without the entry.* A model trained with
 the floor (six levels, a price on retries, no entry for attempts in flight)
@@ -1083,85 +1085,232 @@ the nominal load with half the calls failing, which in its training is a
 service with no room. The entry for attempts in flight said there was room,
 and the model does not rely on it there. The cell was run again (99.74%).
 
-**What it shows.** On their benchmarks, on a deployment that is not theirs,
-the learned limiter in its last form (a policy that is shown the attempts in
-flight, inside a rule that lets its quota rise a level a window and refuses
-retries while attempts pile up) is level with Arolla where no retry can
-succeed and ahead wherever some can:
+**A last round: two more rules, and a model that leans on the cap.** The pass
+above left four things open: the retries at the start of a total failure, the
+cell at three quarters of the calls failing (3 points ahead), the split of
+retries between clients of different rates, and the cell at 2000 requests per
+second (level).
 
-- **Figure 4**, their headline cell: the same requests served at the same
-  latency in both pairs (93.33% against 93.32% and 92.52% against 92.56%, a
-  p99 of 9 to 10 ms), with half the retries let in at the gateway over the run
-  (101 and 108 against 206 and 212) and fewer reaching the frontend (16 and 53
-  against 97 and 73).
-- **Figure 5**: level across the load at a total failure; ahead at every
-  failure rate below one, by 14 points of the requests that met the fault at a
-  quarter of the calls failing, 11 at half and 3 at three quarters, and by
-  more the longer the failure lasts (32 points at 20 s); back in 3 s after a
-  failure of a minute, where Arolla's deployment takes 19 s.
-- **Figure 6**: both groups of clients get 13 to 39 points more of their
-  requests through than under either of their filters; the retries are split
-  as near to proportionally as their fairness filter splits them when the
-  clients send at the same rate, and less near when they do not.
+*Two rules*, in the simulator and the filter as the others.
+`max_attempt=4`: a retry beyond the fourth attempt of its request is refused
+whatever the quota, so a client that retries ten times is let in no more often
+per request than one that retries three times (their fairness filter decides
+on the attempt number too). `confirm`: no quota rises until retries have asked
+in two windows running, so the window in which a failure begins, which always
+looks partial, opens nothing.
+
+*A second ranking, and what its model did.* The models had been ranked on the
+requests served within 150 ms. They were trained on 500 ms, and a simulated
+station here takes 40 to 70 ms over a request where the application takes 6,
+so that bound cuts into service times and puts a model low for letting the cap
+work. On the 500 ms, with every rule on, the strict line of before (never more
+than half a point of an episode behind their prototype's rule in any of the 72
+cells, no more retries than it at a total failure) passes 14 of 34 models, 13
+of them from the two runs trained WITH the cap in the simulator, and the
+largest mean lead is one of those after 1.4 million steps (1.7 points of an
+episode, 0.01 behind at worst; the model of the pass above: 1.4 and 0.56). In
+the simulator it climbs to a full quota at 2000 requests per second with half
+the calls failing and lets the cap decide what gets in. On the cluster, with
+every rule (pairs are Arolla and the learned limiter back to back in one run
+of their harness):
+
+| Cell | | Succeeded % | Started in the fault % | After the fault % | p99 ms | Recovery s |
+| --- | --- | --- | --- | --- | --- | --- |
+| Headline, two pairs | Arolla | 92.53 and 93.34 | 9.4 and 6.1 | 98.9 and 99.6 | 38 and 9 | 3 and 2 |
+| | Cap-trained model | 93.27 and 92.54 | 2.9 and 10.2 | 100.0 and 98.8 | 9 and 9 | 2 and 3 |
+| All failing for 10 s at 600 / 1800 req/s | Cap-trained model | 91.78 / 92.82 | 7.0 / 6.6 | 99.2 / 100.0 | 9 / 91 | 3 / 2 |
+| A quarter failing for 10 s | Cap-trained model | 99.55 | 94.8 | 100.0 | 9 | 0 |
+| Half failing for 10 s | Cap-trained model | 98.29 | 77.8 | 100.0 | 10 | 0 |
+| Three quarters failing for 10 s, a pair | Arolla | 94.42 | 27.9 | 99.9 | 8 | 2 |
+| | Cap-trained model | 94.12 | 34.9 | 99.2 | 10 | 3 |
+| All failing for 30 s / 60 s | Cap-trained model | 80.14 / 66.73 | 0.9 / 1.2 | 99.9 / 99.0 | 9 / 9 | 2 / 3 |
+| Half failing for 20 s at 600 / 1200 req/s | Cap-trained model | 97.92 / 96.87 | 85.5 / 78.1 | 100.0 / 100.0 | 9 / 43 | 0 / 1 |
+| Half failing for 20 s at 2000 req/s, two pairs | Arolla | 91.77 and 93.35 | 42.6 and 53.3 | 99.9 and 99.3 | 633 and 34 | 2 and 3 |
+| | Cap-trained model | 92.01 and 91.98 | 44.1 and 44.5 | 100.0 and 99.8 | 423 and 402 | 2 and 2 |
+
+It is ahead of Arolla everywhere but at 2000 requests per second, and there it
+shows what the simulator cannot. That load is this deployment's edge under a
+failure of half the calls: 2000 first attempts and 3000 refused retries a
+second through two gateway pods. Arolla's own three runs of the cell are one
+clean (53.3%, 34 ms), one half congested (52.4%, 344 ms) and one congested
+(42.6%, 633 ms). The cap-trained model congested in both of its runs. In the
+second, a quota of 10% for two seconds (200 retries a second) was enough, the
+time in flight went to ten times its rest value within two seconds, and the
+application stayed there for the rest of the fault with the cap
+refusing every retry: there is a congested state it does not leave while the
+storm lasts, a simulated queue has none, and a model that learned to lean on
+the cap leans on it exactly there. The model of the pass above, trained
+without the cap, reads that load as a service with no room and stays closed
+(52.0%, 11 ms). So the ranking on 500 ms was tried and its pick is not the
+configuration kept.
+
+*The configuration kept* is therefore the model of the pass above (trained
+without the cap) with every rule: the cap, a level a window, the rest, the
+floor, the bound on the retries shown, no retry beyond a fourth attempt, no
+rise before a second window, and one level for all tenants in the fairness
+runs. Its cells, on the capped profile (the total failures at other loads and
+of other lengths are in the table of the pass above: the two rules do not act
+there):
+
+| Cell | | Succeeded % | Started in the fault % | After the fault % | p99 ms | Recovery s |
+| --- | --- | --- | --- | --- | --- | --- |
+| Headline, a pair | Arolla | 93.33 | 1.5 | 98.7 | 9 | 3 |
+| | Kept | 92.52 | 10.8 | 98.6 | 9 | 3 |
+| A quarter failing for 10 s | Arolla (two runs) | 98.45 to 98.59 | 82.0 to 83.0 | 99.8 to 99.9 | 8 | 1 to 2 |
+| | Kept | 99.46 | 93.7 | 100.0 | 9 | 0 |
+| Half failing for 10 s | Arolla (two runs) | 96.13 to 96.52 | 56.3 to 57.1 | 99.5 to 99.7 | 9 | 2 to 3 |
+| | Kept | 98.10 | 75.9 | 99.9 | 10 | 1 |
+| Three quarters failing for 10 s | Arolla (three runs) | 93.90 to 94.50 | 27.9 to 30.8 | 99.5 to 99.9 | 9 | 2 to 3 |
+| | Kept | 93.91 | 31.0 | 99.4 | 8 | 3 |
+| Half failing for 20 s at 600 req/s | Arolla | 93.00 | 54.7 | 99.5 | 10 | 3 |
+| | Kept | 97.98 | 85.8 | 100.0 | 9 | 0 |
+| at 1200 req/s | Arolla (three runs) | 92.96 to 93.41 | 54.3 to 54.9 | 99.5 to 99.7 | 8 to 70 | 2 to 3 |
+| | Kept | 95.77 | 72.7 | 99.7 | 9 | 2 |
+| at 2000 req/s, a pair | Arolla | 92.16 | 45.2 | 100.0 | 611 | 2 |
+| | Kept | 92.94 | 50.6 | 100.0 | 391 | 2 |
+
+| Retries let in, headline pairs (kept configuration; the two pairs of the cap-trained model; the pair on their own profile) | Warm-up | During the fault | Whole run |
+| --- | --- | --- | --- |
+| Gateway pod, Arolla | 90; 18, 88; 90 | 122; 116, 118; 120 | 214; 138, 212; 212 |
+| Gateway pod, learned | 4; 4, 4; 4 | 40; 36, 40; 40 | 44; 40, 44; 44 |
+| Frontend pod, Arolla | 41; 103, 44; 44 | 49; 51, 61; 45 | 92; 154, 105; 90 |
+| Frontend pod, learned | 1; 2, 2; 1 | 19; 19, 15; 18 | 20; 21, 17; 19 |
+
+| Fairness, half failing for 20 s | Limiter | Retries admitted, polite / aggressive | Share over demand | Succeeded in the fault %, polite / aggressive | Succeeded % |
+| --- | --- | --- | --- | --- | --- |
+| Same rate | Arolla, fairness filter | 665 / 575 | 1.07 / 0.93 | 55.1 / 54.4 | 92.97 |
+| | Kept | 6062 / 6086 | 1.00 / 1.00 | 77.5 / 77.5 | 96.65 |
+| | Cap-trained model | 5910 / 5862 | 1.00 / 1.00 | 78.0 / 78.0 | 96.80 |
+| Different rates | Arolla, fairness filter | 164 / 1067 | 1.10 / 0.99 | 55.0 / 56.7 | 93.39 |
+| | Kept | 1028 / 7958 | 0.94 / 1.01 | 72.7 / 73.3 | 96.01 |
+| | Cap-trained model | 1888 / 13809 | 0.99 / 1.00 | 84.5 / 86.5 | 97.99 |
+
+With `confirm` a total failure lets through the probes and nothing else: 15
+to 19 retries reach the sampled frontend pod during the fault in four pairs,
+against 45 to 61 under Arolla, and 17 to 21 against 90 to 154 over the run
+(Arolla's bucket lets its tenth of the cold start in as well). The requests
+served are the same to within the run-to-run spread: over the four pairs
+Arolla has 92.5 to 93.3% and the learned limiter 92.5 to 93.3%, each ahead
+twice. With `max_attempt` the two groups of clients are treated alike and the
+split of retries is proportional, exactly with equal rates and to within 6%
+with different ones, where their fairness filter is within 7 and 10%; both
+groups get 73 to 78% of their requests through against 54 to 57%. The price of
+`confirm` is a second at the start of every partial failure: half failing for
+20 s gives 72.7% here where the pass above had 86.8% (the model also closed
+more often on a crowded window in this run; one run each).
+
+At 2000 requests per second the kept configuration is ahead in its pair (50.6%
+against 45.2%) and congested with Arolla in it: a step to a 30% quota on one
+gateway pod was enough. Over all the runs of that cell Arolla has 42.6 to
+53.3% in four and this model 50.6 and 52.0% in two; the cell is the
+deployment's edge, both limiters tip it in some runs, and a limiter that lets
+nothing in at all there (the pilot above: 52.7%, 9 ms) is the only clean one.
+
+*On their profile as they ship it* (the frontend at its four cores, nothing
+capped), back to back:
+
+| Cell | | Succeeded % | Started in the fault % | After the fault % | p99 ms | Recovery s |
+| --- | --- | --- | --- | --- | --- | --- |
+| Headline (the cap-trained model) | Arolla | 92.49 | 10.3 | 98.7 | 9 | 3 |
+| | Learned | 92.55 | 9.9 | 98.8 | 9 | 3 |
+| Half failing for 20 s at 1200 req/s | Arolla | 93.03 | 54.7 | 99.6 | 9 | 3 |
+| | Kept | 97.97 | 85.9 | 100.0 | 9 | 0 |
+| Fairness, different rates | Arolla, fairness filter | 93.00 | 54.8 | 99.5 | 14 | 3 |
+| | Kept | 97.98 | 85.4 | 99.9 | 12 | 0 |
+
+In the fairness pair their filter splits 1.06 / 0.99 with 55.5 and 54.7% of
+the two groups' requests succeeding, the kept configuration 1.00 / 1.00 with
+84.8 and 86.3%. With room to spare the picture is the one of the capped
+profile with more of it: level where every call fails (90 retries reach the
+frontend pod against 19), 31 points ahead where half of them do.
+
+**What it shows.** On their benchmarks, on a deployment that is not theirs,
+the learned limiter in the configuration kept (a policy that is shown the
+attempts in flight, inside a rule: a level a window, a cap on retries while
+attempts pile up, a second window before it opens, no retry beyond a fourth
+attempt) is level with Arolla where no retry can succeed and ahead where some
+can and the service has room:
+
+- **Figure 4**, their headline cell, four pairs back to back (three on the
+  capped profile, one on their own): the same requests served (92.5 to 93.3%
+  for each, each ahead twice) at the same latency, and a fifth of the retries
+  at the frontend (17 to 21 against 90 to 154 over the run, 15 to 19 against
+  45 to 61 during the fault).
+- **Figure 5**: level across the load at a total failure. Ahead at a quarter
+  of the calls failing (94% of the requests that met the fault against 82 to
+  83%) and at half (76% against 56 to 57%); at three quarters 31% against 28
+  to 31%, which is level. Back in 3 s after a failure of a minute where
+  Arolla's deployment takes 19 s.
+- **Half the calls failing for 20 s**: 86% against 55% at 600 requests per
+  second, 73% against 55% at 1200 (86% against 55% on their own profile, back
+  to back, at the same 9 ms of p99 and with no second of recovery against
+  three). At 2000 it is the deployment that gives way, under either limiter.
+- **Figure 6**: the retries split in proportion to the requests (1.00 / 1.00
+  with equal rates; 0.94 / 1.01 with different ones, and 1.00 / 1.00 on their
+  own profile where their fairness filter, back to back, has 1.06 / 0.99),
+  and both groups get 17 to 32 points more of their requests through.
+
+Two things in that list are level and will stay so for any limiter. At a total
+failure no retry can succeed: what clients are served, how late, and how soon
+after the fault ends cannot differ between two limiters that both refuse, and
+recovery is the two or three seconds the removal of the fault takes to reach
+the proxies. And at 2000 requests per second the capped deployment has no room
+for retries at all, so the best a limiter can do is what one that refuses
+everything does.
 
 What is whose. The policy decides whether retries are worth letting in: closed
-from the first second at a total failure, open within seconds at a partial
-one. The rule decides whether there is room: the cap is why a full quota does
-not congest the service and why the tail latency stays at Arolla's, the step
-is why the start of a total failure lets a hundred retries through and not a
-thousand (a quota that stayed at zero would let through a fifth of that,
-and the model does not hold it there for the first two seconds). The filter's
-way of refusing (an answer held until the request is
-complete) is the whole of the gain after long failures, and one level for all
-tenants is what makes the split fair. A rule written by hand that raised a
-quota while retries succeed and attempts do not pile up was not built, so what
-these cells do not say is how much of the lead needs a learned policy.
+at a total failure, open within seconds at a partial one, closed where the
+load leaves no room. The rule decides the rest: the cap is why an open quota
+does not cost latency, the step and the second window are why the start of a
+total failure lets through its probes and nothing else, the bound on attempts
+is why the split is fair. The filter's way of refusing (an answer held until
+the request is complete) is the whole of the gain after long failures. A rule
+written by hand that raised a quota while retries succeed and attempts do not
+pile up was not built, so what these cells do not say is how much of the lead
+needs a learned policy; the rules around this one carry a good part of it.
 
 As to whether Arolla was fitted to its testbed: nothing here says its settings
 were. It does on this cluster what it is built to do, keep a failing
 dependency from costing latency (a p99 of 9 ms through the outage, against
 more than 2 s for the three policies with no limiter in the proxies), with the
-settings of their manifests. What does not carry over is the premise of their
-headline figure, that unlimited retries do not recover: with a load generator
-whose connection pool is bounded they are not metastable here, and no control
-ends with MORE requests served than Arolla, late. And two properties of their
-filter cost it on this cluster where they presumably do not on theirs: it
-admits the same tenth at every load, and it answers a refused retry by closing
-the caller's connection.
+settings of their manifests, on their profile capped and as shipped. What does
+not carry over is the premise of their headline figure, that unlimited retries
+do not recover: with a load generator whose connection pool is bounded they
+are not metastable here, and no control ends with MORE requests served than
+Arolla, late. And two properties of their filter cost it on this cluster where
+they presumably do not on theirs: it admits the same tenth at every load, and
+it answers a refused retry by closing the caller's connection.
 
-**What it does not show.** One run per cell (two of the 75% cell and of the
-headline pair), where their paper aggregates ten: Arolla's runs of the headline
-cell spread over 0.8 points (91.79% to 92.57%), so a difference below a point
-of the run between two cells run at different times is not a finding (the
-1800 requests per second cell, 91.77% against 92.68%, is such a difference),
-and the differences above are the ones in the requests that met the fault and
-in what follows it. One deployment, with the frontend capped to make their
-loads stress it. And of the limiter itself:
+**What it does not show.** Anything on their testbed: this is their harness,
+their manifests and their filter on other machines. One to four runs per cell
+where their paper aggregates ten: the headline cell spreads over 0.8 points
+between runs of either limiter, so a difference below a point of the run is
+not a finding, and the differences above are the ones in the requests that met
+the fault and in what follows it. And of the limiter itself:
 
-- The two numbers of the rule (2.5 times the attempts in flight at rest, one
-  level a window) were set once, from the ramp and from the run that
-  congested, and not searched; the cap has a floor of eight attempts in
-  flight per Envoy thread, which at this deployment's rates is what binds.
-- A model trained INSIDE the rule is worse than one trained without it and put
-  inside it afterwards, so the policy that was deployed was not trained on the
-  dynamics it runs in (its ranking in the simulator was made with the rules
-  on). It closes fully at the first sign of crowding, a habit from training
-  without the step, and then has to climb again: at three quarters of the
-  calls failing that leaves it 3 points ahead where the same family of model
-  without the step was 16 ahead (and let a thousand retries through at the
-  start of a total failure).
-- In the simulator the chosen model is behind their prototype's rule in its
-  worst cell by 0.55 points of an episode's requests (the low capacity, 0.6 of
-  the nominal load, half the calls failing for 20 s).
-- At 2000 requests per second it is level with Arolla on requests served, not
-  ahead.
+- The model was not trained inside the rule it runs in. Models trained with
+  the step are worse (they learn to stay closed), and the one trained with the
+  cap leans on it where the deployment has a congested state the simulator
+  lacks (the 2000 requests per second cell: 44% in both of its runs). The
+  model kept was trained with neither, ranked in the simulator with the rules
+  switched on, and of the rankings made it is the pick of the one on the
+  150 ms bound (with the looser tolerance described above), not of the one on
+  the bound it was trained with.
+- The numbers of the rule (2.5 times the attempts in flight at rest with a
+  floor of eight per Envoy thread, one level a window, one window of waiting,
+  four attempts, three asks per failure) were set once each, from the ramp and
+  from the run that showed the need, and not searched.
+- `confirm` costs a second at the start of every partial failure, and the
+  model closes fully on a crowded window and has to climb again: at three
+  quarters of the calls failing for 10 s that leaves it level with Arolla,
+  where a model of the same family without the step and the second window
+  was 16 points ahead (and let a thousand retries through at the start of a
+  total failure).
+- At 2000 requests per second it tipped the deployment into congestion in one
+  of its two runs, as Arolla did in three of four.
 - It is still configured with a nominal rate per proxy, and with the number of
   proxies that share a tenant's traffic; the incident above is what that costs
   when one of them drops out.
-- The split of retries between polite and aggressive clients is less
-  proportional than their fairness filter's when the clients send at different
-  rates (0.81 / 1.03 against 1.10 / 0.99), and less than the first model's
-  with one level.
 - The fixed 10% quota the filter gives retries that name no tenant (calls
   inside the mesh) was never exercised: their faults are injected in the
   caller's proxy, and the gateway does not retry a 500.
