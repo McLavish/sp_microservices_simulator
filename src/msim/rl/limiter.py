@@ -26,8 +26,9 @@ for the retries it lets in.
     scenario.features = quota.features(tenants)
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from msim.admission import (
     AdmissionController,
@@ -342,6 +343,64 @@ class LimiterKnobs:
         if self._flight_at_rest is None or in_flight <= 0.0:
             return 0.0
         return max(0.0, 1.0 - self._flight_at_rest / in_flight)
+
+
+def hand_rule(
+    feature_names: Sequence[str],
+    levels: int,
+    *,
+    alive: float = 0.05,
+    down_above: float = 0.5,
+    hold_above: float | None = None,
+) -> Callable[[Any], list[int]]:
+    """A limiter's policy written by hand, for the question what a learned one adds.
+
+    Three lines on what a `QuotaGrid(in_flight=True)` agent is shown, per
+    tenant: level 0 while fewer than `alive` of the tenant's attempts that
+    ended succeeded; a level down while `IN_FLIGHT` is above `down_above`;
+    otherwise the top level (held where it is above `hold_above`, if given).
+    It is meant to run inside the same rules as a learned policy
+    (`QuotaGrid(step_up=1, in_flight_cap=..., confirm=True, rest=True)`), which
+    make "the top level" a climb of a level a window.
+
+    `feature_names` and `levels` are the environment's (`RetryEnv.feature_names`,
+    the number of levels of a knob); the result maps an observation to an
+    action, as `rl.evaluate.rollout` takes it.
+    """
+    names = list(feature_names)
+    if IN_FLIGHT not in names:
+        raise ValueError(
+            "the hand-written rule needs the in-flight entry: QuotaGrid(in_flight=True)"
+        )
+    crowding = names.index(IN_FLIGHT)
+    tenants = [name.removeprefix("knob:" + _PREFIX) for name in names if name.startswith("knob:")]
+    where = [
+        (
+            names.index(f"{tenant}:ended"),
+            names.index(f"{tenant}:goodput"),
+            names.index(f"knob:{_PREFIX}{tenant}"),
+        )
+        for tenant in tenants
+    ]
+    top = levels - 1
+
+    def policy(observation: Any) -> list[int]:  # an array or a sequence of the entries
+        action = []
+        for ended, goodput, knob in where:
+            level = round(float(observation[knob]) * top)
+            attempts = float(observation[ended]) * ATTEMPTS
+            succeeded = float(observation[goodput]) * GOODPUT / attempts if attempts > 0 else 0.0
+            if succeeded < alive:
+                action.append(0)
+            elif float(observation[crowding]) > down_above:
+                action.append(max(level - 1, 0))
+            elif hold_above is not None and float(observation[crowding]) > hold_above:
+                action.append(level)
+            else:
+                action.append(top)
+        return action
+
+    return policy
 
 
 @dataclass(frozen=True)

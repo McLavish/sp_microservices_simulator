@@ -1268,9 +1268,10 @@ the request is complete) is the whole of the gain after long failures.
 
 How much of the lead needs a LEARNED policy was then asked of the simulator
 alone. The policy was replaced by three lines written by hand on the same
-thirteen entries (closed while fewer than 5% of the attempts that end succeed;
-a level down while the in-flight entry is above 0.5; otherwise up), inside the
-same rules, and ranked on the same 72 cells against their prototype's rule:
+thirteen entries (`limiter.hand_rule`: closed while fewer than 5% of the
+attempts that end succeed; a level down while the in-flight entry is above
+0.5; otherwise up), inside the same rules, and ranked on the same 72 cells
+against their prototype's rule:
 
 | Mean lead over their prototype's rule, points of an episode (worst cell) | Within 500 ms | Within 150 ms |
 | --- | --- | --- |

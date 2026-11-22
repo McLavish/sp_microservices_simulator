@@ -30,6 +30,7 @@ from msim.rl.limiter import (
     QuotaGrid,
     _AttemptBound,
     _GateTap,
+    hand_rule,
 )
 from msim.rl.summary import of_records
 from tests.test_rl_arolla import TENANTS
@@ -276,6 +277,45 @@ class TestAttemptsInFlight(unittest.TestCase):
         observation, _ = env.reset(options={"episode_seed": 1})
         shown = [float(observation[at])] + [float(env.step((1, 1))[0][at]) for _ in range(5)]
         self.assertEqual(shown, [0.0] * 6)
+
+
+class TestTheHandWrittenRule(unittest.TestCase):
+    """`limiter.hand_rule`: the policy a learned one is measured against."""
+
+    GRID = QuotaGrid(
+        shares=(0.0, 0.1, 0.3, 0.6, 1.0, 3.0),
+        floor=1,
+        rest=True,
+        in_flight=True,
+        step_up=1,
+        in_flight_cap=2.5,
+    )
+
+    def _episode(self, p_fail: float, policy=None) -> tuple[list[float], dict]:
+        scenario = _scenario(grid=self.GRID, variation=Variation(p_fail=(p_fail, p_fail)))
+        env = RetryEnv(scenario, slow_s=10.0)
+        rule = policy or hand_rule(env.feature_names, env.knob_levels[0])
+        observation, info = env.reset(options={"episode_seed": 1})
+        in_force = []
+        for _ in range(env.episode_steps):
+            observation, _, _, _, info = env.step(rule(observation))
+            in_force.append(info["knob_quota:plain"])
+        return in_force, info
+
+    def test_it_stays_closed_while_nothing_succeeds_and_climbs_while_something_does(self):
+        # The failure is from second 8 to 14: the windows of steps 3 to 8.
+        nothing, _ = self._episode(1.0)
+        self.assertEqual(max(nothing[4:9]), 0.0)
+        half, opened = self._episode(0.5)
+        self.assertGreaterEqual(max(half[3:9]), 0.6)  # a level a window, from a closed start
+        # ... and more requests get through than with no retry let in.
+        _, closed = self._episode(0.5, policy=lambda observation: [0, 0])
+        self.assertGreater(opened["ep_fault_success_rate"], closed["ep_fault_success_rate"] + 0.05)
+
+    def test_it_needs_the_in_flight_entry(self):
+        env = RetryEnv(_scenario())
+        with self.assertRaisesRegex(ValueError, "in-flight"):
+            hand_rule(env.feature_names, env.knob_levels[0])
 
 
 class TestTheQuotaGrid(unittest.TestCase):
